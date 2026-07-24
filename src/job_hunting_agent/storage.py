@@ -22,6 +22,7 @@ from .models import (
     CandidateProfile,
     CandidateProfileInput,
     ImportedJob,
+    LongTextRecord,
     ProjectExperienceCard,
     ProjectExperienceRecord,
     ResumeDraft,
@@ -483,6 +484,36 @@ class SQLiteStore:
 
         with self.connect() as conn:
             self._add_long_text(conn, entity_type, entity_id, source_label, text)
+
+    def list_long_texts(self, entity_types: list[str] | None = None) -> list[LongTextRecord]:
+        """列出可同步到 RAG 索引的长文本材料。
+
+        SQLite 仍然是长文本来源的登记处；RAG 层只从这里读取并建立语义索引。
+        """
+
+        with self.connect() as conn:
+            if entity_types:
+                placeholders = ", ".join("?" for _ in entity_types)
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM long_texts
+                    WHERE entity_type IN ({placeholders})
+                    ORDER BY id
+                    """,
+                    tuple(entity_types),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM long_texts ORDER BY id").fetchall()
+        return [
+            LongTextRecord(
+                id=int(row["id"]),
+                entity_type=row["entity_type"],
+                entity_id=int(row["entity_id"]),
+                source_label=row["source_label"],
+                text=row["text"],
+            )
+            for row in rows
+        ]
 
     def _add_long_text(
         self,

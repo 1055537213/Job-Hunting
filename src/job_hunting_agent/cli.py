@@ -25,6 +25,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--db", default="data/job_agent.db")
     # 模型配置单独放在 .env，方便后续换供应商/模型，不需要改代码。
     parser.add_argument("--env-file", default=".env")
+    # Chroma 向量库默认持久化到 data/ 下，已被 .gitignore 忽略。
+    parser.add_argument("--rag-dir", default="data/chroma")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("init")
@@ -71,6 +73,13 @@ def main(argv: list[str] | None = None) -> None:
 
     subparsers.add_parser("list-jobs")
 
+    subparsers.add_parser("rag-rebuild")
+
+    rag_search_parser = subparsers.add_parser("rag-search")
+    rag_search_parser.add_argument("query")
+    rag_search_parser.add_argument("--top-k", type=int, default=5)
+    rag_search_parser.add_argument("--entity-types")
+
     match_parser = subparsers.add_parser("match")
     match_parser.add_argument("candidate_id", type=int)
     match_parser.add_argument("job_id", type=int)
@@ -86,6 +95,8 @@ def main(argv: list[str] | None = None) -> None:
     draft_llm.add_argument("--llm-static-response")
     draft_llm.add_argument("--llm-static-response-file")
     draft_llm.add_argument("--use-env-llm", action="store_true")
+    draft_parser.add_argument("--use-rag", action="store_true")
+    draft_parser.add_argument("--rag-query")
 
     list_drafts_parser = subparsers.add_parser("list-resume-drafts")
     list_drafts_parser.add_argument("candidate_id", type=int)
@@ -129,6 +140,11 @@ def main(argv: list[str] | None = None) -> None:
         print_json({"count": len(jobs), "jobs": [asdict(job) for job in jobs]})
     elif args.command == "list-jobs":
         print_json({"jobs": [asdict(job) for job in app.list_jobs()]})
+    elif args.command == "rag-rebuild":
+        print_json(asdict(app.rebuild_rag_index(args.rag_dir)))
+    elif args.command == "rag-search":
+        results = app.search_rag(args.query, args.rag_dir, args.top_k, split_items(args.entity_types))
+        print_json({"query": args.query, "results": [asdict(result) for result in results]})
     elif args.command == "match":
         print_json(asdict(app.match_job(args.candidate_id, args.job_id)))
     elif args.command == "match-all":
@@ -144,7 +160,17 @@ def main(argv: list[str] | None = None) -> None:
             }
         )
     elif args.command == "draft-resume":
-        print_json(asdict(app.create_resume_draft(args.candidate_id, args.job_id, build_cli_llm(args))))
+        print_json(
+            asdict(
+                app.create_resume_draft(
+                    args.candidate_id,
+                    args.job_id,
+                    build_cli_llm(args),
+                    rag_persist_directory=args.rag_dir if args.use_rag else None,
+                    rag_query=args.rag_query,
+                )
+            )
+        )
     elif args.command == "list-resume-drafts":
         print_json(
             {

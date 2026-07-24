@@ -18,9 +18,12 @@ from .models import (
     MatchResult,
     ProjectExperienceCard,
     ProjectExperienceRecord,
+    RAGIndexStats,
+    RAGSearchResult,
     ResumeDraftRecord,
 )
 from .project_analyzer import analyze_project
+from .rag import RAGKnowledgeBase
 from .resume_writer import build_resume_draft
 from .storage import SQLiteStore
 
@@ -28,8 +31,8 @@ from .storage import SQLiteStore
 class JobHuntingApp:
     """求职助手 MVP 的门面类。
 
-    它把 SQLite 存储、职位解析、本地项目分析和匹配规则组合到一起。
-    目前没有接入 LLM，所有能力都是本地规则和标准库实现。
+    它把 SQLite 存储、职位解析、本地项目分析、匹配规则、LLM 草稿生成和
+    RAG 检索组合到一起。外部入口保持简单，内部能力可以逐步替换升级。
     """
 
     def __init__(self, db_path: str | Path):
@@ -122,11 +125,13 @@ class JobHuntingApp:
         candidate_id: int,
         job_id: int,
         llm_client: LLMClient | None = None,
+        rag_persist_directory: str | Path | None = None,
+        rag_query: str | None = None,
     ) -> ResumeDraftRecord:
         """为某个职位生成一版证据约束简历草稿。
 
         LLM 是可选表达工具；即使传入 LLM，最终草稿也会经过真实性检查。
-        生成结果保存为职位定制草稿版本，不会覆盖候选人档案。
+        RAG 是可选证据上下文；即使使用 RAG，也不会覆盖候选人档案。
         """
 
         candidate = self.store.get_candidate_profile(candidate_id)
@@ -136,7 +141,20 @@ class JobHuntingApp:
             for record in self.store.list_project_cards(candidate_id)
             if record.status == "已确认"
         ]
-        draft = build_resume_draft(candidate, job, confirmed_project_cards, llm_client)
+        semantic_evidence = []
+        if rag_persist_directory is not None:
+            query = rag_query or f"{job.title}\n{job.description_text}"
+            # 简历草稿只允许检索已登记的候选人/职位/已确认项目材料；历史草稿不作为事实证据。
+            semantic_evidence = [
+                format_rag_evidence(result)
+                for result in self.search_rag(
+                    query,
+                    rag_persist_directory,
+                    top_k=5,
+                    entity_types=["candidate_profile", "job", "project_experience_card"],
+                )
+            ]
+        draft = build_resume_draft(candidate, job, confirmed_project_cards, llm_client, semantic_evidence)
         return self.store.save_resume_draft(candidate_id, job_id, draft)
 
     def list_resume_drafts(
@@ -147,3 +165,30 @@ class JobHuntingApp:
         """列出候选人的职位定制简历草稿版本。"""
 
         return self.store.list_resume_drafts(candidate_id, job_id)
+
+    def rebuild_rag_index(self, persist_directory: str | Path = "data/chroma") -> RAGIndexStats:
+        """把 SQLite `long_texts` 全量同步到本地 Chroma RAG 索引。"""
+
+        knowledge_base = RAGKnowledgeBase(persist_directory)
+        return knowledge_base.rebuild(self.store.list_long_texts())
+
+    def search_rag(
+        self,
+        query: str,
+        persist_directory: str | Path = "data/chroma",
+        top_k: int = 5,
+        entity_types: list[str] | None = None,
+    ) -> list[RAGSearchResult]:
+        """从本地 Chroma RAG 索引检索带来源的证据片段。"""
+
+        knowledge_base = RAGKnowledgeBase(persist_directory)
+        return knowledge_base.search(query, top_k, entity_types)
+
+
+def format_rag_evidence(result: RAGSearchResult) -> str:
+    """把 RAG 检索结果格式化成简历草稿可引用的证据条目。"""
+
+    return (
+        f"RAG 检索证据[{result.entity_type}#{result.entity_id}/"
+        f"{result.source_label}/chunk{result.chunk_index}]：{result.content}"
+    )

@@ -24,14 +24,17 @@ def build_resume_draft(
     job: ImportedJob,
     confirmed_project_cards: list[ProjectExperienceRecord],
     llm_client: LLMClient | None = None,
+    semantic_evidence: list[str] | None = None,
 ) -> ResumeDraft:
     """生成职位定制简历草稿。
 
     `confirmed_project_cards` 必须由应用服务层提前过滤，只传入候选人已经确认的
-    项目卡片。待确认卡片不能进入简历草稿证据池。
+    项目卡片。`semantic_evidence` 来自 RAG 检索结果，只作为可追溯上下文，
+    不能覆盖候选人档案中的结构化事实。
     """
 
     evidence = collect_evidence(candidate, confirmed_project_cards)
+    evidence.extend(semantic_evidence or [])
     matched_skills = [skill for skill in job.skills if skill in candidate.skills]
     missing_skills = [skill for skill in job.skills if skill not in candidate.skills]
     risks = [
@@ -41,6 +44,7 @@ def build_resume_draft(
     rewrite_notes = [
         "技能熟练度按候选人档案保守表达，不自动拔高。",
         "项目卡片只使用候选人已确认摘要，待确认线索不进入正文。",
+        "RAG 检索结果只作为证据上下文，不能单独证明候选人事实。",
     ]
 
     fallback_content = rule_based_content(candidate, job, matched_skills, confirmed_project_cards)
@@ -170,6 +174,8 @@ def build_prompt(
             "禁止写入的未确认技能：" + "、".join(missing_skills),
             "【允许证据】",
             *evidence,
+            "【RAG 使用边界】",
+            "如果证据条目标注为 RAG 检索证据，只能作为已登记材料的引用上下文，不要把它改写成新的事实。",
             "请输出中文简历草稿正文。",
         ]
     )

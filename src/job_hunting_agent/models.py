@@ -161,3 +161,45 @@ class ResumeDraftRecord:
     status: str
     draft: ResumeDraft
     created_at: str
+
+
+@dataclass
+class LongTextRecord:
+    """SQLite `long_texts` 表中的一条长文本材料。
+
+    它是 RAG 索引的输入来源，但仍然不是向量库本身。RAG 层必须保留这些来源字段，
+    方便候选人追溯“这段证据来自哪里”。
+    """
+
+    id: int
+    entity_type: str
+    entity_id: int
+    source_label: str
+    text: str
+
+
+@dataclass
+class RAGIndexStats:
+    """一次 RAG 索引重建的统计结果。"""
+
+    document_count: int
+    chunk_count: int
+    persist_directory: str
+    collection_name: str
+
+
+@dataclass
+class RAGSearchResult:
+    """RAG 检索返回的证据片段。
+
+    `distance` 来自向量库，数值越小通常表示越相关；它不是事实可信度。
+    事实可信度仍然要回到 SQLite 结构化事实和候选人确认状态判断。
+    """
+
+    content: str
+    entity_type: str
+    entity_id: int
+    source_label: str
+    long_text_id: int
+    chunk_index: int
+    distance: float

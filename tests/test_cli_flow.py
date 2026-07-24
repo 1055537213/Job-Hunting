@@ -138,3 +138,55 @@ def test_cli_can_show_masked_llm_config(tmp_path, capsys):
     assert output["model"] == "deepseek-v4-pro"
     assert output["api_key_set"] is True
     assert "sk-secret" not in output_text
+
+
+def test_cli_can_rebuild_and_search_rag_index(tmp_path, capsys):
+    """命令行可以重建本地 RAG 索引并检索来源证据。"""
+
+    db_path = tmp_path / "cli.db"
+    rag_dir = tmp_path / "chroma"
+    profile_file = tmp_path / "profile.json"
+    job_file = tmp_path / "job.txt"
+    profile_file.write_text(
+        json.dumps(
+            {
+                "name": "小林",
+                "status": "离职",
+                "education": "本科",
+                "experience_years": 1.0,
+                "skills": {"Python": "项目使用", "FastAPI": "项目使用"},
+                "preferred_cities": ["杭州"],
+                "salary_floor_k": 10,
+                "expected_salary_k": 15,
+                "target_directions": ["Python 后端开发"],
+                "unacceptable": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    job_file.write_text(
+        """
+        Python 后端开发工程师
+        15-20K
+        杭州
+        1-3年
+        本科
+        职位描述：负责 Python、FastAPI 和职位文本处理。
+        """,
+        encoding="utf-8",
+    )
+
+    main(["--db", str(db_path), "create-profile", "--from-json", str(profile_file)])
+    capsys.readouterr()
+    main(["--db", str(db_path), "import-job", str(job_file)])
+    capsys.readouterr()
+    main(["--db", str(db_path), "--rag-dir", str(rag_dir), "rag-rebuild"])
+    rebuild_output = json.loads(capsys.readouterr().out)
+    main(["--db", str(db_path), "--rag-dir", str(rag_dir), "rag-search", "FastAPI 职位文本"])
+    search_output = json.loads(capsys.readouterr().out)
+
+    assert rebuild_output["chunk_count"] >= 1
+    assert search_output["query"] == "FastAPI 职位文本"
+    assert search_output["results"]
+    assert any("FastAPI" in result["content"] for result in search_output["results"])

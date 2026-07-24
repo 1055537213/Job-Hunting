@@ -13,6 +13,8 @@
 - 提供 LLM 适配器边界，并生成证据约束的职位定制简历草稿版本。
 - 如果 LLM 输出包含未确认技能或成果数字，系统会丢弃该输出并回退到安全规则草稿。
 - 支持从项目 `.env` 读取 DeepSeek/OpenAI-compatible 模型配置；当前 `.env` 使用 `deepseek-v4-pro`。
+- 使用 LangChain 文档/文本切分接口和本地持久化 Chroma 搭建第一版 RAG 知识库。
+- RAG 检索结果保留来源 metadata，只作为证据上下文，不替代 SQLite 事实源。
 
 ## 运行环境
 
@@ -46,6 +48,12 @@ JOB_AGENT_LLM_REASONING_EFFORT=high
 
 ```powershell
 E:\Anaconda\envs\langchain1.2\python.exe -m pytest tests\test_mvp_flow.py -q
+```
+
+如果环境中还没有 Chroma，可以安装项目依赖：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -m pip install -e .
 ```
 
 ## 运行端到端演示
@@ -145,7 +153,33 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 
 `match-all` 会返回职位信息和对应匹配结果；已淘汰职位排在后面，未淘汰职位按分数从高到低排序。
 
-### 6. 生成职位定制简历草稿
+### 6. 构建和检索 RAG 知识库
+
+RAG 第一版使用 LangChain + Chroma，把 SQLite `long_texts` 中的职位描述、候选人技能、
+已确认项目摘要等材料同步到本地向量库。SQLite 仍然是事实源，Chroma 只是语义检索索引。
+
+重建索引：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['rag-rebuild'])"
+```
+
+检索证据：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['rag-search', 'FastAPI 职位解析 匹配排序'])"
+```
+
+默认向量库目录是 `data/chroma`，已经被 `.gitignore` 忽略。你也可以显式指定：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['--rag-dir', 'data/chroma', 'rag-rebuild'])"
+```
+
+当前 embedding 使用本地确定性 LangChain `Embeddings` 实现，用于先把 RAG 管线跑通；
+后续可以替换成真实 embedding 模型，提高语义检索质量。
+
+### 7. 生成职位定制简历草稿
 
 默认模式不调用真实 LLM，会生成规则版安全草稿：
 
@@ -163,6 +197,12 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 
 ```powershell
 E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['draft-resume', '1', '1', '--use-env-llm'])"
+```
+
+如果已经执行过 `rag-rebuild`，可以让草稿生成时使用 RAG 检索证据：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['draft-resume', '1', '1', '--use-rag', '--rag-query', 'FastAPI 职位解析 匹配排序'])"
 ```
 
 查看已保存的草稿版本：
