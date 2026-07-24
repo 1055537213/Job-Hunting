@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .conversation_ingestion import decide_conversation_ingestion
 from .llm import LLMClient
 from .matcher import match_job
 from .models import (
     CandidateProfile,
     CandidateProfileInput,
+    ConversationIngestionResult,
     ImportedJob,
     MatchResult,
     ProjectExperienceCard,
@@ -57,6 +59,54 @@ class JobHuntingApp:
         """
 
         return self.store.get_candidate_profile(candidate_id)
+
+    def ingest_conversation_message(
+        self,
+        candidate_id: int,
+        message: str,
+        llm_client: LLMClient | None = None,
+        rag_persist_directory: str | Path | None = None,
+        auto_rebuild_rag: bool = False,
+    ) -> ConversationIngestionResult:
+        """自动判断并保存一条候选人对话资料。
+
+        这是“对话即入库”的应用层入口：LLM 或规则只负责产出保存决策，
+        真正的 SQLite 结构化更新、长文本写入和 RAG 重建都在本地代码中完成。
+        这样可以保留清晰边界：SQLite 是事实源，RAG 是证据索引，LLM 是判断/表达工具。
+        """
+
+        candidate = self.store.get_candidate_profile(candidate_id)
+        decision = decide_conversation_ingestion(candidate, message, llm_client)
+
+        # 结构化字段只通过受控 patch 合并到候选人档案，避免模型直接改库。
+        saved_structured_fields = self.store.update_candidate_profile(
+            candidate_id,
+            decision.profile_updates,
+        )
+        # 长文本先进入 SQLite long_texts；Chroma 只从这里同步，便于追溯来源。
+        saved_long_text_ids = [
+            self.store.add_long_text(
+                item.entity_type,
+                item.entity_id,
+                item.source_label,
+                item.text,
+            )
+            for item in decision.long_texts
+            if item.text.strip()
+        ]
+
+        rag_index_stats = None
+        if auto_rebuild_rag:
+            rag_index_stats = self.rebuild_rag_index(rag_persist_directory or "data/chroma")
+
+        return ConversationIngestionResult(
+            candidate_id=candidate_id,
+            reply=decision.reply,
+            saved_structured_fields=saved_structured_fields,
+            saved_long_text_ids=saved_long_text_ids,
+            rag_rebuilt=auto_rebuild_rag,
+            rag_index_stats=rag_index_stats,
+        )
 
     def import_job_text(self, raw_text: str, source_url: str | None = None) -> ImportedJob:
         """导入候选人主动带回的职位原文，并保存标准化结果。"""

@@ -6,6 +6,7 @@ CLI 是当前教学 MVP 最直接的使用入口，所以这里用真实命令�
 
 import json
 
+from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.cli import main
 
 
@@ -138,6 +139,51 @@ def test_cli_can_show_masked_llm_config(tmp_path, capsys):
     assert output["model"] == "deepseek-v4-pro"
     assert output["api_key_set"] is True
     assert "sk-secret" not in output_text
+
+
+def test_cli_can_ingest_conversation_message(tmp_path, capsys):
+    """命令行可以把一段自然语言资料自动保存到 SQLite 和长文本材料库。"""
+
+    db_path = tmp_path / "cli.db"
+    profile_file = tmp_path / "profile.json"
+    profile_file.write_text(
+        json.dumps(
+            {
+                "name": "小林",
+                "status": "待补充",
+                "education": "大专",
+                "experience_years": 0,
+                "skills": {},
+                "preferred_cities": [],
+                "salary_floor_k": 8,
+                "expected_salary_k": 12,
+                "target_directions": [],
+                "unacceptable": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    main(["--db", str(db_path), "create-profile", "--from-json", str(profile_file)])
+    candidate_id = json.loads(capsys.readouterr().out)["candidate_id"]
+    main(
+        [
+            "--db",
+            str(db_path),
+            "ingest-message",
+            str(candidate_id),
+            "我是本科，1年经验，会 Python 和 FastAPI。",
+        ]
+    )
+    output = json.loads(capsys.readouterr().out)
+    profile = JobHuntingApp(db_path).get_candidate_profile(candidate_id)
+
+    assert output["candidate_id"] == candidate_id
+    assert "education" in output["saved_structured_fields"]
+    assert output["saved_long_text_ids"]
+    assert profile.education == "本科"
+    assert profile.skills["Python"] == "待确认"
 
 
 def test_cli_can_rebuild_and_search_rag_index(tmp_path, capsys):

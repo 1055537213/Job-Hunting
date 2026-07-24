@@ -15,6 +15,7 @@
 - 支持从项目 `.env` 读取 DeepSeek/OpenAI-compatible 模型配置；当前 `.env` 使用 `deepseek-v4-pro`。
 - 使用 LangChain 文档/文本切分接口和本地持久化 Chroma 搭建第一版 RAG 知识库。
 - RAG 检索结果保留来源 metadata，只作为证据上下文，不替代 SQLite 事实源。
+- 支持对话式自动入库：用户发来的资料会被自动判断为结构化档案更新或长文本知识库材料。
 
 ## 运行环境
 
@@ -113,7 +114,41 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 
 如果不传 `--from-json`，命令会进入交互式问答，逐项询问候选人档案字段。
 
-### 3. 分析并保存本地项目卡片
+### 3. 对话式自动入库
+
+你可以像聊天一样把资料发给 Agent。系统会一边生成回复，一边自动判断：
+
+- 学历、经验年限、技能、城市、薪资、目标方向、明确不可接受条件，保存到 SQLite 候选人结构化档案。
+- 项目描述、经历叙述、成果材料、HR 对话等长文本，先保存到 SQLite `long_texts`。
+- Chroma RAG 只从 `long_texts` 同步索引，不直接替代 SQLite 事实源。
+
+不调用真实 LLM 时，会用保守规则提取明确事实，并保存原文：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['ingest-message', '1', '我是本科，1年经验，会 Python 和 FastAPI。做过一个求职助手项目，负责职位解析和匹配排序。'])"
+```
+
+调用 `.env` 中的 DeepSeek V4 Pro 做入库判断：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['ingest-message', '1', '我最近做了 LangChain RAG 项目，目标方向是 AI Agent 应用开发。', '--use-env-llm'])"
+```
+
+如果资料很长，建议写到文件里再导入：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['ingest-message', '1', '--message-file', 'materials.txt'])"
+```
+
+默认只写入 SQLite 和 `long_texts`。如果你希望这条资料立刻进入 RAG 检索索引，可以加 `--auto-rag`：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['ingest-message', '1', '--message-file', 'materials.txt', '--auto-rag'])"
+```
+
+不加 `--auto-rag` 也没关系，后面手动执行 `rag-rebuild` 会把所有 `long_texts` 一次性同步到 Chroma。
+
+### 4. 分析并保存本地项目卡片
 
 ```powershell
 E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['analyze-project', 'E:\\path\\to\\your_project', '--candidate-id', '1'])"
@@ -127,7 +162,7 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['confirm-project', '1', '--summary', '本人负责职位解析、匹配排序和 FastAPI 接口设计。'])"
 ```
 
-### 4. 导入职位文本
+### 5. 导入职位文本
 
 单个职位：
 
@@ -141,7 +176,7 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['import-jobs', 'jobs.txt'])"
 ```
 
-### 5. 查看和匹配职位
+### 6. 查看和匹配职位
 
 ```powershell
 E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['list-jobs'])"
@@ -153,7 +188,7 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 
 `match-all` 会返回职位信息和对应匹配结果；已淘汰职位排在后面，未淘汰职位按分数从高到低排序。
 
-### 6. 构建和检索 RAG 知识库
+### 7. 构建和检索 RAG 知识库
 
 RAG 第一版使用 LangChain + Chroma，把 SQLite `long_texts` 中的职位描述、候选人技能、
 已确认项目摘要等材料同步到本地向量库。SQLite 仍然是事实源，Chroma 只是语义检索索引。
@@ -179,7 +214,7 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 当前 embedding 使用本地确定性 LangChain `Embeddings` 实现，用于先把 RAG 管线跑通；
 后续可以替换成真实 embedding 模型，提高语义检索质量。
 
-### 7. 生成职位定制简历草稿
+### 8. 生成职位定制简历草稿
 
 默认模式不调用真实 LLM，会生成规则版安全草稿：
 

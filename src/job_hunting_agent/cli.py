@@ -45,6 +45,17 @@ def main(argv: list[str] | None = None) -> None:
     create_parser.add_argument("--directions")
     create_parser.add_argument("--unacceptable")
 
+    ingest_parser = subparsers.add_parser("ingest-message")
+    ingest_parser.add_argument("candidate_id", type=int)
+    # 短资料可以直接作为命令参数传入；长资料建议放到文件里，避免命令行转义麻烦。
+    ingest_parser.add_argument("message", nargs="?")
+    ingest_parser.add_argument("--message-file")
+    ingest_llm = ingest_parser.add_mutually_exclusive_group()
+    ingest_llm.add_argument("--llm-static-response")
+    ingest_llm.add_argument("--llm-static-response-file")
+    ingest_llm.add_argument("--use-env-llm", action="store_true")
+    ingest_parser.add_argument("--auto-rag", action="store_true")
+
     demo_parser = subparsers.add_parser("demo")
     demo_parser.add_argument("--project", default=".")
 
@@ -115,6 +126,18 @@ def main(argv: list[str] | None = None) -> None:
         profile = build_profile_from_cli(args)
         candidate_id = app.save_candidate_profile(profile)
         print_json({"candidate_id": candidate_id, "profile": asdict(app.get_candidate_profile(candidate_id))})
+    elif args.command == "ingest-message":
+        print_json(
+            asdict(
+                app.ingest_conversation_message(
+                    args.candidate_id,
+                    read_ingestion_message(args),
+                    llm_client=build_cli_llm(args),
+                    rag_persist_directory=args.rag_dir,
+                    auto_rebuild_rag=args.auto_rag,
+                )
+            )
+        )
     elif args.command == "demo":
         run_demo(app, args.project)
     elif args.command == "analyze-project":
@@ -322,6 +345,23 @@ def read_confirmation_summary(args: argparse.Namespace) -> str | None:
     return None
 
 
+def read_ingestion_message(args: argparse.Namespace) -> str:
+    """读取对话式入库消息。
+
+    CLI 同时支持短消息参数和长文本文件；两者只能选一种，避免把同一份资料重复入库。
+    """
+
+    if args.message_file and args.message:
+        raise SystemExit("请只提供 MESSAGE 或 --message-file 其中一种。")
+    if args.message_file:
+        message = Path(args.message_file).read_text(encoding="utf-8").strip()
+    else:
+        message = (args.message or "").strip()
+    if not message:
+        raise SystemExit("请提供需要保存的资料消息，或使用 --message-file 指定文件。")
+    return message
+
+
 def split_job_texts(raw_text: str, separator: str) -> list[str]:
     """按显式分隔符拆分批量职位文本。
 
@@ -336,15 +376,19 @@ def split_job_texts(raw_text: str, separator: str) -> list[str]:
 def build_cli_llm(args: argparse.Namespace) -> LLMClient | None:
     """根据 CLI 参数构造 LLM 客户端。
 
-    默认返回 None，表示使用规则安全草稿；传入 `--use-env-llm` 时才会读取
-    `.env` 调用真实模型，避免用户不小心产生成本或网络请求。
+    默认返回 None，表示使用本地规则逻辑；传入 `--use-env-llm` 时才会读取
+    `.env` 调用真实模型，避免用户不小心产生成本或网络请求。这个 helper 同时服务
+    简历草稿生成和对话式自动入库。
     """
 
-    if args.llm_static_response_file:
-        return StaticLLMClient(Path(args.llm_static_response_file).read_text(encoding="utf-8"))
-    if args.llm_static_response:
-        return StaticLLMClient(args.llm_static_response)
-    if args.use_env_llm:
+    static_response_file = getattr(args, "llm_static_response_file", None)
+    static_response = getattr(args, "llm_static_response", None)
+    use_env_llm = getattr(args, "use_env_llm", False)
+    if static_response_file:
+        return StaticLLMClient(Path(static_response_file).read_text(encoding="utf-8"))
+    if static_response:
+        return StaticLLMClient(static_response)
+    if use_env_llm:
         return build_llm_client(load_llm_settings(args.env_file))
     return None
 

@@ -21,6 +21,7 @@ from .job_parser import parse_job_text
 from .models import (
     CandidateProfile,
     CandidateProfileInput,
+    CandidateProfilePatch,
     ImportedJob,
     LongTextRecord,
     ProjectExperienceCard,
@@ -183,6 +184,90 @@ class SQLiteStore:
             target_directions=json.loads(row["target_directions_json"]),
             unacceptable=json.loads(row["unacceptable_json"]),
         )
+
+    def update_candidate_profile(self, candidate_id: int, patch: CandidateProfilePatch) -> list[str]:
+        """按 patch 局部更新候选人档案，返回实际更新的字段名。
+
+        自动入库只合并消息中明确出现的字段：标量字段覆盖，列表字段去重追加，
+        技能字段按技能名合并/更新熟练度。
+        """
+
+        current = self.get_candidate_profile(candidate_id)
+        updated_fields: list[str] = []
+
+        status = current.status
+        education = current.education
+        experience_years = current.experience_years
+        salary_floor_k = current.salary_floor_k
+        expected_salary_k = current.expected_salary_k
+        skills = dict(current.skills)
+        preferred_cities = list(current.preferred_cities)
+        target_directions = list(current.target_directions)
+        unacceptable = list(current.unacceptable)
+
+        if patch.status:
+            status = patch.status
+            updated_fields.append("status")
+        if patch.education:
+            education = patch.education
+            updated_fields.append("education")
+        if patch.experience_years is not None:
+            experience_years = patch.experience_years
+            updated_fields.append("experience_years")
+        if patch.salary_floor_k is not None:
+            salary_floor_k = patch.salary_floor_k
+            updated_fields.append("salary_floor_k")
+        if patch.expected_salary_k is not None:
+            expected_salary_k = patch.expected_salary_k
+            updated_fields.append("expected_salary_k")
+        if patch.skills:
+            skills.update(patch.skills)
+            updated_fields.append("skills")
+        if patch.preferred_cities:
+            preferred_cities = merge_unique(preferred_cities, patch.preferred_cities)
+            updated_fields.append("preferred_cities")
+        if patch.target_directions:
+            target_directions = merge_unique(target_directions, patch.target_directions)
+            updated_fields.append("target_directions")
+        if patch.unacceptable:
+            unacceptable = merge_unique(unacceptable, patch.unacceptable)
+            updated_fields.append("unacceptable")
+
+        if not updated_fields:
+            return []
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE candidate_profiles
+                SET status = ?, education = ?, experience_years = ?,
+                    salary_floor_k = ?, expected_salary_k = ?,
+                    skills_json = ?, preferred_cities_json = ?,
+                    target_directions_json = ?, unacceptable_json = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    education,
+                    experience_years,
+                    salary_floor_k,
+                    expected_salary_k,
+                    json.dumps(skills, ensure_ascii=False),
+                    json.dumps(preferred_cities, ensure_ascii=False),
+                    json.dumps(target_directions, ensure_ascii=False),
+                    json.dumps(unacceptable, ensure_ascii=False),
+                    candidate_id,
+                ),
+            )
+            # 记录自动更新摘要，方便 RAG 和审计追溯“这次对话改了哪些结构化字段”。
+            self._add_long_text(
+                conn,
+                "candidate_profile",
+                candidate_id,
+                "conversation_structured_update",
+                "自动更新字段：" + "、".join(updated_fields),
+            )
+        return updated_fields
 
     def save_job_text(self, raw_text: str, source_url: str | None = None) -> ImportedJob:
         """保存一段职位原文。
@@ -475,15 +560,15 @@ class SQLiteStore:
             created_at=row["created_at"],
         )
 
-    def add_long_text(self, entity_type: str, entity_id: int, source_label: str, text: str) -> None:
+    def add_long_text(self, entity_type: str, entity_id: int, source_label: str, text: str) -> int:
         """公开的长文本写入方法。
 
-        当前测试和 MVP 还没有直接使用它；保留这个入口是为了后续写入项目描述、
-        简历片段、HR 对话等长文本材料。
+        对话式入库、项目描述、简历片段、HR 对话等长文本材料都通过这个入口登记。
+        返回插入 ID，方便应用层告诉用户本次保存了哪些材料。
         """
 
         with self.connect() as conn:
-            self._add_long_text(conn, entity_type, entity_id, source_label, text)
+            return self._add_long_text(conn, entity_type, entity_id, source_label, text)
 
     def list_long_texts(self, entity_types: list[str] | None = None) -> list[LongTextRecord]:
         """列出可同步到 RAG 索引的长文本材料。
@@ -522,16 +607,17 @@ class SQLiteStore:
         entity_id: int,
         source_label: str,
         text: str,
-    ) -> None:
+    ) -> int:
         """在已有连接中写入长文本，供事务内复用。"""
 
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO long_texts (entity_type, entity_id, source_label, text)
             VALUES (?, ?, ?, ?)
             """,
             (entity_type, entity_id, source_label, text),
         )
+        return int(cursor.lastrowid)
 
 
 def now_iso() -> str:
@@ -553,3 +639,13 @@ def project_card_index_text(card: ProjectExperienceCard) -> str:
     ]
     # 过滤空段落，避免向长文本表写入一堆无意义的空字段。
     return "\n".join(part for part in parts if part.strip())
+
+
+def merge_unique(existing: list[str], incoming: list[str]) -> list[str]:
+    """按原顺序合并列表并去重。"""
+
+    merged = list(existing)
+    for item in incoming:
+        if item and item not in merged:
+            merged.append(item)
+    return merged

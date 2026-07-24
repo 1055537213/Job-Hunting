@@ -203,3 +203,57 @@ class RAGSearchResult:
     long_text_id: int
     chunk_index: int
     distance: float
+
+
+@dataclass
+class CandidateProfilePatch:
+    """对候选人档案的局部更新。
+
+    对话式自动入库不会要求用户一次性提交完整档案；LLM/规则只提取当前消息中
+    明确出现的字段，然后通过这个 patch 合并到 SQLite 结构化档案。
+    """
+
+    status: str | None = None
+    education: str | None = None
+    experience_years: float | None = None
+    skills: dict[str, str] = field(default_factory=dict)
+    preferred_cities: list[str] = field(default_factory=list)
+    salary_floor_k: int | None = None
+    expected_salary_k: int | None = None
+    target_directions: list[str] = field(default_factory=list)
+    unacceptable: list[str] = field(default_factory=list)
+
+
+@dataclass
+class LongTextInput:
+    """一次自动入库希望保存的长文本材料。"""
+
+    entity_type: str
+    entity_id: int
+    source_label: str
+    text: str
+
+
+@dataclass
+class ConversationIngestionDecision:
+    """对一条对话资料的保存决策。
+
+    `profile_updates` 表示进入 SQLite 结构化档案的内容；`long_texts` 表示进入
+    长文本材料库、后续可同步到 RAG 的内容；`reply` 是 agent 对用户的回复。
+    """
+
+    reply: str
+    profile_updates: CandidateProfilePatch
+    long_texts: list[LongTextInput]
+
+
+@dataclass
+class ConversationIngestionResult:
+    """对话式自动入库执行后的结果摘要。"""
+
+    candidate_id: int
+    reply: str
+    saved_structured_fields: list[str]
+    saved_long_text_ids: list[int]
+    rag_rebuilt: bool
+    rag_index_stats: RAGIndexStats | None = None
