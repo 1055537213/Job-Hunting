@@ -12,6 +12,7 @@
 - 对本地已导入职位做批量匹配排序，优先展示未淘汰且分数更高的职位。
 - 提供 LLM 适配器边界，并生成证据约束的职位定制简历草稿版本。
 - 如果 LLM 输出包含未确认技能或成果数字，系统会丢弃该输出并回退到安全规则草稿。
+- 支持从项目 `.env` 读取 DeepSeek/OpenAI-compatible 模型配置；当前 `.env` 使用 `deepseek-v4-pro`。
 
 ## 运行环境
 
@@ -20,6 +21,26 @@
 ```powershell
 E:\Anaconda\envs\langchain1.2\python.exe --version
 ```
+
+## 模型配置
+
+真实模型配置放在项目根目录的 `.env`，不要写死在代码里。当前 `.env` 已根据
+`E:\program\langchain1.2\.env` 中的 DeepSeek 配置生成，并被 `.gitignore` 忽略。
+
+可以参考 [.env.example](<E:/program/Job-hunting Agent/.env.example>)：
+
+```dotenv
+JOB_AGENT_LLM_PROVIDER=deepseek
+JOB_AGENT_LLM_MODEL=deepseek-v4-pro
+JOB_AGENT_LLM_API_KEY=your-api-key-here
+JOB_AGENT_LLM_BASE_URL=https://api.deepseek.com
+JOB_AGENT_LLM_TIMEOUT_SECONDS=60
+JOB_AGENT_LLM_THINKING=enabled
+JOB_AGENT_LLM_REASONING_EFFORT=high
+```
+
+以后要换模型，优先改 `.env` 里的 `JOB_AGENT_LLM_MODEL`、`JOB_AGENT_LLM_BASE_URL`
+和 `JOB_AGENT_LLM_API_KEY`，不要改业务代码。
 
 ## 运行测试
 
@@ -132,14 +153,25 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['draft-resume', '1', '1'])"
 ```
 
+检查当前模型配置。这个命令会脱敏输出，不会显示 API Key：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['llm-config'])"
+```
+
+使用 `.env` 中的 DeepSeek V4 Pro 生成草稿：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['draft-resume', '1', '1', '--use-env-llm'])"
+```
+
 查看已保存的草稿版本：
 
 ```powershell
 E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['list-resume-drafts', '1', '--job-id', '1'])"
 ```
 
-当前还没有接入真实模型供应商，但已经有 LLM 适配器边界。你可以用静态响应模拟
-LLM 输出，观察安全检查是否会丢弃越界内容：
+也可以继续用静态响应模拟 LLM 输出，观察安全检查是否会丢弃越界内容：
 
 ```powershell
 E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['draft-resume', '1', '1', '--llm-static-response', '候选人精通 Kubernetes，并将性能提升 50%。'])"
@@ -160,5 +192,5 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 
 ## 下一步建议
 
-下一步可以接入一个真实 LLM 供应商适配器，例如基于你本地 LangChain 学习环境封装
-DeepSeek/OpenAI 兼容聊天模型；接入后仍然沿用当前的输出安全检查。
+下一步可以让 LLM 辅助“职位文本标准化”：规则解析器先抽取确定字段，LLM 只补充职责、
+要求和不确定项说明，仍然保留规则解析作为兜底。

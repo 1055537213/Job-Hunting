@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .idea/
+.env
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

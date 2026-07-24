@@ -112,3 +112,29 @@ def test_cli_can_create_rule_based_resume_draft(tmp_path, capsys):
     assert "FastAPI" in draft_output["draft"]["content"]
     assert "Kubernetes" not in draft_output["draft"]["content"]
     assert any("未确认技能：Kubernetes" in risk for risk in draft_output["draft"]["authenticity_risks"])
+
+
+def test_cli_can_show_masked_llm_config(tmp_path, capsys):
+    """命令行可以读取 `.env` 并只展示脱敏后的 LLM 配置。"""
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_LLM_PROVIDER=deepseek",
+                "JOB_AGENT_LLM_MODEL=deepseek-v4-pro",
+                "JOB_AGENT_LLM_API_KEY=sk-secret",
+                "JOB_AGENT_LLM_BASE_URL=https://api.deepseek.com",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    main(["--env-file", str(env_file), "llm-config"])
+    output_text = capsys.readouterr().out
+    output = json.loads(output_text)
+
+    assert output["provider"] == "deepseek"
+    assert output["model"] == "deepseek-v4-pro"
+    assert output["api_key_set"] is True
+    assert "sk-secret" not in output_text

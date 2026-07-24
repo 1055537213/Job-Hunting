@@ -12,7 +12,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .app import JobHuntingApp
-from .llm import StaticLLMClient
+from .config import load_llm_settings, masked_llm_settings
+from .llm import LLMClient, StaticLLMClient, build_llm_client
 from .models import CandidateProfileInput
 
 
@@ -22,9 +23,12 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="job-agent")
     # 所有命令共用同一个本地 SQLite 数据库；默认放在 data/ 下，已被 .gitignore 忽略。
     parser.add_argument("--db", default="data/job_agent.db")
+    # 模型配置单独放在 .env，方便后续换供应商/模型，不需要改代码。
+    parser.add_argument("--env-file", default=".env")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("init")
+    subparsers.add_parser("llm-config")
 
     create_parser = subparsers.add_parser("create-profile")
     create_parser.add_argument("--from-json")
@@ -78,9 +82,10 @@ def main(argv: list[str] | None = None) -> None:
     draft_parser.add_argument("candidate_id", type=int)
     draft_parser.add_argument("job_id", type=int)
     draft_llm = draft_parser.add_mutually_exclusive_group()
-    # 当前还没有接真实模型；这个静态响应入口用于教学演示“LLM 输出会被安全检查”。
+    # 静态响应入口用于教学演示“LLM 输出会被安全检查”；真实模型通过 .env 加载。
     draft_llm.add_argument("--llm-static-response")
     draft_llm.add_argument("--llm-static-response-file")
+    draft_llm.add_argument("--use-env-llm", action="store_true")
 
     list_drafts_parser = subparsers.add_parser("list-resume-drafts")
     list_drafts_parser.add_argument("candidate_id", type=int)
@@ -93,6 +98,8 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "init":
         print_json({"status": "ok", "db": str(Path(args.db).resolve())})
+    elif args.command == "llm-config":
+        print_json(masked_llm_settings(load_llm_settings(args.env_file)))
     elif args.command == "create-profile":
         profile = build_profile_from_cli(args)
         candidate_id = app.save_candidate_profile(profile)
@@ -137,7 +144,7 @@ def main(argv: list[str] | None = None) -> None:
             }
         )
     elif args.command == "draft-resume":
-        print_json(asdict(app.create_resume_draft(args.candidate_id, args.job_id, build_static_llm(args))))
+        print_json(asdict(app.create_resume_draft(args.candidate_id, args.job_id, build_cli_llm(args))))
     elif args.command == "list-resume-drafts":
         print_json(
             {
@@ -300,17 +307,19 @@ def split_job_texts(raw_text: str, separator: str) -> list[str]:
     return [chunk for chunk in chunks if chunk]
 
 
-def build_static_llm(args: argparse.Namespace) -> StaticLLMClient | None:
-    """构造教学用静态 LLM。
+def build_cli_llm(args: argparse.Namespace) -> LLMClient | None:
+    """根据 CLI 参数构造 LLM 客户端。
 
-    真实模型适配器还没有接入，所以默认返回 None，表示使用规则安全草稿。
-    如果传入静态响应，业务流程会像调用 LLM 一样调用它，并执行同样的安全检查。
+    默认返回 None，表示使用规则安全草稿；传入 `--use-env-llm` 时才会读取
+    `.env` 调用真实模型，避免用户不小心产生成本或网络请求。
     """
 
     if args.llm_static_response_file:
         return StaticLLMClient(Path(args.llm_static_response_file).read_text(encoding="utf-8"))
     if args.llm_static_response:
         return StaticLLMClient(args.llm_static_response)
+    if args.use_env_llm:
+        return build_llm_client(load_llm_settings(args.env_file))
     return None
 
 
