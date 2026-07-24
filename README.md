@@ -16,6 +16,7 @@
 - 使用 LangChain 文档/文本切分接口和本地持久化 Chroma 搭建第一版 RAG 知识库。
 - RAG 检索结果保留来源 metadata，只作为证据上下文，不替代 SQLite 事实源。
 - 支持对话式自动入库：用户发来的资料会被自动判断为结构化档案更新或长文本知识库材料。
+- 提供本地 Web 前端，可用聊天页面完成档案创建、资料自动入库、职位文本导入和匹配。
 
 ## 运行环境
 
@@ -71,6 +72,45 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 2. 分析当前项目目录，生成项目经历卡片。
 3. 导入一条 BOSS 风格职位文本。
 4. 输出匹配分数、推荐档位、匹配理由、风险和简历建议。
+
+## 本地网页前端
+
+如果你不想使用 CLI，推荐先启动本地网页前端。页面布局采用“左侧档案栏 + 中央聊天区 + 右侧资料/职位面板”，
+日常可以像使用聊天网页一样补充资料。
+
+第一次使用前建议安装为可编辑包：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -m pip install -e .
+```
+
+启动网页：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -m job_hunting_agent.web --db data/job_agent.db --env-file .env --rag-dir data/chroma
+```
+
+然后打开浏览器访问：
+
+```text
+http://127.0.0.1:8000
+```
+
+你也可以通过原来的 CLI 启动同一个网页服务：
+
+```powershell
+job-agent --db data/job_agent.db --env-file .env --rag-dir data/chroma web
+```
+
+网页第一版支持：
+
+- 创建和选择候选人档案。
+- 像聊天一样发送资料，并自动保存到 SQLite 结构化表或 `long_texts`，再按需同步到 RAG 索引。
+- 可选开启“使用 .env 大模型判断”。
+- 默认开启“自动增量 RAG”，新资料会立刻可检索。
+- 粘贴 BOSS 职位文本并查看当前候选人的匹配结果。
+
+这个 Web 服务默认只监听 `127.0.0.1`，适合本机使用。停止服务时，在终端按 `Ctrl+C`。
 
 ## 日常使用命令
 

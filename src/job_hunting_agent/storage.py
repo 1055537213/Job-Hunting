@@ -171,19 +171,14 @@ class SQLiteStore:
             ).fetchone()
         if row is None:
             raise KeyError(f"Candidate profile not found: {candidate_id}")
-        return CandidateProfile(
-            id=int(row["id"]),
-            name=row["name"],
-            status=row["status"],
-            education=row["education"],
-            experience_years=float(row["experience_years"]),
-            salary_floor_k=row["salary_floor_k"],
-            expected_salary_k=row["expected_salary_k"],
-            skills=json.loads(row["skills_json"]),
-            preferred_cities=json.loads(row["preferred_cities_json"]),
-            target_directions=json.loads(row["target_directions_json"]),
-            unacceptable=json.loads(row["unacceptable_json"]),
-        )
+        return candidate_profile_from_row(row)
+
+    def list_candidate_profiles(self) -> list[CandidateProfile]:
+        """列出所有候选人档案，供 Web 侧边栏选择使用。"""
+
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM candidate_profiles ORDER BY id").fetchall()
+        return [candidate_profile_from_row(row) for row in rows]
 
     def update_candidate_profile(self, candidate_id: int, patch: CandidateProfilePatch) -> list[str]:
         """按 patch 局部更新候选人档案，返回实际更新的字段名。
@@ -636,6 +631,24 @@ def now_iso() -> str:
     """返回秒级 ISO 时间字符串，用于记录本地确认时间。"""
 
     return datetime.now().isoformat(timespec="seconds")
+
+
+def candidate_profile_from_row(row: sqlite3.Row) -> CandidateProfile:
+    """把 SQLite 行转换为候选人档案对象。"""
+
+    return CandidateProfile(
+        id=int(row["id"]),
+        name=row["name"],
+        status=row["status"],
+        education=row["education"],
+        experience_years=float(row["experience_years"]),
+        salary_floor_k=row["salary_floor_k"],
+        expected_salary_k=row["expected_salary_k"],
+        skills=json.loads(row["skills_json"]),
+        preferred_cities=json.loads(row["preferred_cities_json"]),
+        target_directions=json.loads(row["target_directions_json"]),
+        unacceptable=json.loads(row["unacceptable_json"]),
+    )
 
 
 def long_text_from_row(row: sqlite3.Row) -> LongTextRecord:

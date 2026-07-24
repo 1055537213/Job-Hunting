@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Job Hunting Agent</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">JA</div>
+          <div>
+            <h1>Job Hunting Agent</h1>
+            <p>本地求职助手</p>
+          </div>
+        </div>
+
+        <section class="panel">
+          <div class="panel-title">候选人档案</div>
+          <select id="profileSelect" class="field"></select>
+          <button id="refreshProfilesBtn" class="ghost-button">刷新档案</button>
+        </section>
+
+        <section class="panel">
+          <div class="panel-title">新建候选人</div>
+          <input id="profileName" class="field" placeholder="姓名，例如 小林" />
+          <div class="grid-two">
+            <input id="profileEducation" class="field" placeholder="学历，本科" />
+            <input id="profileExperience" class="field" type="number" min="0" step="0.5" placeholder="年限" />
+          </div>
+          <input id="profileSkills" class="field" placeholder="技能：Python=项目使用,FastAPI=待确认" />
+          <input id="profileCities" class="field" placeholder="城市：杭州,上海" />
+          <input id="profileDirections" class="field" placeholder="方向：AI Agent 应用开发" />
+          <button id="createProfileBtn" class="primary-button">创建并选择</button>
+        </section>
+
+        <section class="panel subtle">
+          <div class="panel-title">运行边界</div>
+          <p>本页面只使用你主动输入的资料；不会登录 BOSS、不会自动投递、不会自动发送 HR 消息。</p>
+        </section>
+      </aside>
+
+      <main class="chat-column">
+        <header class="chat-header">
+          <div>
+            <div class="eyebrow">Conversation Workspace</div>
+            <h2>像聊天一样补充资料</h2>
+          </div>
+          <div id="healthBadge" class="status-pill">检查中...</div>
+        </header>
+
+        <section id="messages" class="messages">
+          <div class="message assistant">
+            <div class="avatar">A</div>
+            <div class="bubble">
+              你好，我会在回复你的同时，把明确事实保存到 SQLite，把项目/经历等长文本保存到 long_texts，并同步到 RAG 索引。
+              你可以先在左侧创建档案，然后直接发资料。
+            </div>
+          </div>
+        </section>
+
+        <footer class="composer">
+          <div class="composer-options">
+            <label><input id="autoRagToggle" type="checkbox" checked /> 自动增量 RAG</label>
+            <label><input id="useLlmToggle" type="checkbox" /> 使用 .env 大模型判断</label>
+          </div>
+          <div class="composer-row">
+            <textarea id="messageInput" placeholder="例如：我是本科，1年经验，会 Python 和 FastAPI，做过一个求职助手项目..."></textarea>
+            <button id="sendBtn" class="send-button">发送</button>
+          </div>
+        </footer>
+      </main>
+
+      <aside class="right-panel">
+        <section class="panel">
+          <div class="panel-title">当前档案摘要</div>
+          <pre id="profileSummary" class="summary-box">请选择或创建候选人档案。</pre>
+        </section>
+
+        <section class="panel">
+          <div class="panel-title">导入 BOSS 职位文本</div>
+          <input id="jobSourceUrl" class="field" placeholder="职位链接，可选" />
+          <textarea id="jobText" class="field tall" placeholder="把 BOSS 职位详情页里你能看到的文本复制到这里。"></textarea>
+          <button id="importJobBtn" class="primary-button">导入职位</button>
+        </section>
+
+        <section class="panel">
+          <div class="panel-title">职位匹配结果</div>
+          <button id="matchJobsBtn" class="ghost-button">匹配当前候选人</button>
+          <div id="matchResults" class="match-list"></div>
+        </section>
+      </aside>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -60,6 +60,11 @@ class JobHuntingApp:
 
         return self.store.get_candidate_profile(candidate_id)
 
+    def list_candidate_profiles(self) -> list[CandidateProfile]:
+        """列出候选人档案，供 Web 页面侧边栏选择。"""
+
+        return self.store.list_candidate_profiles()
+
     def ingest_conversation_message(
         self,
         candidate_id: int,

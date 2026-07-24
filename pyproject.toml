@@ -6,15 +6,23 @@ description = "A local, read-only job hunting assistant MVP."
 requires-python = ">=3.12"
 dependencies = [
     "chromadb>=1.5.9",
+    "fastapi>=0.124.4",
     "langchain>=1.2.12",
     "langchain-chroma>=1.1.0",
     "langchain-core>=1.2.18",
     "langchain-text-splitters>=1.1.1",
+    "uvicorn>=0.38.0",
 ]
 
 [project.scripts]
 # 安装成包以后，可以通过 `job-agent` 调用 CLI。
 job-agent = "job_hunting_agent.cli:main"
+# 也可以直接启动本地网页前端。
+job-agent-web = "job_hunting_agent.web:main"
+
+[tool.setuptools.package-data]
+# Web 前端静态资源需要随 Python 包一起安装。
+job_hunting_agent = ["web_static/*"]
 
 [tool.pytest.ini_options]
 # 让 pytest 在不安装包的情况下，也能从 src/ 找到项目代码。

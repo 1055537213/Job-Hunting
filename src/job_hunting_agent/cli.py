@@ -32,6 +32,10 @@ def main(argv: list[str] | None = None) -> None:
     subparsers.add_parser("init")
     subparsers.add_parser("llm-config")
 
+    web_parser = subparsers.add_parser("web")
+    web_parser.add_argument("--host", default="127.0.0.1")
+    web_parser.add_argument("--port", type=int, default=8000)
+
     create_parser = subparsers.add_parser("create-profile")
     create_parser.add_argument("--from-json")
     create_parser.add_argument("--name")
@@ -122,6 +126,8 @@ def main(argv: list[str] | None = None) -> None:
         print_json({"status": "ok", "db": str(Path(args.db).resolve())})
     elif args.command == "llm-config":
         print_json(masked_llm_settings(load_llm_settings(args.env_file)))
+    elif args.command == "web":
+        run_web_server(args)
     elif args.command == "create-profile":
         profile = build_profile_from_cli(args)
         candidate_id = app.save_candidate_profile(profile)
@@ -445,6 +451,23 @@ def run_demo(app: JobHuntingApp, project_path: str) -> None:
             "job": asdict(job),
             "match": asdict(match),
         }
+    )
+
+
+def run_web_server(args: argparse.Namespace) -> None:
+    """启动本地 Web 前端。
+
+    CLI 入口只负责启动服务；真正的 Web API 定义放在 `web.py`，避免命令行模块膨胀。
+    """
+
+    from .web import create_web_app
+
+    import uvicorn
+
+    uvicorn.run(
+        create_web_app(args.db, args.env_file, args.rag_dir),
+        host=args.host,
+        port=args.port,
     )
 
 
