@@ -589,16 +589,28 @@ class SQLiteStore:
                 ).fetchall()
             else:
                 rows = conn.execute("SELECT * FROM long_texts ORDER BY id").fetchall()
-        return [
-            LongTextRecord(
-                id=int(row["id"]),
-                entity_type=row["entity_type"],
-                entity_id=int(row["entity_id"]),
-                source_label=row["source_label"],
-                text=row["text"],
-            )
-            for row in rows
-        ]
+        return [long_text_from_row(row) for row in rows]
+
+    def get_long_texts_by_ids(self, ids: list[int]) -> list[LongTextRecord]:
+        """按 ID 读取长文本材料，供增量 RAG 索引使用。
+
+        对话式入库已经知道本次新增了哪些 `long_text_id`，因此增量索引不需要再
+        读取整张 `long_texts` 表。
+        """
+
+        if not ids:
+            return []
+        placeholders = ", ".join("?" for _ in ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM long_texts
+                WHERE id IN ({placeholders})
+                ORDER BY id
+                """,
+                tuple(ids),
+            ).fetchall()
+        return [long_text_from_row(row) for row in rows]
 
     def _add_long_text(
         self,
@@ -624,6 +636,18 @@ def now_iso() -> str:
     """返回秒级 ISO 时间字符串，用于记录本地确认时间。"""
 
     return datetime.now().isoformat(timespec="seconds")
+
+
+def long_text_from_row(row: sqlite3.Row) -> LongTextRecord:
+    """把 SQLite 行转换为长文本记录。"""
+
+    return LongTextRecord(
+        id=int(row["id"]),
+        entity_type=row["entity_type"],
+        entity_id=int(row["entity_id"]),
+        source_label=row["source_label"],
+        text=row["text"],
+    )
 
 
 def project_card_index_text(card: ProjectExperienceCard) -> str:

@@ -140,13 +140,15 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['ingest-message', '1', '--message-file', 'materials.txt'])"
 ```
 
-默认只写入 SQLite 和 `long_texts`。如果你希望这条资料立刻进入 RAG 检索索引，可以加 `--auto-rag`：
+默认只写入 SQLite 和 `long_texts`。如果你希望这条资料立刻进入 RAG 检索索引，可以加 `--auto-rag`。
+这个选项采用增量追加：只索引本次新增的长文本，不会全量重建整个 Chroma 集合。
 
 ```powershell
 E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['ingest-message', '1', '--message-file', 'materials.txt', '--auto-rag'])"
 ```
 
-不加 `--auto-rag` 也没关系，后面手动执行 `rag-rebuild` 会把所有 `long_texts` 一次性同步到 Chroma。
+命令输出中的 `rag_update_mode` 会显示本次 RAG 动作，例如 `incremental`。
+不加 `--auto-rag` 也没关系，后面手动执行 `rag-rebuild` 会把所有 `long_texts` 一次性全量同步到 Chroma。
 
 ### 4. 分析并保存本地项目卡片
 
@@ -193,7 +195,7 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 RAG 第一版使用 LangChain + Chroma，把 SQLite `long_texts` 中的职位描述、候选人技能、
 已确认项目摘要等材料同步到本地向量库。SQLite 仍然是事实源，Chroma 只是语义检索索引。
 
-重建索引：
+全量重建索引。这个命令适合修复索引、切换 embedding 或怀疑 Chroma 与 SQLite 不一致时使用：
 
 ```powershell
 E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['rag-rebuild'])"

@@ -145,6 +145,7 @@ def test_cli_can_ingest_conversation_message(tmp_path, capsys):
     """命令行可以把一段自然语言资料自动保存到 SQLite 和长文本材料库。"""
 
     db_path = tmp_path / "cli.db"
+    rag_dir = tmp_path / "chroma"
     profile_file = tmp_path / "profile.json"
     profile_file.write_text(
         json.dumps(
@@ -171,19 +172,26 @@ def test_cli_can_ingest_conversation_message(tmp_path, capsys):
         [
             "--db",
             str(db_path),
+            "--rag-dir",
+            str(rag_dir),
             "ingest-message",
             str(candidate_id),
             "我是本科，1年经验，会 Python 和 FastAPI。",
+            "--auto-rag",
         ]
     )
     output = json.loads(capsys.readouterr().out)
-    profile = JobHuntingApp(db_path).get_candidate_profile(candidate_id)
+    app = JobHuntingApp(db_path)
+    profile = app.get_candidate_profile(candidate_id)
+    rag_results = app.search_rag("Python FastAPI", rag_dir)
 
     assert output["candidate_id"] == candidate_id
     assert "education" in output["saved_structured_fields"]
     assert output["saved_long_text_ids"]
+    assert output["rag_update_mode"] == "incremental"
     assert profile.education == "本科"
     assert profile.skills["Python"] == "待确认"
+    assert any("FastAPI" in result.content for result in rag_results)
 
 
 def test_cli_can_rebuild_and_search_rag_index(tmp_path, capsys):

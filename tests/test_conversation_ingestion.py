@@ -47,8 +47,8 @@ def test_conversation_message_auto_saves_structured_facts_and_long_text(tmp_path
     assert long_texts[0].text.startswith("我是本科")
 
 
-def test_conversation_message_can_auto_rebuild_rag_index(tmp_path):
-    """自动入库后可以同步重建 RAG 索引，让新资料立刻可检索。"""
+def test_conversation_message_can_auto_incrementally_index_rag(tmp_path):
+    """自动入库后可以增量追加 RAG 索引，让新资料立刻可检索。"""
 
     app = JobHuntingApp(tmp_path / "mvp.db")
     app.initialize()
@@ -75,8 +75,10 @@ def test_conversation_message_can_auto_rebuild_rag_index(tmp_path):
     )
     search_results = app.search_rag("RAG 知识库 简历草稿", tmp_path / "chroma")
 
-    assert result.rag_rebuilt
+    assert not result.rag_rebuilt
+    assert result.rag_update_mode == "incremental"
     assert result.rag_index_stats is not None
+    assert result.rag_index_stats.mode == "incremental"
     assert search_results
     assert any("RAG 知识库" in item.content for item in search_results)
 

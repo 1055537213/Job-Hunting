@@ -83,8 +83,8 @@ def stable_hash(token: str) -> int:
 class RAGKnowledgeBase:
     """本地持久化 RAG 知识库门面。
 
-    外部只需要关心“重建索引”和“检索证据”。Chroma、文本切分、metadata 规范都
-    封装在这里，避免这些细节散落到 App/CLI。
+    外部只需要关心“重建索引”“追加索引”和“检索证据”。Chroma、文本切分、
+    metadata 规范都封装在这里，避免这些细节散落到 App/CLI。
     """
 
     def __init__(
@@ -102,7 +102,8 @@ class RAGKnowledgeBase:
     def rebuild(self, long_texts: list[LongTextRecord]) -> RAGIndexStats:
         """用 SQLite 长文本重建 Chroma 索引。
 
-        第一版采用全量重建，简单可靠；后续数据量变大时再做增量同步。
+        全量重建适合修复索引、切换 embedding 或怀疑 Chroma 与 SQLite 不一致时使用；
+        日常对话新增资料优先走 `index_long_texts` 增量追加。
         """
 
         vector_store = self._vector_store()
@@ -116,6 +117,30 @@ class RAGKnowledgeBase:
             chunk_count=len(documents),
             persist_directory=str(self.persist_directory),
             collection_name=self.collection_name,
+            mode="rebuild",
+        )
+
+    def index_long_texts(self, long_texts: list[LongTextRecord]) -> RAGIndexStats:
+        """把新增长文本增量追加到现有 Chroma 索引。
+
+        这个方法不会清空集合，只处理传入的长文本。chunk ID 由 `long_text_id` 和
+        `chunk_index` 稳定生成；如果同一条长文本被重复索引，会先删除同 ID chunk
+        再写入，避免重复记录。
+        """
+
+        documents = self._split_documents(self._to_documents(long_texts))
+        if documents:
+            vector_store = self._vector_store()
+            ids = [document.metadata["chunk_id"] for document in documents]
+            # Chroma 的 add 是追加语义；先按稳定 ID 删除，保证重复调用不会制造重复 chunk。
+            vector_store.delete(ids=ids)
+            vector_store.add_documents(documents, ids=ids)
+        return RAGIndexStats(
+            document_count=len(long_texts),
+            chunk_count=len(documents),
+            persist_directory=str(self.persist_directory),
+            collection_name=self.collection_name,
+            mode="incremental",
         )
 
     def search(
@@ -191,8 +216,11 @@ class RAGKnowledgeBase:
             separators=["\n\n", "\n", "。", "；", "，", " ", ""],
         )
         chunks = splitter.split_documents(documents)
-        for index, chunk in enumerate(chunks):
+        chunk_indexes_by_long_text: dict[int, int] = {}
+        for chunk in chunks:
             long_text_id = chunk.metadata["long_text_id"]
-            chunk.metadata["chunk_index"] = index
-            chunk.metadata["chunk_id"] = f"long-text-{long_text_id}-chunk-{index}"
+            chunk_index = chunk_indexes_by_long_text.get(long_text_id, 0)
+            chunk_indexes_by_long_text[long_text_id] = chunk_index + 1
+            chunk.metadata["chunk_index"] = chunk_index
+            chunk.metadata["chunk_id"] = f"long-text-{long_text_id}-chunk-{chunk_index}"
         return chunks

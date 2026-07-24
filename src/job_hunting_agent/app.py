@@ -71,7 +71,7 @@ class JobHuntingApp:
         """自动判断并保存一条候选人对话资料。
 
         这是“对话即入库”的应用层入口：LLM 或规则只负责产出保存决策，
-        真正的 SQLite 结构化更新、长文本写入和 RAG 重建都在本地代码中完成。
+        真正的 SQLite 结构化更新、长文本写入和 RAG 增量索引都在本地代码中完成。
         这样可以保留清晰边界：SQLite 是事实源，RAG 是证据索引，LLM 是判断/表达工具。
         """
 
@@ -96,16 +96,23 @@ class JobHuntingApp:
         ]
 
         rag_index_stats = None
+        rag_update_mode = "none"
         if auto_rebuild_rag:
-            rag_index_stats = self.rebuild_rag_index(rag_persist_directory or "data/chroma")
+            # 参数名沿用早期版本；现在对话入库的自动 RAG 刷新采用增量追加，不做全量重建。
+            rag_index_stats = self.index_rag_long_texts(
+                saved_long_text_ids,
+                rag_persist_directory or "data/chroma",
+            )
+            rag_update_mode = rag_index_stats.mode
 
         return ConversationIngestionResult(
             candidate_id=candidate_id,
             reply=decision.reply,
             saved_structured_fields=saved_structured_fields,
             saved_long_text_ids=saved_long_text_ids,
-            rag_rebuilt=auto_rebuild_rag,
+            rag_rebuilt=False,
             rag_index_stats=rag_index_stats,
+            rag_update_mode=rag_update_mode,
         )
 
     def import_job_text(self, raw_text: str, source_url: str | None = None) -> ImportedJob:
@@ -221,6 +228,20 @@ class JobHuntingApp:
 
         knowledge_base = RAGKnowledgeBase(persist_directory)
         return knowledge_base.rebuild(self.store.list_long_texts())
+
+    def index_rag_long_texts(
+        self,
+        long_text_ids: list[int],
+        persist_directory: str | Path = "data/chroma",
+    ) -> RAGIndexStats:
+        """把指定长文本增量追加到本地 Chroma RAG 索引。
+
+        SQLite 仍然是长文本材料登记处；这个方法只把指定 ID 的材料同步到 Chroma，
+        适合对话式自动入库后的即时检索。
+        """
+
+        knowledge_base = RAGKnowledgeBase(persist_directory)
+        return knowledge_base.index_long_texts(self.store.get_long_texts_by_ids(long_text_ids))
 
     def search_rag(
         self,

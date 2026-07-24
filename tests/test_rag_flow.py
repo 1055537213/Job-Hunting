@@ -59,6 +59,52 @@ def test_rag_rebuilds_from_long_texts_and_retrieves_source_metadata(tmp_path):
     assert all(result.long_text_id > 0 for result in results)
 
 
+def test_rag_can_incrementally_index_new_long_texts_without_rebuild(tmp_path):
+    """新增长文本可以追加进 Chroma，且不会清空已经索引过的历史资料。"""
+
+    app = JobHuntingApp(tmp_path / "mvp.db")
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="小林",
+            status="离职",
+            education="本科",
+            experience_years=1.0,
+            skills={"Python": "项目使用"},
+            preferred_cities=["杭州"],
+            salary_floor_k=10,
+            expected_salary_k=15,
+            target_directions=["AI Agent 应用开发"],
+            unacceptable=[],
+        )
+    )
+    first_id = app.store.add_long_text(
+        "conversation_message",
+        candidate_id,
+        "first_note",
+        "第一条资料：负责职位解析模块。",
+    )
+    first_stats = app.index_rag_long_texts([first_id], tmp_path / "chroma")
+
+    second_id = app.store.add_long_text(
+        "conversation_message",
+        candidate_id,
+        "second_note",
+        "第二条资料：负责 RAG 知识库和简历草稿生成。",
+    )
+    second_stats = app.index_rag_long_texts([second_id], tmp_path / "chroma")
+
+    first_results = app.search_rag("职位解析", tmp_path / "chroma")
+    second_results = app.search_rag("RAG 知识库 简历草稿", tmp_path / "chroma")
+
+    assert first_stats.mode == "incremental"
+    assert second_stats.mode == "incremental"
+    assert first_stats.document_count == 1
+    assert second_stats.document_count == 1
+    assert any("职位解析" in result.content for result in first_results)
+    assert any("RAG 知识库" in result.content for result in second_results)
+
+
 def test_resume_draft_can_use_rag_evidence_without_treating_it_as_profile_fact(tmp_path):
     """简历草稿可以引用 RAG 检索证据，但不会把向量结果写回候选人档案。"""
 

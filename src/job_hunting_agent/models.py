@@ -180,12 +180,17 @@ class LongTextRecord:
 
 @dataclass
 class RAGIndexStats:
-    """一次 RAG 索引重建的统计结果。"""
+    """一次 RAG 索引写入的统计结果。
+
+    `mode` 用来区分全量重建和增量追加；两种模式都只描述向量索引动作，
+    不改变 SQLite 事实源。
+    """
 
     document_count: int
     chunk_count: int
     persist_directory: str
     collection_name: str
+    mode: str = "rebuild"
 
 
 @dataclass
@@ -257,3 +262,4 @@ class ConversationIngestionResult:
     saved_long_text_ids: list[int]
     rag_rebuilt: bool
     rag_index_stats: RAGIndexStats | None = None
+    rag_update_mode: str = "none"
