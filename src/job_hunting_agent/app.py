@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .llm import LLMClient
 from .matcher import match_job
 from .models import (
     CandidateProfile,
@@ -17,8 +18,10 @@ from .models import (
     MatchResult,
     ProjectExperienceCard,
     ProjectExperienceRecord,
+    ResumeDraftRecord,
 )
 from .project_analyzer import analyze_project
+from .resume_writer import build_resume_draft
 from .storage import SQLiteStore
 
 
@@ -113,3 +116,34 @@ class JobHuntingApp:
         candidate = self.store.get_candidate_profile(candidate_id)
         matches = [match_job(candidate, job) for job in self.store.list_jobs()]
         return sorted(matches, key=lambda result: (result.eliminated, -result.score, result.job_id))
+
+    def create_resume_draft(
+        self,
+        candidate_id: int,
+        job_id: int,
+        llm_client: LLMClient | None = None,
+    ) -> ResumeDraftRecord:
+        """为某个职位生成一版证据约束简历草稿。
+
+        LLM 是可选表达工具；即使传入 LLM，最终草稿也会经过真实性检查。
+        生成结果保存为职位定制草稿版本，不会覆盖候选人档案。
+        """
+
+        candidate = self.store.get_candidate_profile(candidate_id)
+        job = self.store.get_job(job_id)
+        confirmed_project_cards = [
+            record
+            for record in self.store.list_project_cards(candidate_id)
+            if record.status == "已确认"
+        ]
+        draft = build_resume_draft(candidate, job, confirmed_project_cards, llm_client)
+        return self.store.save_resume_draft(candidate_id, job_id, draft)
+
+    def list_resume_drafts(
+        self,
+        candidate_id: int,
+        job_id: int | None = None,
+    ) -> list[ResumeDraftRecord]:
+        """列出候选人的职位定制简历草稿版本。"""
+
+        return self.store.list_resume_drafts(candidate_id, job_id)

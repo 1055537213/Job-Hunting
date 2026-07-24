@@ -24,6 +24,8 @@ from .models import (
     ImportedJob,
     ProjectExperienceCard,
     ProjectExperienceRecord,
+    ResumeDraft,
+    ResumeDraftRecord,
 )
 
 
@@ -111,6 +113,18 @@ class SQLiteStore:
                     created_at TEXT NOT NULL,
                     confirmed_at TEXT,
                     FOREIGN KEY(candidate_id) REFERENCES candidate_profiles(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS resume_drafts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    candidate_id INTEGER NOT NULL,
+                    job_id INTEGER NOT NULL,
+                    version INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    draft_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(candidate_id) REFERENCES candidate_profiles(id),
+                    FOREIGN KEY(job_id) REFERENCES jobs(id)
                 );
                 """
             )
@@ -323,6 +337,89 @@ class SQLiteStore:
             self._add_long_text(conn, "project_experience_card", record_id, "confirmed", text_for_index)
         return self.get_project_card(record_id)
 
+    def save_resume_draft(
+        self,
+        candidate_id: int,
+        job_id: int,
+        draft: ResumeDraft,
+    ) -> ResumeDraftRecord:
+        """保存一个职位定制简历草稿版本。
+
+        草稿版本单独保存，不会更新候选人档案，也不会覆盖历史版本。
+        """
+
+        created_at = now_iso()
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(MAX(version), 0) AS latest_version
+                FROM resume_drafts
+                WHERE candidate_id = ? AND job_id = ?
+                """,
+                (candidate_id, job_id),
+            ).fetchone()
+            version = int(row["latest_version"]) + 1
+            cursor = conn.execute(
+                """
+                INSERT INTO resume_drafts (
+                    candidate_id, job_id, version, status, draft_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candidate_id,
+                    job_id,
+                    version,
+                    "需候选人确认",
+                    json.dumps(asdict(draft), ensure_ascii=False),
+                    created_at,
+                ),
+            )
+            record_id = int(cursor.lastrowid)
+            # 草稿全文进入 long_texts，后续可以用于“比较不同版本”或向量检索，
+            # 但它的 entity_type 明确标记为草稿，不会被当成档案事实。
+            self._add_long_text(conn, "resume_draft", record_id, f"v{version}", draft.content)
+        return self.get_resume_draft(record_id)
+
+    def get_resume_draft(self, record_id: int) -> ResumeDraftRecord:
+        """按 ID 读取简历草稿版本。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM resume_drafts WHERE id = ?",
+                (record_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Resume draft not found: {record_id}")
+        return self._resume_draft_from_row(row)
+
+    def list_resume_drafts(
+        self,
+        candidate_id: int,
+        job_id: int | None = None,
+    ) -> list[ResumeDraftRecord]:
+        """列出候选人的简历草稿版本，可按职位过滤。"""
+
+        with self.connect() as conn:
+            if job_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM resume_drafts
+                    WHERE candidate_id = ?
+                    ORDER BY job_id, version
+                    """,
+                    (candidate_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM resume_drafts
+                    WHERE candidate_id = ? AND job_id = ?
+                    ORDER BY version
+                    """,
+                    (candidate_id, job_id),
+                ).fetchall()
+        return [self._resume_draft_from_row(row) for row in rows]
+
     def _job_from_row(self, row: sqlite3.Row) -> ImportedJob:
         """把 jobs 表的一行转换成 `ImportedJob`。"""
 
@@ -361,6 +458,20 @@ class SQLiteStore:
             confirmed_summary=row["confirmed_summary"],
             created_at=row["created_at"],
             confirmed_at=row["confirmed_at"],
+        )
+
+    def _resume_draft_from_row(self, row: sqlite3.Row) -> ResumeDraftRecord:
+        """把简历草稿表的一行转换成领域模型。"""
+
+        draft = ResumeDraft(**json.loads(row["draft_json"]))
+        return ResumeDraftRecord(
+            id=int(row["id"]),
+            candidate_id=int(row["candidate_id"]),
+            job_id=int(row["job_id"]),
+            version=int(row["version"]),
+            status=row["status"],
+            draft=draft,
+            created_at=row["created_at"],
         )
 
     def add_long_text(self, entity_type: str, entity_id: int, source_label: str, text: str) -> None:

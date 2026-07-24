@@ -12,6 +12,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .app import JobHuntingApp
+from .llm import StaticLLMClient
 from .models import CandidateProfileInput
 
 
@@ -73,6 +74,18 @@ def main(argv: list[str] | None = None) -> None:
     match_all_parser = subparsers.add_parser("match-all")
     match_all_parser.add_argument("candidate_id", type=int)
 
+    draft_parser = subparsers.add_parser("draft-resume")
+    draft_parser.add_argument("candidate_id", type=int)
+    draft_parser.add_argument("job_id", type=int)
+    draft_llm = draft_parser.add_mutually_exclusive_group()
+    # 当前还没有接真实模型；这个静态响应入口用于教学演示“LLM 输出会被安全检查”。
+    draft_llm.add_argument("--llm-static-response")
+    draft_llm.add_argument("--llm-static-response-file")
+
+    list_drafts_parser = subparsers.add_parser("list-resume-drafts")
+    list_drafts_parser.add_argument("candidate_id", type=int)
+    list_drafts_parser.add_argument("--job-id", type=int)
+
     args = parser.parse_args(argv)
     app = JobHuntingApp(args.db)
     # 每次运行命令前都初始化表结构，让新手不用单独记住建表步骤。
@@ -120,6 +133,18 @@ def main(argv: list[str] | None = None) -> None:
                 "matches": [
                     {"job": asdict(jobs_by_id[match.job_id]), "match": asdict(match)}
                     for match in matches
+                ],
+            }
+        )
+    elif args.command == "draft-resume":
+        print_json(asdict(app.create_resume_draft(args.candidate_id, args.job_id, build_static_llm(args))))
+    elif args.command == "list-resume-drafts":
+        print_json(
+            {
+                "candidate_id": args.candidate_id,
+                "resume_drafts": [
+                    asdict(record)
+                    for record in app.list_resume_drafts(args.candidate_id, args.job_id)
                 ],
             }
         )
@@ -273,6 +298,20 @@ def split_job_texts(raw_text: str, separator: str) -> list[str]:
 
     chunks = [chunk.strip() for chunk in raw_text.split(separator)]
     return [chunk for chunk in chunks if chunk]
+
+
+def build_static_llm(args: argparse.Namespace) -> StaticLLMClient | None:
+    """构造教学用静态 LLM。
+
+    真实模型适配器还没有接入，所以默认返回 None，表示使用规则安全草稿。
+    如果传入静态响应，业务流程会像调用 LLM 一样调用它，并执行同样的安全检查。
+    """
+
+    if args.llm_static_response_file:
+        return StaticLLMClient(Path(args.llm_static_response_file).read_text(encoding="utf-8"))
+    if args.llm_static_response:
+        return StaticLLMClient(args.llm_static_response)
+    return None
 
 
 def run_demo(app: JobHuntingApp, project_path: str) -> None:

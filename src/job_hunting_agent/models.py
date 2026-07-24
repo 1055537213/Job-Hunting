@@ -126,3 +126,38 @@ class ProjectExperienceRecord:
     confirmed_summary: str | None
     created_at: str
     confirmed_at: str | None
+
+
+@dataclass
+class ResumeDraft:
+    """职位定制简历草稿正文。
+
+    草稿是给候选人编辑和确认的表达结果，不是候选人档案事实源。
+    `evidence_items` 说明正文来自哪些已确认材料，`authenticity_risks`
+    记录缺口、LLM 回退或可能需要人工确认的风险。
+    """
+
+    title: str
+    content: str
+    evidence_items: list[str]
+    authenticity_risks: list[str]
+    rewrite_notes: list[str]
+    llm_used: bool
+    llm_discarded: bool
+
+
+@dataclass
+class ResumeDraftRecord:
+    """已经保存的职位定制简历草稿版本。
+
+    同一候选人针对同一职位可以生成多个版本；这些版本不会反向覆盖
+    候选人档案，只作为可编辑草稿保存。
+    """
+
+    id: int
+    candidate_id: int
+    job_id: int
+    version: int
+    status: str
+    draft: ResumeDraft
+    created_at: str

@@ -10,6 +10,8 @@
 - 分析候选人提供的本地项目目录，生成待确认项目经历卡片。
 - 保存项目经历卡片，并在候选人确认后把它作为后续检索/简历改写材料。
 - 对本地已导入职位做批量匹配排序，优先展示未淘汰且分数更高的职位。
+- 提供 LLM 适配器边界，并生成证据约束的职位定制简历草稿版本。
+- 如果 LLM 输出包含未确认技能或成果数字，系统会丢弃该输出并回退到安全规则草稿。
 
 ## 运行环境
 
@@ -122,6 +124,30 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 
 `match-all` 会返回职位信息和对应匹配结果；已淘汰职位排在后面，未淘汰职位按分数从高到低排序。
 
+### 6. 生成职位定制简历草稿
+
+默认模式不调用真实 LLM，会生成规则版安全草稿：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['draft-resume', '1', '1'])"
+```
+
+查看已保存的草稿版本：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['list-resume-drafts', '1', '--job-id', '1'])"
+```
+
+当前还没有接入真实模型供应商，但已经有 LLM 适配器边界。你可以用静态响应模拟
+LLM 输出，观察安全检查是否会丢弃越界内容：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['draft-resume', '1', '1', '--llm-static-response', '候选人精通 Kubernetes，并将性能提升 50%。'])"
+```
+
+如果候选人档案和已确认项目卡片里没有 Kubernetes 或“提升 50%”这样的成果证据，
+最终草稿正文不会采用这段 LLM 输出，而会在 `authenticity_risks` 中记录风险。
+
 ## 代码注释约定
 
 以后本项目新增或修改代码时，默认要补充注释：
@@ -134,4 +160,5 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 
 ## 下一步建议
 
-下一步可以开始接入 LLM 抽象层：先让 LLM 辅助“职位文本标准化”和“证据约束简历草稿生成”，同时继续保留当前规则解析器作为兜底。
+下一步可以接入一个真实 LLM 供应商适配器，例如基于你本地 LangChain 学习环境封装
+DeepSeek/OpenAI 兼容聊天模型；接入后仍然沿用当前的输出安全检查。

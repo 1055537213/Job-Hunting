@@ -59,3 +59,56 @@ def test_cli_can_create_profile_import_job_and_match_all(tmp_path, capsys):
     assert match_output["candidate_id"] == candidate_id
     assert match_output["matches"][0]["job"]["id"] == imported_job["id"]
     assert match_output["matches"][0]["match"]["tier"] in {"强推荐", "可投递"}
+
+
+def test_cli_can_create_rule_based_resume_draft(tmp_path, capsys):
+    """命令行可以生成不依赖真实 LLM 的证据约束简历草稿。"""
+
+    db_path = tmp_path / "cli.db"
+    profile_file = tmp_path / "profile.json"
+    job_file = tmp_path / "job.txt"
+    profile_file.write_text(
+        json.dumps(
+            {
+                "name": "小林",
+                "status": "离职",
+                "education": "本科",
+                "experience_years": 1.0,
+                "skills": {"Python": "项目使用", "FastAPI": "项目使用"},
+                "preferred_cities": ["杭州"],
+                "salary_floor_k": 10,
+                "expected_salary_k": 15,
+                "target_directions": ["Python 后端开发"],
+                "unacceptable": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    job_file.write_text(
+        """
+        Python 后端开发工程师
+        15-20K
+        杭州
+        1-3年
+        本科
+        职位描述：负责 Python、FastAPI 和 Kubernetes 平台开发。
+        """,
+        encoding="utf-8",
+    )
+
+    main(["--db", str(db_path), "create-profile", "--from-json", str(profile_file)])
+    candidate_id = json.loads(capsys.readouterr().out)["candidate_id"]
+    main(["--db", str(db_path), "import-job", str(job_file)])
+    job_id = json.loads(capsys.readouterr().out)["id"]
+
+    main(["--db", str(db_path), "draft-resume", str(candidate_id), str(job_id)])
+    draft_output = json.loads(capsys.readouterr().out)
+
+    assert draft_output["candidate_id"] == candidate_id
+    assert draft_output["job_id"] == job_id
+    assert draft_output["version"] == 1
+    assert "Python" in draft_output["draft"]["content"]
+    assert "FastAPI" in draft_output["draft"]["content"]
+    assert "Kubernetes" not in draft_output["draft"]["content"]
+    assert any("未确认技能：Kubernetes" in risk for risk in draft_output["draft"]["authenticity_risks"])
