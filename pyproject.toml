@@ -1,0 +1,15 @@
+[project]
+# Python 包的基础元数据。当前项目还是本地 MVP，没有发布到 PyPI。
+name = "job-hunting-agent"
+version = "0.1.0"
+description = "A local, read-only job hunting assistant MVP."
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+# 安装成包以后，可以通过 `job-agent` 调用 CLI。
+job-agent = "job_hunting_agent.cli:main"
+
+[tool.pytest.ini_options]
+# 让 pytest 在不安装包的情况下，也能从 src/ 找到项目代码。
+pythonpath = ["src"]
