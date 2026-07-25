@@ -16,9 +16,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .app import JobHuntingApp
-from .config import load_llm_settings, masked_llm_settings
+from .config import (
+    load_embedding_settings,
+    load_llm_settings,
+    masked_embedding_settings,
+    masked_llm_settings,
+)
 from .llm import LLMClient, LLMRequestError, build_llm_client
 from .models import CandidateProfileInput
+from .rag import EmbeddingRequestError
 
 
 STATIC_DIR = Path(__file__).with_name("web_static")
@@ -66,7 +72,7 @@ def create_web_app(
     不同的数据目录。
     """
 
-    backend = JobHuntingApp(db_path)
+    backend = JobHuntingApp(db_path, env_file)
     backend.initialize()
     env_path = Path(env_file)
     rag_path = Path(rag_dir)
@@ -82,7 +88,7 @@ def create_web_app(
 
     @web_app.get("/api/health")
     def health() -> dict[str, object]:
-        """返回本地服务状态和脱敏 LLM 配置。"""
+        """返回本地服务状态和脱敏模型配置。"""
 
         try:
             llm_config: dict[str, object] = masked_llm_settings(load_llm_settings(env_path))
@@ -90,11 +96,16 @@ def create_web_app(
             llm_config = {"configured": False, "error": str(error)}
         else:
             llm_config["configured"] = True
+        try:
+            embedding_config = masked_embedding_settings(load_embedding_settings(env_path))
+        except ValueError as error:
+            embedding_config = {"configured": False, "error": str(error)}
         return {
             "status": "ok",
             "db_path": str(Path(db_path)),
             "rag_dir": str(rag_path),
             "llm": llm_config,
+            "embedding": embedding_config,
         }
 
     @web_app.get("/api/profiles")
@@ -149,6 +160,8 @@ def create_web_app(
             )
         except LLMRequestError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
+        except EmbeddingRequestError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
         return {
             "result": asdict(result),
             "profile": asdict(backend.get_candidate_profile(payload.candidate_id)),
@@ -188,10 +201,11 @@ def create_web_app(
     def search_rag(query: str = Query(...), top_k: int = 5) -> dict[str, object]:
         """检索本地 RAG 证据片段。"""
 
-        return {
-            "query": query,
-            "results": [asdict(result) for result in backend.search_rag(query, rag_path, top_k)],
-        }
+        try:
+            results = backend.search_rag(query, rag_path, top_k)
+        except EmbeddingRequestError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        return {"query": query, "results": [asdict(result) for result in results]}
 
     return web_app
 

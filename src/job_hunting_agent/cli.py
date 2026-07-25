@@ -12,7 +12,12 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .app import JobHuntingApp
-from .config import load_llm_settings, masked_llm_settings
+from .config import (
+    load_embedding_settings,
+    load_llm_settings,
+    masked_embedding_settings,
+    masked_llm_settings,
+)
 from .llm import LLMClient, StaticLLMClient, build_llm_client
 from .models import CandidateProfileInput
 
@@ -31,6 +36,7 @@ def main(argv: list[str] | None = None) -> None:
 
     subparsers.add_parser("init")
     subparsers.add_parser("llm-config")
+    subparsers.add_parser("embedding-config")
 
     web_parser = subparsers.add_parser("web")
     web_parser.add_argument("--host", default="127.0.0.1")
@@ -118,7 +124,7 @@ def main(argv: list[str] | None = None) -> None:
     list_drafts_parser.add_argument("--job-id", type=int)
 
     args = parser.parse_args(argv)
-    app = JobHuntingApp(args.db)
+    app = JobHuntingApp(args.db, args.env_file)
     # 每次运行命令前都初始化表结构，让新手不用单独记住建表步骤。
     app.initialize()
 
@@ -126,6 +132,8 @@ def main(argv: list[str] | None = None) -> None:
         print_json({"status": "ok", "db": str(Path(args.db).resolve())})
     elif args.command == "llm-config":
         print_json(masked_llm_settings(load_llm_settings(args.env_file)))
+    elif args.command == "embedding-config":
+        print_json(masked_embedding_settings(load_embedding_settings(args.env_file)))
     elif args.command == "web":
         run_web_server(args)
     elif args.command == "create-profile":

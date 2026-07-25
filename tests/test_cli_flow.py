@@ -141,6 +141,34 @@ def test_cli_can_show_masked_llm_config(tmp_path, capsys):
     assert "sk-secret" not in output_text
 
 
+def test_cli_can_show_masked_embedding_config(tmp_path, capsys):
+    """命令行可以读取并脱敏展示 embedding 配置。"""
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_EMBEDDING_PROVIDER=openai_compatible",
+                "JOB_AGENT_EMBEDDING_MODEL=text-embedding-3-small",
+                "JOB_AGENT_EMBEDDING_API_KEY=sk-embed-secret",
+                "JOB_AGENT_EMBEDDING_BASE_URL=https://api.openai.com/v1",
+                "JOB_AGENT_EMBEDDING_BATCH_SIZE=32",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    main(["--env-file", str(env_file), "embedding-config"])
+    output_text = capsys.readouterr().out
+    output = json.loads(output_text)
+
+    assert output["provider"] == "openai_compatible"
+    assert output["model"] == "text-embedding-3-small"
+    assert output["api_key_set"] is True
+    assert output["batch_size"] == 32
+    assert "sk-embed-secret" not in output_text
+
+
 def test_cli_can_ingest_conversation_message(tmp_path, capsys):
     """命令行可以把一段自然语言资料自动保存到 SQLite 和长文本材料库。"""
 

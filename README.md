@@ -41,10 +41,23 @@ JOB_AGENT_LLM_BASE_URL=https://api.deepseek.com
 JOB_AGENT_LLM_TIMEOUT_SECONDS=60
 JOB_AGENT_LLM_THINKING=enabled
 JOB_AGENT_LLM_REASONING_EFFORT=high
+
+JOB_AGENT_EMBEDDING_PROVIDER=openai_compatible
+JOB_AGENT_EMBEDDING_MODEL=text-embedding-3-small
+JOB_AGENT_EMBEDDING_API_KEY=your-embedding-api-key-here
+JOB_AGENT_EMBEDDING_BASE_URL=https://api.openai.com/v1
+JOB_AGENT_EMBEDDING_TIMEOUT_SECONDS=60
+JOB_AGENT_EMBEDDING_BATCH_SIZE=64
 ```
 
 以后要换模型，优先改 `.env` 里的 `JOB_AGENT_LLM_MODEL`、`JOB_AGENT_LLM_BASE_URL`
 和 `JOB_AGENT_LLM_API_KEY`，不要改业务代码。
+
+聊天模型和 embedding 模型分开配置更稳妥：很多供应商提供聊天模型，但不一定提供
+embedding，或者两者的模型名、计费和接口地址不同。
+
+如果没有配置 `JOB_AGENT_EMBEDDING_*`，当前项目会回退到本地 hash embedding，
+这样测试、教学和离线演示仍然能跑通；但语义检索质量会明显弱于真实 embedding。
 
 ## 运行测试
 
@@ -268,6 +281,12 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 
 ```powershell
 E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['llm-config'])"
+```
+
+检查当前 embedding 配置：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['embedding-config'])"
 ```
 
 使用 `.env` 中的 DeepSeek V4 Pro 生成草稿：

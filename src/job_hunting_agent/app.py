@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .config import DEFAULT_ENV_PATH
 from .conversation_ingestion import decide_conversation_ingestion
 from .llm import LLMClient
 from .matcher import match_job
@@ -37,10 +38,11 @@ class JobHuntingApp:
     RAG 检索组合到一起。外部入口保持简单，内部能力可以逐步替换升级。
     """
 
-    def __init__(self, db_path: str | Path):
-        """绑定一个 SQLite 数据库路径。"""
+    def __init__(self, db_path: str | Path, env_path: str | Path = DEFAULT_ENV_PATH):
+        """绑定一个 SQLite 数据库路径和项目 `.env` 路径。"""
 
         self.store = SQLiteStore(db_path)
+        self.env_path = Path(env_path)
 
     def initialize(self) -> None:
         """创建 MVP 需要的数据表。"""
@@ -231,7 +233,7 @@ class JobHuntingApp:
     def rebuild_rag_index(self, persist_directory: str | Path = "data/chroma") -> RAGIndexStats:
         """把 SQLite `long_texts` 全量同步到本地 Chroma RAG 索引。"""
 
-        knowledge_base = RAGKnowledgeBase(persist_directory)
+        knowledge_base = RAGKnowledgeBase(persist_directory, env_path=self.env_path)
         return knowledge_base.rebuild(self.store.list_long_texts())
 
     def index_rag_long_texts(
@@ -245,7 +247,7 @@ class JobHuntingApp:
         适合对话式自动入库后的即时检索。
         """
 
-        knowledge_base = RAGKnowledgeBase(persist_directory)
+        knowledge_base = RAGKnowledgeBase(persist_directory, env_path=self.env_path)
         return knowledge_base.index_long_texts(self.store.get_long_texts_by_ids(long_text_ids))
 
     def search_rag(
@@ -257,7 +259,7 @@ class JobHuntingApp:
     ) -> list[RAGSearchResult]:
         """从本地 Chroma RAG 索引检索带来源的证据片段。"""
 
-        knowledge_base = RAGKnowledgeBase(persist_directory)
+        knowledge_base = RAGKnowledgeBase(persist_directory, env_path=self.env_path)
         return knowledge_base.search(query, top_k, entity_types)
 
 

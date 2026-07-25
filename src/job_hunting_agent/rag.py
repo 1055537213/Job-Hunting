@@ -8,15 +8,21 @@ SQLite 结构化表为准；向量库只帮助找到“可能相关的证据片�
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
+import urllib.error
+import urllib.request
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from .config import DEFAULT_ENV_PATH, EmbeddingSettings, load_embedding_settings
 from .models import LongTextRecord, RAGIndexStats, RAGSearchResult
 
 
@@ -57,6 +63,86 @@ class LocalHashEmbeddings(Embeddings):
         return [value / norm for value in vector]
 
 
+class OpenAICompatibleEmbeddings(Embeddings):
+    """OpenAI-compatible embeddings 适配器。
+
+    许多向量模型供应商都兼容 OpenAI Embeddings 接口形态。这里保持一个最小实现：
+    业务层只依赖 `Embeddings` 接口，不绑死具体 SDK。
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        timeout_seconds: int = 60,
+        batch_size: int = 64,
+        dimensions: int | None = None,
+        transport: Callable[[str, dict[str, str], dict[str, object], int], dict[str, object]] | None = None,
+    ):
+        """保存 embedding 调用配置。"""
+
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout_seconds = timeout_seconds
+        self.batch_size = batch_size
+        self.dimensions = dimensions
+        self.transport = transport or post_embeddings_json
+        self.embeddings_url = normalize_embeddings_url(base_url)
+
+    @classmethod
+    def from_settings(cls, settings: EmbeddingSettings) -> "OpenAICompatibleEmbeddings":
+        """从统一配置对象创建 embedding 客户端。"""
+
+        return cls(
+            api_key=settings.api_key,
+            base_url=settings.base_url,
+            model=settings.model,
+            timeout_seconds=settings.timeout_seconds,
+            batch_size=settings.batch_size,
+            dimensions=settings.dimensions,
+        )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """调用真实 embeddings API 批量生成向量。"""
+
+        if not texts:
+            return []
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), self.batch_size):
+            vectors.extend(self._embed_batch(texts[start : start + self.batch_size]))
+        return vectors
+
+    def embed_query(self, text: str) -> list[float]:
+        """生成单条查询向量。"""
+
+        vectors = self._embed_batch([text])
+        return vectors[0]
+
+    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """调用一次 OpenAI-compatible embeddings 接口。"""
+
+        payload: dict[str, object] = {
+            "model": self.model,
+            "input": texts,
+            "encoding_format": "float",
+        }
+        # OpenAI text-embedding-3 系列支持 dimensions；其它兼容供应商通常会忽略未知字段或自行报错。
+        if self.dimensions is not None:
+            payload["dimensions"] = self.dimensions
+        response = self.transport(
+            self.embeddings_url,
+            {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            payload,
+            self.timeout_seconds,
+        )
+        return extract_embedding_vectors(response)
+
+
 def tokenize(text: str) -> list[str]:
     """生成中英文都能覆盖的轻量 token。
 
@@ -80,6 +166,76 @@ def stable_hash(token: str) -> int:
     return int(hashlib.sha256(token.encode("utf-8")).hexdigest(), 16)
 
 
+def normalize_embeddings_url(base_url: str) -> str:
+    """把 `.env` 中的 base URL 转成 embeddings URL。"""
+
+    stripped = base_url.rstrip("/")
+    if stripped.endswith("/embeddings"):
+        return stripped
+    return f"{stripped}/embeddings"
+
+
+def extract_embedding_vectors(response: dict[str, Any]) -> list[list[float]]:
+    """从 OpenAI-compatible embeddings 响应中提取向量列表。"""
+
+    data = response.get("data")
+    if not isinstance(data, list) or not data:
+        raise ValueError("Embedding API 响应缺少 data")
+    vectors_by_index: dict[int, list[float]] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            raise ValueError("Embedding API data 项格式异常")
+        index = int(item.get("index", len(vectors_by_index)))
+        embedding = item.get("embedding")
+        if not isinstance(embedding, list) or not all(isinstance(value, (int, float)) for value in embedding):
+            raise ValueError("Embedding API 响应缺少 embedding 向量")
+        vectors_by_index[index] = [float(value) for value in embedding]
+    return [vectors_by_index[index] for index in sorted(vectors_by_index)]
+
+
+class EmbeddingRequestError(RuntimeError):
+    """调用真实 embedding 接口失败时抛出的业务异常。"""
+
+
+def post_embeddings_json(
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, object],
+    timeout: int,
+) -> dict[str, object]:
+    """发送 embeddings JSON POST 请求。"""
+
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise EmbeddingRequestError(f"Embedding API HTTP {error.code}: {detail}") from error
+    except urllib.error.URLError as error:
+        raise EmbeddingRequestError(f"Embedding API 请求失败：{error.reason}") from error
+
+
+def build_rag_embeddings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+) -> Embeddings:
+    """根据 `.env` 构造 RAG embedding 实现。
+
+    如果没有配置真实 embedding，就回退到本地 hash embedding，保证测试和离线教学
+    场景仍可运行。
+    """
+
+    settings = load_embedding_settings(env_path)
+    if settings is None:
+        return LocalHashEmbeddings()
+    if settings.provider in {"local", "local_hash"}:
+        return LocalHashEmbeddings(dimensions=settings.dimensions or 384)
+    if settings.provider in {"openai", "openai_compatible"}:
+        return OpenAICompatibleEmbeddings.from_settings(settings)
+    raise ValueError(f"暂不支持的 embedding provider：{settings.provider}")
+
+
 class RAGKnowledgeBase:
     """本地持久化 RAG 知识库门面。
 
@@ -92,12 +248,13 @@ class RAGKnowledgeBase:
         persist_directory: str | Path = "data/chroma",
         collection_name: str = DEFAULT_RAG_COLLECTION,
         embeddings: Embeddings | None = None,
+        env_path: str | Path = DEFAULT_ENV_PATH,
     ):
         """绑定 Chroma 持久化目录、集合名和 embedding 实现。"""
 
         self.persist_directory = Path(persist_directory)
         self.collection_name = collection_name
-        self.embeddings = embeddings or LocalHashEmbeddings()
+        self.embeddings = embeddings or build_rag_embeddings(env_path)
 
     def rebuild(self, long_texts: list[LongTextRecord]) -> RAGIndexStats:
         """用 SQLite 长文本重建 Chroma 索引。

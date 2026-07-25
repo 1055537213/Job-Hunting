@@ -36,7 +36,9 @@ async function loadHealth() {
   const badge = el("healthBadge");
   try {
     const data = await requestJson("/api/health");
-    badge.textContent = data.llm?.configured ? "LLM 已配置" : "本地规则模式";
+    const llmText = data.llm?.configured ? "LLM 已配置" : "LLM 本地规则";
+    const embeddingText = data.embedding?.configured ? "Embedding 真实" : "Embedding 本地";
+    badge.textContent = `${llmText} · ${embeddingText}`;
   } catch (error) {
     badge.textContent = "服务异常";
     badge.classList.add("error");
