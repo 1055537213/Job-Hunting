@@ -1,15 +1,24 @@
-"""LLM 配置和 DeepSeek 适配器测试。
+"""LangChain LLM 配置测试。
 
-这些测试不访问真实网络，也不读取真实 `.env`。目标是保证 API Key、base URL、
-模型名都来自配置文件/环境变量，而不是写死在业务代码里。
+当前项目已经把真实聊天模型统一切到 LangChain ChatModel，所以这里主要验证：
+
+- `.env` 仍然是唯一配置来源。
+- DeepSeek 仍然通过 OpenAI-compatible 方式接入。
+- 业务层拿到的仍然是 `LLMClient` 边界，而不是直接裸用 SDK。
 """
 
-import json
-
 import pytest
+from langchain_core.messages import AIMessage
+from langchain_openai import ChatOpenAI
 
 from job_hunting_agent.config import load_llm_settings
-from job_hunting_agent.llm import DeepSeekChatClient, build_llm_client
+from job_hunting_agent.llm import (
+    LangChainLLMClient,
+    build_chat_model,
+    build_llm_client,
+    extract_message_text,
+    normalize_openai_compatible_base_url,
+)
 
 
 def test_load_llm_settings_reads_project_env_and_deepseek_aliases(tmp_path):
@@ -42,46 +51,8 @@ def test_load_llm_settings_reads_project_env_and_deepseek_aliases(tmp_path):
     assert settings.reasoning_effort == "high"
 
 
-def test_deepseek_client_builds_openai_compatible_chat_request():
-    """DeepSeek 适配器按 OpenAI ChatCompletions 兼容格式构造请求。"""
-
-    captured: dict[str, object] = {}
-
-    def fake_transport(url: str, headers: dict[str, str], payload: dict[str, object], timeout: int) -> dict[str, object]:
-        """测试用传输函数：记录请求并返回模拟响应。"""
-
-        captured["url"] = url
-        captured["headers"] = headers
-        captured["payload"] = payload
-        captured["timeout"] = timeout
-        return {"choices": [{"message": {"content": "安全草稿"}}]}
-
-    client = DeepSeekChatClient(
-        api_key="sk-test",
-        base_url="https://api.deepseek.com",
-        model="deepseek-v4-pro",
-        timeout_seconds=30,
-        thinking="enabled",
-        reasoning_effort="high",
-        transport=fake_transport,
-    )
-
-    result = client.complete("请生成简历草稿")
-
-    assert result == "安全草稿"
-    assert captured["url"] == "https://api.deepseek.com/chat/completions"
-    assert captured["headers"]["Authorization"] == "Bearer sk-test"
-    assert captured["timeout"] == 30
-    assert captured["payload"]["model"] == "deepseek-v4-pro"
-    assert captured["payload"]["messages"] == [{"role": "user", "content": "请生成简历草稿"}]
-    assert captured["payload"]["thinking"] == {"type": "enabled"}
-    assert captured["payload"]["reasoning_effort"] == "high"
-    # 确认 payload 可序列化，避免真实请求时才暴露 JSON 编码问题。
-    json.dumps(captured["payload"], ensure_ascii=False)
-
-
-def test_build_llm_client_uses_settings_without_hardcoding_provider_details(tmp_path):
-    """工厂函数根据 `.env` 配置创建真实模型适配器。"""
+def test_build_chat_model_uses_openai_compatible_langchain_model(tmp_path):
+    """真实模型接入改为 LangChain ChatOpenAI，并从 `.env` 读取参数。"""
 
     env_file = tmp_path / ".env"
     env_file.write_text(
@@ -90,7 +61,35 @@ def test_build_llm_client_uses_settings_without_hardcoding_provider_details(tmp_
                 "JOB_AGENT_LLM_PROVIDER=deepseek",
                 "JOB_AGENT_LLM_MODEL=deepseek-v4-pro",
                 "JOB_AGENT_LLM_API_KEY=sk-from-job-agent",
-                "JOB_AGENT_LLM_BASE_URL=https://api.deepseek.com/v1",
+                "JOB_AGENT_LLM_BASE_URL=https://api.deepseek.com/chat/completions",
+                "JOB_AGENT_LLM_REASONING_EFFORT=high",
+                "JOB_AGENT_LLM_THINKING=enabled",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    model = build_chat_model(load_llm_settings(env_file, environ={}))
+
+    assert isinstance(model, ChatOpenAI)
+    assert model.model_name == "deepseek-v4-pro"
+    assert str(model.openai_api_base) == "https://api.deepseek.com"
+    assert model.reasoning_effort == "high"
+    assert model.use_responses_api is False
+    assert model.extra_body == {"thinking": {"type": "enabled"}}
+
+
+def test_build_llm_client_returns_langchain_wrapper(tmp_path):
+    """业务层仍然得到 `LLMClient.complete()` 包装，而不是直接依赖 SDK。"""
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_LLM_PROVIDER=deepseek",
+                "JOB_AGENT_LLM_MODEL=deepseek-v4-pro",
+                "JOB_AGENT_LLM_API_KEY=sk-from-job-agent",
+                "JOB_AGENT_LLM_BASE_URL=https://api.deepseek.com",
             ]
         ),
         encoding="utf-8",
@@ -98,9 +97,29 @@ def test_build_llm_client_uses_settings_without_hardcoding_provider_details(tmp_
 
     client = build_llm_client(load_llm_settings(env_file, environ={}))
 
-    assert isinstance(client, DeepSeekChatClient)
-    assert client.model == "deepseek-v4-pro"
-    assert client.chat_completions_url == "https://api.deepseek.com/v1/chat/completions"
+    assert isinstance(client, LangChainLLMClient)
+    assert isinstance(client.model, ChatOpenAI)
+    assert client.model.model_name == "deepseek-v4-pro"
+
+
+def test_normalize_openai_compatible_base_url_strips_specific_endpoints():
+    """LangChain 需要根 base URL，不应保留 `/chat/completions` 这类具体端点。"""
+
+    assert normalize_openai_compatible_base_url("https://api.deepseek.com/chat/completions") == "https://api.deepseek.com"
+    assert normalize_openai_compatible_base_url("https://api.openai.com/v1/embeddings") == "https://api.openai.com/v1"
+
+
+def test_extract_message_text_handles_rich_content_blocks():
+    """富文本响应块也能被压平成普通文本，供业务层复用。"""
+
+    message = AIMessage(
+        content=[
+            {"type": "text", "text": "第一段"},
+            {"type": "output_text", "text": "第二段"},
+        ]
+    )
+
+    assert extract_message_text(message) == "第一段\n第二段"
 
 
 def test_llm_settings_requires_model_and_base_url_from_env(tmp_path):

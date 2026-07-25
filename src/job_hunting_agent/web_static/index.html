@@ -55,7 +55,7 @@
           <div class="message assistant">
             <div class="avatar">A</div>
             <div class="bubble">
-              你好，我会在回复你的同时，把明确事实保存到 SQLite，把项目/经历等长文本保存到 long_texts，并同步到 RAG 索引。
+              你好，我会优先通过标准 LangChain Agent 来处理你的聊天请求；Agent 会通过工具把明确事实保存到 SQLite，把项目/经历等长文本保存到 long_texts，并按需同步到 RAG。
               你可以先在左侧创建档案，然后直接发资料。
             </div>
           </div>
@@ -64,7 +64,7 @@
         <footer class="composer">
           <div class="composer-options">
             <label><input id="autoRagToggle" type="checkbox" checked /> 自动增量 RAG</label>
-            <label><input id="useLlmToggle" type="checkbox" /> 使用 .env 大模型判断</label>
+            <label><input id="useLlmToggle" type="checkbox" checked /> 使用 LangChain Agent（需 .env）</label>
           </div>
           <div class="composer-row">
             <textarea id="messageInput" placeholder="例如：我是本科，1年经验，会 Python 和 FastAPI，做过一个求职助手项目..."></textarea>

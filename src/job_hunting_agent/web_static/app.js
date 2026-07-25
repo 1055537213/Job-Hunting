@@ -36,9 +36,13 @@ async function loadHealth() {
   const badge = el("healthBadge");
   try {
     const data = await requestJson("/api/health");
-    const llmText = data.llm?.configured ? "LLM 已配置" : "LLM 本地规则";
+    const agentText = data.agent?.configured ? "Agent 已就绪" : "Agent 未启用";
+    const llmText = data.llm?.configured ? "LLM 已配置" : "LLM 未配置";
     const embeddingText = data.embedding?.configured ? "Embedding 真实" : "Embedding 本地";
-    badge.textContent = `${llmText} · ${embeddingText}`;
+    badge.textContent = `${agentText} · ${llmText} · ${embeddingText}`;
+    // 没有 `.env` 时自动切到规则兜底，避免用户第一次打开页面就遇到 400。
+    el("useLlmToggle").checked = Boolean(data.agent?.configured);
+    el("useLlmToggle").disabled = !data.agent?.configured;
   } catch (error) {
     badge.textContent = "服务异常";
     badge.classList.add("error");
@@ -146,9 +150,10 @@ async function sendMessage() {
         message,
         use_env_llm: el("useLlmToggle").checked,
         auto_rag: el("autoRagToggle").checked,
+        session_id: `web-candidate-${state.currentProfileId}`,
       }),
     });
-    appendAssistant(buildChatReply(data.result));
+    appendAssistant(buildChatReply(data));
     renderProfileSummary(data.profile);
   } catch (error) {
     appendAssistant(error.message, true);
@@ -157,7 +162,18 @@ async function sendMessage() {
   }
 }
 
-function buildChatReply(result) {
+function buildChatReply(payload) {
+  // Agent 模式下，前端只展示工具摘要；真正的结构化事实仍以 SQLite 为准，
+  // RAG 检索结果也只作证据展示，不在这里被当成新事实写回页面状态。
+  if (payload.mode === "langchain_agent") {
+    const toolLine = payload.used_tools?.length
+      ? `工具：${payload.used_tools.join("、")}`
+      : "工具：本轮未调用工具";
+    const toolSummary = summarizeToolOutputs(payload.tool_outputs || []);
+    return [payload.reply, toolLine, toolSummary].filter(Boolean).join("\n\n");
+  }
+
+  const result = payload.result;
   const savedFields = result.saved_structured_fields.length
     ? result.saved_structured_fields.join("、")
     : "无结构化字段";
@@ -165,7 +181,34 @@ function buildChatReply(result) {
     result.rag_update_mode === "incremental"
       ? "RAG：已增量索引本次长文本"
       : "RAG：本次未更新索引";
-  return `${result.reply}\n\n保存字段：${savedFields}\n长文本 ID：${result.saved_long_text_ids.join("、") || "无"}\n${ragLine}`;
+  return `${payload.reply}\n\n保存字段：${savedFields}\n长文本 ID：${result.saved_long_text_ids.join("、") || "无"}\n${ragLine}`;
+}
+
+function summarizeToolOutputs(toolOutputs) {
+  // 这里故意只提炼“可展示摘要”，而不是把工具输出整包反写进前端状态；
+  // 候选人事实仍以后端 SQLite 档案为准，避免 UI 摘要和事实源混淆。
+  const lines = [];
+  for (const item of toolOutputs) {
+    const data = item.data || {};
+    if (Array.isArray(data.saved_structured_fields)) {
+      lines.push(`保存字段：${data.saved_structured_fields.join("、") || "无结构化字段"}`);
+    }
+    if (Array.isArray(data.saved_long_text_ids)) {
+      lines.push(`长文本 ID：${data.saved_long_text_ids.join("、") || "无"}`);
+    }
+    if (data.rag_update_mode) {
+      lines.push(
+        data.rag_update_mode === "incremental" ? "RAG：已增量索引本次长文本" : `RAG：${data.rag_update_mode}`
+      );
+    }
+    if (data.job?.title) {
+      lines.push(`导入职位：${data.job.title}`);
+    }
+    if (Array.isArray(data.matches) && data.matches.length) {
+      lines.push(`匹配结果：共 ${data.matches.length} 个职位，已按推荐顺序返回。`);
+    }
+  }
+  return lines.join("\n");
 }
 
 async function importJob() {

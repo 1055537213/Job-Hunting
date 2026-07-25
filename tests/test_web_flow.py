@@ -6,8 +6,21 @@
 """
 
 from fastapi.testclient import TestClient
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+from langchain_core.messages import AIMessage
 
+from job_hunting_agent.agent import JobHuntingAgent
+from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.web import create_web_app
+
+
+class ToolCallingFakeChatModel(FakeMessagesListChatModel):
+    """测试用假模型：支持 `create_agent` 的工具绑定。"""
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):  # noqa: ANN001,D401
+        """直接返回自身，让测试可以手工指定工具调用序列。"""
+
+        return self
 
 
 def test_web_home_page_and_assets_are_available(tmp_path):
@@ -104,3 +117,69 @@ def test_web_can_import_job_and_return_matches(tmp_path):
     assert matches
     assert matches[0]["job"]["id"] == imported["id"]
     assert matches[0]["match"]["tier"] in {"强推荐", "可投递"}
+
+
+def test_web_chat_can_use_langchain_agent_mode(tmp_path):
+    """网页聊天在开启开关时，会走标准 LangChain Agent 主流程。"""
+
+    agent_backend = JobHuntingApp(tmp_path / "web.db")
+    agent_backend.initialize()
+    model = ToolCallingFakeChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "name": "ingest_candidate_message",
+                        "args": {
+                            "message": "我是本科，1年经验，会 Python 和 FastAPI。",
+                            "auto_rag": True,
+                        },
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="我已经通过 Agent 工具保存了你的资料。"),
+        ]
+    )
+    backend_app = create_web_app(
+        db_path=tmp_path / "web.db",
+        rag_dir=tmp_path / "chroma",
+        chat_agent=JobHuntingAgent(
+            app=agent_backend,
+            rag_dir=tmp_path / "chroma",
+            model=model,
+        ),
+    )
+    client = TestClient(backend_app)
+    created = client.post(
+        "/api/profiles",
+        json={
+            "name": "小林",
+            "status": "待补充",
+            "education": "大专",
+            "experience_years": 0,
+            "skills": {},
+            "preferred_cities": [],
+            "salary_floor_k": None,
+            "expected_salary_k": None,
+            "target_directions": [],
+            "unacceptable": [],
+        },
+    )
+    candidate_id = created.json()["candidate_id"]
+
+    chat = client.post(
+        "/api/chat",
+        json={
+            "candidate_id": candidate_id,
+            "message": "我是本科，1年经验，会 Python 和 FastAPI。",
+            "auto_rag": True,
+            "use_env_llm": True,
+        },
+    )
+
+    assert chat.status_code == 200
+    assert chat.json()["mode"] == "langchain_agent"
+    assert "ingest_candidate_message" in chat.json()["used_tools"]

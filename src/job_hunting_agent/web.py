@@ -1,7 +1,12 @@
 """本地 Web 前端入口。
 
-这个模块把现有 `JobHuntingApp` 暴露成一个本地 FastAPI 应用，并提供静态网页。
-Web 层只负责请求/响应和页面资源，不直接绕过应用服务操作 SQLite、RAG 或 LLM。
+这个模块现在同时支持两种聊天路径：
+
+- 标准 LangChain Agent 模式：Web -> JobHuntingAgent -> Tools -> JobHuntingApp
+- 本地规则兜底模式：Web -> JobHuntingApp.ingest_conversation_message
+
+之所以保留兜底，是为了在 `.env` 未配置或测试场景下，项目仍然能离线运行。
+一旦用户开启“使用 LangChain Agent”，主流程就会走标准 Agent 结构。
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .agent import JobHuntingAgent
 from .app import JobHuntingApp
 from .config import (
     load_embedding_settings,
@@ -22,7 +28,6 @@ from .config import (
     masked_embedding_settings,
     masked_llm_settings,
 )
-from .llm import LLMClient, LLMRequestError, build_llm_client
 from .models import CandidateProfileInput
 from .rag import EmbeddingRequestError
 
@@ -46,12 +51,19 @@ class ProfilePayload(BaseModel):
 
 
 class ChatPayload(BaseModel):
-    """网页聊天输入。"""
+    """网页聊天输入。
+
+    为了兼容已有前端字段名，这里沿用 `use_env_llm`。现在它的语义是：
+
+    - `true`：走标准 LangChain Agent 主流程。
+    - `false`：走本地规则兜底流程。
+    """
 
     candidate_id: int
     message: str
     use_env_llm: bool = False
     auto_rag: bool = True
+    session_id: str | None = None
 
 
 class JobPayload(BaseModel):
@@ -65,17 +77,29 @@ def create_web_app(
     db_path: str | Path = "data/job_agent.db",
     env_file: str | Path = ".env",
     rag_dir: str | Path = "data/chroma",
+    chat_agent: JobHuntingAgent | None = None,
 ) -> FastAPI:
     """创建本地 FastAPI 应用。
 
-    参数保留为显式路径，方便测试使用临时数据库，也方便用户后续把 Web 服务指向
-    不同的数据目录。
+    这里显式保留数据库路径、`.env` 路径、RAG 目录和可注入 Agent，目的是：
+
+    - 生产使用时，Web 层通过 `JobHuntingAgent` 或 `JobHuntingApp` 访问业务能力；
+    - 测试时，可以安全地注入临时 SQLite、临时 Chroma 和假模型；
+    - Web 层自己不直接碰 SQLite 连接、RAG 向量库细节或厂商 SDK。
     """
 
     backend = JobHuntingApp(db_path, env_file)
     backend.initialize()
     env_path = Path(env_file)
     rag_path = Path(rag_dir)
+
+    agent_error: str | None = None
+    if chat_agent is None:
+        try:
+            chat_agent = JobHuntingAgent(backend, env_path=env_path, rag_dir=rag_path)
+        except ValueError as error:
+            # `.env` 没配好时，网页仍然可以以本地规则模式工作。
+            agent_error = str(error)
 
     web_app = FastAPI(title="Job Hunting Agent Web", version="0.1.0")
     web_app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -106,6 +130,10 @@ def create_web_app(
             "rag_dir": str(rag_path),
             "llm": llm_config,
             "embedding": embedding_config,
+            "agent": {
+                "configured": chat_agent is not None,
+                "error": agent_error,
+            },
         }
 
     @web_app.get("/api/profiles")
@@ -144,25 +172,57 @@ def create_web_app(
 
     @web_app.post("/api/chat")
     def chat(payload: ChatPayload) -> dict[str, object]:
-        """处理网页聊天消息，并执行对话式自动入库。"""
+        """处理网页聊天消息。
+
+        - 开启 Agent 时：执行标准 LangChain Agent 对话。
+        - 关闭 Agent 时：回退到原有“对话式自动入库”规则链路。
+        """
 
         get_profile_or_404(backend, payload.candidate_id)
         if not payload.message.strip():
             raise HTTPException(status_code=400, detail="消息不能为空。")
-        llm_client = build_web_llm(payload.use_env_llm, env_path)
+
+        if payload.use_env_llm:
+            if chat_agent is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"LangChain Agent 未就绪：{agent_error or '请检查 .env 配置'}",
+                )
+            try:
+                result = chat_agent.chat(
+                    payload.message.strip(),
+                    candidate_id=payload.candidate_id,
+                    session_id=payload.session_id or f"web-candidate-{payload.candidate_id}",
+                    use_tool_llm=True,
+                    auto_rag=payload.auto_rag,
+                )
+            except EmbeddingRequestError as error:
+                raise HTTPException(status_code=502, detail=str(error)) from error
+            except Exception as error:  # noqa: BLE001 - 对 Web 层统一转成可读错误。
+                raise HTTPException(status_code=502, detail=str(error)) from error
+            return {
+                "mode": result.mode,
+                "reply": result.reply,
+                "used_tools": result.used_tools,
+                "tool_outputs": result.tool_outputs,
+                "profile": asdict(backend.get_candidate_profile(payload.candidate_id)),
+            }
+
         try:
             result = backend.ingest_conversation_message(
                 payload.candidate_id,
                 payload.message.strip(),
-                llm_client=llm_client,
+                llm_client=None,
                 rag_persist_directory=rag_path,
                 auto_rebuild_rag=payload.auto_rag,
             )
-        except LLMRequestError as error:
-            raise HTTPException(status_code=502, detail=str(error)) from error
         except EmbeddingRequestError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         return {
+            "mode": "rule_based_ingestion",
+            "reply": result.reply,
+            "used_tools": ["ingest_conversation_message"],
+            "tool_outputs": [{"tool_name": "ingest_conversation_message", "data": asdict(result)}],
             "result": asdict(result),
             "profile": asdict(backend.get_candidate_profile(payload.candidate_id)),
         }
@@ -217,17 +277,6 @@ def get_profile_or_404(backend: JobHuntingApp, candidate_id: int):
         return backend.get_candidate_profile(candidate_id)
     except KeyError as error:
         raise HTTPException(status_code=404, detail=f"候选人不存在：{candidate_id}") from error
-
-
-def build_web_llm(use_env_llm: bool, env_file: Path) -> LLMClient | None:
-    """根据网页开关决定是否使用 `.env` 中配置的真实模型。"""
-
-    if not use_env_llm:
-        return None
-    try:
-        return build_llm_client(load_llm_settings(env_file))
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 def clean_string_list(values: list[str]) -> list[str]:

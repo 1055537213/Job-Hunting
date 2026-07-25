@@ -11,6 +11,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+from .agent import JobHuntingAgent
 from .app import JobHuntingApp
 from .config import (
     load_embedding_settings,
@@ -65,6 +66,13 @@ def main(argv: list[str] | None = None) -> None:
     ingest_llm.add_argument("--llm-static-response-file")
     ingest_llm.add_argument("--use-env-llm", action="store_true")
     ingest_parser.add_argument("--auto-rag", action="store_true")
+
+    agent_chat_parser = subparsers.add_parser("agent-chat")
+    agent_chat_parser.add_argument("candidate_id", type=int)
+    # 标准 Agent 聊天入口同样支持短消息参数和长文本文件两种输入方式。
+    agent_chat_parser.add_argument("message", nargs="?")
+    agent_chat_parser.add_argument("--message-file")
+    agent_chat_parser.add_argument("--session-id")
 
     demo_parser = subparsers.add_parser("demo")
     demo_parser.add_argument("--project", default=".")
@@ -152,6 +160,38 @@ def main(argv: list[str] | None = None) -> None:
                 )
             )
         )
+    elif args.command == "agent-chat":
+        message = read_ingestion_message(args)
+        try:
+            agent = JobHuntingAgent(app, env_path=args.env_file, rag_dir=args.rag_dir)
+        except ValueError as error:
+            # 如果 `.env` 没配好，CLI 仍然回退到本地规则入库，避免新入口完全不可用。
+            fallback = app.ingest_conversation_message(
+                args.candidate_id,
+                message,
+                llm_client=None,
+                rag_persist_directory=args.rag_dir,
+                auto_rebuild_rag=True,
+            )
+            print_json(
+                {
+                    "mode": "rule_based_ingestion",
+                    "fallback_reason": str(error),
+                    "result": asdict(fallback),
+                }
+            )
+        else:
+            print_json(
+                asdict(
+                    agent.chat(
+                        message,
+                        candidate_id=args.candidate_id,
+                        session_id=args.session_id,
+                        use_tool_llm=True,
+                        auto_rag=True,
+                    )
+                )
+            )
     elif args.command == "demo":
         run_demo(app, args.project)
     elif args.command == "analyze-project":

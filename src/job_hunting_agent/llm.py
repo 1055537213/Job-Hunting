@@ -1,18 +1,22 @@
-"""LLM 适配器边界。
+"""LangChain LLM 适配边界。
 
-当前 MVP 不绑定任何具体大模型供应商。业务代码只依赖 `LLMClient`
-这个极小接口：输入 prompt，返回文本。以后无论接 OpenAI、DeepSeek、
-本地模型还是 LangChain 封装，都应该在这个模块里新增适配器，
-不要让业务流程直接依赖某个厂商 SDK。
+当前项目已经把“真实聊天模型”统一切到 LangChain ChatModel 接口：
+
+- Agent 主流程通过 `create_agent` + `ChatOpenAI` 运行。
+- 简历改写、对话入库判断等旧的“单次 prompt -> 单次文本”场景，仍然只依赖
+  `LLMClient.complete()` 这个极小接口。
+
+这样做的好处是：上层业务不用关心 DeepSeek、OpenAI-compatible、工具调用协议等
+供应商细节；以后如果要换模型，只需要改 `.env` 或替换本模块适配器。
 """
 
 from __future__ import annotations
 
-import json
-import urllib.error
-import urllib.request
-from collections.abc import Callable
-from typing import Protocol
+from typing import Any, Protocol
+
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_openai import ChatOpenAI
 
 from .config import LLMSettings
 
@@ -20,8 +24,8 @@ from .config import LLMSettings
 class LLMClient(Protocol):
     """业务层需要的最小 LLM 能力。
 
-    这里故意不暴露 temperature、model、messages 等供应商细节；这些配置应由
-    具体适配器内部处理。这样 `resume_writer.py` 可以专注真实性边界。
+    这里故意不暴露温度、响应格式、工具调用等 LangChain 细节；这些能力都由
+    适配器层消化。业务代码只关心“给一段 prompt，拿回一段文本”。
     """
 
     def complete(self, prompt: str) -> str:
@@ -29,11 +33,7 @@ class LLMClient(Protocol):
 
 
 class StaticLLMClient:
-    """测试或演示用的静态 LLM。
-
-    它不会联网，也不需要 API Key。真实供应商适配器接入前，可以用它验证
-    “LLM 输出进入业务流程后会被安全检查”这件事。
-    """
+    """测试或演示用的静态 LLM。"""
 
     def __init__(self, response: str):
         """保存固定响应文本。"""
@@ -47,139 +47,121 @@ class StaticLLMClient:
 
 
 class LLMRequestError(RuntimeError):
-    """调用真实模型接口失败时抛出的业务异常。"""
+    """调用真实模型失败时抛出的业务异常。"""
 
 
-class DeepSeekChatClient:
-    """DeepSeek V4 Pro 的 OpenAI-compatible ChatCompletions 适配器。
+class LangChainLLMClient:
+    """把 LangChain ChatModel 包装成现有业务可复用的 `LLMClient`。"""
 
-    这里不写死 API Key、base URL 或模型名；它们都由 `LLMSettings` 传入。
-    DeepSeek 官方接口兼容 OpenAI ChatCompletions 形态，所以后续如果接其他
-    OpenAI-compatible 供应商，也可以复用这类实现。
-    """
+    def __init__(self, model: BaseChatModel):
+        """保存底层 LangChain 聊天模型。"""
 
-    def __init__(
-        self,
-        api_key: str,
-        base_url: str,
-        model: str,
-        timeout_seconds: int = 60,
-        thinking: str | None = None,
-        reasoning_effort: str | None = None,
-        transport: Callable[[str, dict[str, str], dict[str, object], int], dict[str, object]] | None = None,
-    ):
-        """保存模型调用配置。
-
-        `transport` 是测试缝：生产环境使用 urllib；测试里注入假传输函数，
-        就能验证请求结构而不访问真实网络。
-        """
-
-        self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
         self.model = model
-        self.timeout_seconds = timeout_seconds
-        self.thinking = thinking
-        self.reasoning_effort = reasoning_effort
-        self.transport = transport or post_json
-        self.chat_completions_url = normalize_chat_completions_url(base_url)
-
-    @classmethod
-    def from_settings(cls, settings: LLMSettings) -> "DeepSeekChatClient":
-        """从统一配置对象创建 DeepSeek 客户端。"""
-
-        return cls(
-            api_key=settings.api_key,
-            base_url=settings.base_url,
-            model=settings.model,
-            timeout_seconds=settings.timeout_seconds,
-            thinking=settings.thinking,
-            reasoning_effort=settings.reasoning_effort,
-        )
 
     def complete(self, prompt: str) -> str:
-        """调用 DeepSeek ChatCompletions 接口并返回助手文本。"""
+        """调用 LangChain ChatModel，并把返回结果压平成普通文本。"""
 
-        payload: dict[str, object] = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        # DeepSeek V4 Pro 支持 thinking 配置；只有 `.env` 显式配置时才发送，
-        # 避免把供应商特有参数强加给所有模型。
-        if self.thinking:
-            payload["thinking"] = {"type": self.thinking}
-        if self.reasoning_effort:
-            payload["reasoning_effort"] = self.reasoning_effort
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        response = self.transport(self.chat_completions_url, headers, payload, self.timeout_seconds)
-        return extract_chat_completion_text(response)
+        try:
+            response = self.model.invoke(prompt)
+        except Exception as error:  # noqa: BLE001 - 这里统一转成业务异常，便于上层处理。
+            raise LLMRequestError(f"LLM 调用失败：{error}") from error
+        return extract_message_text(response)
 
 
 def build_llm_client(settings: LLMSettings) -> LLMClient:
-    """根据配置创建 LLM 客户端。
+    """根据 `.env` 配置创建业务层可复用的 LLM 客户端。"""
 
-    当前只实现 DeepSeek；后续如果要换模型，可以新增 provider 分支，但业务层仍然
-    只依赖 `LLMClient.complete()`。
+    return LangChainLLMClient(build_chat_model(settings))
+
+
+def build_chat_model(settings: LLMSettings, temperature: float = 0) -> BaseChatModel:
+    """根据 `.env` 配置创建标准 LangChain ChatModel。
+
+    当前项目默认使用 `langchain_openai.ChatOpenAI` 去适配 OpenAI-compatible
+    接口，包括 DeepSeek。这样 Agent、工具调用、消息对象、后续中间件扩展都能
+    走 LangChain 标准能力，而不是手写 HTTP 请求。
     """
 
-    if settings.provider == "deepseek":
-        return DeepSeekChatClient.from_settings(settings)
-    raise ValueError(f"暂不支持的 LLM provider：{settings.provider}")
+    if settings.provider not in {"deepseek", "openai", "openai_compatible"}:
+        raise ValueError(f"暂不支持的 LLM provider：{settings.provider}")
+
+    extra_body: dict[str, object] = {}
+    # DeepSeek 的 thinking 参数不属于 OpenAI 标准字段，所以通过 extra_body 透传。
+    if settings.thinking:
+        extra_body["thinking"] = {"type": settings.thinking}
+
+    return ChatOpenAI(
+        model=settings.model,
+        api_key=settings.api_key,
+        base_url=normalize_openai_compatible_base_url(settings.base_url),
+        timeout=settings.timeout_seconds,
+        temperature=temperature,
+        max_retries=2,
+        reasoning_effort=settings.reasoning_effort,
+        extra_body=extra_body or None,
+        # 当前接入的是 OpenAI-compatible 提供商，强制走 Chat Completions 更稳。
+        use_responses_api=False,
+        # 某些兼容供应商不会返回流式 token 使用量，这里关闭以减少兼容性问题。
+        stream_usage=False,
+    )
 
 
-def normalize_chat_completions_url(base_url: str) -> str:
-    """把 `.env` 中的 base URL 转成 ChatCompletions URL。
+def normalize_openai_compatible_base_url(base_url: str) -> str:
+    """把用户配置的接口地址归一化成 ChatOpenAI 需要的 base URL。
 
-    允许使用者在 `.env` 中写供应商根地址、版本化根地址，或者直接写完整的
-    `/chat/completions` 地址。
+    用户有时会把 `.env` 写成根地址，有时会写成 `/chat/completions` 这样的具体
+    端点。LangChain 这里需要“根 base URL”，所以要把具体端点后缀去掉。
     """
 
     stripped = base_url.rstrip("/")
-    if stripped.endswith("/chat/completions"):
-        return stripped
-    return f"{stripped}/chat/completions"
+    for suffix in ("/chat/completions", "/responses", "/embeddings"):
+        if stripped.endswith(suffix):
+            return stripped[: -len(suffix)]
+    return stripped
 
 
-def post_json(
-    url: str,
-    headers: dict[str, str],
-    payload: dict[str, object],
-    timeout: int,
-) -> dict[str, object]:
-    """用标准库发送 JSON POST 请求。
+def extract_message_text(message: BaseMessage | object) -> str:
+    """从 LangChain 消息对象中提取纯文本正文。
 
-    为了让项目先保持轻依赖，这里不用 requests 或供应商 SDK。以后如果接 LangChain，
-    可以新增一个 LangChain 适配器而不影响业务层。
+    兼容两类常见返回：
+
+    - `AIMessage.content` 直接就是字符串。
+    - `AIMessage.content` 是富文本分段列表，例如 Responses API 的文本块。
     """
 
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise LLMRequestError(f"LLM API HTTP {error.code}: {detail}") from error
-    except urllib.error.URLError as error:
-        raise LLMRequestError(f"LLM API 请求失败：{error.reason}") from error
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+                continue
+            # 一些消息块会把正文放在嵌套字段里，这里做一次保守兼容。
+            if item.get("type") in {"text", "output_text"} and isinstance(item.get("content"), str):
+                parts.append(str(item["content"]))
+        return "\n".join(part for part in parts if part.strip()).strip()
+    if isinstance(message, AIMessage):
+        return str(message.content)
+    if isinstance(content, (int, float)):
+        return str(content)
+    raise LLMRequestError("LLM 响应缺少可读取的文本内容")
 
 
-def extract_chat_completion_text(response: dict[str, object]) -> str:
-    """从 ChatCompletions 响应中提取助手正文。"""
+def masked_chat_model_settings(model: BaseChatModel) -> dict[str, Any]:
+    """返回适合调试展示的 LangChain ChatModel 摘要。"""
 
-    choices = response.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise LLMRequestError("LLM API 响应缺少 choices")
-    first_choice = choices[0]
-    if not isinstance(first_choice, dict):
-        raise LLMRequestError("LLM API choices[0] 格式异常")
-    message = first_choice.get("message")
-    if not isinstance(message, dict):
-        raise LLMRequestError("LLM API 响应缺少 message")
-    content = message.get("content")
-    if not isinstance(content, str):
-        raise LLMRequestError("LLM API 响应缺少文本 content")
-    return content
+    return {
+        "model_name": getattr(model, "model_name", None),
+        "base_url": getattr(model, "openai_api_base", None),
+        "timeout": getattr(model, "request_timeout", None),
+        "reasoning_effort": getattr(model, "reasoning_effort", None),
+        "uses_responses_api": getattr(model, "use_responses_api", None),
+    }

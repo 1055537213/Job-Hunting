@@ -13,10 +13,11 @@
 - 提供 LLM 适配器边界，并生成证据约束的职位定制简历草稿版本。
 - 如果 LLM 输出包含未确认技能或成果数字，系统会丢弃该输出并回退到安全规则草稿。
 - 支持从项目 `.env` 读取 DeepSeek/OpenAI-compatible 模型配置；当前 `.env` 使用 `deepseek-v4-pro`。
+- 新增标准 LangChain Agent 主链路：`Web/CLI -> JobHuntingAgent -> create_agent -> Tools -> JobHuntingApp`。
 - 使用 LangChain 文档/文本切分接口和本地持久化 Chroma 搭建第一版 RAG 知识库。
 - RAG 检索结果保留来源 metadata，只作为证据上下文，不替代 SQLite 事实源。
 - 支持对话式自动入库：用户发来的资料会被自动判断为结构化档案更新或长文本知识库材料。
-- 提供本地 Web 前端，可用聊天页面完成档案创建、资料自动入库、职位文本导入和匹配。
+- 提供本地 Web 前端，可用聊天页面通过 LangChain Agent 或本地规则模式完成档案创建、资料自动入库、职位文本导入和匹配。
 
 ## 运行环境
 
@@ -65,6 +66,12 @@ embedding，或者两者的模型名、计费和接口地址不同。
 E:\Anaconda\envs\langchain1.2\python.exe -m pytest tests\test_mvp_flow.py -q
 ```
 
+完整回归测试：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -m pytest -q
+```
+
 如果环境中还没有 Chroma，可以安装项目依赖：
 
 ```powershell
@@ -89,7 +96,8 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 ## 本地网页前端
 
 如果你不想使用 CLI，推荐先启动本地网页前端。页面布局采用“左侧档案栏 + 中央聊天区 + 右侧资料/职位面板”，
-日常可以像使用聊天网页一样补充资料。
+日常可以像使用聊天网页一样补充资料。当前网页聊天默认优先走标准 LangChain Agent；如果你取消勾选，
+会回退到本地规则兜底模式。
 
 第一次使用前建议安装为可编辑包：
 
@@ -118,8 +126,8 @@ job-agent --db data/job_agent.db --env-file .env --rag-dir data/chroma web
 网页第一版支持：
 
 - 创建和选择候选人档案。
-- 像聊天一样发送资料，并自动保存到 SQLite 结构化表或 `long_texts`，再按需同步到 RAG 索引。
-- 可选开启“使用 .env 大模型判断”。
+- 像聊天一样发送资料，并通过 LangChain Agent 工具链或本地规则链自动保存到 SQLite 结构化表或 `long_texts`，再按需同步到 RAG 索引。
+- 可选开启“使用 LangChain Agent（需 .env）”。
 - 默认开启“自动增量 RAG”，新资料会立刻可检索。
 - 粘贴 BOSS 职位文本并查看当前候选人的匹配结果。
 
@@ -202,6 +210,20 @@ E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src
 
 命令输出中的 `rag_update_mode` 会显示本次 RAG 动作，例如 `incremental`。
 不加 `--auto-rag` 也没关系，后面手动执行 `rag-rebuild` 会把所有 `long_texts` 一次性全量同步到 Chroma。
+
+如果你想直接体验标准 LangChain Agent，而不是只调用底层“入库”命令，可以使用新的 CLI 聊天入口：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -c "import sys; sys.path.insert(0, 'src'); from job_hunting_agent.cli import main; main(['--db', 'data/job_agent.db', '--env-file', '.env', '--rag-dir', 'data/chroma', 'agent-chat', '1', '请根据我现在的资料总结一下，还缺哪些岗位证据'])"
+```
+
+这个命令会走标准链路：
+
+- CLI 接收自然语言；
+- `JobHuntingAgent` 调用 LangChain `create_agent`；
+- Agent 按需选择工具；
+- 工具通过 `JobHuntingApp` 读写 SQLite / long_texts / RAG；
+- 最终返回中文回复，并保留对话线程记忆。
 
 ### 4. 分析并保存本地项目卡片
 

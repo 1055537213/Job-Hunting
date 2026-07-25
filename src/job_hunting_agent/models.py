@@ -263,3 +263,19 @@ class ConversationIngestionResult:
     rag_rebuilt: bool
     rag_index_stats: RAGIndexStats | None = None
     rag_update_mode: str = "none"
+
+
+@dataclass
+class AgentChatResult:
+    """LangChain Agent 一轮对话的执行摘要。
+
+    这个对象面向 Web/CLI 等用户入口：除了最终回复，还会记录本轮实际使用了哪些
+    工具，以及工具输出的结构化摘要，方便界面展示和后续调试。
+    """
+
+    reply: str
+    candidate_id: int | None
+    session_id: str
+    mode: str
+    used_tools: list[str] = field(default_factory=list)
+    tool_outputs: list[dict[str, object]] = field(default_factory=list)
