@@ -176,6 +176,25 @@ class LongTextRecord:
     entity_id: int
     source_label: str
     text: str
+    # 账号级 metadata 用于 Chroma 检索过滤；旧离线记录可以为空。
+    account_id: int | None = None
+
+
+@dataclass
+class ChatMessageRecord:
+    """网页聊天窗口中的一条持久化消息。
+
+    这张记录只用于恢复用户界面中的对话历史，不作为候选人档案事实源。
+    真正会影响匹配、简历改写的事实仍然必须经过结构化档案或长文本/RAG 流程。
+    """
+
+    id: int
+    candidate_id: int
+    session_id: str
+    role: str
+    content: str
+    metadata: dict[str, object]
+    created_at: str
 
 
 @dataclass
@@ -279,3 +298,90 @@ class AgentChatResult:
     mode: str
     used_tools: list[str] = field(default_factory=list)
     tool_outputs: list[dict[str, object]] = field(default_factory=list)
+    # 当前轮可从供应商响应中确认的用量摘要；缺失时使用 None/0，不把估算值冒充精确账单。
+    usage: dict[str, int | str] = field(default_factory=dict)
+
+
+@dataclass
+class AccountRecord:
+    """账号记录。
+
+    账号是共享访问和统一计费的主体。一个账号可以包含多个求职者档案，
+    因此这里不把账号和某一个候选人绑定。密码只保存哈希，绝不会出现在这个模型中。
+    """
+
+    id: int
+    email: str
+    display_name: str | None
+    role: str
+    status: str
+    created_at: str
+    updated_at: str
+    must_change_password: bool = False
+
+
+@dataclass
+class AuthSessionRecord:
+    """服务端登录 Session 记录。
+
+    `token_hash` 是浏览器 Cookie 中随机令牌的 SHA-256 摘要，原始令牌只在登录响应
+    中短暂返回，数据库不会保存可直接使用的登录凭证。
+    """
+
+    id: int
+    account_id: int
+    token_hash: str
+    created_at: str
+    last_seen_at: str
+    expires_at: str
+    absolute_expires_at: str
+    revoked_at: str | None
+    user_agent: str | None
+    ip_address: str | None
+
+
+@dataclass
+class ChatSessionRecord:
+    """一个求职者档案下的独立持久化对话。"""
+
+    id: int
+    session_id: str
+    account_id: int
+    candidate_id: int
+    job_id: int | None
+    title: str
+    status: str
+    created_at: str
+    updated_at: str
+    archived_at: str | None
+
+
+@dataclass
+class UsageEventRecord:
+    """一次真实上游调用的追加式 Token 用量流水。
+
+    `usage_source` 用来区分供应商确认、估算、缺失和本地零成本操作；正式计费时
+    只采用供应商确认的用量。`root_request_id` 可以把一轮用户操作中的多个模型调用
+    关联起来，`call_id` 则用于幂等和重试排查。
+    """
+
+    id: int
+    account_id: int
+    candidate_id: int | None
+    session_id: str | None
+    root_request_id: str | None
+    call_id: str
+    provider: str
+    model: str
+    operation: str
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    usage_source: str
+    status: str
+    attempt: int
+    provider_request_id: str | None
+    raw_usage: dict[str, object]
+    created_at: str
+    billable: bool
+    pricing_version: str | None

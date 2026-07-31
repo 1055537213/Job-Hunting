@@ -79,6 +79,8 @@ class OpenAICompatibleEmbeddings(Embeddings):
         batch_size: int = 64,
         dimensions: int | None = None,
         transport: Callable[[str, dict[str, str], dict[str, object], int], dict[str, object]] | None = None,
+        usage_callback: Callable[[dict[str, object]], None] | None = None,
+        usage_operation: str = "embedding",
     ):
         """保存 embedding 调用配置。"""
 
@@ -89,10 +91,17 @@ class OpenAICompatibleEmbeddings(Embeddings):
         self.batch_size = batch_size
         self.dimensions = dimensions
         self.transport = transport or post_embeddings_json
+        self.usage_callback = usage_callback
+        self.usage_operation = usage_operation
         self.embeddings_url = normalize_embeddings_url(base_url)
 
     @classmethod
-    def from_settings(cls, settings: EmbeddingSettings) -> "OpenAICompatibleEmbeddings":
+    def from_settings(
+        cls,
+        settings: EmbeddingSettings,
+        usage_callback: Callable[[dict[str, object]], None] | None = None,
+        usage_operation: str = "embedding",
+    ) -> "OpenAICompatibleEmbeddings":
         """从统一配置对象创建 embedding 客户端。"""
 
         return cls(
@@ -102,6 +111,8 @@ class OpenAICompatibleEmbeddings(Embeddings):
             timeout_seconds=settings.timeout_seconds,
             batch_size=settings.batch_size,
             dimensions=settings.dimensions,
+            usage_callback=usage_callback,
+            usage_operation=usage_operation,
         )
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -140,6 +151,11 @@ class OpenAICompatibleEmbeddings(Embeddings):
             payload,
             self.timeout_seconds,
         )
+        if self.usage_callback is not None:
+            try:
+                self.usage_callback(response)
+            except Exception:  # noqa: BLE001 - 计量旁路不能阻断向量索引。
+                pass
         return extract_embedding_vectors(response)
 
 
@@ -193,6 +209,22 @@ def extract_embedding_vectors(response: dict[str, Any]) -> list[list[float]]:
     return [vectors_by_index[index] for index in sorted(vectors_by_index)]
 
 
+def extract_embedding_usage(response: dict[str, Any]) -> dict[str, int]:
+    """读取 OpenAI-compatible embedding 响应中的 usage 字段。"""
+
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return {}
+    input_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+    output_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+    total_tokens = int(usage.get("total_tokens", input_tokens + output_tokens) or 0)
+    return {
+        "input_tokens": max(0, input_tokens),
+        "output_tokens": max(0, output_tokens),
+        "total_tokens": max(0, total_tokens),
+    }
+
+
 class EmbeddingRequestError(RuntimeError):
     """调用真实 embedding 接口失败时抛出的业务异常。"""
 
@@ -219,6 +251,8 @@ def post_embeddings_json(
 
 def build_rag_embeddings(
     env_path: str | Path = DEFAULT_ENV_PATH,
+    usage_callback: Callable[[dict[str, object]], None] | None = None,
+    usage_operation: str = "embedding",
 ) -> Embeddings:
     """根据 `.env` 构造 RAG embedding 实现。
 
@@ -232,7 +266,11 @@ def build_rag_embeddings(
     if settings.provider in {"local", "local_hash"}:
         return LocalHashEmbeddings(dimensions=settings.dimensions or 384)
     if settings.provider in {"openai", "openai_compatible"}:
-        return OpenAICompatibleEmbeddings.from_settings(settings)
+        return OpenAICompatibleEmbeddings.from_settings(
+            settings,
+            usage_callback=usage_callback,
+            usage_operation=usage_operation,
+        )
     raise ValueError(f"暂不支持的 embedding provider：{settings.provider}")
 
 
@@ -249,14 +287,24 @@ class RAGKnowledgeBase:
         collection_name: str = DEFAULT_RAG_COLLECTION,
         embeddings: Embeddings | None = None,
         env_path: str | Path = DEFAULT_ENV_PATH,
+        usage_callback: Callable[[dict[str, object]], None] | None = None,
+        usage_operation: str = "embedding",
     ):
         """绑定 Chroma 持久化目录、集合名和 embedding 实现。"""
 
         self.persist_directory = Path(persist_directory)
         self.collection_name = collection_name
-        self.embeddings = embeddings or build_rag_embeddings(env_path)
+        self.embeddings = embeddings or build_rag_embeddings(
+            env_path,
+            usage_callback=usage_callback,
+            usage_operation=usage_operation,
+        )
 
-    def rebuild(self, long_texts: list[LongTextRecord]) -> RAGIndexStats:
+    def rebuild(
+        self,
+        long_texts: list[LongTextRecord],
+        account_id: int | None = None,
+    ) -> RAGIndexStats:
         """用 SQLite 长文本重建 Chroma 索引。
 
         全量重建适合修复索引、切换 embedding 或怀疑 Chroma 与 SQLite 不一致时使用；
@@ -264,9 +312,19 @@ class RAGKnowledgeBase:
         """
 
         vector_store = self._vector_store()
-        # reset_collection 会清空当前集合，但不删除整个持久化目录，避免误删其它数据。
-        vector_store.reset_collection()
-        documents = self._split_documents(self._to_documents(long_texts))
+        # 账号级重建只能替换当前账号的 chunk；共享 Chroma 集合中其它账号的资料
+        # 必须保留。只有 CLI/维护命令明确不传 account_id 时才重置整个集合。
+        if account_id is None:
+            vector_store.reset_collection()
+        else:
+            try:
+                vector_store.delete(where={"account_id": account_id})
+            except (TypeError, ValueError):
+                # 兼容旧版 Chroma 不接受 where 的情况：删除当前账号的稳定 chunk ID。
+                existing_ids = vector_store.get(where={"account_id": account_id}).get("ids", [])
+                if existing_ids:
+                    vector_store.delete(ids=existing_ids)
+        documents = self._split_documents(self._to_documents(long_texts, account_id=account_id))
         if documents:
             vector_store.add_documents(documents, ids=[document.metadata["chunk_id"] for document in documents])
         return RAGIndexStats(
@@ -277,7 +335,11 @@ class RAGKnowledgeBase:
             mode="rebuild",
         )
 
-    def index_long_texts(self, long_texts: list[LongTextRecord]) -> RAGIndexStats:
+    def index_long_texts(
+        self,
+        long_texts: list[LongTextRecord],
+        account_id: int | None = None,
+    ) -> RAGIndexStats:
         """把新增长文本增量追加到现有 Chroma 索引。
 
         这个方法不会清空集合，只处理传入的长文本。chunk ID 由 `long_text_id` 和
@@ -285,7 +347,7 @@ class RAGKnowledgeBase:
         再写入，避免重复记录。
         """
 
-        documents = self._split_documents(self._to_documents(long_texts))
+        documents = self._split_documents(self._to_documents(long_texts, account_id=account_id))
         if documents:
             vector_store = self._vector_store()
             ids = [document.metadata["chunk_id"] for document in documents]
@@ -305,6 +367,7 @@ class RAGKnowledgeBase:
         query: str,
         top_k: int = 5,
         entity_types: list[str] | None = None,
+        account_id: int | None = None,
     ) -> list[RAGSearchResult]:
         """检索相关证据片段，并保留来源 metadata。"""
 
@@ -312,7 +375,11 @@ class RAGKnowledgeBase:
             return []
         vector_store = self._vector_store()
         # 先多取一些，再在 Python 侧做 entity_type 过滤，避免依赖不同向量库的过滤语法。
-        docs_with_scores = vector_store.similarity_search_with_score(query, k=max(top_k * 3, top_k))
+        search_kwargs: dict[str, object] = {"k": max(top_k * 3, top_k)}
+        if account_id is not None:
+            # 账号 metadata 过滤必须在 Chroma 查询层执行，不能先取全局 top-k 再在 Python 侧过滤。
+            search_kwargs["filter"] = {"account_id": account_id}
+        docs_with_scores = vector_store.similarity_search_with_score(query, **search_kwargs)
         results: list[RAGSearchResult] = []
         allowed = set(entity_types or [])
         for document, distance in docs_with_scores:
@@ -344,13 +411,18 @@ class RAGKnowledgeBase:
             persist_directory=str(self.persist_directory),
         )
 
-    def _to_documents(self, long_texts: list[LongTextRecord]) -> list[Document]:
+    def _to_documents(
+        self,
+        long_texts: list[LongTextRecord],
+        account_id: int | None = None,
+    ) -> list[Document]:
         """把 SQLite 长文本记录转换为 LangChain Document。"""
 
         documents = []
         for record in long_texts:
             if not record.text.strip():
                 continue
+            resolved_account_id = account_id if account_id is not None else record.account_id
             documents.append(
                 Document(
                     page_content=record.text,
@@ -359,6 +431,7 @@ class RAGKnowledgeBase:
                         "entity_type": record.entity_type,
                         "entity_id": record.entity_id,
                         "source_label": record.source_label,
+                        "account_id": resolved_account_id if resolved_account_id is not None else -1,
                     },
                 )
             )

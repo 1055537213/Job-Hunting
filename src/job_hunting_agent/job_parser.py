@@ -8,6 +8,7 @@ LLM 再补充职责、要求、技能和不确定说明。
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import datetime
 
 from .models import ImportedJob
@@ -51,12 +52,127 @@ KNOWN_SKILLS = [
     "OpenAI",
 ]
 
+JOB_TITLE_KEYWORDS = (
+    # 常见职位标题关键词；用于判断首行是否像“岗位名称”，而不是项目日志或普通聊天。
+    "工程师",
+    "开发",
+    "实习",
+    "测试",
+    "算法",
+    "数据",
+    "产品",
+    "运营",
+    "设计",
+    "架构",
+    "前端",
+    "后端",
+    "全栈",
+    "客户端",
+    "服务端",
+    "研发",
+    "助理",
+    "专员",
+    "顾问",
+    "经理",
+    "Java",
+    "Python",
+    "AI",
+    "Agent",
+)
+
+JOB_STRUCTURE_KEYWORDS = (
+    # 招聘文本里常见的结构化字段或段落标题。
+    "职位描述",
+    "岗位职责",
+    "工作职责",
+    "任职要求",
+    "岗位要求",
+    "职位要求",
+    "专业要求",
+    "职位类别",
+    "职位性质",
+    "工作年限",
+    "工作地点",
+    "薪资",
+    "招聘",
+    "立即投递",
+)
+
+JOB_DESCRIPTION_KEYWORDS = (
+    # 职责/要求段落中的动作词；只作为辅助信号，不能单独证明是职位。
+    "负责",
+    "参与",
+    "完成",
+    "熟悉",
+    "掌握",
+    "具备",
+    "优先",
+    "要求",
+    "职责",
+    "任职",
+    "工作内容",
+)
+
+KNOWN_CITIES = (
+    "北京",
+    "上海",
+    "杭州",
+    "深圳",
+    "广州",
+    "成都",
+    "南京",
+    "武汉",
+    "西安",
+    "苏州",
+    "长沙",
+    "天津",
+    "重庆",
+    "厦门",
+    "合肥",
+    "郑州",
+    "青岛",
+    "宁波",
+)
+
+
+class InvalidJobTextError(ValueError):
+    """职位文本审核失败。
+
+    把错误独立成类型，是为了让 Web 层可以返回 400，而不是把用户输入错误当成服务异常。
+    """
+
+
+@dataclass(frozen=True)
+class JobTextValidationResult:
+    """职位文本审核结果。
+
+    `score` 是启发式分数，只用于判断“是否像招聘职位”，不是职位匹配分数。
+    """
+
+    is_valid: bool
+    score: int
+    matched_signals: list[str]
+    missing_suggestions: list[str]
+
+    def error_message(self) -> str:
+        """把审核失败原因整理成可以直接展示给用户的中文错误。"""
+
+        suggestions = "、".join(self.missing_suggestions)
+        matched = "、".join(self.matched_signals) or "无明显招聘信号"
+        return (
+            "输入内容不像一段完整的招聘职位信息，已拒绝保存。"
+            f"请补充：{suggestions}。"
+            f"当前识别到的信号：{matched}。"
+        )
+
 
 def parse_job_text(raw_text: str, job_id: int = 0, source_url: str | None = None) -> ImportedJob:
     """把候选人导入的职位原文解析成 `ImportedJob`。
 
     解析目标不是做到百分百准确，而是先得到可比较字段，并明确标记字段置信度。
     """
+
+    ensure_valid_job_text(raw_text)
 
     lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
     compact_text = "\n".join(lines)
@@ -105,6 +221,115 @@ def parse_job_text(raw_text: str, job_id: int = 0, source_url: str | None = None
         field_confidence=field_confidence,
         uncertainty_notes=uncertainty_notes,
     )
+
+
+def ensure_valid_job_text(raw_text: str) -> JobTextValidationResult:
+    """审核用户粘贴的内容是否像招聘职位信息。
+
+    这里采用保守规则：至少要有一个像职位标题的首行，并且同时出现多项招聘文本信号。
+    这样可以挡住普通聊天、项目更新日志、单个数字、代码片段等误导入内容。
+    """
+
+    result = validate_job_text(raw_text)
+    if not result.is_valid:
+        raise InvalidJobTextError(result.error_message())
+    return result
+
+
+def validate_job_text(raw_text: str) -> JobTextValidationResult:
+    """返回职位文本审核结果，不做数据库写入。"""
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    compact_text = "\n".join(lines)
+    matched_signals: list[str] = []
+    missing_suggestions: list[str] = []
+
+    if len(compact_text) < 20:
+        return JobTextValidationResult(
+            is_valid=False,
+            score=0,
+            matched_signals=[],
+            missing_suggestions=["职位名称", "职位描述或任职要求", "薪资/地点/经验/学历等字段"],
+        )
+
+    first_line = lines[0] if lines else ""
+    title_like = is_plausible_job_title(first_line)
+    if title_like:
+        matched_signals.append("职位名称")
+    else:
+        missing_suggestions.append("清晰的职位名称")
+
+    salary_min, salary_max, _, _ = parse_salary(compact_text)
+    has_salary = salary_min is not None and salary_max is not None
+    if has_salary:
+        matched_signals.append("薪资")
+
+    _, _, experience_label = parse_experience(compact_text)
+    has_experience = experience_label is not None or "工作年限" in compact_text
+    if has_experience:
+        matched_signals.append("经验要求")
+
+    has_education = parse_education(compact_text) is not None or "学历" in compact_text
+    if has_education:
+        matched_signals.append("学历要求")
+
+    has_location = "工作地点" in compact_text or any(city in compact_text for city in KNOWN_CITIES)
+    if has_location:
+        matched_signals.append("工作地点")
+
+    has_structure = any(keyword in compact_text for keyword in JOB_STRUCTURE_KEYWORDS)
+    if has_structure:
+        matched_signals.append("招聘字段")
+
+    has_description = any(keyword in compact_text for keyword in JOB_DESCRIPTION_KEYWORDS)
+    if has_description:
+        matched_signals.append("职责/要求描述")
+
+    has_company_context = bool(re.search(r"\d+-\d+人|\d+人以上|公司|企业|集团", compact_text))
+    if has_company_context:
+        matched_signals.append("公司信息")
+
+    score = 0
+    score += 2 if title_like else 0
+    score += 2 if has_structure else 0
+    score += 1 if has_salary else 0
+    score += 1 if has_experience else 0
+    score += 1 if has_education else 0
+    score += 1 if has_location else 0
+    score += 1 if has_description else 0
+    score += 1 if has_company_context else 0
+
+    if not any([has_salary, has_experience, has_education, has_location, has_structure]):
+        missing_suggestions.append("薪资/地点/经验/学历/职位字段中的至少两项")
+    if not has_description and not has_structure:
+        missing_suggestions.append("职位描述、岗位职责或任职要求")
+
+    # 需要“像职位标题”并且至少有若干招聘结构信号；否则项目日志里出现技术词也不能入库。
+    is_valid = title_like and score >= 4 and len(matched_signals) >= 3
+    return JobTextValidationResult(
+        is_valid=is_valid,
+        score=score,
+        matched_signals=matched_signals,
+        missing_suggestions=missing_suggestions or ["更完整的职位原文"],
+    )
+
+
+def is_plausible_job_title(line: str) -> bool:
+    """判断首行是否像职位名称。
+
+    首行以项目符号开头、过短、过长或更像说明句时，都不认为是职位标题。
+    """
+
+    normalized = line.strip()
+    if not normalized or len(normalized) < 2 or len(normalized) > 80:
+        return False
+    if re.match(r"^[-*+•·]\s*", normalized):
+        return False
+    if re.fullmatch(r"\d+|https?://\S+", normalized):
+        return False
+    if normalized.endswith(("。", "；", ";")) and not any(keyword in normalized for keyword in JOB_TITLE_KEYWORDS):
+        return False
+    return any(keyword.lower() in normalized.lower() for keyword in JOB_TITLE_KEYWORDS)
 
 
 def parse_salary(text: str) -> tuple[int | None, int | None, int | None, str]:

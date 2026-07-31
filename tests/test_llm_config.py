@@ -11,7 +11,7 @@ import pytest
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 
-from job_hunting_agent.config import load_llm_settings
+from job_hunting_agent.config import load_agent_memory_settings, load_llm_settings
 from job_hunting_agent.llm import (
     LangChainLLMClient,
     build_chat_model,
@@ -77,6 +77,7 @@ def test_build_chat_model_uses_openai_compatible_langchain_model(tmp_path):
     assert model.reasoning_effort == "high"
     assert model.use_responses_api is False
     assert model.extra_body == {"thinking": {"type": "enabled"}}
+    assert model.streaming is True
 
 
 def test_build_llm_client_returns_langchain_wrapper(tmp_path):
@@ -138,3 +139,35 @@ def test_llm_settings_requires_model_and_base_url_from_env(tmp_path):
 
     with pytest.raises(ValueError, match="base URL|模型名"):
         load_llm_settings(env_file, environ={})
+
+
+def test_load_agent_memory_settings_reads_context_thresholds(tmp_path):
+    """Agent 记忆阈值可以从 `.env` 配置，方便按模型上下文窗口调整。"""
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_MEMORY_ENABLED=true",
+                "JOB_AGENT_MEMORY_RESTORE_HISTORY_LIMIT=80",
+                "JOB_AGENT_MEMORY_RESTORE_TRIGGER_TOKENS=3000",
+                "JOB_AGENT_MEMORY_RESTORE_KEEP_MESSAGES=12",
+                "JOB_AGENT_MEMORY_RESTORE_SUMMARY_CHARS=1600",
+                "JOB_AGENT_MEMORY_SUMMARY_TRIGGER_TOKENS=4000",
+                "JOB_AGENT_MEMORY_SUMMARY_KEEP_MESSAGES=16",
+                "JOB_AGENT_MEMORY_SUMMARY_TRIM_TOKENS=2000",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_agent_memory_settings(env_file, environ={})
+
+    assert settings.enabled is True
+    assert settings.restore_history_limit == 80
+    assert settings.restore_trigger_tokens == 3000
+    assert settings.restore_keep_messages == 12
+    assert settings.restore_summary_chars == 1600
+    assert settings.summary_trigger_tokens == 4000
+    assert settings.summary_keep_messages == 16
+    assert settings.summary_trim_tokens == 2000

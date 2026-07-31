@@ -20,20 +20,26 @@ Web / CLI
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import asdict
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any, TypedDict
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import SummarizationMiddleware
 from langchain.tools import ToolRuntime, tool
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 
 from .app import JobHuntingApp
-from .config import DEFAULT_ENV_PATH, load_llm_settings
+from .auth import utc_now
+from .config import AgentMemorySettings, DEFAULT_ENV_PATH, load_agent_memory_settings, load_llm_settings
+from .conversation_memory import build_restored_context_messages
+from .job_parser import InvalidJobTextError
 from .llm import build_chat_model, build_llm_client, extract_message_text
-from .models import AgentChatResult
+from .models import AgentChatResult, UsageEventRecord
 
 
 class JobHuntingAgentContext(TypedDict):
@@ -46,6 +52,9 @@ class JobHuntingAgentContext(TypedDict):
     """
 
     candidate_id: int | None
+    account_id: int | None
+    session_id: str
+    root_request_id: str
     rag_dir: str
     use_tool_llm: bool
     default_auto_rag: bool
@@ -76,6 +85,21 @@ AGENT_SYSTEM_PROMPT = """
 """.strip()
 
 
+CONVERSATION_SUMMARY_PROMPT = """
+你是求职助手 Agent 的对话记忆压缩器。
+
+请把下面即将被替换的历史消息压缩成后续对话仍然需要的上下文。必须遵守：
+1. 保留用户明确说过的候选人事实、偏好、求职方向、职位选择、HR 对话要点和待办。
+2. 保留本轮或历史中已经执行过的重要动作，例如保存资料、导入职位、生成草稿、匹配职位。
+3. 不要编造学历、年限、技能熟练度、项目成果数字或投递状态。
+4. 如果某项内容只是推测或待确认，请标记为“待确认”。
+5. 用中文输出，尽量短，但不要丢失会影响后续判断的边界。
+
+历史消息：
+{messages}
+""".strip()
+
+
 class JobHuntingAgent:
     """求职助手的标准 LangChain Agent 门面。"""
 
@@ -85,6 +109,7 @@ class JobHuntingAgent:
         env_path: str | Path = DEFAULT_ENV_PATH,
         rag_dir: str | Path = "data/chroma",
         model: BaseChatModel | None = None,
+        memory_settings: AgentMemorySettings | None = None,
     ):
         """创建一个绑定本地应用服务的 LangChain Agent。
 
@@ -96,10 +121,13 @@ class JobHuntingAgent:
         self.env_path = Path(env_path)
         self.rag_dir = Path(rag_dir)
         self.model = model or build_chat_model(load_llm_settings(self.env_path))
+        self.memory_settings = memory_settings or load_agent_memory_settings(self.env_path)
+        self._restored_sessions: set[tuple[int | None, int | None, str]] = set()
         self.graph = create_agent(
             model=self.model,
             tools=build_job_hunting_tools(app, self.env_path),
             system_prompt=AGENT_SYSTEM_PROMPT,
+            middleware=build_memory_middleware(self.model, self.memory_settings),
             context_schema=JobHuntingAgentContext,
             checkpointer=MemorySaver(),
             name="job_hunting_agent",
@@ -112,21 +140,34 @@ class JobHuntingAgent:
         session_id: str | None = None,
         use_tool_llm: bool = True,
         auto_rag: bool = True,
+        account_id: int | None = None,
     ) -> AgentChatResult:
         """执行一轮标准 LangChain Agent 对话。"""
 
-        resolved_session_id = session_id or default_session_id(candidate_id)
+        resolved_session_id = session_id or default_session_id(candidate_id, account_id)
+        root_request_id = uuid.uuid4().hex
         result = self.graph.invoke(
-            {"messages": [HumanMessage(content=message)]},
-            config={"configurable": {"thread_id": resolved_session_id}},
+            {"messages": self.build_turn_messages(message, candidate_id, resolved_session_id, account_id)},
+            config={"configurable": {"thread_id": scoped_thread_id(account_id, candidate_id, resolved_session_id)}},
             context={
                 "candidate_id": candidate_id,
+                "account_id": account_id,
+                "session_id": resolved_session_id,
                 "rag_dir": str(self.rag_dir),
                 "use_tool_llm": use_tool_llm,
                 "default_auto_rag": auto_rag,
+                "root_request_id": root_request_id,
             },
         )
         messages = list(result.get("messages", []))
+        usage = record_agent_usage(
+            self.app,
+            messages,
+            account_id=account_id,
+            candidate_id=candidate_id,
+            session_id=resolved_session_id,
+            root_request_id=root_request_id,
+        )
         return AgentChatResult(
             reply=extract_final_reply(messages),
             candidate_id=candidate_id,
@@ -134,7 +175,156 @@ class JobHuntingAgent:
             mode="langchain_agent",
             used_tools=collect_used_tools(messages),
             tool_outputs=collect_tool_outputs(messages),
+            usage=usage,
         )
+
+    def stream_chat(
+        self,
+        message: str,
+        candidate_id: int | None,
+        session_id: str | None = None,
+        use_tool_llm: bool = True,
+        auto_rag: bool = True,
+        account_id: int | None = None,
+    ) -> Iterator[dict[str, object]]:
+        """流式执行一轮标准 LangChain Agent 对话。
+
+        事件格式面向 Web SSE：
+
+        - `{"type": "token", "content": "..."}`：模型增量文本。
+        - `{"type": "tool", "name": "..."}`：工具调用完成提示。
+        - `{"type": "final", "result": AgentChatResult}`：完整结果，供落库和刷新 UI。
+
+        注意：工具调用可能在模型回复中间发生，所以最终仍要发送 `final` 事件，
+        让前端拿到工具摘要、候选人档案更新和可持久化的完整回复。
+        """
+
+        resolved_session_id = session_id or default_session_id(candidate_id, account_id)
+        root_request_id = uuid.uuid4().hex
+        tool_and_final_messages: list[BaseMessage] = []
+        streamed_reply_parts: list[str] = []
+        streamed_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+        for stream_item in self.graph.stream(
+            {"messages": self.build_turn_messages(message, candidate_id, resolved_session_id, account_id)},
+            config={"configurable": {"thread_id": scoped_thread_id(account_id, candidate_id, resolved_session_id)}},
+            context={
+                "candidate_id": candidate_id,
+                "account_id": account_id,
+                "session_id": resolved_session_id,
+                "rag_dir": str(self.rag_dir),
+                "use_tool_llm": use_tool_llm,
+                "default_auto_rag": auto_rag,
+                "root_request_id": root_request_id,
+            },
+            stream_mode="messages",
+        ):
+            streamed_message = unpack_stream_message(stream_item)
+            if streamed_message is None:
+                continue
+
+            if isinstance(streamed_message, ToolMessage):
+                tool_and_final_messages.append(streamed_message)
+                yield {"type": "tool", "name": streamed_message.name or "unknown_tool"}
+                continue
+
+            if isinstance(streamed_message, AIMessageChunk):
+                merge_usage(streamed_usage, extract_usage_metadata(streamed_message))
+                token = extract_stream_token(streamed_message)
+                if token:
+                    streamed_reply_parts.append(token)
+                    yield {"type": "token", "content": token}
+                continue
+
+            if isinstance(streamed_message, AIMessage):
+                # FakeChatModel 等测试模型可能一次性给出完整 AIMessage，而不是 AIMessageChunk。
+                tool_and_final_messages.append(streamed_message)
+                token = extract_stream_token(streamed_message)
+                if token and not streamed_message.tool_calls:
+                    streamed_reply_parts.append(token)
+                    yield {"type": "token", "content": token}
+
+        reply = extract_final_reply(tool_and_final_messages)
+        if reply.startswith("本轮没有生成") and streamed_reply_parts:
+            reply = "".join(streamed_reply_parts).strip()
+        usage = record_usage_summary(
+            self.app,
+            streamed_usage,
+            account_id=account_id,
+            candidate_id=candidate_id,
+            session_id=resolved_session_id,
+            root_request_id=root_request_id,
+        )
+        yield {
+            "type": "final",
+            "result": AgentChatResult(
+                reply=reply,
+                candidate_id=candidate_id,
+                session_id=resolved_session_id,
+                mode="langchain_agent",
+                used_tools=collect_used_tools(tool_and_final_messages),
+                tool_outputs=collect_tool_outputs(tool_and_final_messages),
+                usage=usage,
+            ),
+        }
+
+    def build_turn_messages(
+        self,
+        message: str,
+        candidate_id: int | None,
+        session_id: str,
+        account_id: int | None = None,
+    ) -> list[BaseMessage]:
+        """构造本轮输入消息，并在新进程首次会话时恢复持久化聊天历史。"""
+
+        restored_messages = self.restore_persistent_history(candidate_id, session_id, account_id)
+        return [*restored_messages, HumanMessage(content=message)]
+
+    def restore_persistent_history(
+        self,
+        candidate_id: int | None,
+        session_id: str,
+        account_id: int | None = None,
+    ) -> list[BaseMessage]:
+        """从 SQLite `chat_messages` 恢复一次历史上下文。
+
+        `MemorySaver` 只在当前进程里有效；服务重启后它是空的。这里在每个
+        `(candidate_id, session_id)` 首次调用时读取 SQLite 历史，把页面上能恢复的
+        对话也恢复到模型上下文里。之后同一进程内交给 LangGraph checkpointer 累积。
+        """
+
+        if not self.memory_settings.enabled or candidate_id is None:
+            return []
+        session_key = (account_id, candidate_id, session_id)
+        if session_key in self._restored_sessions:
+            return []
+        self._restored_sessions.add(session_key)
+        records = self.app.list_chat_messages(
+            candidate_id,
+            session_id,
+            limit=self.memory_settings.restore_history_limit,
+            account_id=account_id,
+        )
+        return build_restored_context_messages(records, self.memory_settings)
+
+
+def build_memory_middleware(
+    model: BaseChatModel,
+    settings: AgentMemorySettings,
+) -> list[object]:
+    """构建 LangChain 运行时上下文压缩中间件。"""
+
+    if not settings.enabled:
+        return []
+    return [
+        SummarizationMiddleware(
+            model=model,
+            trigger=("tokens", settings.summary_trigger_tokens),
+            keep=("messages", settings.summary_keep_messages),
+            summary_prompt=CONVERSATION_SUMMARY_PROMPT,
+            trim_tokens_to_summarize=settings.summary_trim_tokens,
+        )
+    ]
 
 
 def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
@@ -150,13 +340,22 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
 
         context = require_runtime_context(runtime)
         candidate_id = require_candidate_id(context)
-        llm_client = load_tool_llm_client(env_path) if context["use_tool_llm"] else None
+        account_id = context.get("account_id")
+        llm_client = (
+            load_tool_llm_client(
+                env_path,
+                usage_callback=build_tool_usage_callback(app, context, "tool_llm_ingestion"),
+            )
+            if context["use_tool_llm"]
+            else None
+        )
         result = app.ingest_conversation_message(
             candidate_id,
             message,
             llm_client=llm_client,
             rag_persist_directory=context["rag_dir"],
             auto_rebuild_rag=context["default_auto_rag"] if auto_rag is None else auto_rag,
+            account_id=account_id,
         )
         return dumps_tool_output(
             {
@@ -174,13 +373,17 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
 
         context = require_runtime_context(runtime)
         candidate_id = require_candidate_id(context)
-        return dumps_tool_output(asdict(app.get_candidate_profile(candidate_id)))
+        return dumps_tool_output(asdict(app.get_candidate_profile(candidate_id, account_id=context.get("account_id"))))
 
     @tool
-    def list_candidate_profiles() -> str:
+    def list_candidate_profiles(runtime: ToolRuntime) -> str:
         """列出本地所有候选人档案，适合在用户不确定当前档案时使用。"""
 
-        return dumps_tool_output({"profiles": [asdict(profile) for profile in app.list_candidate_profiles()]})
+        # 同账号内可以共享所有档案，但不能看到其它账号的档案。
+        context = require_runtime_context(runtime)
+        return dumps_tool_output(
+            {"profiles": [asdict(profile) for profile in app.list_candidate_profiles(account_id=context.get("account_id"))]}
+        )
 
     @tool
     def search_candidate_evidence(
@@ -192,21 +395,36 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
         """从本地 RAG 索引检索候选人证据片段，但不要把结果直接当成新的事实。"""
 
         context = require_runtime_context(runtime)
-        results = app.search_rag(query, context["rag_dir"], top_k, entity_types)
+        results = app.search_rag(
+            query,
+            context["rag_dir"],
+            top_k,
+            entity_types,
+            account_id=context.get("account_id"),
+        )
         return dumps_tool_output({"query": query, "results": [asdict(item) for item in results]})
 
     @tool
-    def import_job_from_text(raw_text: str, source_url: str | None = None) -> str:
+    def import_job_from_text(
+        raw_text: str,
+        runtime: ToolRuntime,
+        source_url: str | None = None,
+    ) -> str:
         """导入用户主动复制回来的职位文本，并解析成标准化职位记录。"""
 
-        job = app.import_job_text(raw_text, source_url)
+        try:
+            job = app.import_job_text(raw_text, source_url, account_id=runtime.context.get("account_id"))
+        except InvalidJobTextError as error:
+            # 工具返回可读失败结果，避免 Agent 把非职位文本误认为已经成功入库。
+            return dumps_tool_output({"saved": False, "error": str(error)})
         return dumps_tool_output({"job": asdict(job)})
 
     @tool
-    def list_imported_jobs() -> str:
+    def list_imported_jobs(runtime: ToolRuntime) -> str:
         """列出本地已经导入的职位池，供后续匹配或简历改写选择。"""
 
-        return dumps_tool_output({"jobs": [asdict(job) for job in app.list_jobs()]})
+        context = require_runtime_context(runtime)
+        return dumps_tool_output({"jobs": [asdict(job) for job in app.list_jobs(account_id=context.get("account_id"))]})
 
     @tool
     def match_all_jobs_for_candidate(runtime: ToolRuntime) -> str:
@@ -214,8 +432,9 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
 
         context = require_runtime_context(runtime)
         candidate_id = require_candidate_id(context)
-        jobs_by_id = {job.id: job for job in app.list_jobs()}
-        matches = app.match_all_jobs(candidate_id)
+        account_id = context.get("account_id")
+        jobs_by_id = {job.id: job for job in app.list_jobs(account_id=account_id)}
+        matches = app.match_all_jobs(candidate_id, account_id=account_id)
         return dumps_tool_output(
             {
                 "candidate_id": candidate_id,
@@ -235,7 +454,7 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
 
         context = require_runtime_context(runtime)
         candidate_id = require_candidate_id(context)
-        cards = app.list_project_cards(candidate_id)
+        cards = app.list_project_cards(candidate_id, account_id=context.get("account_id"))
         return dumps_tool_output({"project_cards": [asdict(card) for card in cards]})
 
     @tool
@@ -247,7 +466,7 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
 
         context = require_runtime_context(runtime)
         candidate_id = require_candidate_id(context)
-        record = app.analyze_project_for_candidate(candidate_id, project_path)
+        record = app.analyze_project_for_candidate(candidate_id, project_path, account_id=context.get("account_id"))
         return dumps_tool_output(asdict(record))
 
     @tool
@@ -264,10 +483,17 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
 
         context = require_runtime_context(runtime)
         candidate_id = require_candidate_id(context)
-        allowed_record_ids = {record.id for record in app.list_project_cards(candidate_id)}
+        allowed_record_ids = {
+            record.id
+            for record in app.list_project_cards(candidate_id, account_id=context.get("account_id"))
+        }
         if record_id not in allowed_record_ids:
             raise ValueError(f"项目卡片 {record_id} 不属于当前候选人 {candidate_id}。")
-        record = app.confirm_project_card(record_id, confirmed_summary)
+        record = app.confirm_project_card(
+            record_id,
+            confirmed_summary,
+            account_id=context.get("account_id"),
+        )
         return dumps_tool_output(asdict(record))
 
     @tool
@@ -281,13 +507,22 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
 
         context = require_runtime_context(runtime)
         candidate_id = require_candidate_id(context)
-        llm_client = load_tool_llm_client(env_path) if context["use_tool_llm"] else None
+        account_id = context.get("account_id")
+        llm_client = (
+            load_tool_llm_client(
+                env_path,
+                usage_callback=build_tool_usage_callback(app, context, "resume_rewrite"),
+            )
+            if context["use_tool_llm"]
+            else None
+        )
         draft = app.create_resume_draft(
             candidate_id,
             job_id,
             llm_client=llm_client,
             rag_persist_directory=context["rag_dir"] if use_rag else None,
             rag_query=rag_query,
+            account_id=account_id,
         )
         return dumps_tool_output(asdict(draft))
 
@@ -325,10 +560,34 @@ def require_candidate_id(context: JobHuntingAgentContext) -> int:
     return candidate_id
 
 
-def load_tool_llm_client(env_path: Path):
+def load_tool_llm_client(env_path: Path, usage_callback=None):
     """为工具内部的“单次 prompt”场景构造 LLM 客户端。"""
 
-    return build_llm_client(load_llm_settings(env_path))
+    return build_llm_client(load_llm_settings(env_path), usage_callback=usage_callback)
+
+
+def build_tool_usage_callback(
+    app: JobHuntingApp,
+    context: JobHuntingAgentContext,
+    operation: str,
+):
+    """为工具内部的单次 LLM 调用构造用量回调。"""
+
+    def callback(message: object) -> None:
+        """读取一次工具模型响应并追加到账号用量流水。"""
+
+        record_usage_summary(
+            app,
+            extract_usage_metadata(message),
+            account_id=context.get("account_id"),
+            candidate_id=context.get("candidate_id"),
+            session_id=context.get("session_id", "") or "",
+            root_request_id=context.get("root_request_id", "") or uuid.uuid4().hex,
+            operation=operation,
+            call_id=f"{context.get('root_request_id', uuid.uuid4().hex)}-{operation}-{uuid.uuid4().hex}",
+        )
+
+    return callback
 
 
 def dumps_tool_output(value: dict[str, Any]) -> str:
@@ -337,13 +596,129 @@ def dumps_tool_output(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2)
 
 
-def default_session_id(candidate_id: int | None) -> str:
+def extract_usage_metadata(message: object) -> dict[str, int]:
+    """从 LangChain 消息兼容读取供应商 token usage。"""
+
+    usage = getattr(message, "usage_metadata", None)
+    if not isinstance(usage, dict):
+        response_metadata = getattr(message, "response_metadata", None)
+        usage = response_metadata.get("token_usage") if isinstance(response_metadata, dict) else None
+    if not isinstance(usage, dict):
+        return {}
+    input_tokens = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+    output_tokens = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+    total_tokens = int(usage.get("total_tokens", input_tokens + output_tokens) or 0)
+    return {
+        "input_tokens": max(0, input_tokens),
+        "output_tokens": max(0, output_tokens),
+        "total_tokens": max(0, total_tokens),
+    }
+
+
+def merge_usage(target: dict[str, int], incoming: dict[str, int]) -> None:
+    """合并流式 usage；流式结束块通常携带累计值，因此取最大值避免重复累加。"""
+
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        target[key] = max(target.get(key, 0), incoming.get(key, 0))
+
+
+def record_usage_summary(
+    app: JobHuntingApp,
+    usage: dict[str, int],
+    *,
+    account_id: int | None,
+    candidate_id: int | None,
+    session_id: str,
+    root_request_id: str,
+    operation: str = "agent_model",
+    call_id: str | None = None,
+    model: str = "agent",
+) -> dict[str, int | str]:
+    """把一轮 Agent 主模型 usage 写入追加式流水；无账号的 CLI 不写账单。"""
+
+    normalized = {
+        "input_tokens": max(0, int(usage.get("input_tokens", 0))),
+        "output_tokens": max(0, int(usage.get("output_tokens", 0))),
+        "total_tokens": max(0, int(usage.get("total_tokens", 0))),
+    }
+    source = "provider" if normalized["total_tokens"] > 0 else "missing"
+    if account_id is not None:
+        app.store.record_usage_event(
+            UsageEventRecord(
+                id=0,
+                account_id=account_id,
+                candidate_id=candidate_id,
+                session_id=session_id,
+                root_request_id=root_request_id,
+                call_id=call_id or f"{root_request_id}-{operation}",
+                provider="configured-llm",
+                model=model,
+                operation=operation,
+                input_tokens=normalized["input_tokens"],
+                output_tokens=normalized["output_tokens"],
+                total_tokens=normalized["total_tokens"],
+                usage_source=source,
+                status="succeeded",
+                attempt=1,
+                provider_request_id=None,
+                raw_usage=normalized,
+                created_at=utc_now().isoformat(timespec="seconds"),
+                billable=source == "provider",
+                pricing_version=None,
+            )
+        )
+    return {**normalized, "usage_source": source}
+
+
+def record_agent_usage(
+    app: JobHuntingApp,
+    messages: list[BaseMessage],
+    *,
+    account_id: int | None,
+    candidate_id: int | None,
+    session_id: str,
+    root_request_id: str,
+) -> dict[str, int | str]:
+    """汇总非流式 Agent 中各 AI 消息的 usage，并写入当前主模型流水。"""
+
+    total = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    for message in messages:
+        if isinstance(message, AIMessage):
+            usage = extract_usage_metadata(message)
+            for key in total:
+                total[key] += usage.get(key, 0)
+    return record_usage_summary(
+        app,
+        total,
+        account_id=account_id,
+        candidate_id=candidate_id,
+        session_id=session_id,
+        root_request_id=root_request_id,
+    )
+
+
+def default_session_id(candidate_id: int | None, account_id: int | None = None) -> str:
     """生成默认会话 ID。
 
     这里把候选人 ID 编进会话名，避免多个候选人共用同一段 Agent 历史记忆。
     """
 
-    return f"candidate-{candidate_id or 'unknown'}"
+    return f"account-{account_id or 'unknown'}-candidate-{candidate_id or 'unknown'}"
+
+
+def scoped_thread_id(
+    account_id: int | None,
+    candidate_id: int | None,
+    session_id: str,
+) -> str:
+    """为 LangGraph checkpointer 生成不可串线的线程键。
+
+    Web 会话 ID 是可公开传输的业务标识，不能单独作为 MemorySaver 的键；
+    把账号和候选人一起纳入后，即使同一账号下两个档案使用相同的自定义会话名，
+    短期记忆也不会互相污染。
+    """
+
+    return f"account-{account_id or 'legacy'}:candidate-{candidate_id or 'unknown'}:session-{session_id}"
 
 
 def extract_final_reply(messages: list[BaseMessage]) -> str:
@@ -358,6 +733,32 @@ def extract_final_reply(messages: list[BaseMessage]) -> str:
             if text:
                 return text
     return "本轮没有生成可展示回复，但相关工具可能已经执行。"
+
+
+def unpack_stream_message(stream_item: object) -> BaseMessage | None:
+    """从 LangGraph `stream_mode="messages"` 事件中取出消息对象。
+
+    当前版本通常返回 `(message, metadata)`；这里做成宽松解析，方便后续
+    LangChain/LangGraph 小版本调整时仍能兼容。
+    """
+
+    if isinstance(stream_item, BaseMessage):
+        return stream_item
+    if isinstance(stream_item, tuple) and stream_item:
+        first_item = stream_item[0]
+        if isinstance(first_item, BaseMessage):
+            return first_item
+    return None
+
+
+def extract_stream_token(message: BaseMessage) -> str:
+    """从流式消息中提取可增量展示的文本片段。"""
+
+    try:
+        return extract_message_text(message)
+    except Exception:  # noqa: BLE001 - 流式展示失败时只丢弃该片段，不中断工具执行。
+        content = getattr(message, "content", "")
+        return content if isinstance(content, str) else ""
 
 
 def collect_used_tools(messages: list[BaseMessage]) -> list[str]:

@@ -17,18 +17,34 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-from .job_parser import parse_job_text
+from .auth import AuthSession, AuthUser, is_session_expired, session_expiry, session_token_hash, utc_now
+from .job_parser import parse_job_text, validate_job_text
 from .models import (
+    AccountRecord,
+    AuthSessionRecord,
     CandidateProfile,
     CandidateProfileInput,
     CandidateProfilePatch,
+    ChatMessageRecord,
+    ChatSessionRecord,
     ImportedJob,
     LongTextRecord,
     ProjectExperienceCard,
     ProjectExperienceRecord,
     ResumeDraft,
     ResumeDraftRecord,
+    UsageEventRecord,
 )
+
+
+class ClosingSQLiteConnection(sqlite3.Connection):
+    """让 `with self.connect()` 在提交/回滚后同时释放 Windows 文件句柄。"""
+
+    def __exit__(self, exc_type, exc_value, traceback):  # noqa: ANN001
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
 
 
 class SQLiteStore:
@@ -46,7 +62,9 @@ class SQLiteStore:
         """创建 SQLite 连接，并让查询结果可以像字典一样按列名读取。"""
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
+        # 启用外键约束并稍微延长等待时间，避免认证和聊天并发写入时过早报锁库。
+        conn = sqlite3.connect(self.db_path, timeout=30, factory=ClosingSQLiteConnection)
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -60,8 +78,92 @@ class SQLiteStore:
         with self.connect() as conn:
             conn.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    display_name TEXT,
+                    role TEXT NOT NULL DEFAULT 'user',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    must_change_password INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS auth_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    absolute_expires_at TEXT NOT NULL,
+                    revoked_at TEXT,
+                    user_agent TEXT,
+                    ip_address TEXT,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_auth_sessions_account
+                    ON auth_sessions(account_id, revoked_at);
+                CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry
+                    ON auth_sessions(expires_at, absolute_expires_at);
+
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL UNIQUE,
+                    account_id INTEGER NOT NULL,
+                    candidate_id INTEGER NOT NULL,
+                    job_id INTEGER,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    archived_at TEXT,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                    FOREIGN KEY(candidate_id) REFERENCES candidate_profiles(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_chat_sessions_account
+                    ON chat_sessions(account_id, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_chat_sessions_candidate
+                    ON chat_sessions(candidate_id, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS usage_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    candidate_id INTEGER,
+                    session_id TEXT,
+                    root_request_id TEXT,
+                    call_id TEXT NOT NULL UNIQUE,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    usage_source TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'succeeded',
+                    attempt INTEGER NOT NULL DEFAULT 1,
+                    provider_request_id TEXT,
+                    raw_usage_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    billable INTEGER NOT NULL DEFAULT 0,
+                    pricing_version TEXT,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_usage_events_account_time
+                    ON usage_events(account_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_usage_events_session
+                    ON usage_events(session_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_usage_events_request
+                    ON usage_events(root_request_id, created_at);
+
                 CREATE TABLE IF NOT EXISTS candidate_profiles (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    account_id INTEGER,
                     name TEXT NOT NULL,
                     status TEXT NOT NULL,
                     education TEXT NOT NULL,
@@ -71,11 +173,14 @@ class SQLiteStore:
                     skills_json TEXT NOT NULL,
                     preferred_cities_json TEXT NOT NULL,
                     target_directions_json TEXT NOT NULL,
-                    unacceptable_json TEXT NOT NULL
+                    unacceptable_json TEXT NOT NULL,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    account_id INTEGER,
                     raw_text TEXT NOT NULL,
                     source_url TEXT,
                     title TEXT NOT NULL,
@@ -94,19 +199,41 @@ class SQLiteStore:
                     skills_json TEXT NOT NULL,
                     description_text TEXT NOT NULL,
                     field_confidence_json TEXT NOT NULL,
-                    uncertainty_notes_json TEXT NOT NULL
+                    uncertainty_notes_json TEXT NOT NULL,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS long_texts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    account_id INTEGER,
+                    candidate_id INTEGER,
                     entity_type TEXT NOT NULL,
                     entity_id INTEGER NOT NULL,
                     source_label TEXT NOT NULL,
-                    text TEXT NOT NULL
+                    text TEXT NOT NULL,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                    FOREIGN KEY(candidate_id) REFERENCES candidate_profiles(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    account_id INTEGER,
+                    candidate_id INTEGER NOT NULL,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                    FOREIGN KEY(candidate_id) REFERENCES candidate_profiles(id)
                 );
 
                 CREATE TABLE IF NOT EXISTS project_experience_cards (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    account_id INTEGER,
                     candidate_id INTEGER NOT NULL,
                     status TEXT NOT NULL,
                     project_name TEXT NOT NULL,
@@ -114,36 +241,533 @@ class SQLiteStore:
                     confirmed_summary TEXT,
                     created_at TEXT NOT NULL,
                     confirmed_at TEXT,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
                     FOREIGN KEY(candidate_id) REFERENCES candidate_profiles(id)
                 );
 
                 CREATE TABLE IF NOT EXISTS resume_drafts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    account_id INTEGER,
                     candidate_id INTEGER NOT NULL,
                     job_id INTEGER NOT NULL,
                     version INTEGER NOT NULL,
                     status TEXT NOT NULL,
                     draft_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
                     FOREIGN KEY(candidate_id) REFERENCES candidate_profiles(id),
                     FOREIGN KEY(job_id) REFERENCES jobs(id)
                 );
+
                 """
             )
+            # 兼容用户已有的本地数据库：旧表缺字段时只补充可空归属列，
+            # 不自动删除任何数据；正式部署可用全新数据库初始化。
+            for table in (
+                "candidate_profiles",
+                "jobs",
+                "long_texts",
+                "chat_messages",
+                "project_experience_cards",
+                "resume_drafts",
+            ):
+                self._ensure_column(conn, table, "user_id", "INTEGER")
 
-    def save_candidate_profile(self, profile: CandidateProfileInput) -> int:
+            # 账号是共享访问和统一计费边界；旧测试数据库没有 account_id 时补充可空列。
+            self._ensure_column(conn, "candidate_profiles", "account_id", "INTEGER")
+            self._ensure_column(conn, "jobs", "account_id", "INTEGER")
+            self._ensure_column(conn, "long_texts", "account_id", "INTEGER")
+            self._ensure_column(conn, "long_texts", "candidate_id", "INTEGER")
+            self._ensure_column(conn, "chat_messages", "account_id", "INTEGER")
+            self._ensure_column(conn, "project_experience_cards", "account_id", "INTEGER")
+            self._ensure_column(conn, "resume_drafts", "account_id", "INTEGER")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_candidate_profiles_account "
+                "ON candidate_profiles(account_id, id)"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_account ON jobs(account_id, id)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_long_texts_account "
+                "ON long_texts(account_id, id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_messages_account "
+                "ON chat_messages(account_id, candidate_id, session_id, id)"
+            )
+
+    # ------------------------------------------------------------------
+    # 账号、Session、会话和用量流水
+    # ------------------------------------------------------------------
+
+    def create_account(
+        self,
+        email: str,
+        password_hash: str,
+        display_name: str | None = None,
+        role: str = "user",
+        status: str = "active",
+        must_change_password: bool = False,
+    ) -> AccountRecord:
+        """写入一个账号并返回不含密码的账号记录。"""
+
+        if role not in {"user", "admin"}:
+            raise ValueError("账号角色只能是 user 或 admin。")
+        if status not in {"active", "disabled"}:
+            raise ValueError("账号状态只能是 active 或 disabled。")
+        now = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO accounts (
+                    email, password_hash, display_name, role, status,
+                    must_change_password, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    email,
+                    password_hash,
+                    display_name,
+                    role,
+                    status,
+                    int(must_change_password),
+                    now,
+                    now,
+                ),
+            )
+            account_id = int(cursor.lastrowid)
+        return self.get_account(account_id)
+
+    def get_account(self, account_id: int) -> AccountRecord:
+        """按 ID 读取账号；密码哈希不会暴露给调用方。"""
+
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Account not found: {account_id}")
+        return account_from_row(row)
+
+    def get_account_with_password(self, account_id: int) -> tuple[AccountRecord, str]:
+        """认证服务内部读取账号和哈希；其他业务代码不应调用此方法。"""
+
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Account not found: {account_id}")
+        return account_from_row(row), str(row["password_hash"])
+
+    def get_account_by_email(self, email: str) -> tuple[AccountRecord, str] | None:
+        """按不区分大小写的邮箱读取账号和密码哈希。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM accounts WHERE email = ? COLLATE NOCASE",
+                (email,),
+            ).fetchone()
+        if row is None:
+            return None
+        return account_from_row(row), str(row["password_hash"])
+
+    def list_accounts(self, include_disabled: bool = True) -> list[AccountRecord]:
+        """列出账号，供管理员后台展示。"""
+
+        with self.connect() as conn:
+            if include_disabled:
+                rows = conn.execute("SELECT * FROM accounts ORDER BY id").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM accounts WHERE status = 'active' ORDER BY id"
+                ).fetchall()
+        return [account_from_row(row) for row in rows]
+
+    def count_active_admins(self) -> int:
+        """返回当前仍可登录的管理员数量。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM accounts WHERE role = 'admin' AND status = 'active'"
+            ).fetchone()
+        return int(row["count"])
+
+    def touch_account_login(self, account_id: int) -> None:
+        """记录最近一次成功登录时间，兼容 Web 认证门面。"""
+
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE accounts SET updated_at = ? WHERE id = ?",
+                (now_iso(), account_id),
+            )
+
+    def update_account_status(self, account_id: int, status: str) -> AccountRecord:
+        """更新账号状态，例如管理员禁用或恢复账号。"""
+
+        if status not in {"active", "disabled"}:
+            raise ValueError("账号状态只能是 active 或 disabled。")
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE accounts SET status = ?, updated_at = ? WHERE id = ?",
+                (status, now_iso(), account_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Account not found: {account_id}")
+        return self.get_account(account_id)
+
+    def update_account_password(
+        self,
+        account_id: int,
+        password_hash: str,
+        must_change_password: bool = False,
+    ) -> AccountRecord:
+        """更新密码哈希，并可清除首次登录改密标记。"""
+
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE accounts
+                SET password_hash = ?, must_change_password = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (password_hash, int(must_change_password), now_iso(), account_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Account not found: {account_id}")
+        return self.get_account(account_id)
+
+    def save_auth_session(
+        self,
+        account_id: int,
+        token_hash: str,
+        created_at: str,
+        last_seen_at: str,
+        expires_at: str,
+        absolute_expires_at: str,
+        user_agent: str | None = None,
+        ip_address: str | None = None,
+    ) -> AuthSessionRecord:
+        """保存服务端 Session；Cookie 原文不会进入数据库。"""
+
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO auth_sessions (
+                    account_id, token_hash, created_at, last_seen_at, expires_at,
+                    absolute_expires_at, revoked_at, user_agent, ip_address
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    account_id,
+                    token_hash,
+                    created_at,
+                    last_seen_at,
+                    expires_at,
+                    absolute_expires_at,
+                    user_agent,
+                    ip_address,
+                ),
+            )
+            session_id = int(cursor.lastrowid)
+        return self.get_auth_session(session_id)
+
+    def get_auth_session(self, session_id: int) -> AuthSessionRecord:
+        """按数据库 ID 读取 Session。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM auth_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Auth session not found: {session_id}")
+        return auth_session_from_row(row)
+
+    def get_auth_session_by_token_hash(self, token_hash: str) -> AuthSessionRecord | None:
+        """按令牌摘要读取 Session。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM auth_sessions WHERE token_hash = ?", (token_hash,)
+            ).fetchone()
+        return auth_session_from_row(row) if row is not None else None
+
+    def touch_auth_session(self, session_id: int, last_seen_at: str, expires_at: str) -> None:
+        """滑动更新闲置过期时间，但绝不延长绝对过期时间。"""
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE auth_sessions
+                SET last_seen_at = ?, expires_at = ?
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (last_seen_at, expires_at, session_id),
+            )
+
+    def revoke_auth_session(self, session_id: int) -> None:
+        """撤销一个 Session，使其立即失效。"""
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE auth_sessions SET revoked_at = COALESCE(revoked_at, ?)
+                WHERE id = ?
+                """,
+                (now_iso(), session_id),
+            )
+
+    def revoke_all_auth_sessions(self, account_id: int) -> int:
+        """撤销账号的全部登录设备并返回受影响的 Session 数。"""
+
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE auth_sessions SET revoked_at = ?
+                WHERE account_id = ? AND revoked_at IS NULL
+                """,
+                (now_iso(), account_id),
+            )
+            return int(cursor.rowcount)
+
+    def create_chat_session(
+        self,
+        session_id: str,
+        account_id: int,
+        candidate_id: int,
+        title: str,
+        job_id: int | None = None,
+    ) -> ChatSessionRecord:
+        """创建一个账号内、绑定候选人档案的独立对话。"""
+
+        # 同一账号可以访问其全部档案，但对话不能绑定到其他账号的档案或职位。
+        self.get_candidate_profile(candidate_id, account_id=account_id)
+        if job_id is not None:
+            self.get_job(job_id, account_id=account_id)
+        now = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO chat_sessions (
+                    session_id, account_id, candidate_id, job_id, title,
+                    status, created_at, updated_at, archived_at
+                ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL)
+                """,
+                (session_id, account_id, candidate_id, job_id, title, now, now),
+            )
+            record_id = int(cursor.lastrowid)
+        return self.get_chat_session(record_id)
+
+    def get_chat_session(self, record_id: int) -> ChatSessionRecord:
+        """按自增 ID 读取独立对话。"""
+
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM chat_sessions WHERE id = ?", (record_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Chat session not found: {record_id}")
+        return chat_session_from_row(row)
+
+    def get_chat_session_by_key(self, session_id: str, account_id: int) -> ChatSessionRecord:
+        """按账号和公开 Session ID读取对话，防止跨账号猜 ID。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM chat_sessions
+                WHERE session_id = ? AND account_id = ?
+                """,
+                (session_id, account_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Chat session not found: {session_id}")
+        return chat_session_from_row(row)
+
+    def list_chat_sessions(
+        self,
+        account_id: int,
+        candidate_id: int | None = None,
+        include_archived: bool = False,
+    ) -> list[ChatSessionRecord]:
+        """列出账号内对话，可按候选人档案过滤。"""
+
+        conditions = ["account_id = ?"]
+        parameters: list[object] = [account_id]
+        if candidate_id is not None:
+            conditions.append("candidate_id = ?")
+            parameters.append(candidate_id)
+        if not include_archived:
+            conditions.append("status = 'active'")
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM chat_sessions WHERE {' AND '.join(conditions)} "
+                "ORDER BY updated_at DESC, id DESC",
+                tuple(parameters),
+            ).fetchall()
+        return [chat_session_from_row(row) for row in rows]
+
+    def archive_chat_session(self, session_id: str, account_id: int) -> ChatSessionRecord:
+        """软归档一段对话，保留历史和计费流水。"""
+
+        now = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE chat_sessions
+                SET status = 'archived', archived_at = ?, updated_at = ?
+                WHERE session_id = ? AND account_id = ?
+                """,
+                (now, now, session_id, account_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Chat session not found: {session_id}")
+        return self.get_chat_session_by_key(session_id, account_id)
+
+    def record_usage_event(self, event: UsageEventRecord) -> UsageEventRecord:
+        """追加一条用量流水；相同 `call_id` 重复上报时保持幂等。"""
+
+        if event.usage_source not in {"provider", "estimated", "missing", "local"}:
+            raise ValueError(f"Unsupported usage source: {event.usage_source}")
+        self.get_account(event.account_id)
+        if event.candidate_id is not None:
+            self.get_candidate_profile(event.candidate_id, account_id=event.account_id)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO usage_events (
+                    account_id, candidate_id, session_id, root_request_id, call_id,
+                    provider, model, operation, input_tokens, output_tokens,
+                    total_tokens, usage_source, status, attempt, provider_request_id,
+                    raw_usage_json, created_at, billable, pricing_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.account_id,
+                    event.candidate_id,
+                    event.session_id,
+                    event.root_request_id,
+                    event.call_id,
+                    event.provider,
+                    event.model,
+                    event.operation,
+                    max(0, int(event.input_tokens)),
+                    max(0, int(event.output_tokens)),
+                    max(0, int(event.total_tokens)),
+                    event.usage_source,
+                    event.status,
+                    max(1, int(event.attempt)),
+                    event.provider_request_id,
+                    json.dumps(event.raw_usage or {}, ensure_ascii=False),
+                    event.created_at,
+                    # 只有供应商确认的成功用量才进入正式计费汇总；estimated/missing/local
+                    # 仍会保留明细，但不会被误加到 billable_tokens。
+                    int(event.billable and event.usage_source == "provider" and event.status == "succeeded"),
+                    event.pricing_version,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM usage_events WHERE call_id = ?", (event.call_id,)
+            ).fetchone()
+        if row is None:  # pragma: no cover - 仅在数据库异常时触发
+            raise RuntimeError(f"Usage event was not persisted: {event.call_id}")
+        return usage_event_from_row(row)
+
+    def list_usage_events(
+        self,
+        account_id: int | None = None,
+        candidate_id: int | None = None,
+        session_id: str | None = None,
+        limit: int = 200,
+    ) -> list[UsageEventRecord]:
+        """列出用量明细；管理员不传账号过滤时才可查看全局数据。"""
+
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            parameters.append(account_id)
+        if candidate_id is not None:
+            conditions.append("candidate_id = ?")
+            parameters.append(candidate_id)
+        if session_id is not None:
+            conditions.append("session_id = ?")
+            parameters.append(session_id)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        parameters.append(max(1, min(limit, 5000)))
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM usage_events{where} ORDER BY id DESC LIMIT ?",
+                tuple(parameters),
+            ).fetchall()
+        return [usage_event_from_row(row) for row in rows]
+
+    def summarize_usage(self, account_id: int | None = None) -> dict[str, int]:
+        """汇总 Token；`billable_tokens` 只计算标记为可计费的流水。"""
+
+        where = " WHERE account_id = ?" if account_id is not None else ""
+        parameters = (account_id,) if account_id is not None else ()
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                    COALESCE(SUM(CASE WHEN billable = 1 THEN total_tokens ELSE 0 END), 0)
+                        AS billable_tokens,
+                    COUNT(*) AS event_count
+                FROM usage_events{where}
+                """,
+                parameters,
+            ).fetchone()
+        return {key: int(row[key]) for key in row.keys()}
+
+    def summarize_usage_by_account(self) -> list[dict[str, int]]:
+        """按账号聚合 Token，供管理员查看不同计费主体的用量。"""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    account_id,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                    COALESCE(SUM(CASE WHEN billable = 1 THEN total_tokens ELSE 0 END), 0)
+                        AS billable_tokens,
+                    COUNT(*) AS event_count
+                FROM usage_events
+                GROUP BY account_id
+                ORDER BY account_id
+                """
+            ).fetchall()
+        return [
+            {key: int(row[key]) for key in row.keys()}
+            for row in rows
+        ]
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        """为旧版本地表补充兼容列。"""
+
+        columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+    def save_candidate_profile(
+        self,
+        profile: CandidateProfileInput,
+        account_id: int | None = None,
+    ) -> int:
         """保存候选人结构化档案，返回新建档案 ID。"""
 
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO candidate_profiles (
-                    name, status, education, experience_years, salary_floor_k,
+                    account_id, name, status, education, experience_years, salary_floor_k,
                     expected_salary_k, skills_json, preferred_cities_json,
                     target_directions_json, unacceptable_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    account_id,
                     profile.name,
                     profile.status,
                     profile.education,
@@ -158,36 +782,65 @@ class SQLiteStore:
             )
             candidate_id = int(cursor.lastrowid)
             # 同一个事务里写 long_texts，避免 Windows 上 SQLite 多连接写入导致锁库。
-            self._add_long_text(conn, "candidate_profile", candidate_id, "skills", " ".join(profile.skills))
+            self._add_long_text(
+                conn,
+                "candidate_profile",
+                candidate_id,
+                "skills",
+                " ".join(profile.skills),
+                account_id=account_id,
+                candidate_id=candidate_id,
+            )
             return candidate_id
 
-    def get_candidate_profile(self, candidate_id: int) -> CandidateProfile:
+    def get_candidate_profile(
+        self,
+        candidate_id: int,
+        account_id: int | None = None,
+    ) -> CandidateProfile:
         """按 ID 读取候选人档案，并把 JSON 字段还原成 Python 对象。"""
 
         with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM candidate_profiles WHERE id = ?",
-                (candidate_id,),
-            ).fetchone()
+            if account_id is None:
+                row = conn.execute(
+                    "SELECT * FROM candidate_profiles WHERE id = ?",
+                    (candidate_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM candidate_profiles WHERE id = ? AND account_id = ?",
+                    (candidate_id, account_id),
+                ).fetchone()
         if row is None:
             raise KeyError(f"Candidate profile not found: {candidate_id}")
         return candidate_profile_from_row(row)
 
-    def list_candidate_profiles(self) -> list[CandidateProfile]:
+    def list_candidate_profiles(self, account_id: int | None = None) -> list[CandidateProfile]:
         """列出所有候选人档案，供 Web 侧边栏选择使用。"""
 
         with self.connect() as conn:
-            rows = conn.execute("SELECT * FROM candidate_profiles ORDER BY id").fetchall()
+            if account_id is None:
+                rows = conn.execute("SELECT * FROM candidate_profiles ORDER BY id").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM candidate_profiles WHERE account_id = ? ORDER BY id",
+                    (account_id,),
+                ).fetchall()
         return [candidate_profile_from_row(row) for row in rows]
 
-    def update_candidate_profile(self, candidate_id: int, patch: CandidateProfilePatch) -> list[str]:
+    def update_candidate_profile(
+        self,
+        candidate_id: int,
+        patch: CandidateProfilePatch,
+        account_id: int | None = None,
+    ) -> list[str]:
         """按 patch 局部更新候选人档案，返回实际更新的字段名。
 
         自动入库只合并消息中明确出现的字段：标量字段覆盖，列表字段去重追加，
         技能字段按技能名合并/更新熟练度。
         """
 
-        current = self.get_candidate_profile(candidate_id)
+        current = self.get_candidate_profile(candidate_id, account_id=account_id)
         updated_fields: list[str] = []
 
         status = current.status
@@ -239,7 +892,7 @@ class SQLiteStore:
                     salary_floor_k = ?, expected_salary_k = ?,
                     skills_json = ?, preferred_cities_json = ?,
                     target_directions_json = ?, unacceptable_json = ?
-                WHERE id = ?
+                WHERE id = ? AND (? IS NULL OR account_id = ?)
                 """,
                 (
                     status,
@@ -252,6 +905,8 @@ class SQLiteStore:
                     json.dumps(target_directions, ensure_ascii=False),
                     json.dumps(unacceptable, ensure_ascii=False),
                     candidate_id,
+                    account_id,
+                    account_id,
                 ),
             )
             # 记录自动更新摘要，方便 RAG 和审计追溯“这次对话改了哪些结构化字段”。
@@ -261,10 +916,17 @@ class SQLiteStore:
                 candidate_id,
                 "conversation_structured_update",
                 "自动更新字段：" + "、".join(updated_fields),
+                account_id=account_id,
+                candidate_id=candidate_id,
             )
         return updated_fields
 
-    def save_job_text(self, raw_text: str, source_url: str | None = None) -> ImportedJob:
+    def save_job_text(
+        self,
+        raw_text: str,
+        source_url: str | None = None,
+        account_id: int | None = None,
+    ) -> ImportedJob:
         """保存一段职位原文。
 
         这里先调用规则解析器得到 `ImportedJob`，再同时保存原文、结构化字段和
@@ -276,14 +938,15 @@ class SQLiteStore:
             cursor = conn.execute(
                 """
                 INSERT INTO jobs (
-                    raw_text, source_url, title, city, salary_min_k, salary_max_k,
+                    account_id, raw_text, source_url, title, city, salary_min_k, salary_max_k,
                     salary_months, salary_unit, experience_min_years,
                     experience_max_years, experience_label, education,
                     company_name, industry, company_size, skills_json,
                     description_text, field_confidence_json, uncertainty_notes_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    account_id,
                     parsed.raw_text,
                     parsed.source_url,
                     parsed.title,
@@ -307,19 +970,32 @@ class SQLiteStore:
             )
             job_id = int(cursor.lastrowid)
             # 职位描述先进入 long_texts，后续可以同步到真正的向量数据库。
-            self._add_long_text(conn, "job", job_id, "description", parsed.description_text)
+            self._add_long_text(
+                conn,
+                "job",
+                job_id,
+                "description",
+                parsed.description_text,
+                account_id=account_id,
+            )
         return self.get_job(job_id)
 
-    def get_job(self, job_id: int) -> ImportedJob:
+    def get_job(self, job_id: int, account_id: int | None = None) -> ImportedJob:
         """按 ID 读取标准化职位信息。"""
 
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if account_id is None:
+                row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM jobs WHERE id = ? AND account_id = ?",
+                    (job_id, account_id),
+                ).fetchone()
         if row is None:
             raise KeyError(f"Job not found: {job_id}")
         return self._job_from_row(row)
 
-    def list_jobs(self) -> list[ImportedJob]:
+    def list_jobs(self, account_id: int | None = None) -> list[ImportedJob]:
         """按导入顺序列出所有职位。
 
         批量匹配需要先拿到候选人主动导入过的职位池；这里仍然只读取本地数据，
@@ -327,13 +1003,103 @@ class SQLiteStore:
         """
 
         with self.connect() as conn:
-            rows = conn.execute("SELECT * FROM jobs ORDER BY id").fetchall()
-        return [self._job_from_row(row) for row in rows]
+            if account_id is None:
+                rows = conn.execute("SELECT * FROM jobs ORDER BY id").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM jobs WHERE account_id = ? ORDER BY id",
+                    (account_id,),
+                ).fetchall()
+        jobs = [self._job_from_row(row) for row in rows]
+        # 旧版本可能已经把普通聊天、项目日志或测试文本误写进 jobs 表；
+        # 列表和批量匹配只暴露通过当前审核规则的记录，避免继续把脏数据当职位打分。
+        return [job for job in jobs if validate_job_text(job.raw_text).is_valid]
+
+    def save_chat_message(
+        self,
+        candidate_id: int,
+        session_id: str,
+        role: str,
+        content: str,
+        metadata: dict[str, object] | None = None,
+        account_id: int | None = None,
+    ) -> ChatMessageRecord:
+        """保存一条网页聊天消息。
+
+        聊天历史用于恢复前端页面，不参与职位匹配和简历改写；如果消息中包含
+        候选人事实，仍然必须由 `ingest_conversation_message` 单独判断后写入档案或 long_texts。
+        """
+
+        if role not in {"user", "assistant"}:
+            raise ValueError(f"Unsupported chat role: {role}")
+        now = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO chat_messages (
+                    account_id, candidate_id, session_id, role, content, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_id,
+                    candidate_id,
+                    session_id,
+                    role,
+                    content,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            record_id = int(cursor.lastrowid)
+        return self.get_chat_message(record_id)
+
+    def get_chat_message(self, record_id: int) -> ChatMessageRecord:
+        """按 ID 读取一条聊天消息。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM chat_messages WHERE id = ?",
+                (record_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Chat message not found: {record_id}")
+        return self._chat_message_from_row(row)
+
+    def list_chat_messages(
+        self,
+        candidate_id: int,
+        session_id: str,
+        limit: int = 100,
+        account_id: int | None = None,
+    ) -> list[ChatMessageRecord]:
+        """列出某个候选人在某个网页会话中的最近聊天记录。"""
+
+        with self.connect() as conn:
+            owner_clause = " AND account_id = ?" if account_id is not None else ""
+            parameters: tuple[object, ...]
+            if account_id is None:
+                parameters = (candidate_id, session_id, max(1, limit))
+            else:
+                parameters = (candidate_id, session_id, account_id, max(1, limit))
+            rows = conn.execute(
+                f"""
+                SELECT * FROM (
+                    SELECT * FROM chat_messages
+                    WHERE candidate_id = ? AND session_id = ?{owner_clause}
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                ORDER BY id
+                """,
+                parameters,
+            ).fetchall()
+        return [self._chat_message_from_row(row) for row in rows]
 
     def save_project_card(
         self,
         candidate_id: int,
         card: ProjectExperienceCard,
+        account_id: int | None = None,
     ) -> ProjectExperienceRecord:
         """保存一张待确认项目经历卡片。
 
@@ -346,11 +1112,12 @@ class SQLiteStore:
             cursor = conn.execute(
                 """
                 INSERT INTO project_experience_cards (
-                    candidate_id, status, project_name, card_json,
+                    account_id, candidate_id, status, project_name, card_json,
                     confirmed_summary, created_at, confirmed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    account_id,
                     candidate_id,
                     "待确认",
                     card.project_name,
@@ -363,36 +1130,64 @@ class SQLiteStore:
             record_id = int(cursor.lastrowid)
         return self.get_project_card(record_id)
 
-    def get_project_card(self, record_id: int) -> ProjectExperienceRecord:
+    def get_project_card(
+        self,
+        record_id: int,
+        account_id: int | None = None,
+    ) -> ProjectExperienceRecord:
         """按 ID 读取一张项目经历卡片记录。"""
 
         with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM project_experience_cards WHERE id = ?",
-                (record_id,),
-            ).fetchone()
+            if account_id is None:
+                row = conn.execute(
+                    "SELECT * FROM project_experience_cards WHERE id = ?",
+                    (record_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT * FROM project_experience_cards
+                    WHERE id = ? AND account_id = ?
+                    """,
+                    (record_id, account_id),
+                ).fetchone()
         if row is None:
             raise KeyError(f"Project experience card not found: {record_id}")
         return self._project_card_from_row(row)
 
-    def list_project_cards(self, candidate_id: int) -> list[ProjectExperienceRecord]:
+    def list_project_cards(
+        self,
+        candidate_id: int,
+        account_id: int | None = None,
+    ) -> list[ProjectExperienceRecord]:
         """列出某个候选人的项目经历卡片。"""
 
         with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM project_experience_cards
-                WHERE candidate_id = ?
-                ORDER BY id
-                """,
-                (candidate_id,),
-            ).fetchall()
+            if account_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM project_experience_cards
+                    WHERE candidate_id = ?
+                    ORDER BY id
+                    """,
+                    (candidate_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM project_experience_cards
+                    WHERE candidate_id = ? AND account_id = ?
+                    ORDER BY id
+                    """,
+                    (candidate_id, account_id),
+                ).fetchall()
         return [self._project_card_from_row(row) for row in rows]
 
     def confirm_project_card(
         self,
         record_id: int,
         confirmed_summary: str | None = None,
+        account_id: int | None = None,
     ) -> ProjectExperienceRecord:
         """把项目经历卡片标记为已确认，并保存候选人的确认摘要。
 
@@ -400,7 +1195,7 @@ class SQLiteStore:
         但它仍然不会自动覆盖候选人档案中的学历、技能等结构化事实。
         """
 
-        existing = self.get_project_card(record_id)
+        existing = self.get_project_card(record_id, account_id=account_id)
         summary = confirmed_summary if confirmed_summary is not None else existing.confirmed_summary
         confirmed_at = now_iso()
         with self.connect() as conn:
@@ -408,21 +1203,30 @@ class SQLiteStore:
                 """
                 UPDATE project_experience_cards
                 SET status = ?, confirmed_summary = ?, confirmed_at = ?
-                WHERE id = ?
+                WHERE id = ? AND (? IS NULL OR account_id = ?)
                 """,
-                ("已确认", summary, confirmed_at, record_id),
+                ("已确认", summary, confirmed_at, record_id, account_id, account_id),
             )
             # 如果候选人没有写确认摘要，就把卡片草稿作为可检索材料保存，
             # 但界面仍然应该提示它来自候选人确认过的卡片而不是原始档案事实。
             text_for_index = summary or project_card_index_text(existing.card)
-            self._add_long_text(conn, "project_experience_card", record_id, "confirmed", text_for_index)
-        return self.get_project_card(record_id)
+            self._add_long_text(
+                conn,
+                "project_experience_card",
+                record_id,
+                "confirmed",
+                text_for_index,
+                account_id=account_id,
+                candidate_id=existing.candidate_id,
+            )
+        return self.get_project_card(record_id, account_id=account_id)
 
     def save_resume_draft(
         self,
         candidate_id: int,
         job_id: int,
         draft: ResumeDraft,
+        account_id: int | None = None,
     ) -> ResumeDraftRecord:
         """保存一个职位定制简历草稿版本。
 
@@ -443,10 +1247,11 @@ class SQLiteStore:
             cursor = conn.execute(
                 """
                 INSERT INTO resume_drafts (
-                    candidate_id, job_id, version, status, draft_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    account_id, candidate_id, job_id, version, status, draft_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    account_id,
                     candidate_id,
                     job_id,
                     version,
@@ -458,7 +1263,15 @@ class SQLiteStore:
             record_id = int(cursor.lastrowid)
             # 草稿全文进入 long_texts，后续可以用于“比较不同版本”或向量检索，
             # 但它的 entity_type 明确标记为草稿，不会被当成档案事实。
-            self._add_long_text(conn, "resume_draft", record_id, f"v{version}", draft.content)
+            self._add_long_text(
+                conn,
+                "resume_draft",
+                record_id,
+                f"v{version}",
+                draft.content,
+                account_id=account_id,
+                candidate_id=candidate_id,
+            )
         return self.get_resume_draft(record_id)
 
     def get_resume_draft(self, record_id: int) -> ResumeDraftRecord:
@@ -477,11 +1290,12 @@ class SQLiteStore:
         self,
         candidate_id: int,
         job_id: int | None = None,
+        account_id: int | None = None,
     ) -> list[ResumeDraftRecord]:
         """列出候选人的简历草稿版本，可按职位过滤。"""
 
         with self.connect() as conn:
-            if job_id is None:
+            if job_id is None and account_id is None:
                 rows = conn.execute(
                     """
                     SELECT * FROM resume_drafts
@@ -490,7 +1304,7 @@ class SQLiteStore:
                     """,
                     (candidate_id,),
                 ).fetchall()
-            else:
+            elif job_id is not None and account_id is None:
                 rows = conn.execute(
                     """
                     SELECT * FROM resume_drafts
@@ -498,6 +1312,24 @@ class SQLiteStore:
                     ORDER BY version
                     """,
                     (candidate_id, job_id),
+                ).fetchall()
+            elif job_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM resume_drafts
+                    WHERE candidate_id = ? AND account_id = ?
+                    ORDER BY job_id, version
+                    """,
+                    (candidate_id, account_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM resume_drafts
+                    WHERE candidate_id = ? AND job_id = ? AND account_id = ?
+                    ORDER BY version
+                    """,
+                    (candidate_id, job_id, account_id),
                 ).fetchall()
         return [self._resume_draft_from_row(row) for row in rows]
 
@@ -555,7 +1387,28 @@ class SQLiteStore:
             created_at=row["created_at"],
         )
 
-    def add_long_text(self, entity_type: str, entity_id: int, source_label: str, text: str) -> int:
+    def _chat_message_from_row(self, row: sqlite3.Row) -> ChatMessageRecord:
+        """把聊天记录表的一行转换成领域模型。"""
+
+        return ChatMessageRecord(
+            id=int(row["id"]),
+            candidate_id=int(row["candidate_id"]),
+            session_id=row["session_id"],
+            role=row["role"],
+            content=row["content"],
+            metadata=json.loads(row["metadata_json"]),
+            created_at=row["created_at"],
+        )
+
+    def add_long_text(
+        self,
+        entity_type: str,
+        entity_id: int,
+        source_label: str,
+        text: str,
+        account_id: int | None = None,
+        candidate_id: int | None = None,
+    ) -> int:
         """公开的长文本写入方法。
 
         对话式入库、项目描述、简历片段、HR 对话等长文本材料都通过这个入口登记。
@@ -563,30 +1416,52 @@ class SQLiteStore:
         """
 
         with self.connect() as conn:
-            return self._add_long_text(conn, entity_type, entity_id, source_label, text)
+            return self._add_long_text(
+                conn,
+                entity_type,
+                entity_id,
+                source_label,
+                text,
+                account_id=account_id,
+                candidate_id=candidate_id,
+            )
 
-    def list_long_texts(self, entity_types: list[str] | None = None) -> list[LongTextRecord]:
+    def list_long_texts(
+        self,
+        entity_types: list[str] | None = None,
+        account_id: int | None = None,
+        candidate_id: int | None = None,
+    ) -> list[LongTextRecord]:
         """列出可同步到 RAG 索引的长文本材料。
 
         SQLite 仍然是长文本来源的登记处；RAG 层只从这里读取并建立语义索引。
         """
 
         with self.connect() as conn:
+            conditions: list[str] = []
+            parameters: list[object] = []
             if entity_types:
                 placeholders = ", ".join("?" for _ in entity_types)
-                rows = conn.execute(
-                    f"""
-                    SELECT * FROM long_texts
-                    WHERE entity_type IN ({placeholders})
-                    ORDER BY id
-                    """,
-                    tuple(entity_types),
-                ).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM long_texts ORDER BY id").fetchall()
+                conditions.append(f"entity_type IN ({placeholders})")
+                parameters.extend(entity_types)
+            if account_id is not None:
+                conditions.append("account_id = ?")
+                parameters.append(account_id)
+            if candidate_id is not None:
+                conditions.append("candidate_id = ?")
+                parameters.append(candidate_id)
+            where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+            rows = conn.execute(
+                f"SELECT * FROM long_texts{where} ORDER BY id",
+                tuple(parameters),
+            ).fetchall()
         return [long_text_from_row(row) for row in rows]
 
-    def get_long_texts_by_ids(self, ids: list[int]) -> list[LongTextRecord]:
+    def get_long_texts_by_ids(
+        self,
+        ids: list[int],
+        account_id: int | None = None,
+    ) -> list[LongTextRecord]:
         """按 ID 读取长文本材料，供增量 RAG 索引使用。
 
         对话式入库已经知道本次新增了哪些 `long_text_id`，因此增量索引不需要再
@@ -597,13 +1472,18 @@ class SQLiteStore:
             return []
         placeholders = ", ".join("?" for _ in ids)
         with self.connect() as conn:
+            parameters: list[object] = list(ids)
+            owner_clause = ""
+            if account_id is not None:
+                owner_clause = " AND account_id = ?"
+                parameters.append(account_id)
             rows = conn.execute(
                 f"""
                 SELECT * FROM long_texts
-                WHERE id IN ({placeholders})
+                WHERE id IN ({placeholders}){owner_clause}
                 ORDER BY id
                 """,
-                tuple(ids),
+                tuple(parameters),
             ).fetchall()
         return [long_text_from_row(row) for row in rows]
 
@@ -614,23 +1494,101 @@ class SQLiteStore:
         entity_id: int,
         source_label: str,
         text: str,
+        account_id: int | None = None,
+        candidate_id: int | None = None,
     ) -> int:
         """在已有连接中写入长文本，供事务内复用。"""
 
         cursor = conn.execute(
             """
-            INSERT INTO long_texts (entity_type, entity_id, source_label, text)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO long_texts (
+                account_id, candidate_id, entity_type, entity_id, source_label, text
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (entity_type, entity_id, source_label, text),
+            (account_id, candidate_id, entity_type, entity_id, source_label, text),
         )
         return int(cursor.lastrowid)
-
 
 def now_iso() -> str:
     """返回秒级 ISO 时间字符串，用于记录本地确认时间。"""
 
     return datetime.now().isoformat(timespec="seconds")
+
+
+def account_from_row(row: sqlite3.Row) -> AccountRecord:
+    """把账号行转换为不含密码的领域对象。"""
+
+    return AccountRecord(
+        id=int(row["id"]),
+        email=str(row["email"]),
+        display_name=row["display_name"],
+        role=str(row["role"]),
+        status=str(row["status"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+        must_change_password=bool(row["must_change_password"]),
+    )
+
+
+def auth_session_from_row(row: sqlite3.Row) -> AuthSessionRecord:
+    """把认证 Session 行转换为领域对象。"""
+
+    return AuthSessionRecord(
+        id=int(row["id"]),
+        account_id=int(row["account_id"]),
+        token_hash=str(row["token_hash"]),
+        created_at=str(row["created_at"]),
+        last_seen_at=str(row["last_seen_at"]),
+        expires_at=str(row["expires_at"]),
+        absolute_expires_at=str(row["absolute_expires_at"]),
+        revoked_at=row["revoked_at"],
+        user_agent=row["user_agent"],
+        ip_address=row["ip_address"],
+    )
+
+
+def chat_session_from_row(row: sqlite3.Row) -> ChatSessionRecord:
+    """把独立对话行转换为领域对象。"""
+
+    return ChatSessionRecord(
+        id=int(row["id"]),
+        session_id=str(row["session_id"]),
+        account_id=int(row["account_id"]),
+        candidate_id=int(row["candidate_id"]),
+        job_id=int(row["job_id"]) if row["job_id"] is not None else None,
+        title=str(row["title"]),
+        status=str(row["status"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+        archived_at=row["archived_at"],
+    )
+
+
+def usage_event_from_row(row: sqlite3.Row) -> UsageEventRecord:
+    """把用量流水行转换为领域对象。"""
+
+    return UsageEventRecord(
+        id=int(row["id"]),
+        account_id=int(row["account_id"]),
+        candidate_id=int(row["candidate_id"]) if row["candidate_id"] is not None else None,
+        session_id=row["session_id"],
+        root_request_id=row["root_request_id"],
+        call_id=str(row["call_id"]),
+        provider=str(row["provider"]),
+        model=str(row["model"]),
+        operation=str(row["operation"]),
+        input_tokens=int(row["input_tokens"]),
+        output_tokens=int(row["output_tokens"]),
+        total_tokens=int(row["total_tokens"]),
+        usage_source=str(row["usage_source"]),
+        status=str(row["status"]),
+        attempt=int(row["attempt"]),
+        provider_request_id=row["provider_request_id"],
+        raw_usage=(json.loads(row["raw_usage_json"] or "{}") or {}),
+        created_at=str(row["created_at"]),
+        billable=bool(row["billable"]),
+        pricing_version=row["pricing_version"],
+    )
 
 
 def candidate_profile_from_row(row: sqlite3.Row) -> CandidateProfile:
@@ -660,6 +1618,7 @@ def long_text_from_row(row: sqlite3.Row) -> LongTextRecord:
         entity_id=int(row["entity_id"]),
         source_label=row["source_label"],
         text=row["text"],
+        account_id=row["account_id"] if "account_id" in row.keys() else None,
     )
 
 

@@ -50,6 +50,26 @@ class EmbeddingSettings:
     dimensions: int | None = None
 
 
+@dataclass(frozen=True)
+class AgentMemorySettings:
+    """Agent 对话记忆配置。
+
+    `restore_history_limit` 控制启动恢复时最多读取多少条 SQLite 聊天记录。
+    `restore_trigger_tokens` 控制恢复历史过长时何时先压缩再交给 Agent。
+    `summary_trigger_tokens` 控制 LangChain 运行中何时触发自动总结。
+    `summary_keep_messages` 表示总结后保留最近多少条原文消息。
+    """
+
+    enabled: bool = True
+    restore_history_limit: int = 200
+    restore_trigger_tokens: int = 12000
+    restore_keep_messages: int = 24
+    restore_summary_chars: int = 6000
+    summary_trigger_tokens: int = 12000
+    summary_keep_messages: int = 24
+    summary_trim_tokens: int = 6000
+
+
 def load_dotenv_values(env_path: str | Path = DEFAULT_ENV_PATH) -> dict[str, str]:
     """读取 `.env` 文件并返回键值字典。
 
@@ -228,3 +248,100 @@ def masked_embedding_settings(settings: EmbeddingSettings | None) -> dict[str, o
         "dimensions": settings.dimensions,
         "configured": settings.provider not in {"local", "local_hash"},
     }
+
+
+def load_agent_memory_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> AgentMemorySettings:
+    """从 `.env` 和系统环境变量加载 Agent 记忆配置。
+
+    这些配置不包含敏感信息；提供环境变量只是为了后续按不同模型上下文窗口调整阈值，
+    不需要改业务代码。
+    """
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(*keys: str, default: str | None = None) -> str | None:
+        """按优先级读取多个候选键名。"""
+
+        for key in keys:
+            if key in environment and environment[key]:
+                return environment[key]
+            if key in file_values and file_values[key]:
+                return file_values[key]
+        return default
+
+    enabled = parse_bool(get("JOB_AGENT_MEMORY_ENABLED", default="true"))
+    return AgentMemorySettings(
+        enabled=enabled,
+        restore_history_limit=parse_positive_int(
+            get("JOB_AGENT_MEMORY_RESTORE_HISTORY_LIMIT", default="200"),
+            "JOB_AGENT_MEMORY_RESTORE_HISTORY_LIMIT",
+        ),
+        restore_trigger_tokens=parse_positive_int(
+            get("JOB_AGENT_MEMORY_RESTORE_TRIGGER_TOKENS", default="12000"),
+            "JOB_AGENT_MEMORY_RESTORE_TRIGGER_TOKENS",
+        ),
+        restore_keep_messages=parse_positive_int(
+            get("JOB_AGENT_MEMORY_RESTORE_KEEP_MESSAGES", default="24"),
+            "JOB_AGENT_MEMORY_RESTORE_KEEP_MESSAGES",
+        ),
+        restore_summary_chars=parse_positive_int(
+            get("JOB_AGENT_MEMORY_RESTORE_SUMMARY_CHARS", default="6000"),
+            "JOB_AGENT_MEMORY_RESTORE_SUMMARY_CHARS",
+        ),
+        summary_trigger_tokens=parse_positive_int(
+            get("JOB_AGENT_MEMORY_SUMMARY_TRIGGER_TOKENS", default="12000"),
+            "JOB_AGENT_MEMORY_SUMMARY_TRIGGER_TOKENS",
+        ),
+        summary_keep_messages=parse_positive_int(
+            get("JOB_AGENT_MEMORY_SUMMARY_KEEP_MESSAGES", default="24"),
+            "JOB_AGENT_MEMORY_SUMMARY_KEEP_MESSAGES",
+        ),
+        summary_trim_tokens=parse_positive_int(
+            get("JOB_AGENT_MEMORY_SUMMARY_TRIM_TOKENS", default="6000"),
+            "JOB_AGENT_MEMORY_SUMMARY_TRIM_TOKENS",
+        ),
+    )
+
+
+def masked_agent_memory_settings(settings: AgentMemorySettings) -> dict[str, object]:
+    """返回适合 Web/CLI 展示的 Agent 记忆配置。"""
+
+    return {
+        "enabled": settings.enabled,
+        "restore_history_limit": settings.restore_history_limit,
+        "restore_trigger_tokens": settings.restore_trigger_tokens,
+        "restore_keep_messages": settings.restore_keep_messages,
+        "restore_summary_chars": settings.restore_summary_chars,
+        "summary_trigger_tokens": settings.summary_trigger_tokens,
+        "summary_keep_messages": settings.summary_keep_messages,
+        "summary_trim_tokens": settings.summary_trim_tokens,
+    }
+
+
+def parse_bool(value: str | None) -> bool:
+    """解析常见布尔配置值。"""
+
+    if value is None:
+        return True
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"无法解析布尔配置：{value}")
+
+
+def parse_positive_int(value: str | None, field_name: str) -> int:
+    """解析正整数配置，并给出可读错误。"""
+
+    try:
+        parsed = int(value or "")
+    except ValueError as error:
+        raise ValueError(f"{field_name} 必须是正整数") from error
+    if parsed <= 0:
+        raise ValueError(f"{field_name} 必须大于 0")
+    return parsed

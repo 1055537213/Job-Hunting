@@ -222,6 +222,53 @@ def test_cli_can_ingest_conversation_message(tmp_path, capsys):
     assert any("FastAPI" in result.content for result in rag_results)
 
 
+def test_cli_agent_chat_fallback_persists_history(tmp_path, capsys):
+    """CLI Agent 聊天即使回退到规则链，也要写入持久化聊天历史。"""
+
+    db_path = tmp_path / "cli.db"
+    profile_file = tmp_path / "profile.json"
+    profile_file.write_text(
+        json.dumps(
+            {
+                "name": "小林",
+                "status": "待补充",
+                "education": "大专",
+                "experience_years": 0,
+                "skills": {},
+                "preferred_cities": [],
+                "salary_floor_k": 8,
+                "expected_salary_k": 12,
+                "target_directions": [],
+                "unacceptable": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    main(["--db", str(db_path), "create-profile", "--from-json", str(profile_file)])
+    candidate_id = json.loads(capsys.readouterr().out)["candidate_id"]
+    main(
+        [
+            "--db",
+            str(db_path),
+            "--env-file",
+            str(tmp_path / "missing.env"),
+            "agent-chat",
+            str(candidate_id),
+            "我是本科，1年经验，会 Python。",
+        ]
+    )
+    output = json.loads(capsys.readouterr().out)
+    app = JobHuntingApp(db_path)
+    history = app.list_chat_messages(candidate_id, f"candidate-{candidate_id}")
+
+    assert output["mode"] == "rule_based_ingestion"
+    assert [message.role for message in history] == ["user", "assistant"]
+    assert history[0].content == "我是本科，1年经验，会 Python。"
+    assert "已保存你的原始资料" in history[1].content
+
+
 def test_cli_can_rebuild_and_search_rag_index(tmp_path, capsys):
     """命令行可以重建本地 RAG 索引并检索来源证据。"""
 

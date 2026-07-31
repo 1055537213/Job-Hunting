@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from langchain_core.language_models import BaseChatModel
@@ -53,10 +54,15 @@ class LLMRequestError(RuntimeError):
 class LangChainLLMClient:
     """把 LangChain ChatModel 包装成现有业务可复用的 `LLMClient`。"""
 
-    def __init__(self, model: BaseChatModel):
+    def __init__(
+        self,
+        model: BaseChatModel,
+        usage_callback: Callable[[BaseMessage], None] | None = None,
+    ):
         """保存底层 LangChain 聊天模型。"""
 
         self.model = model
+        self.usage_callback = usage_callback
 
     def complete(self, prompt: str) -> str:
         """调用 LangChain ChatModel，并把返回结果压平成普通文本。"""
@@ -65,13 +71,23 @@ class LangChainLLMClient:
             response = self.model.invoke(prompt)
         except Exception as error:  # noqa: BLE001 - 这里统一转成业务异常，便于上层处理。
             raise LLMRequestError(f"LLM 调用失败：{error}") from error
+        if self.usage_callback is not None:
+            # 计量失败不能让已经成功的业务调用失败；回调内部会把缺失 usage
+            # 标记为 missing，并自行处理数据库异常。
+            try:
+                self.usage_callback(response)
+            except Exception:  # noqa: BLE001 - 账单旁路失败不影响用户主流程。
+                pass
         return extract_message_text(response)
 
 
-def build_llm_client(settings: LLMSettings) -> LLMClient:
+def build_llm_client(
+    settings: LLMSettings,
+    usage_callback: Callable[[BaseMessage], None] | None = None,
+) -> LLMClient:
     """根据 `.env` 配置创建业务层可复用的 LLM 客户端。"""
 
-    return LangChainLLMClient(build_chat_model(settings))
+    return LangChainLLMClient(build_chat_model(settings), usage_callback=usage_callback)
 
 
 def build_chat_model(settings: LLMSettings, temperature: float = 0) -> BaseChatModel:
@@ -101,8 +117,11 @@ def build_chat_model(settings: LLMSettings, temperature: float = 0) -> BaseChatM
         extra_body=extra_body or None,
         # 当前接入的是 OpenAI-compatible 提供商，强制走 Chat Completions 更稳。
         use_responses_api=False,
-        # 某些兼容供应商不会返回流式 token 使用量，这里关闭以减少兼容性问题。
-        stream_usage=False,
+        # Agent 网页聊天默认需要增量输出；显式开启 streaming，避免 LangGraph 只拿到完整 AIMessage。
+        streaming=True,
+        # 请求流式结束块携带 usage；如果供应商不支持，计量层会标记为 missing，
+        # 而不是把估算值直接当成正式账单。
+        stream_usage=True,
     )
 
 

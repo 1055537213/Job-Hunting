@@ -7,12 +7,14 @@ CLI 只负责把用户输入转成应用服务调用，并把结果打印成 JSO
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 from dataclasses import asdict
 from pathlib import Path
 
 from .agent import JobHuntingAgent
 from .app import JobHuntingApp
+from .auth import hash_password
 from .config import (
     load_embedding_settings,
     load_llm_settings,
@@ -38,6 +40,7 @@ def main(argv: list[str] | None = None) -> None:
     subparsers.add_parser("init")
     subparsers.add_parser("llm-config")
     subparsers.add_parser("embedding-config")
+    subparsers.add_parser("create-admin")
 
     web_parser = subparsers.add_parser("web")
     web_parser.add_argument("--host", default="127.0.0.1")
@@ -138,6 +141,8 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "init":
         print_json({"status": "ok", "db": str(Path(args.db).resolve())})
+    elif args.command == "create-admin":
+        create_admin_account(app)
     elif args.command == "llm-config":
         print_json(masked_llm_settings(load_llm_settings(args.env_file)))
     elif args.command == "embedding-config":
@@ -173,6 +178,14 @@ def main(argv: list[str] | None = None) -> None:
                 rag_persist_directory=args.rag_dir,
                 auto_rebuild_rag=True,
             )
+            save_cli_chat_turn(
+                app,
+                args.candidate_id,
+                args.session_id or f"candidate-{args.candidate_id}",
+                message,
+                fallback.reply,
+                {"mode": "rule_based_ingestion", "fallback_reason": str(error)},
+            )
             print_json(
                 {
                     "mode": "rule_based_ingestion",
@@ -181,16 +194,23 @@ def main(argv: list[str] | None = None) -> None:
                 }
             )
         else:
+            result = agent.chat(
+                message,
+                candidate_id=args.candidate_id,
+                session_id=args.session_id,
+                use_tool_llm=True,
+                auto_rag=True,
+            )
+            save_cli_chat_turn(
+                app,
+                args.candidate_id,
+                result.session_id,
+                message,
+                result.reply,
+                {"mode": result.mode, "used_tools": result.used_tools},
+            )
             print_json(
-                asdict(
-                    agent.chat(
-                        message,
-                        candidate_id=args.candidate_id,
-                        session_id=args.session_id,
-                        use_tool_llm=True,
-                        auto_rag=True,
-                    )
-                )
+                asdict(result)
             )
     elif args.command == "demo":
         run_demo(app, args.project)
@@ -357,6 +377,32 @@ def split_items(value: str | list[str] | None) -> list[str] | None:
     return [item.strip() for item in normalized.split(",") if item.strip()]
 
 
+def save_cli_chat_turn(
+    app: JobHuntingApp,
+    candidate_id: int,
+    session_id: str,
+    user_message: str,
+    assistant_message: str,
+    assistant_metadata: dict[str, object],
+) -> None:
+    """保存一次 CLI Agent 聊天，让命令行和网页共用持久化对话记忆。"""
+
+    app.save_chat_message(
+        candidate_id,
+        session_id,
+        "user",
+        user_message,
+        {"source": "cli_agent_chat"},
+    )
+    app.save_chat_message(
+        candidate_id,
+        session_id,
+        "assistant",
+        assistant_message,
+        assistant_metadata,
+    )
+
+
 def parse_skills(value: str | dict[str, str] | None) -> dict[str, str] | None:
     """解析技能输入。
 
@@ -513,10 +559,27 @@ def run_web_server(args: argparse.Namespace) -> None:
     import uvicorn
 
     uvicorn.run(
-        create_web_app(args.db, args.env_file, args.rag_dir),
+        create_web_app(args.db, args.env_file, args.rag_dir, require_auth=True),
         host=args.host,
         port=args.port,
     )
+
+
+def create_admin_account(app: JobHuntingApp) -> None:
+    """交互式创建管理员账号，不把管理员密码写入代码或命令历史。"""
+
+    email = input("管理员邮箱: ").strip().lower()
+    password = getpass.getpass("管理员密码（至少 8 位）: ")
+    password_again = getpass.getpass("再次输入密码: ")
+    if password != password_again:
+        raise SystemExit("两次密码不一致。")
+    try:
+        account = app.store.create_account(email, hash_password(password), role="admin")
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    except Exception as error:  # noqa: BLE001 - CLI 需要把唯一约束错误转成可读信息。
+        raise SystemExit(f"管理员创建失败：{error}") from error
+    print_json({"status": "ok", "account": asdict(account)})
 
 
 def print_json(value: object) -> None:

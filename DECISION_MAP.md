@@ -120,7 +120,7 @@ Agent 应按什么顺序询问城市、岗位方向、薪资、经验、学历�
 
 ### Answer
 
-第一版采用“先定搜索意图，再定平台入口，最后定排序偏好”的对话顺序。已用 throwaway 命令行原型验证，见 [对话式缩小范围原型](./prototypes/dialogue_scope_prototype.py)，可用 `E:\Anaconda\envs\langchain1.2\python.exe .\prototypes\dialogue_scope_prototype.py` 运行。
+第一版采用“先定搜索意图，再定平台入口，最后定排序偏好”的对话顺序。该流程已整合到正式 Agent 对话与职位匹配链路中，当前以 `src/job_hunting_agent/agent.py`、`src/job_hunting_agent/matcher.py` 和 Web/CLI 入口为准。
 
 推荐提问顺序：
 
@@ -194,7 +194,7 @@ Type: Prototype
 
 ### Answer
 
-第一版采用最小必要读取的本地项目分析流程。已用 throwaway 命令行原型验证，见 [本地项目分析原型](./prototypes/project_analysis_prototype.py)，可用 `E:\Anaconda\envs\langchain1.2\python.exe .\prototypes\project_analysis_prototype.py <项目目录>` 运行。
+第一版采用最小必要读取的本地项目分析流程。该流程已整合到正式项目分析模块 `src/job_hunting_agent/project_analyzer.py`，当前以该模块和对应测试为准。
 
 项目分析流程为：候选人提供本地项目目录；系统跳过敏感文件、账号配置、数据库文件、大型数据集、缓存、虚拟环境、依赖目录、构建产物和日志；系统读取 README、文档、依赖配置、源码入口、测试和部署配置等材料；系统提取读取边界状态、技术栈线索、核心功能线索、代码符号、职责草稿、项目亮点和候选人待确认问题。
 

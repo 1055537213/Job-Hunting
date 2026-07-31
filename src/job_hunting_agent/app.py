@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 
+from .auth import AuthService, utc_now
 from .config import DEFAULT_ENV_PATH
 from .conversation_ingestion import decide_conversation_ingestion
 from .llm import LLMClient
@@ -16,6 +18,7 @@ from .matcher import match_job
 from .models import (
     CandidateProfile,
     CandidateProfileInput,
+    ChatMessageRecord,
     ConversationIngestionResult,
     ImportedJob,
     MatchResult,
@@ -24,6 +27,7 @@ from .models import (
     RAGIndexStats,
     RAGSearchResult,
     ResumeDraftRecord,
+    UsageEventRecord,
 )
 from .project_analyzer import analyze_project
 from .rag import RAGKnowledgeBase
@@ -42,6 +46,8 @@ class JobHuntingApp:
         """绑定一个 SQLite 数据库路径和项目 `.env` 路径。"""
 
         self.store = SQLiteStore(db_path)
+        # Web/CLI 都通过同一认证服务创建账号和 Session，避免重复实现密码逻辑。
+        self.auth = AuthService(self.store)
         self.env_path = Path(env_path)
 
     def initialize(self) -> None:
@@ -49,23 +55,23 @@ class JobHuntingApp:
 
         self.store.initialize()
 
-    def save_candidate_profile(self, profile: CandidateProfileInput) -> int:
+    def save_candidate_profile(self, profile: CandidateProfileInput, account_id: int | None = None) -> int:
         """保存候选人档案，返回候选人 ID。"""
 
-        return self.store.save_candidate_profile(profile)
+        return self.store.save_candidate_profile(profile, account_id=account_id)
 
-    def get_candidate_profile(self, candidate_id: int) -> CandidateProfile:
+    def get_candidate_profile(self, candidate_id: int, account_id: int | None = None) -> CandidateProfile:
         """读取候选人档案。
 
         CLI 和测试需要通过应用服务读取档案，避免越过门面类直接访问 SQLite。
         """
 
-        return self.store.get_candidate_profile(candidate_id)
+        return self.store.get_candidate_profile(candidate_id, account_id=account_id)
 
-    def list_candidate_profiles(self) -> list[CandidateProfile]:
+    def list_candidate_profiles(self, account_id: int | None = None) -> list[CandidateProfile]:
         """列出候选人档案，供 Web 页面侧边栏选择。"""
 
-        return self.store.list_candidate_profiles()
+        return self.store.list_candidate_profiles(account_id=account_id)
 
     def ingest_conversation_message(
         self,
@@ -74,6 +80,7 @@ class JobHuntingApp:
         llm_client: LLMClient | None = None,
         rag_persist_directory: str | Path | None = None,
         auto_rebuild_rag: bool = False,
+        account_id: int | None = None,
     ) -> ConversationIngestionResult:
         """自动判断并保存一条候选人对话资料。
 
@@ -82,13 +89,14 @@ class JobHuntingApp:
         这样可以保留清晰边界：SQLite 是事实源，RAG 是证据索引，LLM 是判断/表达工具。
         """
 
-        candidate = self.store.get_candidate_profile(candidate_id)
+        candidate = self.store.get_candidate_profile(candidate_id, account_id=account_id)
         decision = decide_conversation_ingestion(candidate, message, llm_client)
 
         # 结构化字段只通过受控 patch 合并到候选人档案，避免模型直接改库。
         saved_structured_fields = self.store.update_candidate_profile(
             candidate_id,
             decision.profile_updates,
+            account_id=account_id,
         )
         # 长文本先进入 SQLite long_texts；Chroma 只从这里同步，便于追溯来源。
         saved_long_text_ids = [
@@ -97,6 +105,8 @@ class JobHuntingApp:
                 item.entity_id,
                 item.source_label,
                 item.text,
+                account_id=account_id,
+                candidate_id=candidate_id,
             )
             for item in decision.long_texts
             if item.text.strip()
@@ -109,6 +119,7 @@ class JobHuntingApp:
             rag_index_stats = self.index_rag_long_texts(
                 saved_long_text_ids,
                 rag_persist_directory or "data/chroma",
+                account_id=account_id,
             )
             rag_update_mode = rag_index_stats.mode
 
@@ -122,15 +133,47 @@ class JobHuntingApp:
             rag_update_mode=rag_update_mode,
         )
 
-    def import_job_text(self, raw_text: str, source_url: str | None = None) -> ImportedJob:
+    def import_job_text(
+        self,
+        raw_text: str,
+        source_url: str | None = None,
+        account_id: int | None = None,
+    ) -> ImportedJob:
         """导入候选人主动带回的职位原文，并保存标准化结果。"""
 
-        return self.store.save_job_text(raw_text, source_url)
+        return self.store.save_job_text(raw_text, source_url, account_id=account_id)
 
-    def list_jobs(self) -> list[ImportedJob]:
+    def list_jobs(self, account_id: int | None = None) -> list[ImportedJob]:
         """列出候选人已经主动导入的所有职位。"""
 
-        return self.store.list_jobs()
+        return self.store.list_jobs(account_id=account_id)
+
+    def save_chat_message(
+        self,
+        candidate_id: int,
+        session_id: str,
+        role: str,
+        content: str,
+        metadata: dict[str, object] | None = None,
+        account_id: int | None = None,
+    ) -> ChatMessageRecord:
+        """保存网页聊天消息，用于刷新页面后恢复对话。"""
+
+        # 先读取候选人，避免前端给不存在的档案写聊天记录。
+        self.store.get_candidate_profile(candidate_id, account_id=account_id)
+        return self.store.save_chat_message(candidate_id, session_id, role, content, metadata, account_id=account_id)
+
+    def list_chat_messages(
+        self,
+        candidate_id: int,
+        session_id: str,
+        limit: int = 100,
+        account_id: int | None = None,
+    ) -> list[ChatMessageRecord]:
+        """读取网页聊天历史，用于重新打开页面时恢复消息。"""
+
+        self.store.get_candidate_profile(candidate_id, account_id=account_id)
+        return self.store.list_chat_messages(candidate_id, session_id, limit, account_id=account_id)
 
     def analyze_project(self, project_path: str | Path) -> ProjectExperienceCard:
         """分析候选人提供的本地项目目录，返回待确认项目经历卡片。"""
@@ -141,6 +184,7 @@ class JobHuntingApp:
         self,
         candidate_id: int,
         project_path: str | Path,
+        account_id: int | None = None,
     ) -> ProjectExperienceRecord:
         """分析并保存某个候选人的项目经历卡片。
 
@@ -148,40 +192,41 @@ class JobHuntingApp:
         自动发现的技术栈写入候选人档案，避免把线索误当成已确认事实。
         """
 
-        self.store.get_candidate_profile(candidate_id)
+        self.store.get_candidate_profile(candidate_id, account_id=account_id)
         card = analyze_project(project_path)
-        return self.store.save_project_card(candidate_id, card)
+        return self.store.save_project_card(candidate_id, card, account_id=account_id)
 
     def confirm_project_card(
         self,
         record_id: int,
         confirmed_summary: str | None = None,
+        account_id: int | None = None,
     ) -> ProjectExperienceRecord:
         """确认一张项目经历卡片，并保存候选人确认摘要。"""
 
-        return self.store.confirm_project_card(record_id, confirmed_summary)
+        return self.store.confirm_project_card(record_id, confirmed_summary, account_id=account_id)
 
-    def list_project_cards(self, candidate_id: int) -> list[ProjectExperienceRecord]:
+    def list_project_cards(self, candidate_id: int, account_id: int | None = None) -> list[ProjectExperienceRecord]:
         """列出某个候选人的项目经历卡片。"""
 
-        return self.store.list_project_cards(candidate_id)
+        return self.store.list_project_cards(candidate_id, account_id=account_id)
 
-    def match_job(self, candidate_id: int, job_id: int) -> MatchResult:
+    def match_job(self, candidate_id: int, job_id: int, account_id: int | None = None) -> MatchResult:
         """读取候选人和职位后，执行一次可解释职位匹配。"""
 
-        candidate = self.store.get_candidate_profile(candidate_id)
-        job = self.store.get_job(job_id)
+        candidate = self.store.get_candidate_profile(candidate_id, account_id=account_id)
+        job = self.store.get_job(job_id, account_id=account_id)
         return match_job(candidate, job)
 
-    def match_all_jobs(self, candidate_id: int) -> list[MatchResult]:
+    def match_all_jobs(self, candidate_id: int, account_id: int | None = None) -> list[MatchResult]:
         """对当前本地职位池做批量匹配，并按推荐顺序返回结果。
 
         排序规则很朴素：未淘汰职位优先，同组内分数高的靠前。这个结果只是帮助
         候选人决定先看哪些岗位，不代表录用概率。
         """
 
-        candidate = self.store.get_candidate_profile(candidate_id)
-        matches = [match_job(candidate, job) for job in self.store.list_jobs()]
+        candidate = self.store.get_candidate_profile(candidate_id, account_id=account_id)
+        matches = [match_job(candidate, job) for job in self.store.list_jobs(account_id=account_id)]
         return sorted(matches, key=lambda result: (result.eliminated, -result.score, result.job_id))
 
     def create_resume_draft(
@@ -191,6 +236,7 @@ class JobHuntingApp:
         llm_client: LLMClient | None = None,
         rag_persist_directory: str | Path | None = None,
         rag_query: str | None = None,
+        account_id: int | None = None,
     ) -> ResumeDraftRecord:
         """为某个职位生成一版证据约束简历草稿。
 
@@ -198,11 +244,11 @@ class JobHuntingApp:
         RAG 是可选证据上下文；即使使用 RAG，也不会覆盖候选人档案。
         """
 
-        candidate = self.store.get_candidate_profile(candidate_id)
-        job = self.store.get_job(job_id)
+        candidate = self.store.get_candidate_profile(candidate_id, account_id=account_id)
+        job = self.store.get_job(job_id, account_id=account_id)
         confirmed_project_cards = [
             record
-            for record in self.store.list_project_cards(candidate_id)
+            for record in self.store.list_project_cards(candidate_id, account_id=account_id)
             if record.status == "已确认"
         ]
         semantic_evidence = []
@@ -216,30 +262,38 @@ class JobHuntingApp:
                     rag_persist_directory,
                     top_k=5,
                     entity_types=["candidate_profile", "job", "project_experience_card"],
+                    account_id=account_id,
                 )
             ]
         draft = build_resume_draft(candidate, job, confirmed_project_cards, llm_client, semantic_evidence)
-        return self.store.save_resume_draft(candidate_id, job_id, draft)
+        return self.store.save_resume_draft(candidate_id, job_id, draft, account_id=account_id)
 
     def list_resume_drafts(
         self,
         candidate_id: int,
         job_id: int | None = None,
+        account_id: int | None = None,
     ) -> list[ResumeDraftRecord]:
         """列出候选人的职位定制简历草稿版本。"""
 
-        return self.store.list_resume_drafts(candidate_id, job_id)
+        return self.store.list_resume_drafts(candidate_id, job_id, account_id=account_id)
 
-    def rebuild_rag_index(self, persist_directory: str | Path = "data/chroma") -> RAGIndexStats:
+    def rebuild_rag_index(self, persist_directory: str | Path = "data/chroma", account_id: int | None = None) -> RAGIndexStats:
         """把 SQLite `long_texts` 全量同步到本地 Chroma RAG 索引。"""
 
-        knowledge_base = RAGKnowledgeBase(persist_directory, env_path=self.env_path)
-        return knowledge_base.rebuild(self.store.list_long_texts())
+        knowledge_base = RAGKnowledgeBase(
+            persist_directory,
+            env_path=self.env_path,
+            usage_callback=self._embedding_usage_callback(account_id, "embedding_rebuild"),
+            usage_operation="embedding_rebuild",
+        )
+        return knowledge_base.rebuild(self.store.list_long_texts(account_id=account_id), account_id=account_id)
 
     def index_rag_long_texts(
         self,
         long_text_ids: list[int],
         persist_directory: str | Path = "data/chroma",
+        account_id: int | None = None,
     ) -> RAGIndexStats:
         """把指定长文本增量追加到本地 Chroma RAG 索引。
 
@@ -247,8 +301,13 @@ class JobHuntingApp:
         适合对话式自动入库后的即时检索。
         """
 
-        knowledge_base = RAGKnowledgeBase(persist_directory, env_path=self.env_path)
-        return knowledge_base.index_long_texts(self.store.get_long_texts_by_ids(long_text_ids))
+        knowledge_base = RAGKnowledgeBase(
+            persist_directory,
+            env_path=self.env_path,
+            usage_callback=self._embedding_usage_callback(account_id, "embedding_index"),
+            usage_operation="embedding_index",
+        )
+        return knowledge_base.index_long_texts(self.store.get_long_texts_by_ids(long_text_ids, account_id=account_id), account_id=account_id)
 
     def search_rag(
         self,
@@ -256,11 +315,59 @@ class JobHuntingApp:
         persist_directory: str | Path = "data/chroma",
         top_k: int = 5,
         entity_types: list[str] | None = None,
+        account_id: int | None = None,
     ) -> list[RAGSearchResult]:
         """从本地 Chroma RAG 索引检索带来源的证据片段。"""
 
-        knowledge_base = RAGKnowledgeBase(persist_directory, env_path=self.env_path)
-        return knowledge_base.search(query, top_k, entity_types)
+        knowledge_base = RAGKnowledgeBase(
+            persist_directory,
+            env_path=self.env_path,
+            usage_callback=self._embedding_usage_callback(account_id, "embedding_query"),
+            usage_operation="embedding_query",
+        )
+        return knowledge_base.search(query, top_k, entity_types, account_id=account_id)
+
+    def _embedding_usage_callback(self, account_id: int | None, operation: str):
+        """构造远程 embedding 用量记录回调。
+
+        本地 hash embedding 不会触发该回调，因此不会产生虚假的供应商 Token；
+        远程接口没有返回 usage 时仍保留一条 `missing` 明细，但不进入账单汇总。
+        """
+
+        if account_id is None:
+            return None
+
+        def callback(response: dict[str, object]) -> None:
+            from .rag import extract_embedding_usage
+
+            usage = extract_embedding_usage(response)
+            source = "provider" if usage.get("total_tokens", 0) > 0 else "missing"
+            self.store.record_usage_event(
+                UsageEventRecord(
+                    id=0,
+                    account_id=account_id,
+                    candidate_id=None,
+                    session_id=None,
+                    root_request_id=None,
+                    call_id=f"{operation}-{uuid.uuid4().hex}",
+                    provider="configured-embedding",
+                    model="embedding",
+                    operation=operation,
+                    input_tokens=usage.get("input_tokens", 0),
+                    output_tokens=usage.get("output_tokens", 0),
+                    total_tokens=usage.get("total_tokens", 0),
+                    usage_source=source,
+                    status="succeeded",
+                    attempt=1,
+                    provider_request_id=None,
+                    raw_usage=usage,
+                    created_at=utc_now().isoformat(timespec="seconds"),
+                    billable=source == "provider",
+                    pricing_version=None,
+                )
+            )
+
+        return callback
 
 
 def format_rag_evidence(result: RAGSearchResult) -> str:

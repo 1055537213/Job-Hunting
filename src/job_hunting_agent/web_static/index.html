@@ -3,97 +3,532 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Job Hunting Agent</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <title>求职助手 Agent</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260731-auth-admin" />
   </head>
   <body>
-    <div class="app-shell">
-      <aside class="sidebar">
-        <div class="brand">
-          <div class="brand-mark">JA</div>
+    <!-- Vue 还没有挂载完成时隐藏模板，避免用户短暂看到未编译的 {{ }}。 -->
+    <div id="app" class="app-shell" v-cloak>
+      <main v-if="!auth.authenticated" class="auth-shell" aria-labelledby="authTitle">
+        <section class="auth-frame">
+          <div class="auth-intro">
+            <p class="auth-kicker">求职助手 Agent</p>
+            <h1 id="authTitle">把经历说清楚<br />把机会挑出来</h1>
+            <p class="auth-lede">
+              从资料整理、岗位匹配到简历定制与 HR 对话，陪你把每一步求职准备做得更扎实。
+            </p>
+          </div>
+
+          <form class="auth-form" @submit.prevent="submitAuth">
+            <div class="auth-form-head">
+              <div>
+                <p class="eyebrow">{{ authMode === "login" ? "Welcome back" : "Create account" }}</p>
+                <h2>{{ authMode === "login" ? "登录工作区" : "创建普通账号" }}</h2>
+              </div>
+              <button class="text-button" type="button" @click="toggleAuthMode">
+                {{ authMode === "login" ? "注册" : "返回登录" }}
+              </button>
+            </div>
+
+            <label class="field-group" for="authEmail">
+              <span>邮箱</span>
+              <input
+                id="authEmail"
+                v-model.trim="authForm.email"
+                class="field"
+                type="email"
+                autocomplete="email"
+                required
+                :aria-invalid="String(Boolean(authError))"
+                aria-describedby="authError"
+              />
+            </label>
+            <label class="field-group" for="authPassword">
+              <span>密码</span>
+              <input
+                id="authPassword"
+                v-model="authForm.password"
+                class="field"
+                type="password"
+                :autocomplete="authMode === 'login' ? 'current-password' : 'new-password'"
+                minlength="8"
+                required
+                :aria-invalid="String(Boolean(authError))"
+                aria-describedby="authError"
+              />
+            </label>
+            <label v-if="authMode === 'register'" class="field-group" for="authDisplayName">
+              <span>显示名称（可选）</span>
+              <input
+                id="authDisplayName"
+                v-model.trim="authForm.displayName"
+                class="field"
+                type="text"
+                autocomplete="name"
+              />
+            </label>
+            <div v-if="authError" id="authError" class="inline-error" role="alert">{{ authError }}</div>
+            <button
+              class="primary-button auth-submit"
+              type="submit"
+              :disabled="authLoading"
+              :data-state="authLoading ? 'loading' : authSuccess ? 'success' : authError ? 'error' : 'idle'"
+            >
+              {{ authLoading ? "处理中" : authMode === "login" ? "登录" : "注册并继续" }}
+            </button>
+          </form>
+        </section>
+      </main>
+
+      <header v-if="auth.authenticated && activeView === 'workspace'" class="topbar">
+        <a class="brand" href="#chatPanel" aria-label="回到聊天工作区">
+          <span class="brand-mark">JA</span>
+          <span class="brand-copy">
+            <span class="brand-title">Job Hunting Agent</span>
+            <span class="brand-subtitle">本地求职工作台</span>
+          </span>
+        </a>
+
+        <button
+          class="searchpill"
+          type="button"
+          aria-haspopup="dialog"
+          :aria-expanded="String(commandPaletteOpen)"
+          @click="openCommandPalette"
+        >
+          <span class="searchpill-dot" aria-hidden="true"></span>
+          <span class="searchpill-text">搜索动作：补资料、导入职位、匹配</span>
+          <span class="kbd" aria-hidden="true">Ctrl K</span>
+        </button>
+
+        <nav class="quick-nav" aria-label="常用操作">
+          <button class="nav-link" type="button" @click="focusMessageInput">补资料</button>
+          <button class="nav-link" type="button" @click="focusJobImport">导入职位</button>
+          <button
+            class="primary-button compact"
+            type="button"
+            :disabled="loadingMatches"
+            :data-state="loadingMatches ? 'loading' : 'idle'"
+            @click="matchJobs(false)"
+          >
+            {{ loadingMatches ? "匹配中" : "匹配职位" }}
+          </button>
+          <button v-if="auth.account && auth.account.role === 'admin'" class="nav-link" type="button" @click="openAdmin">后台</button>
+          <button class="nav-link account-link" type="button" @click="logout">{{ auth.account?.display_name || auth.account?.email || "账号" }} · 退出</button>
+          <button class="nav-link account-link" type="button" @click="logoutAll">退出所有设备</button>
+        </nav>
+      </header>
+
+      <div v-if="auth.authenticated && activeView === 'workspace'" class="workspace-grid">
+        <aside id="profilePanel" class="sidebar" aria-label="候选人档案">
+          <section class="panel panel-hero">
+            <div class="panel-title-row">
+              <div>
+                <p class="eyebrow">Profile Source</p>
+                <h2 class="panel-title">候选人档案</h2>
+              </div>
+              <span class="count-chip">{{ profiles.length }} 个</span>
+            </div>
+            <label class="field-group" for="profileSelect">
+              <span>当前档案</span>
+              <select
+                id="profileSelect"
+                v-model.number="currentProfileId"
+                class="field"
+                @change="onProfileChange"
+              >
+                <option :value="0">暂无档案，请先创建</option>
+                <option v-for="profile in profiles" :key="profile.id" :value="profile.id">
+                  #{{ profile.id }} {{ profile.name }}
+                </option>
+              </select>
+            </label>
+            <button
+              class="ghost-button"
+              type="button"
+              :disabled="loadingProfiles"
+              :data-state="loadingProfiles ? 'loading' : 'idle'"
+              @click="loadProfiles"
+            >
+              {{ loadingProfiles ? "刷新中" : "刷新档案" }}
+            </button>
+          </section>
+
+          <section class="panel">
+            <div class="panel-title-row">
+              <div>
+                <p class="eyebrow">New Candidate</p>
+                <h2 class="panel-title">新建候选人</h2>
+              </div>
+            </div>
+            <form class="form-stack" @submit.prevent="createProfile">
+              <label class="field-group" for="profileName">
+                <span>姓名</span>
+                <input
+                  id="profileName"
+                  v-model.trim="profileForm.name"
+                  class="field"
+                  placeholder="例如：小林"
+                />
+              </label>
+              <div class="grid-two">
+                <label class="field-group" for="profileEducation">
+                  <span>学历</span>
+                  <input
+                    id="profileEducation"
+                    v-model.trim="profileForm.education"
+                    class="field"
+                    placeholder="本科"
+                  />
+                </label>
+                <label class="field-group" for="profileYears">
+                  <span>经验年限</span>
+                  <input
+                    id="profileYears"
+                    v-model.number="profileForm.experienceYears"
+                    class="field"
+                    type="number"
+                    min="0"
+                    step="0.5"
+                    placeholder="1"
+                  />
+                </label>
+              </div>
+              <label class="field-group" for="profileSkills">
+                <span>技能与熟练度</span>
+                <input
+                  id="profileSkills"
+                  v-model="profileForm.skills"
+                  class="field"
+                  placeholder="Python=项目使用,FastAPI=待确认"
+                />
+              </label>
+              <label class="field-group" for="profileCities">
+                <span>目标城市</span>
+                <input
+                  id="profileCities"
+                  v-model="profileForm.cities"
+                  class="field"
+                  placeholder="杭州,上海"
+                />
+              </label>
+              <label class="field-group" for="profileDirections">
+                <span>求职方向</span>
+                <input
+                  id="profileDirections"
+                  v-model="profileForm.directions"
+                  class="field"
+                  placeholder="AI Agent 应用开发"
+                />
+              </label>
+              <button
+                class="primary-button"
+                type="submit"
+                :disabled="creatingProfile"
+                :data-state="creatingProfile ? 'loading' : 'idle'"
+              >
+                {{ creatingProfile ? "创建中" : "创建并选择" }}
+              </button>
+            </form>
+          </section>
+
+          <section class="panel boundary-note">
+            <div class="panel-title-row">
+              <div>
+                <p class="eyebrow">Local Boundary</p>
+                <h2 class="panel-title">运行边界</h2>
+              </div>
+            </div>
+            <p>本页面只使用你主动输入的资料；不会登录 BOSS、不会自动投递、不会自动发送 HR 消息。</p>
+          </section>
+        </aside>
+
+        <main id="chatPanel" class="chat-column" aria-label="Agent 对话">
+          <header class="chat-head">
+            <div>
+              <p class="eyebrow">Conversation Index</p>
+              <h1 class="chat-title">{{ currentProfile ? `${currentProfile.name} 的求职对话` : "选择一个档案开始" }}</h1>
+            </div>
+            <div class="chat-session-actions">
+              <label class="sr-only" for="sessionSelect">当前会话</label>
+              <select
+                id="sessionSelect"
+                v-model="activeSessionId"
+                class="field session-select"
+                :disabled="!currentProfileId || !sessions.length"
+                @change="switchChatSession"
+              >
+                <option v-if="!sessions.length" value="">暂无会话</option>
+                <option v-for="session in sessions" :key="session.session_id" :value="session.session_id">
+                  {{ session.title }}
+                </option>
+              </select>
+              <button class="ghost-button compact" type="button" :disabled="!currentProfileId" @click="createChatSession">新对话</button>
+            </div>
+          </header>
+          <section ref="messages" class="messages" aria-live="polite">
+            <div
+              v-for="message in messages"
+              :key="message.localId || message.id"
+              class="message"
+              :class="message.role"
+            >
+              <div class="avatar">{{ message.role === "user" ? "你" : "A" }}</div>
+              <div
+                class="bubble"
+                :class="{ error: message.isError }"
+                v-html="renderMarkdown(message.content)"
+              ></div>
+            </div>
+          </section>
+
+          <footer class="composer">
+            <form class="composer-row" @submit.prevent="sendMessage">
+              <label class="sr-only" for="messageInput">聊天输入</label>
+              <textarea
+                id="messageInput"
+                ref="messageInput"
+                v-model="messageInput"
+                placeholder="例如：我是本科，1 年经验，会 Python 和 FastAPI，做过一个求职助手项目。"
+                @keydown.ctrl.enter.prevent="sendMessage"
+                @keydown.meta.enter.prevent="sendMessage"
+              ></textarea>
+              <button
+                class="send-button"
+                type="submit"
+                :disabled="sending"
+                :data-state="sending ? 'loading' : 'idle'"
+              >
+                {{ sending ? "生成中" : "发送" }}
+              </button>
+            </form>
+          </footer>
+        </main>
+
+        <aside id="jobPanel" class="right-panel" aria-label="职位导入与匹配">
+          <section class="panel">
+            <div class="panel-title-row">
+              <div>
+                <p class="eyebrow">Structured Snapshot</p>
+                <h2 class="panel-title">当前档案摘要</h2>
+              </div>
+            </div>
+            <pre class="summary-box">{{ profileSummary }}</pre>
+          </section>
+
+          <section class="panel">
+            <div class="panel-title-row">
+              <div>
+                <p class="eyebrow">BOSS Import</p>
+                <h2 class="panel-title">导入 BOSS 职位文本</h2>
+              </div>
+            </div>
+            <form class="form-stack" @submit.prevent="importJob">
+              <label class="field-group" for="jobSourceUrl">
+                <span>职位链接，可选</span>
+                <input
+                  id="jobSourceUrl"
+                  v-model.trim="jobForm.sourceUrl"
+                  class="field"
+                  placeholder="https://www.zhipin.com/job_detail/..."
+                />
+              </label>
+              <label class="field-group" for="jobRawText">
+                <span>职位详情文本</span>
+                <textarea
+                  id="jobRawText"
+                  ref="jobText"
+                  v-model="jobForm.rawText"
+                  class="field tall"
+                  :aria-invalid="String(Boolean(jobImportError))"
+                  aria-describedby="jobImportError"
+                  placeholder="把 BOSS 职位详情页里你能看到的文本复制到这里。"
+                ></textarea>
+              </label>
+              <button
+                class="primary-button"
+                type="submit"
+                :disabled="importingJob"
+                :data-state="importingJob ? 'loading' : 'idle'"
+              >
+                {{ importingJob ? "审核中" : "审核并导入" }}
+              </button>
+              <div
+                v-if="jobImportError"
+                id="jobImportError"
+                class="inline-error"
+                role="alert"
+              >
+                {{ jobImportError }}
+              </div>
+            </form>
+          </section>
+
+          <section class="panel">
+            <div class="panel-title-row">
+              <div>
+                <p class="eyebrow">Imported Jobs</p>
+                <h2 class="panel-title">已导入职位</h2>
+              </div>
+              <button
+                class="ghost-button compact"
+                type="button"
+                :disabled="loadingJobs"
+                :data-state="loadingJobs ? 'loading' : 'idle'"
+                @click="loadJobs"
+              >
+                {{ loadingJobs ? "刷新中" : "刷新" }}
+              </button>
+            </div>
+            <div id="jobList" class="job-list">
+              <div v-if="!jobs.length" class="empty-state">
+                <strong>还没有导入职位。</strong>
+                <span>把 BOSS 职位详情文本粘贴到上方后，会显示在这里。</span>
+              </div>
+              <article v-for="job in jobs" :key="job.id" class="job-card">
+                <h3 class="job-card-title">{{ job.title }}</h3>
+                <div class="job-card-meta">{{ formatJobMeta(job) }}</div>
+                <p class="job-card-desc">{{ trimText(job.description_text || job.raw_text || "", 110) }}</p>
+              </article>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-title-row">
+              <div>
+                <p class="eyebrow">Match Queue</p>
+                <h2 class="panel-title">职位匹配结果</h2>
+              </div>
+              <button
+                class="ghost-button compact"
+                type="button"
+                :disabled="loadingMatches"
+                :data-state="loadingMatches ? 'loading' : 'idle'"
+                @click="matchJobs(false)"
+              >
+                {{ loadingMatches ? "匹配中" : "重算" }}
+              </button>
+            </div>
+            <div class="match-list">
+              <div v-if="!matches.length" class="empty-state">
+                <strong>还没有匹配结果。</strong>
+                <span>选择候选人并导入职位后，可以在这里查看排序。</span>
+              </div>
+              <article v-for="item in matches" :key="item.job.id" class="match-card">
+                <div class="match-card-head">
+                  <h3>{{ item.job.title }}</h3>
+                  <span class="score-chip">{{ item.match.score }} 分</span>
+                </div>
+                <div class="match-meta">
+                  {{ item.job.city || "未知城市" }} · {{ item.match.tier }}
+                </div>
+                <div class="match-meta">
+                  {{ item.match.eliminated ? "已淘汰：" : "理由：" }} {{ matchReason(item) }}
+                </div>
+              </article>
+            </div>
+          </section>
+        </aside>
+      </div>
+
+      <section v-if="auth.authenticated && activeView === 'admin'" class="admin-shell" aria-labelledby="adminTitle">
+        <header class="admin-head">
           <div>
-            <h1>Job Hunting Agent</h1>
-            <p>本地求职助手</p>
+            <p class="eyebrow">Account Operations</p>
+            <h1 id="adminTitle">用量与账号</h1>
+            <p class="admin-lede">只显示账号、系统和 Token 流水；候选人正文与对话内容默认不进入后台。</p>
           </div>
-        </div>
-
-        <section class="panel">
-          <div class="panel-title">候选人档案</div>
-          <select id="profileSelect" class="field"></select>
-          <button id="refreshProfilesBtn" class="ghost-button">刷新档案</button>
-        </section>
-
-        <section class="panel">
-          <div class="panel-title">新建候选人</div>
-          <input id="profileName" class="field" placeholder="姓名，例如 小林" />
-          <div class="grid-two">
-            <input id="profileEducation" class="field" placeholder="学历，本科" />
-            <input id="profileExperience" class="field" type="number" min="0" step="0.5" placeholder="年限" />
+          <div class="admin-actions">
+            <button class="ghost-button" type="button" @click="activeView = 'workspace'">回到工作台</button>
+            <button class="ghost-button" type="button" @click="logout">退出登录</button>
+            <button class="ghost-button" type="button" @click="logoutAll">退出所有设备</button>
           </div>
-          <input id="profileSkills" class="field" placeholder="技能：Python=项目使用,FastAPI=待确认" />
-          <input id="profileCities" class="field" placeholder="城市：杭州,上海" />
-          <input id="profileDirections" class="field" placeholder="方向：AI Agent 应用开发" />
-          <button id="createProfileBtn" class="primary-button">创建并选择</button>
-        </section>
-
-        <section class="panel subtle">
-          <div class="panel-title">运行边界</div>
-          <p>本页面只使用你主动输入的资料；不会登录 BOSS、不会自动投递、不会自动发送 HR 消息。</p>
-        </section>
-      </aside>
-
-      <main class="chat-column">
-        <header class="chat-header">
-          <div>
-            <div class="eyebrow">Conversation Workspace</div>
-            <h2>像聊天一样补充资料</h2>
-          </div>
-          <div id="healthBadge" class="status-pill">检查中...</div>
         </header>
+        <div class="admin-metrics" aria-live="polite">
+          <div class="admin-metric"><span>账号数</span><strong>{{ admin.accounts.length }}</strong></div>
+          <div class="admin-metric"><span>请求事件</span><strong>{{ admin.summary.event_count || 0 }}</strong></div>
+          <div class="admin-metric"><span>总 Token</span><strong>{{ admin.summary.total_tokens || 0 }}</strong></div>
+          <div class="admin-metric"><span>可计费 Token</span><strong>{{ admin.summary.billable_tokens || 0 }}</strong></div>
+        </div>
+        <div class="admin-grid">
+          <section class="panel admin-panel">
+            <div class="panel-title-row"><div><p class="eyebrow">Accounts</p><h2 class="panel-title">账号状态</h2></div></div>
+            <div v-if="!admin.accounts.length" class="empty-state"><strong>还没有账号</strong><span>普通用户可以从登录页自行注册。</span></div>
+            <div v-else class="admin-account-list">
+              <article v-for="account in admin.accounts" :key="account.id" class="admin-account-row">
+                <div><strong>{{ account.email }}</strong><span>{{ account.role }} · {{ account.status }} · {{ accountUsage(account.id) }} 可计费 Token</span></div>
+                <button class="ghost-button compact" type="button" @click="toggleAccountStatus(account)">
+                  {{ account.status === 'active' ? '禁用' : '恢复' }}
+                </button>
+              </article>
+            </div>
+          </section>
+          <section class="panel admin-panel admin-events">
+            <div class="panel-title-row"><div><p class="eyebrow">Usage Ledger</p><h2 class="panel-title">Token 明细</h2></div><button class="ghost-button compact" type="button" @click="loadAdminData">刷新</button></div>
+            <div v-if="!admin.events.length" class="empty-state"><strong>暂无用量流水</strong><span>供应商返回 usage 后，记录会出现在这里。</span></div>
+            <div v-else class="admin-table-wrap">
+              <table class="admin-table"><thead><tr><th>时间</th><th>账号</th><th>操作</th><th>模型</th><th>Token</th><th>来源</th><th>状态</th></tr></thead>
+                <tbody><tr v-for="event in admin.events" :key="event.id"><td>{{ formatDate(event.created_at) }}</td><td>#{{ event.account_id }}</td><td>{{ event.operation }}</td><td>{{ event.model }}</td><td>{{ event.total_tokens }}</td><td>{{ event.usage_source }}</td><td>{{ event.status }}</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
 
-        <section id="messages" class="messages">
-          <div class="message assistant">
-            <div class="avatar">A</div>
-            <div class="bubble">
-              你好，我会优先通过标准 LangChain Agent 来处理你的聊天请求；Agent 会通过工具把明确事实保存到 SQLite，把项目/经历等长文本保存到 long_texts，并按需同步到 RAG。
-              你可以先在左侧创建档案，然后直接发资料。
+      <div v-if="auth.authenticated && activeView === 'workspace'" class="cmdk" :class="{ 'is-open': commandPaletteOpen }" :aria-hidden="String(!commandPaletteOpen)">
+        <div class="cmdk-backdrop" @click="closeCommandPalette"></div>
+        <section
+          class="cmdk-panel"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="cmdkTitle"
+        >
+          <div class="cmdk-field">
+            <span class="searchpill-dot" aria-hidden="true"></span>
+            <label class="sr-only" for="commandInput">搜索工作台动作</label>
+            <input
+              id="commandInput"
+              ref="commandInput"
+              v-model.trim="commandQuery"
+              placeholder="搜索动作，例如：补资料、导入职位、匹配"
+              @keydown.down.prevent="moveCommandSelection(1)"
+              @keydown.up.prevent="moveCommandSelection(-1)"
+              @keydown.enter.prevent="runActiveCommand"
+              @keydown.esc.prevent="closeCommandPalette"
+            />
+            <kbd>Esc</kbd>
+          </div>
+          <div class="cmdk-results">
+            <p id="cmdkTitle" class="cmdk-group">Suggested</p>
+            <div
+              v-for="(item, index) in filteredCommands"
+              :key="item.key"
+              :class="{ 'is-active': index === activeCommandIndex }"
+              class="cmdk-row"
+              @mouseenter="activeCommandIndex = index"
+            >
+              <button
+                class="cmdk-item"
+                type="button"
+                :disabled="item.disabled"
+                :title="item.description"
+                @click="runCommand(item)"
+              >
+                <span class="cmdk-title">{{ item.title }}</span>
+                <span class="kbd command-shortcut">{{ item.shortcut }}</span>
+              </button>
+              <p class="cmdk-description">{{ item.description }}</p>
+            </div>
+            <div v-if="!filteredCommands.length" class="cmdk-empty">
+              没找到对应动作。可以直接在聊天框里告诉 Agent 你想做什么。
             </div>
           </div>
         </section>
-
-        <footer class="composer">
-          <div class="composer-options">
-            <label><input id="autoRagToggle" type="checkbox" checked /> 自动增量 RAG</label>
-            <label><input id="useLlmToggle" type="checkbox" checked /> 使用 LangChain Agent（需 .env）</label>
-          </div>
-          <div class="composer-row">
-            <textarea id="messageInput" placeholder="例如：我是本科，1年经验，会 Python 和 FastAPI，做过一个求职助手项目..."></textarea>
-            <button id="sendBtn" class="send-button">发送</button>
-          </div>
-        </footer>
-      </main>
-
-      <aside class="right-panel">
-        <section class="panel">
-          <div class="panel-title">当前档案摘要</div>
-          <pre id="profileSummary" class="summary-box">请选择或创建候选人档案。</pre>
-        </section>
-
-        <section class="panel">
-          <div class="panel-title">导入 BOSS 职位文本</div>
-          <input id="jobSourceUrl" class="field" placeholder="职位链接，可选" />
-          <textarea id="jobText" class="field tall" placeholder="把 BOSS 职位详情页里你能看到的文本复制到这里。"></textarea>
-          <button id="importJobBtn" class="primary-button">导入职位</button>
-        </section>
-
-        <section class="panel">
-          <div class="panel-title">职位匹配结果</div>
-          <button id="matchJobsBtn" class="ghost-button">匹配当前候选人</button>
-          <div id="matchResults" class="match-list"></div>
-        </section>
-      </aside>
+      </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <!-- Vue 3 global build 已放入本地静态目录，避免本地页面依赖外部 CDN。 -->
+    <script src="/static/vendor/vue.global.prod.js?v=20260731-auth-admin"></script>
+    <script src="/static/app.js?v=20260731-auth-admin"></script>
   </body>
 </html>
