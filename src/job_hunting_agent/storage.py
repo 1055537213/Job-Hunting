@@ -31,6 +31,7 @@ from .models import (
     LongTextRecord,
     ProjectExperienceCard,
     ProjectExperienceRecord,
+    ResumeArtifactRecord,
     ResumeDraft,
     ResumeDraftRecord,
     UsageEventRecord,
@@ -260,6 +261,36 @@ class SQLiteStore:
                     FOREIGN KEY(job_id) REFERENCES jobs(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS resume_artifacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    account_id INTEGER,
+                    candidate_id INTEGER NOT NULL,
+                    job_id INTEGER,
+                    draft_id INTEGER,
+                    parent_artifact_id INTEGER,
+                    version INTEGER NOT NULL,
+                    artifact_type TEXT NOT NULL,
+                    original_filename TEXT NOT NULL,
+                    download_filename TEXT NOT NULL,
+                    storage_key TEXT NOT NULL UNIQUE,
+                    media_type TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    extraction_method TEXT NOT NULL,
+                    extracted_text TEXT NOT NULL,
+                    text_length INTEGER NOT NULL,
+                    page_count INTEGER,
+                    status TEXT NOT NULL,
+                    long_text_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                    FOREIGN KEY(candidate_id) REFERENCES candidate_profiles(id) ON DELETE CASCADE,
+                    FOREIGN KEY(job_id) REFERENCES jobs(id),
+                    FOREIGN KEY(draft_id) REFERENCES resume_drafts(id),
+                    FOREIGN KEY(parent_artifact_id) REFERENCES resume_artifacts(id)
+                );
+
                 """
             )
             # 兼容用户已有的本地数据库：旧表缺字段时只补充可空归属列，
@@ -271,6 +302,7 @@ class SQLiteStore:
                 "chat_messages",
                 "project_experience_cards",
                 "resume_drafts",
+                "resume_artifacts",
             ):
                 self._ensure_column(conn, table, "user_id", "INTEGER")
 
@@ -282,6 +314,7 @@ class SQLiteStore:
             self._ensure_column(conn, "chat_messages", "account_id", "INTEGER")
             self._ensure_column(conn, "project_experience_cards", "account_id", "INTEGER")
             self._ensure_column(conn, "resume_drafts", "account_id", "INTEGER")
+            self._ensure_column(conn, "resume_artifacts", "account_id", "INTEGER")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_candidate_profiles_account "
                 "ON candidate_profiles(account_id, id)"
@@ -294,6 +327,14 @@ class SQLiteStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_chat_messages_account "
                 "ON chat_messages(account_id, candidate_id, session_id, id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_resume_artifacts_owner "
+                "ON resume_artifacts(account_id, candidate_id, id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_resume_artifacts_parent "
+                "ON resume_artifacts(parent_artifact_id, draft_id)"
             )
 
     # ------------------------------------------------------------------
@@ -1272,16 +1313,26 @@ class SQLiteStore:
                 account_id=account_id,
                 candidate_id=candidate_id,
             )
-        return self.get_resume_draft(record_id)
+        return self.get_resume_draft(record_id, account_id=account_id)
 
-    def get_resume_draft(self, record_id: int) -> ResumeDraftRecord:
-        """按 ID 读取简历草稿版本。"""
+    def get_resume_draft(
+        self,
+        record_id: int,
+        account_id: int | None = None,
+    ) -> ResumeDraftRecord:
+        """按 ID 读取简历草稿版本，并在 Web 场景校验账号归属。"""
 
         with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM resume_drafts WHERE id = ?",
-                (record_id,),
-            ).fetchone()
+            if account_id is None:
+                row = conn.execute(
+                    "SELECT * FROM resume_drafts WHERE id = ?",
+                    (record_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM resume_drafts WHERE id = ? AND account_id = ?",
+                    (record_id, account_id),
+                ).fetchone()
         if row is None:
             raise KeyError(f"Resume draft not found: {record_id}")
         return self._resume_draft_from_row(row)
@@ -1332,6 +1383,204 @@ class SQLiteStore:
                     (candidate_id, job_id, account_id),
                 ).fetchall()
         return [self._resume_draft_from_row(row) for row in rows]
+
+    def save_resume_artifact(
+        self,
+        *,
+        account_id: int | None,
+        candidate_id: int,
+        artifact_type: str,
+        original_filename: str,
+        download_filename: str,
+        storage_key: str,
+        media_type: str,
+        file_size: int,
+        sha256: str,
+        extraction_method: str,
+        extracted_text: str,
+        page_count: int | None,
+        job_id: int | None = None,
+        draft_id: int | None = None,
+        parent_artifact_id: int | None = None,
+        version: int | None = None,
+        status: str = "ready",
+        register_long_text: bool = False,
+    ) -> ResumeArtifactRecord:
+        """保存一份简历文件元数据，可选地同时登记 RAG 长文本来源。
+
+        二进制文件应先由 `ResumeFileStore` 原子写入；调用方在本方法失败时负责
+        删除刚写入的文件，避免文件系统和 SQLite 之间留下孤立记录。
+        """
+
+        if artifact_type not in {"source", "tailored"}:
+            raise ValueError("简历文件类型只能是 source 或 tailored。")
+        # 这些读取同时承担所有权校验，防止跨账号拼接候选人、职位、草稿或父文件。
+        self.get_candidate_profile(candidate_id, account_id=account_id)
+        if job_id is not None:
+            self.get_job(job_id, account_id=account_id)
+        if draft_id is not None:
+            self.get_resume_draft(draft_id, account_id=account_id)
+        if parent_artifact_id is not None:
+            parent = self.get_resume_artifact(parent_artifact_id, account_id=account_id)
+            if parent.candidate_id != candidate_id:
+                raise ValueError("派生简历与源简历必须属于同一候选人。")
+
+        created_at = now_iso()
+        with self.connect() as conn:
+            actual_version = version
+            if actual_version is None:
+                row = conn.execute(
+                    """
+                    SELECT COALESCE(MAX(version), 0) AS latest_version
+                    FROM resume_artifacts
+                    WHERE candidate_id = ? AND artifact_type = ?
+                    """,
+                    (candidate_id, artifact_type),
+                ).fetchone()
+                actual_version = int(row["latest_version"]) + 1
+            cursor = conn.execute(
+                """
+                INSERT INTO resume_artifacts (
+                    account_id, candidate_id, job_id, draft_id, parent_artifact_id,
+                    version, artifact_type, original_filename, download_filename,
+                    storage_key, media_type, file_size, sha256, extraction_method,
+                    extracted_text, text_length, page_count, status, long_text_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_id,
+                    candidate_id,
+                    job_id,
+                    draft_id,
+                    parent_artifact_id,
+                    actual_version,
+                    artifact_type,
+                    original_filename,
+                    download_filename,
+                    storage_key,
+                    media_type,
+                    file_size,
+                    sha256,
+                    extraction_method,
+                    extracted_text,
+                    len(extracted_text),
+                    page_count,
+                    status,
+                    None,
+                    created_at,
+                ),
+            )
+            artifact_id = int(cursor.lastrowid)
+            if register_long_text:
+                long_text_id = self._add_long_text(
+                    conn,
+                    "resume_artifact",
+                    artifact_id,
+                    f"uploaded:{original_filename}",
+                    extracted_text,
+                    account_id=account_id,
+                    candidate_id=candidate_id,
+                )
+                conn.execute(
+                    "UPDATE resume_artifacts SET long_text_id = ? WHERE id = ?",
+                    (long_text_id, artifact_id),
+                )
+        return self.get_resume_artifact(artifact_id, account_id=account_id)
+
+    def get_resume_artifact(
+        self,
+        artifact_id: int,
+        account_id: int | None = None,
+    ) -> ResumeArtifactRecord:
+        """按 ID 读取简历文件元数据，并可强制账号过滤。"""
+
+        with self.connect() as conn:
+            if account_id is None:
+                row = conn.execute(
+                    "SELECT * FROM resume_artifacts WHERE id = ?",
+                    (artifact_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM resume_artifacts WHERE id = ? AND account_id = ?",
+                    (artifact_id, account_id),
+                ).fetchone()
+        if row is None:
+            raise KeyError(f"Resume artifact not found: {artifact_id}")
+        return self._resume_artifact_from_row(row)
+
+    def get_resume_artifact_text(
+        self,
+        artifact_id: int,
+        account_id: int | None = None,
+    ) -> str:
+        """读取简历提取正文；正文不随列表接口批量返回。"""
+
+        with self.connect() as conn:
+            if account_id is None:
+                row = conn.execute(
+                    "SELECT extracted_text FROM resume_artifacts WHERE id = ?",
+                    (artifact_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT extracted_text FROM resume_artifacts
+                    WHERE id = ? AND account_id = ?
+                    """,
+                    (artifact_id, account_id),
+                ).fetchone()
+        if row is None:
+            raise KeyError(f"Resume artifact not found: {artifact_id}")
+        return str(row["extracted_text"])
+
+    def list_resume_artifacts(
+        self,
+        candidate_id: int,
+        account_id: int | None = None,
+    ) -> list[ResumeArtifactRecord]:
+        """按创建顺序列出候选人的原始和职位定制简历文件。"""
+
+        with self.connect() as conn:
+            if account_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM resume_artifacts WHERE candidate_id = ? ORDER BY id",
+                    (candidate_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM resume_artifacts
+                    WHERE candidate_id = ? AND account_id = ?
+                    ORDER BY id
+                    """,
+                    (candidate_id, account_id),
+                ).fetchall()
+        return [self._resume_artifact_from_row(row) for row in rows]
+
+    def delete_resume_artifacts(
+        self,
+        artifact_ids: list[int],
+        account_id: int | None = None,
+    ) -> None:
+        """回滚未完整生成的派生文件元数据。
+
+        该方法只用于应用层生成两个导出格式时的补偿事务；正常用户操作不删除历史版本。
+        """
+
+        if not artifact_ids:
+            return
+        placeholders = ", ".join("?" for _ in artifact_ids)
+        parameters: list[object] = list(artifact_ids)
+        owner_clause = ""
+        if account_id is not None:
+            owner_clause = " AND account_id = ?"
+            parameters.append(account_id)
+        with self.connect() as conn:
+            conn.execute(
+                f"DELETE FROM resume_artifacts WHERE id IN ({placeholders}){owner_clause}",
+                tuple(parameters),
+            )
 
     def _job_from_row(self, row: sqlite3.Row) -> ImportedJob:
         """把 jobs 表的一行转换成 `ImportedJob`。"""
@@ -1385,6 +1634,36 @@ class SQLiteStore:
             status=row["status"],
             draft=draft,
             created_at=row["created_at"],
+        )
+
+    def _resume_artifact_from_row(self, row: sqlite3.Row) -> ResumeArtifactRecord:
+        """把简历文件表的一行转换成不携带全文的领域记录。"""
+
+        return ResumeArtifactRecord(
+            id=int(row["id"]),
+            account_id=int(row["account_id"]) if row["account_id"] is not None else None,
+            candidate_id=int(row["candidate_id"]),
+            job_id=int(row["job_id"]) if row["job_id"] is not None else None,
+            draft_id=int(row["draft_id"]) if row["draft_id"] is not None else None,
+            parent_artifact_id=(
+                int(row["parent_artifact_id"])
+                if row["parent_artifact_id"] is not None
+                else None
+            ),
+            version=int(row["version"]),
+            artifact_type=str(row["artifact_type"]),
+            original_filename=str(row["original_filename"]),
+            download_filename=str(row["download_filename"]),
+            storage_key=str(row["storage_key"]),
+            media_type=str(row["media_type"]),
+            file_size=int(row["file_size"]),
+            sha256=str(row["sha256"]),
+            extraction_method=str(row["extraction_method"]),
+            text_length=int(row["text_length"]),
+            page_count=int(row["page_count"]) if row["page_count"] is not None else None,
+            status=str(row["status"]),
+            long_text_id=int(row["long_text_id"]) if row["long_text_id"] is not None else None,
+            created_at=str(row["created_at"]),
         )
 
     def _chat_message_from_row(self, row: sqlite3.Row) -> ChatMessageRecord:
