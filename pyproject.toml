@@ -32,8 +32,12 @@ job-agent-web = "job_hunting_agent.web:main"
 
 [tool.setuptools.package-data]
 # Web 前端静态资源需要随 Python 包一起安装。
-job_hunting_agent = ["web_static/*"]
+job_hunting_agent = ["web_static/*", "web_static/vendor/*"]
 
 [tool.pytest.ini_options]
 # 让 pytest 在不安装包的情况下，也能从 src/ 找到项目代码。
 pythonpath = ["src"]
+# 只收集正式测试目录，避免扫描 data/ 中已忽略的运行文件和历史临时目录。
+testpaths = ["tests"]
+# 项目不依赖 pytest 增量缓存；关闭缓存也避免异常 ACL 的旧目录影响测试。
+addopts = "-p no:cacheprovider"

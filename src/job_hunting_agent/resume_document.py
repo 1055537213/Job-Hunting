@@ -30,6 +30,8 @@ DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingm
 PDF_MEDIA_TYPE = "application/pdf"
 MAX_RESUME_FILE_BYTES = 20 * 1024 * 1024
 MAX_PDF_PAGES = 30
+MAX_DOCX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+MAX_DOCX_XML_PART_BYTES = 10 * 1024 * 1024
 MIN_DOCUMENT_TEXT_CHARS = 20
 MIN_PDF_TEXT_CHARS_PER_PAGE = 20
 WORD_NAMESPACE = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -157,6 +159,14 @@ def sanitize_download_filename(filename: str, fallback: str = "resume") -> str:
     cleaned = re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", basename).strip(" .")
     if not cleaned:
         cleaned = fallback
+    if len(cleaned) <= 120:
+        return cleaned
+
+    # 截断超长源文件名时保留扩展名，否则合法 DOCX/PDF 会在后续签名检查前被误拒绝。
+    suffix = Path(cleaned).suffix
+    if suffix and len(suffix) < 120:
+        stem = cleaned[: -len(suffix)][: 120 - len(suffix)].rstrip(" .")
+        return f"{stem or fallback}{suffix}"
     return cleaned[:120]
 
 
@@ -176,6 +186,7 @@ def extract_docx(content: bytes) -> ResumeExtraction:
                 for name in sorted(names)
                 if re.fullmatch(r"word/(?:header|footer)\d+\.xml", name)
             )
+            validate_docx_archive_sizes(archive, part_names)
             lines: list[str] = []
             for part_name in part_names:
                 lines.extend(extract_ooxml_paragraphs(archive.read(part_name)))
@@ -187,6 +198,16 @@ def extract_docx(content: bytes) -> ResumeExtraction:
     text = normalize_extracted_text("\n".join(lines))
     ensure_meaningful_resume_text(text)
     return ResumeExtraction(text=text, method="docx", page_count=None)
+
+
+def validate_docx_archive_sizes(archive: zipfile.ZipFile, part_names: list[str]) -> None:
+    """在解压 XML 前拒绝异常膨胀的 DOCX，降低压缩炸弹造成的内存风险。"""
+
+    if sum(info.file_size for info in archive.infolist()) > MAX_DOCX_UNCOMPRESSED_BYTES:
+        raise ResumeDocumentError("DOCX 解压后内容过大，请压缩图片或精简文档后重试。")
+    for part_name in part_names:
+        if archive.getinfo(part_name).file_size > MAX_DOCX_XML_PART_BYTES:
+            raise ResumeDocumentError("DOCX 正文结构异常过大，无法安全读取。")
 
 
 def extract_ooxml_paragraphs(xml_content: bytes) -> list[str]:

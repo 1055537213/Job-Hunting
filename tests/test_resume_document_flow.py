@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import zipfile
 from io import BytesIO
 
 import pytest
@@ -17,7 +18,12 @@ from reportlab.pdfgen import canvas
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.llm import StaticLLMClient
 from job_hunting_agent.models import CandidateProfileInput
-from job_hunting_agent.resume_document import ResumeDocumentError, extract_resume_document
+from job_hunting_agent import resume_document
+from job_hunting_agent.resume_document import (
+    ResumeDocumentError,
+    extract_resume_document,
+    sanitize_download_filename,
+)
 from job_hunting_agent.web import create_web_app
 
 
@@ -144,6 +150,33 @@ def test_resume_parser_rejects_unsupported_or_corrupt_files(filename: str, conte
         extract_resume_document(filename, content)
 
 
+def test_docx_parser_rejects_abnormally_large_uncompressed_xml(monkeypatch) -> None:
+    """DOCX 在读取 XML 前必须限制解压大小，避免小压缩包异常膨胀。"""
+
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", "<Types />")
+        archive.writestr(
+            "word/document.xml",
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            + ("A" * 2_000)
+            + "</w:document>",
+        )
+    monkeypatch.setattr(resume_document, "MAX_DOCX_XML_PART_BYTES", 1_000)
+
+    with pytest.raises(ResumeDocumentError, match="结构异常过大"):
+        extract_resume_document("resume.docx", output.getvalue())
+
+
+def test_sanitized_long_resume_filename_keeps_supported_extension() -> None:
+    """超长下载名被截断后仍应保留扩展名，避免合法简历被误判格式。"""
+
+    filename = sanitize_download_filename(("候选人" * 80) + ".docx")
+
+    assert len(filename) <= 120
+    assert filename.endswith(".docx")
+
+
 def test_app_saves_uploaded_resume_as_versioned_artifact_and_rag_source(tmp_path) -> None:
     """上传简历应同时保存原文件、受控元数据和一条候选人范围的长文本来源。"""
 
@@ -223,6 +256,8 @@ def test_web_upload_list_and_download_are_scoped_to_logged_in_account(tmp_path) 
     artifact = uploaded.json()["artifact"]
     assert artifact["extraction_method"] == "docx"
     assert artifact["download_url"].endswith(f"/{artifact['id']}/download")
+    assert "storage_key" not in artifact
+    assert "account_id" not in artifact
     listed = owner.get("/api/resumes", params={"candidate_id": candidate_id})
     downloaded = owner.get(artifact["download_url"])
     forbidden = stranger.get(artifact["download_url"])

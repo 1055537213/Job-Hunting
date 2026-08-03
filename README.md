@@ -129,6 +129,7 @@ Job-hunting Agent/
 │     └─ web_static/
 │        ├─ index.html            # Vue 3 页面结构
 │        ├─ app.js                # 前端状态、请求和流式聊天
+│        ├─ china_cities.js       # 中国省份和城市二级选择数据
 │        ├─ styles.css            # 页面样式
 │        ├─ tokens.css            # 前端设计 Token
 │        └─ vendor/vue.global.prod.js
