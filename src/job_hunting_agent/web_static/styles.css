@@ -409,6 +409,19 @@ textarea::placeholder,
   color: var(--color-muted-2);
 }
 
+/* 原生分组下拉在展开时以较深底色区分省份标题。 */
+.field optgroup {
+  color: var(--color-ink);
+  background: var(--color-paper-2);
+  font-weight: 700;
+}
+
+.field option {
+  color: var(--color-ink-2);
+  background: var(--color-paper);
+  font-weight: 400;
+}
+
 .field:focus-visible,
 textarea:focus-visible,
 .cmdk-field input:focus-visible {

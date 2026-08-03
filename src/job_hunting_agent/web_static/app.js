@@ -15,6 +15,18 @@ if (!window.Vue) {
   const { createApp, nextTick } = window.Vue;
   const DEFAULT_USE_LANGCHAIN_AGENT = true;
   const DEFAULT_AUTO_INCREMENTAL_RAG = true;
+  const PINYIN_COLLATOR = new Intl.Collator("zh-CN-u-co-pinyin");
+
+  /** 克隆并按拼音排列省份和城市，避免改变静态数据源。 */
+  function buildSortedCityGroups() {
+    const source = Array.isArray(window.CHINA_CITY_GROUPS) ? window.CHINA_CITY_GROUPS : [];
+    return source
+      .map((group) => ({
+        province: group.province,
+        cities: [...group.cities].sort(PINYIN_COLLATOR.compare),
+      }))
+      .sort((left, right) => PINYIN_COLLATOR.compare(left.province, right.province));
+  }
 
   const WELCOME_MESSAGE =
     "你好，我会默认通过标准 LangChain Agent 来处理你的聊天请求，并自动把新增长文本增量同步到 RAG。\n你可以先在左侧创建档案，然后直接发资料；如果模型、.env 或 embedding 配置有问题，页面会直接显示后端返回的原因。";
@@ -49,12 +61,13 @@ if (!window.Vue) {
         messages: [],
         currentProfileId: Number(localStorage.getItem("currentProfileId") || 0),
         messageInput: "",
+        cityGroups: buildSortedCityGroups(),
         profileForm: {
           name: "",
           education: "",
           experienceYears: 0,
           skills: "",
-          cities: "",
+          city: "",
           directions: "",
         },
         jobForm: {
@@ -541,7 +554,7 @@ if (!window.Vue) {
             education: this.profileForm.education.trim() || "待补充",
             experience_years: Number(this.profileForm.experienceYears || 0),
             skills: this.parseSkills(this.profileForm.skills),
-            preferred_cities: this.splitItems(this.profileForm.cities),
+            preferred_cities: this.profileForm.city ? [this.profileForm.city] : [],
             salary_floor_k: null,
             expected_salary_k: null,
             target_directions: this.splitItems(this.profileForm.directions),
@@ -560,7 +573,7 @@ if (!window.Vue) {
             education: "",
             experienceYears: 0,
             skills: "",
-            cities: "",
+            city: "",
             directions: "",
           };
         } catch (error) {

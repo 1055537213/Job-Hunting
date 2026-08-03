@@ -102,6 +102,35 @@ def test_web_frontend_defaults_to_agent_and_incremental_rag_without_toggles(tmp_
     assert "this.useLlm =" not in script
 
 
+def test_web_profile_form_uses_recovered_selectors_and_auth_copy(tmp_path):
+    """恢复注册密码显示、学历枚举和单框省市选择等前端约束。"""
+
+    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+
+    home = client.get("/").text
+    script = client.get("/static/app.js").text
+    cities = client.get("/static/china_cities.js")
+
+    assert ':type="authMode === \'register\' ? \'text\' : \'password\'"' in home
+    assert 'placeholder="例如：小林"' not in home
+    assert 'placeholder="Python=项目使用,FastAPI=待确认"' not in home
+    assert 'placeholder="AI Agent 应用开发"' not in home
+    assert "Local Boundary" not in home
+    assert "运行边界" not in home
+    assert home.count("退出所有设备") == 1
+    for education in ("高中及以下", "大专", "本科", "硕士", "博士"):
+        assert f'<option value="{education}">{education}</option>' in home
+    assert 'v-for="province in cityGroups"' in home
+    assert 'v-for="city in province.cities"' in home
+    assert '/static/china_cities.js?v=20260803-cities' in home
+    assert "cityGroups: buildSortedCityGroups()" in script
+    assert "preferred_cities: this.profileForm.city ? [this.profileForm.city] : []" in script
+    assert cities.status_code == 200
+    assert "北京市" in cities.text
+    assert "广州市" in cities.text
+    assert "乌鲁木齐市" in cities.text
+
+
 def test_web_can_create_profile_and_ingest_chat_message_incrementally(tmp_path):
     """网页 API 可以创建候选人档案，并通过聊天消息自动入库和增量索引。"""
 
