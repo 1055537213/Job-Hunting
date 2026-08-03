@@ -58,6 +58,8 @@ if (!window.Vue) {
         profiles: [],
         jobs: [],
         matches: [],
+        resumeArtifacts: [],
+        resumeJobSelections: {},
         messages: [],
         currentProfileId: Number(localStorage.getItem("currentProfileId") || 0),
         messageInput: "",
@@ -84,6 +86,9 @@ if (!window.Vue) {
         loadingJobs: false,
         importingJob: false,
         loadingMatches: false,
+        uploadingResume: false,
+        tailoringArtifactId: 0,
+        resumeError: "",
         sending: false,
         jobImportError: "",
         commandPaletteOpen: false,
@@ -142,6 +147,14 @@ if (!window.Vue) {
             shortcut: "Paste",
             action: "focusJobImport",
             disabled: false,
+          },
+          {
+            key: "resume-upload",
+            title: "上传简历",
+            description: "为当前候选人上传 DOCX 或 PDF 简历文件。",
+            shortcut: "DOCX PDF",
+            action: "triggerResumeUpload",
+            disabled: !this.currentProfileId || this.uploadingResume,
           },
           {
             key: "match",
@@ -266,6 +279,8 @@ if (!window.Vue) {
         this.profiles = [];
         this.jobs = [];
         this.matches = [];
+        this.resumeArtifacts = [];
+        this.resumeJobSelections = {};
       },
 
       /** 撤销当前账号在所有设备上的 Session，并回到登录页。 */
@@ -282,6 +297,8 @@ if (!window.Vue) {
         this.profiles = [];
         this.jobs = [];
         this.matches = [];
+        this.resumeArtifacts = [];
+        this.resumeJobSelections = {};
         this.sessions = [];
         this.activeSessionId = "";
       },
@@ -424,6 +441,15 @@ if (!window.Vue) {
         });
       },
 
+      /** 打开当前候选人的本地 DOCX/PDF 文件选择器。 */
+      triggerResumeUpload() {
+        if (!this.currentProfileId) {
+          this.appendAssistant("请先创建或选择候选人档案，再上传简历。", true);
+          return;
+        }
+        this.$refs.resumeFileInput?.click();
+      },
+
       /**
        * 初始化页面所需数据。
        *
@@ -468,6 +494,7 @@ if (!window.Vue) {
             localStorage.removeItem("currentProfileId");
             this.setWelcomeMessage();
             this.matches = [];
+            this.resumeArtifacts = [];
             return;
           }
 
@@ -478,6 +505,7 @@ if (!window.Vue) {
           await this.refreshCurrentProfile();
           await this.loadChatSessions();
           await this.loadChatHistory();
+          await this.loadResumeArtifacts();
           await this.matchJobs(true);
         } finally {
           this.loadingProfiles = false;
@@ -490,11 +518,14 @@ if (!window.Vue) {
         if (!this.currentProfileId) {
           this.setWelcomeMessage();
           this.matches = [];
+          this.resumeArtifacts = [];
+          this.resumeJobSelections = {};
           return;
         }
         await this.refreshCurrentProfile();
         await this.loadChatSessions();
         await this.loadChatHistory();
+        await this.loadResumeArtifacts();
         await this.matchJobs(true);
       },
 
@@ -907,6 +938,154 @@ if (!window.Vue) {
           }
         }
         return lines.join("\n");
+      },
+
+      /** 上传当前选择的 DOCX/PDF，并让后端完成解析、保存和增量 RAG。 */
+      async uploadResume(event) {
+        const input = event?.target || this.$refs.resumeFileInput;
+        const file = input?.files?.[0];
+        if (!file) {
+          return;
+        }
+        if (!this.currentProfileId) {
+          this.resumeError = "请先选择候选人档案。";
+          input.value = "";
+          return;
+        }
+        if (file.size > 20 * 1024 * 1024) {
+          this.resumeError = "简历文件不能超过 20 MB。";
+          input.value = "";
+          return;
+        }
+
+        this.uploadingResume = true;
+        this.resumeError = "";
+        try {
+          const form = new FormData();
+          form.append("candidate_id", String(this.currentProfileId));
+          form.append("file", file, file.name);
+          const data = await this.requestFormJson("/api/resumes/upload", form);
+          await this.loadResumeArtifacts();
+          const method = this.resumeExtractionLabel(data.artifact.extraction_method);
+          const indexLine = data.warning || "简历正文已增量同步到当前账号的 RAG。";
+          this.appendAssistant(
+            `已上传简历：**${data.artifact.download_filename}**\n\n解析方式：${method}\n\n${indexLine}`,
+            Boolean(data.warning)
+          );
+        } catch (error) {
+          this.resumeError = error.message || "简历上传失败。";
+          this.appendAssistant(this.resumeError, true);
+        } finally {
+          this.uploadingResume = false;
+          input.value = "";
+        }
+      },
+
+      /** 恢复当前候选人的原始和职位定制简历文件列表。 */
+      async loadResumeArtifacts() {
+        if (!this.currentProfileId) {
+          this.resumeArtifacts = [];
+          this.resumeJobSelections = {};
+          return;
+        }
+        try {
+          const data = await this.requestJson(
+            `/api/resumes?candidate_id=${encodeURIComponent(this.currentProfileId)}`
+          );
+          this.resumeArtifacts = data.artifacts || [];
+          const activeSourceIds = new Set(
+            this.resumeArtifacts
+              .filter((artifact) => artifact.artifact_type === "source")
+              .map((artifact) => String(artifact.id))
+          );
+          const nextSelections = Object.fromEntries(
+            Object.entries(this.resumeJobSelections).filter(([artifactId]) =>
+              activeSourceIds.has(String(artifactId))
+            )
+          );
+          for (const artifactId of activeSourceIds) {
+            if (!(artifactId in nextSelections)) {
+              nextSelections[artifactId] = 0;
+            }
+          }
+          this.resumeJobSelections = nextSelections;
+        } catch (error) {
+          this.resumeArtifacts = [];
+          this.resumeError = error.message || "简历列表加载失败。";
+        }
+      },
+
+      /** 用选定职位改写原始简历，并刷新 DOCX/PDF 下载版本。 */
+      async tailorResume(artifact) {
+        const jobId = Number(this.resumeJobSelections[artifact.id] || 0);
+        if (!jobId) {
+          this.resumeError = "请先为这份简历选择目标职位。";
+          return;
+        }
+
+        this.tailoringArtifactId = artifact.id;
+        this.resumeError = "";
+        try {
+          const data = await this.requestJson(`/api/resumes/${artifact.id}/tailor`, {
+            method: "POST",
+            body: JSON.stringify({
+              job_id: jobId,
+              use_rag: true,
+              allow_proficiency_upgrade: false,
+            }),
+          });
+          await this.loadResumeArtifacts();
+          const links = (data.artifacts || [])
+            .map((item) => `- [下载 ${this.resumeFileExtension(item)}](${item.download_url})`)
+            .join("\n");
+          const fallbackWarning = data.draft?.draft?.llm_discarded
+            ? "\n\n模型改写未通过真实性检查，当前文件使用了保守回退内容。"
+            : "";
+          this.appendAssistant(
+            `已生成 **${this.jobTitle(jobId)}** 的职位定制简历。\n\n${links}${fallbackWarning}`
+          );
+        } catch (error) {
+          this.resumeError = error.message || "职位定制简历生成失败。";
+          this.appendAssistant(this.resumeError, true);
+        } finally {
+          this.tailoringArtifactId = 0;
+        }
+      },
+
+      /** 将后端解析方式转换为简短、稳定的页面标签。 */
+      resumeExtractionLabel(method) {
+        return {
+          docx: "Word 文本",
+          pdf_text: "PDF 文本层",
+          pdf_ocr: "扫描 PDF OCR",
+          pdf_mixed: "PDF 文本 + OCR",
+          generated: "Agent 定制",
+        }[method] || "已解析";
+      },
+
+      /** 区分用户上传的源文件和 Agent 生成的职位定制版本。 */
+      resumeArtifactKind(artifact) {
+        return artifact.artifact_type === "source" ? "原始" : "定制";
+      },
+
+      /** 从文件名提取下载按钮使用的格式标签。 */
+      resumeFileExtension(artifact) {
+        const parts = String(artifact.download_filename || "文件").split(".");
+        return parts.length > 1 ? parts.pop().toUpperCase() : "文件";
+      },
+
+      /** 格式化文件大小，避免页面显示难读的原始字节数。 */
+      formatFileSize(bytes) {
+        const value = Number(bytes || 0);
+        if (value >= 1024 * 1024) {
+          return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+        }
+        return `${Math.max(1, Math.round(value / 1024))} KB`;
+      },
+
+      /** 根据职位 ID 返回当前账号职位池中的标题。 */
+      jobTitle(jobId) {
+        return this.jobs.find((job) => Number(job.id) === Number(jobId))?.title || "目标职位";
       },
 
       /** 导入职位文本；后端会先验证它是否确实像招聘职位。 */
@@ -1441,6 +1620,20 @@ if (!window.Vue) {
             "Content-Type": "application/json",
             ...(options.headers || {}),
           },
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data.detail || `请求失败：${response.status}`);
+        }
+        return data;
+      },
+
+      /** 发送 multipart/form-data；浏览器负责生成带 boundary 的 Content-Type。 */
+      async requestFormJson(url, formData) {
+        const response = await fetch(url, {
+          method: "POST",
+          credentials: "same-origin",
+          body: formData,
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {

@@ -66,7 +66,7 @@ AGENT_SYSTEM_PROMPT = """
 你的职责：
 1. 在当前会话已经绑定候选人档案时，帮用户整理并保存候选人资料。
 2. 基于本地已导入职位做匹配分析。
-3. 为职位生成职位定制简历草稿。
+3. 为职位生成职位定制简历草稿，或基于用户已上传的简历生成 DOCX/PDF 文件。
 4. 对本地项目进行分析，并等待候选人确认项目摘要。
 
 你必须遵守这些边界：
@@ -79,7 +79,10 @@ AGENT_SYSTEM_PROMPT = """
   并明确提醒用户先创建或选择候选人，再继续保存资料。
 - 当用户补充资料时，优先调用 ingest_candidate_message。
 - 当用户问“适合哪些岗位”时，优先调用 match_all_jobs_for_candidate。
-- 当用户让你改简历时，优先调用 create_resume_draft_for_job。
+- 当用户让你改简历时，先调用 list_resume_artifacts_for_candidate 查看是否有原始上传文件。
+- 如果存在原始上传文件，优先调用 create_tailored_resume_from_upload，并把返回的下载链接告诉用户。
+- 如果没有上传文件，才调用 create_resume_draft_for_job 生成纯文本草稿。
+- `allow_proficiency_upgrade` 只能在用户明确要求提高熟练度措辞时设为 true。
 
 最终回复请使用中文，先说你已经完成了什么，再简洁说明下一步建议。
 """.strip()
@@ -120,7 +123,20 @@ class JobHuntingAgent:
         self.app = app
         self.env_path = Path(env_path)
         self.rag_dir = Path(rag_dir)
-        self.model = model or build_chat_model(load_llm_settings(self.env_path))
+        if model is None:
+            llm_settings = load_llm_settings(self.env_path)
+            self.model = build_chat_model(llm_settings)
+            self.tool_llm_available = True
+        else:
+            self.model = model
+            # 注入主模型常用于离线测试或自托管模型。工具内的二次单轮 LLM 仍由
+            # `.env` 独立创建；配置不存在时使用规则实现，而不是让整轮 Agent 返回 502。
+            try:
+                load_llm_settings(self.env_path)
+            except ValueError:
+                self.tool_llm_available = False
+            else:
+                self.tool_llm_available = True
         self.memory_settings = memory_settings or load_agent_memory_settings(self.env_path)
         self._restored_sessions: set[tuple[int | None, int | None, str]] = set()
         self.graph = create_agent(
@@ -154,7 +170,7 @@ class JobHuntingAgent:
                 "account_id": account_id,
                 "session_id": resolved_session_id,
                 "rag_dir": str(self.rag_dir),
-                "use_tool_llm": use_tool_llm,
+                "use_tool_llm": use_tool_llm and self.tool_llm_available,
                 "default_auto_rag": auto_rag,
                 "root_request_id": root_request_id,
             },
@@ -213,7 +229,7 @@ class JobHuntingAgent:
                 "account_id": account_id,
                 "session_id": resolved_session_id,
                 "rag_dir": str(self.rag_dir),
-                "use_tool_llm": use_tool_llm,
+                "use_tool_llm": use_tool_llm and self.tool_llm_available,
                 "default_auto_rag": auto_rag,
                 "root_request_id": root_request_id,
             },
@@ -526,6 +542,75 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
         )
         return dumps_tool_output(asdict(draft))
 
+    @tool
+    def list_resume_artifacts_for_candidate(runtime: ToolRuntime) -> str:
+        """列出当前候选人已上传和已生成的简历文件，供改写前选择源文件。"""
+
+        context = require_runtime_context(runtime)
+        candidate_id = require_candidate_id(context)
+        artifacts = app.list_resume_artifacts(
+            candidate_id,
+            account_id=context.get("account_id"),
+        )
+        return dumps_tool_output(
+            {
+                "artifacts": [
+                    resume_artifact_tool_payload(artifact)
+                    for artifact in artifacts
+                ]
+            }
+        )
+
+    @tool
+    def create_tailored_resume_from_upload(
+        source_artifact_id: int,
+        job_id: int,
+        runtime: ToolRuntime,
+        use_rag: bool = True,
+        rag_query: str | None = None,
+        allow_proficiency_upgrade: bool = False,
+    ) -> str:
+        """基于当前候选人的原始上传简历生成职位定制 DOCX/PDF 和独立草稿版本。
+
+        默认不得拔高技能熟练度。只有用户在当前对话中明确要求提高熟练度措辞时，
+        才能把 `allow_proficiency_upgrade` 设为 true；生成结果始终不会覆盖原文件或档案。
+        """
+
+        context = require_runtime_context(runtime)
+        candidate_id = require_candidate_id(context)
+        account_id = context.get("account_id")
+        llm_client = (
+            load_tool_llm_client(
+                env_path,
+                usage_callback=build_tool_usage_callback(
+                    app,
+                    context,
+                    "resume_document_rewrite",
+                ),
+            )
+            if context["use_tool_llm"]
+            else None
+        )
+        result = app.create_tailored_resume_from_artifact(
+            candidate_id=candidate_id,
+            source_artifact_id=source_artifact_id,
+            job_id=job_id,
+            llm_client=llm_client,
+            rag_persist_directory=context["rag_dir"] if use_rag else None,
+            rag_query=rag_query,
+            allow_proficiency_upgrade=allow_proficiency_upgrade,
+            account_id=account_id,
+        )
+        return dumps_tool_output(
+            {
+                "draft": asdict(result.draft),
+                "artifacts": [
+                    resume_artifact_tool_payload(artifact)
+                    for artifact in result.artifacts
+                ],
+            }
+        )
+
     return [
         ingest_candidate_message,
         get_current_candidate_profile,
@@ -538,6 +623,8 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
         analyze_local_project_for_candidate,
         confirm_project_card,
         create_resume_draft_for_job,
+        list_resume_artifacts_for_candidate,
+        create_tailored_resume_from_upload,
     ]
 
 
@@ -594,6 +681,16 @@ def dumps_tool_output(value: dict[str, Any]) -> str:
     """统一序列化工具输出，方便 Agent 阅读，也方便 Web/CLI 再解析。"""
 
     return json.dumps(value, ensure_ascii=False, indent=2)
+
+
+def resume_artifact_tool_payload(artifact) -> dict[str, Any]:  # noqa: ANN001
+    """把简历文件记录转换为 Agent 可读且不泄露服务器路径的工具结果。"""
+
+    payload = asdict(artifact)
+    payload.pop("storage_key", None)
+    payload.pop("account_id", None)
+    payload["download_url"] = f"/api/resumes/{artifact.id}/download"
+    return payload
 
 
 def extract_usage_metadata(message: object) -> dict[str, int]:

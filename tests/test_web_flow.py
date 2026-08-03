@@ -73,6 +73,17 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert "Vue" in vue.text
 
 
+def test_web_health_reports_enabled_memory_as_configured(tmp_path):
+    """记忆配置成功且启用时，健康接口不能错误显示为未配置。"""
+
+    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+
+    health = client.get("/api/health")
+
+    assert health.status_code == 200
+    assert health.json()["memory"]["configured"] is True
+
+
 def test_web_auth_bootstrap_does_not_surface_probe_errors_in_login_form(tmp_path):
     """初始化 Session 探测失败时，不应把错误提前显示成登录失败。"""
 
@@ -164,7 +175,7 @@ def test_web_can_create_profile_and_ingest_chat_message_incrementally(tmp_path):
     profile = client.get(f"/api/profiles/{candidate_id}").json()["profile"]
     rag = client.get("/api/rag/search", params={"query": "FastAPI 求职助手"}).json()
 
-    assert chat.status_code == 200
+    assert chat.status_code == 200, chat.text
     assert chat.json()["result"]["rag_update_mode"] == "incremental"
     assert profile["education"] == "本科"
     assert profile["skills"]["Python"] == "待确认"
@@ -445,7 +456,7 @@ def test_web_chat_can_use_langchain_agent_mode(tmp_path):
         },
     )
 
-    assert chat.status_code == 200
+    assert chat.status_code == 200, chat.text
     assert chat.json()["mode"] == "langchain_agent"
     assert "ingest_candidate_message" in chat.json()["used_tools"]
 

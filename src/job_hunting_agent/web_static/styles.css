@@ -724,9 +724,75 @@ textarea:focus-visible,
 }
 
 .job-list,
-.match-list {
+.match-list,
+.resume-artifact-list {
   display: grid;
   gap: var(--space-sm);
+}
+
+.resume-artifact-list {
+  gap: var(--rule-thin);
+  overflow: hidden;
+  background: var(--color-rule);
+  border: var(--rule-thin) solid var(--color-rule);
+  border-radius: var(--radius-md);
+}
+
+.resume-artifact-row {
+  min-width: 0;
+  display: grid;
+  gap: var(--space-xs);
+  padding: var(--space-sm);
+  background: var(--color-paper);
+}
+
+.resume-artifact-head {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-xs);
+}
+
+.resume-artifact-head strong {
+  min-width: 0;
+  color: var(--color-ink);
+  font-size: var(--text-sm);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.file-kind,
+.resume-artifact-meta {
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.file-kind {
+  flex: 0 0 auto;
+  color: var(--color-accent);
+  font-weight: 700;
+}
+
+.resume-tailor-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-xs);
+}
+
+.resume-tailor-controls .field {
+  min-width: 0;
+}
+
+.resume-download {
+  width: 100%;
+  text-decoration: none;
+}
+
+.compact-empty {
+  border: 0;
+  border-radius: 0;
 }
 
 .job-card,

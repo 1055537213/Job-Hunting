@@ -19,12 +19,12 @@ import uuid
 from dataclasses import asdict
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .agent import JobHuntingAgent
+from .agent import JobHuntingAgent, build_tool_usage_callback, load_tool_llm_client
 from .app import JobHuntingApp
 from .auth import (
     hash_password,
@@ -43,9 +43,11 @@ from .config import (
     masked_embedding_settings,
     masked_llm_settings,
 )
-from .models import AccountRecord, CandidateProfileInput
+from .models import AccountRecord, CandidateProfileInput, ResumeArtifactRecord
 from .job_parser import InvalidJobTextError
+from .llm import LLMClient, LLMRequestError
 from .rag import EmbeddingRequestError
+from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
 
 
 STATIC_DIR = Path(__file__).with_name("web_static")
@@ -136,11 +138,22 @@ class ChatSessionPayload(BaseModel):
     job_id: int | None = None
 
 
+class TailorResumePayload(BaseModel):
+    """根据一份已上传简历生成职位定制文件时提交的参数。"""
+
+    job_id: int
+    use_rag: bool = True
+    # 只有用户明确要求拔高技能措辞时才允许为 true；网页默认始终保持保守表达。
+    allow_proficiency_upgrade: bool = False
+
+
 def create_web_app(
     db_path: str | Path = "data/job_agent.db",
     env_file: str | Path = ".env",
     rag_dir: str | Path = "data/chroma",
+    resume_dir: str | Path | None = None,
     chat_agent: JobHuntingAgent | None = None,
+    resume_llm_client: LLMClient | None = None,
     require_auth: bool = True,
 ) -> FastAPI:
     """创建本地 FastAPI 应用。
@@ -152,7 +165,7 @@ def create_web_app(
     - Web 层自己不直接碰 SQLite 连接、RAG 向量库细节或厂商 SDK。
     """
 
-    backend = JobHuntingApp(db_path, env_file)
+    backend = JobHuntingApp(db_path, env_file, resume_dir=resume_dir)
     backend.initialize()
     env_path = Path(env_file)
     rag_path = Path(rag_dir)
@@ -325,7 +338,7 @@ def create_web_app(
                 "agent": {"configured": chat_agent is not None},
                 "llm": {"configured": bool(llm_config.get("configured"))},
                 "embedding": {"configured": bool(embedding_config.get("configured"))},
-                "memory": {"configured": bool(memory_config.get("configured"))},
+                "memory": {"configured": bool(memory_config.get("enabled"))},
             }
         return {
             "status": "ok",
@@ -651,6 +664,149 @@ def create_web_app(
             ],
         }
 
+    @web_app.post("/api/resumes/upload")
+    async def upload_resume(
+        request: Request,
+        candidate_id: int = Form(...),
+        file: UploadFile = File(...),
+    ) -> dict[str, object]:
+        """上传并解析 DOCX/PDF 简历，然后自动增量登记到当前账号的 RAG。"""
+
+        account = current_account(request)
+        account_id = account.id if account else None
+        get_profile_or_404(backend, candidate_id, account_id)
+        filename = file.filename or "resume"
+        # 多读一个字节即可判断超限，避免把任意大文件一次性长期保留在内存中。
+        content = await file.read(MAX_RESUME_FILE_BYTES + 1)
+        try:
+            artifact = backend.upload_resume_document(
+                candidate_id,
+                filename,
+                content,
+                account_id=account_id,
+            )
+        except ResumeDocumentError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+        rag_update = None
+        rag_warning = None
+        if artifact.long_text_id is not None:
+            try:
+                rag_update = asdict(
+                    backend.index_rag_long_texts(
+                        [artifact.long_text_id],
+                        rag_path,
+                        account_id=account_id,
+                    )
+                )
+            except EmbeddingRequestError as error:
+                # 文件与 SQLite 正文已经安全保存；索引失败单独告知，避免用户重复上传。
+                rag_warning = f"简历已保存，但 RAG 增量索引失败：{error}"
+        return {
+            "artifact": serialize_resume_artifact(artifact),
+            "rag_update": rag_update,
+            "warning": rag_warning,
+        }
+
+    @web_app.get("/api/resumes")
+    def list_resumes(
+        request: Request,
+        candidate_id: int = Query(...),
+    ) -> dict[str, object]:
+        """列出当前账号指定候选人的全部简历文件版本。"""
+
+        account = current_account(request)
+        try:
+            artifacts = backend.list_resume_artifacts(
+                candidate_id,
+                account_id=account.id if account else None,
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="候选人档案不存在。") from error
+        return {"artifacts": [serialize_resume_artifact(item) for item in artifacts]}
+
+    @web_app.get("/api/resumes/{artifact_id}/download")
+    def download_resume(artifact_id: int, request: Request) -> FileResponse:
+        """鉴权后下载原始或职位定制简历文件。"""
+
+        account = current_account(request)
+        try:
+            artifact = backend.get_resume_artifact(
+                artifact_id,
+                account_id=account.id if account else None,
+            )
+        except KeyError as error:
+            # 不区分“ID 不存在”和“属于其他账号”，避免泄露资源是否存在。
+            raise HTTPException(status_code=404, detail="简历文件不存在。") from error
+        path = backend.resume_file_path(artifact)
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="简历文件已丢失，请重新上传或生成。")
+        return FileResponse(
+            path,
+            media_type=artifact.media_type,
+            filename=artifact.download_filename,
+        )
+
+    @web_app.post("/api/resumes/{artifact_id}/tailor")
+    def tailor_resume(
+        artifact_id: int,
+        payload: TailorResumePayload,
+        request: Request,
+    ) -> dict[str, object]:
+        """调用证据约束改写并生成可下载 DOCX/PDF，不覆盖上传源文件。"""
+
+        account = current_account(request)
+        account_id = account.id if account else None
+        try:
+            source = backend.get_resume_artifact(artifact_id, account_id=account_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="原始简历文件不存在。") from error
+
+        active_llm = resume_llm_client
+        if active_llm is None:
+            request_id = uuid.uuid4().hex
+            context = {
+                "candidate_id": source.candidate_id,
+                "account_id": account_id,
+                "session_id": f"resume-web-{source.candidate_id}",
+                "root_request_id": request_id,
+                "rag_dir": str(rag_path),
+                "use_tool_llm": True,
+                "default_auto_rag": True,
+            }
+            try:
+                active_llm = load_tool_llm_client(
+                    env_path,
+                    usage_callback=build_tool_usage_callback(
+                        backend,
+                        context,
+                        "resume_document_rewrite",
+                    ),
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=f"简历改写模型未就绪：{error}") from error
+
+        try:
+            result = backend.create_tailored_resume_from_artifact(
+                candidate_id=source.candidate_id,
+                source_artifact_id=source.id,
+                job_id=payload.job_id,
+                llm_client=active_llm,
+                rag_persist_directory=rag_path if payload.use_rag else None,
+                allow_proficiency_upgrade=payload.allow_proficiency_upgrade,
+                account_id=account_id,
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="职位、候选人或简历文件不存在。") from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except (EmbeddingRequestError, LLMRequestError) as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        return {
+            "draft": asdict(result.draft),
+            "artifacts": [serialize_resume_artifact(item) for item in result.artifacts],
+        }
+
     @web_app.get("/api/rag/search")
     def search_rag(request: Request, query: str = Query(...), top_k: int = 5) -> dict[str, object]:
         """检索本地 RAG 证据片段。"""
@@ -844,6 +1000,16 @@ def sse_event(event: str, data: dict[str, object]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def serialize_resume_artifact(artifact: ResumeArtifactRecord) -> dict[str, object]:
+    """返回前端需要的文件元数据，不暴露服务器内部存储键。"""
+
+    payload = asdict(artifact)
+    payload.pop("storage_key", None)
+    payload.pop("account_id", None)
+    payload["download_url"] = f"/api/resumes/{artifact.id}/download"
+    return payload
+
+
 def default_web_session_id(candidate_id: int, account_id: int | None = None) -> str:
     """生成网页默认会话 ID。
 
@@ -1002,6 +1168,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--db", default="data/job_agent.db")
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--rag-dir", default="data/chroma")
+    parser.add_argument("--resume-dir", default="data/resumes")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
@@ -1009,7 +1176,13 @@ def main(argv: list[str] | None = None) -> None:
     import uvicorn
 
     uvicorn.run(
-        create_web_app(args.db, args.env_file, args.rag_dir, require_auth=True),
+        create_web_app(
+            args.db,
+            args.env_file,
+            args.rag_dir,
+            resume_dir=args.resume_dir,
+            require_auth=True,
+        ),
         host=args.host,
         port=args.port,
     )

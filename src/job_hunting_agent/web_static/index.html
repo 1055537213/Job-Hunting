@@ -244,6 +244,81 @@
             </form>
           </section>
 
+          <section class="panel" aria-labelledby="resumePanelTitle">
+            <div class="panel-title-row">
+              <div>
+                <p class="eyebrow">Resume Files</p>
+                <h2 id="resumePanelTitle" class="panel-title">简历文件</h2>
+              </div>
+              <span class="count-chip">{{ resumeArtifacts.length }} 份</span>
+            </div>
+            <input
+              ref="resumeFileInput"
+              class="sr-only"
+              type="file"
+              accept=".docx,.pdf"
+              @change="uploadResume"
+            />
+            <button
+              class="primary-button"
+              type="button"
+              :disabled="!currentProfileId || uploadingResume"
+              :data-state="uploadingResume ? 'loading' : 'idle'"
+              @click="triggerResumeUpload"
+            >
+              {{ uploadingResume ? "解析中" : "上传简历" }}
+            </button>
+            <div v-if="resumeError" class="inline-error" role="alert">{{ resumeError }}</div>
+
+            <div class="resume-artifact-list">
+              <div v-if="!resumeArtifacts.length" class="empty-state compact-empty">
+                <strong>暂无简历文件</strong>
+              </div>
+              <article
+                v-for="artifact in resumeArtifacts"
+                :key="artifact.id"
+                class="resume-artifact-row"
+              >
+                <div class="resume-artifact-head">
+                  <strong>{{ artifact.download_filename }}</strong>
+                  <span class="file-kind">{{ resumeArtifactKind(artifact) }}</span>
+                </div>
+                <span class="resume-artifact-meta">
+                  v{{ artifact.version }} · {{ resumeExtractionLabel(artifact.extraction_method) }} · {{ formatFileSize(artifact.file_size) }}
+                </span>
+                <div v-if="artifact.artifact_type === 'source'" class="resume-tailor-controls">
+                  <select
+                    v-model.number="resumeJobSelections[artifact.id]"
+                    class="field"
+                    :disabled="!jobs.length"
+                    :aria-label="`选择 ${artifact.download_filename} 的目标职位`"
+                  >
+                    <option :value="0">{{ jobs.length ? "选择目标职位" : "请先导入职位" }}</option>
+                    <option v-for="job in jobs" :key="job.id" :value="job.id">
+                      {{ job.title }}
+                    </option>
+                  </select>
+                  <button
+                    class="ghost-button compact"
+                    type="button"
+                    :disabled="!jobs.length || !resumeJobSelections[artifact.id] || tailoringArtifactId === artifact.id"
+                    :data-state="tailoringArtifactId === artifact.id ? 'loading' : 'idle'"
+                    @click="tailorResume(artifact)"
+                  >
+                    {{ tailoringArtifactId === artifact.id ? "生成中" : "生成定制版" }}
+                  </button>
+                </div>
+                <a
+                  class="ghost-button compact resume-download"
+                  :href="artifact.download_url"
+                  :download="artifact.download_filename"
+                >
+                  下载
+                </a>
+              </article>
+            </div>
+          </section>
+
         </aside>
 
         <main id="chatPanel" class="chat-column" aria-label="Agent 对话">
