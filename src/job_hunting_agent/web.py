@@ -5,15 +5,14 @@
 - 标准 LangChain Agent 模式：Web -> JobHuntingAgent -> Tools -> JobHuntingApp
 - 本地规则兜底模式：Web -> JobHuntingApp.ingest_conversation_message
 
-之所以保留兜底，是为了在 `.env` 未配置或测试场景下，项目仍然能离线运行。
-一旦用户开启“使用 LangChain Agent”，主流程就会走标准 Agent 结构。
+之所以保留兜底，是为了测试和显式离线调用；网页与 API 默认都走标准 Agent 结构，
+模型配置错误时直接返回原因，不会静默切换执行逻辑。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sqlite3
 import uuid
 from dataclasses import asdict
@@ -38,6 +37,7 @@ from .auth import (
 from .config import (
     load_agent_memory_settings,
     load_embedding_settings,
+    load_cookie_secure,
     load_llm_settings,
     masked_agent_memory_settings,
     masked_embedding_settings,
@@ -91,13 +91,13 @@ class ChatPayload(BaseModel):
 
     为了兼容已有前端字段名，这里沿用 `use_env_llm`。现在它的语义是：
 
-    - `true`：走标准 LangChain Agent 主流程。
+    - `true`（默认）：走标准 LangChain Agent 主流程。
     - `false`：走本地规则兜底流程。
     """
 
     candidate_id: int
     message: str
-    use_env_llm: bool = False
+    use_env_llm: bool = True
     auto_rag: bool = True
     session_id: str | None = None
 
@@ -143,8 +143,6 @@ class TailorResumePayload(BaseModel):
 
     job_id: int
     use_rag: bool = True
-    # 只有用户明确要求拔高技能措辞时才允许为 true；网页默认始终保持保守表达。
-    allow_proficiency_upgrade: bool = False
 
 
 def create_web_app(
@@ -169,6 +167,7 @@ def create_web_app(
     backend.initialize()
     env_path = Path(env_file)
     rag_path = Path(rag_dir)
+    cookie_secure = load_cookie_secure(env_path)
 
     agent_error: str | None = None
     if chat_agent is None:
@@ -268,7 +267,7 @@ def create_web_app(
             raw_token,
             max_age=SESSION_MAX_AGE_SECONDS,
             httponly=True,
-            secure=os.getenv("JOB_AGENT_COOKIE_SECURE", "false").lower() == "true",
+            secure=cookie_secure,
             samesite="lax",
             path="/",
         )
@@ -793,7 +792,8 @@ def create_web_app(
                 job_id=payload.job_id,
                 llm_client=active_llm,
                 rag_persist_directory=rag_path if payload.use_rag else None,
-                allow_proficiency_upgrade=payload.allow_proficiency_upgrade,
+                # 网页按钮始终采用档案熟练度；一次性放宽只允许 Agent 完成风险确认后调用。
+                allow_proficiency_upgrade=False,
                 account_id=account_id,
             )
         except KeyError as error:

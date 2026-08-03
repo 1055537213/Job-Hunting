@@ -308,6 +308,21 @@ def load_agent_memory_settings(
     )
 
 
+def load_cookie_secure(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """按系统环境变量优先级读取 Session Cookie 的 Secure 开关。"""
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+    raw_value = environment.get("JOB_AGENT_COOKIE_SECURE") or file_values.get(
+        "JOB_AGENT_COOKIE_SECURE",
+        "false",
+    )
+    return parse_bool(raw_value)
+
+
 def masked_agent_memory_settings(settings: AgentMemorySettings) -> dict[str, object]:
     """返回适合 Web/CLI 展示的 Agent 记忆配置。"""
 

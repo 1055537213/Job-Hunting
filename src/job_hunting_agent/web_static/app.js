@@ -693,6 +693,8 @@ if (!window.Vue) {
             this.updateProfileInState(data.profile);
           }
           await this.loadJobs();
+          // Agent 可能在本轮生成了职位定制文件，侧栏必须同步刷新版本列表。
+          await this.loadResumeArtifacts();
           await this.matchJobs(true);
         } catch (error) {
           this.updateMessage(assistantMessage, error.message, true);
@@ -1031,7 +1033,6 @@ if (!window.Vue) {
             body: JSON.stringify({
               job_id: jobId,
               use_rag: true,
-              allow_proficiency_upgrade: false,
             }),
           });
           await this.loadResumeArtifacts();

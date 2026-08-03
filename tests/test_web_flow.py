@@ -12,7 +12,7 @@ from langchain_core.messages import AIMessage
 from job_hunting_agent.agent import JobHuntingAgent
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.models import CandidateProfileInput
-from job_hunting_agent.web import create_web_app
+from job_hunting_agent.web import ChatPayload, create_web_app
 
 
 class ToolCallingFakeChatModel(FakeMessagesListChatModel):
@@ -37,6 +37,43 @@ def legacy_client(db_path, rag_dir):
     """旧版 Web 行为测试显式关闭认证，生产默认仍要求登录。"""
 
     return TestClient(create_web_app(db_path=db_path, rag_dir=rag_dir, require_auth=False))
+
+
+def test_web_chat_payload_defaults_to_langchain_agent() -> None:
+    """省略旧开关字段时，后端也必须默认走 LangChain Agent 主流程。"""
+
+    payload = ChatPayload(candidate_id=1, message="你好")
+
+    assert payload.use_env_llm is True
+    assert payload.auto_rag is True
+
+
+def test_secure_cookie_setting_is_loaded_from_project_env(tmp_path, monkeypatch) -> None:
+    """Cookie 安全开关应读取项目 `.env`，而不要求用户额外导出系统变量。"""
+
+    monkeypatch.delenv("JOB_AGENT_COOKIE_SECURE", raising=False)
+    env_path = tmp_path / ".env"
+    env_path.write_text("JOB_AGENT_COOKIE_SECURE=true\n", encoding="utf-8")
+    client = TestClient(
+        create_web_app(
+            db_path=tmp_path / "web.db",
+            env_file=env_path,
+            rag_dir=tmp_path / "chroma",
+            require_auth=True,
+        )
+    )
+    registered = client.post(
+        "/api/auth/register",
+        json={"email": "secure@example.com", "password": "password-123"},
+    )
+    response = client.post(
+        "/api/auth/login",
+        json={"email": "secure@example.com", "password": "password-123"},
+    )
+
+    assert registered.status_code == 200
+    assert response.status_code == 200
+    assert "; secure" in response.headers["set-cookie"].lower()
 
 
 def test_web_home_page_and_assets_are_available(tmp_path):
