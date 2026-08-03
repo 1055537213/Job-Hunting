@@ -93,13 +93,10 @@ def build_llm_client(
 def build_chat_model(settings: LLMSettings, temperature: float = 0) -> BaseChatModel:
     """根据 `.env` 配置创建标准 LangChain ChatModel。
 
-    当前项目默认使用 `langchain_openai.ChatOpenAI` 去适配 OpenAI-compatible
-    接口，包括 DeepSeek。这样 Agent、工具调用、消息对象、后续中间件扩展都能
-    走 LangChain 标准能力，而不是手写 HTTP 请求。
+    项目统一使用 `langchain_openai.ChatOpenAI` 适配 OpenAI-compatible 接口。
+    `provider` 只作为日志和 Token 计量标签，因此 DeepSeek、OpenAI、本地服务及
+    中转站都可以只改 `.env` 接入，不需要向代码白名单追加供应商名称。
     """
-
-    if settings.provider not in {"deepseek", "openai", "openai_compatible"}:
-        raise ValueError(f"暂不支持的 LLM provider：{settings.provider}")
 
     extra_body: dict[str, object] = {}
     # DeepSeek 的 thinking 参数不属于 OpenAI 标准字段，所以通过 extra_body 透传。
