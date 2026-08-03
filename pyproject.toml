@@ -13,6 +13,14 @@ dependencies = [
     "langchain-openai>=1.1.11",
     "langchain-text-splitters>=1.1.1",
     "argon2-cffi>=23.1.0",
+    "onnxruntime>=1.18.0",
+    "pdfplumber>=0.11.0",
+    "Pillow>=10.0.0",
+    "pypdfium2>=4.30.0",
+    "python-docx>=1.1.2",
+    "python-multipart>=0.0.9",
+    "rapidocr>=3.0.0",
+    "reportlab>=4.0.0",
     "uvicorn>=0.38.0",
 ]
 
@@ -24,8 +32,12 @@ job-agent-web = "job_hunting_agent.web:main"
 
 [tool.setuptools.package-data]
 # Web 前端静态资源需要随 Python 包一起安装。
-job_hunting_agent = ["web_static/*"]
+job_hunting_agent = ["web_static/*", "web_static/vendor/*"]
 
 [tool.pytest.ini_options]
 # 让 pytest 在不安装包的情况下，也能从 src/ 找到项目代码。
 pythonpath = ["src"]
+# 只收集正式测试目录，避免扫描 data/ 中已忽略的运行文件和历史临时目录。
+testpaths = ["tests"]
+# 项目不依赖 pytest 增量缓存；关闭缓存也避免异常 ACL 的旧目录影响测试。
+addopts = "-p no:cacheprovider"

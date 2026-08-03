@@ -8,7 +8,8 @@
 - 读取候选人主动提供的本地项目目录，分析技术栈、功能线索和项目经历草稿。
 - 保存候选人主动复制的 BOSS 职位文本，解析职位名称、城市、薪资、学历、经验和技能要求。
 - 按硬性条件和普通偏好计算职位匹配结果，并解释淘汰原因、短板和风险。
-- 根据目标职位生成证据约束的简历改写草稿，不覆盖候选人原始档案。
+- 上传 DOCX、文字 PDF 或扫描 PDF 简历，扫描件通过本地 OCR 提取文字。
+- 根据目标职位生成证据约束的简历草稿和独立 DOCX/PDF 文件，不覆盖候选人档案或原文件。
 - 根据候选人主动带回的 HR 问题生成可编辑回复草稿。
 - 在对话中自动判断内容应保存到 SQLite 结构化存储还是长文本 RAG 知识库。
 
@@ -31,6 +32,7 @@
 - Embedding：OpenAI-compatible Embedding API；未配置时支持本地回退 embedding。
 - 结构化存储：SQLite。
 - 语义检索：Chroma、LangChain Chroma 集成、LangChain 文本切分器。
+- 简历文档：python-docx、pdfplumber、PDFium、RapidOCR、ONNX Runtime、ReportLab。
 - 前端：Vue 3 本地静态构建、SSE 流式聊天、Markdown 渲染。
 - 认证：Argon2id 密码哈希、HttpOnly Session Cookie。
 - 测试：pytest。
@@ -55,24 +57,24 @@ JobHuntingAgent
   档案工具
   项目分析工具
   职位导入与匹配工具
-  简历草稿工具
+  简历上传、改写与导出工具
   HR 回复草稿工具
           |
           +----------------------+
           |                      |
           v                      v
-SQLite 结构化事实源       Chroma RAG 索引
-学历、经验、技能、证书     项目描述、成果材料、职位全文、
-偏好、职位字段、会话元数据  简历片段、对话上下文
+SQLite 结构化事实源       Chroma RAG 索引          受控文件目录
+学历、经验、技能、证书     项目描述、成果材料、       原始 DOCX/PDF、
+偏好、职位字段、文件元数据  职位全文、简历片段         职位定制 DOCX/PDF
 ```
 
 ### 数据流
 
 1. 用户登录后选择候选人档案和求职会话。
-2. 用户输入资料、职位文本、项目目录或 HR 问题。
+2. 用户输入资料、职位文本、项目目录、简历文件或 HR 问题。
 3. LangChain Agent 判断需要调用的工具。
 4. 工具把可精确比较的字段写入 SQLite，把长文本切分后写入 Chroma。
-5. 匹配、简历改写和回复草稿同时读取 SQLite 事实与 RAG 证据。
+5. 匹配、简历改写和回复草稿同时读取 SQLite 事实、上传简历正文与 RAG 证据。
 6. 模型输出经过事实边界检查；不安全时回退到规则版草稿。
 7. Agent 和 embedding 的 token usage 按账号写入 `usage_events`，供后台统计和后续计费。
 
@@ -87,6 +89,7 @@ SQLite 是结构化事实源，适合精确过滤和比较：
 - 城市、薪资、工作形式和不可接受条件。
 - 职位标准化字段。
 - 账号、Session、候选人档案、对话和 Token 用量。
+- 简历文件版本、文件哈希、解析方式、源文件与定制文件关系。
 
 Chroma 是派生的语义检索索引，适合长文本召回：
 
@@ -94,6 +97,7 @@ Chroma 是派生的语义检索索引，适合长文本召回：
 - 本地项目分析摘要。
 - 职位职责和任职要求全文。
 - 简历片段和自我介绍。
+- 上传简历中提取的正文。
 - HR 对话上下文。
 
 向量库不是唯一事实源。结构化字段和候选人确认状态始终以 SQLite 为准。
@@ -117,19 +121,23 @@ Job-hunting Agent/
 │     ├─ models.py                # 数据模型和领域对象
 │     ├─ project_analyzer.py      # 本地项目最小必要读取与分析
 │     ├─ rag.py                   # LangChain + Chroma RAG
+│     ├─ resume_document.py       # DOCX/PDF 解析、扫描 PDF OCR 和受控文件存储
+│     ├─ resume_exporter.py       # 职位定制 DOCX/PDF 导出
 │     ├─ resume_writer.py         # 证据约束的简历草稿
 │     ├─ storage.py               # SQLite 持久化和查询
 │     ├─ web.py                   # FastAPI API 和 SSE
 │     └─ web_static/
 │        ├─ index.html            # Vue 3 页面结构
 │        ├─ app.js                # 前端状态、请求和流式聊天
+│        ├─ china_cities.js       # 中国省份和城市二级选择数据
 │        ├─ styles.css            # 页面样式
 │        ├─ tokens.css            # 前端设计 Token
 │        └─ vendor/vue.global.prod.js
 ├─ tests/                         # 单元测试和 Web/API 回归测试
 ├─ docs/
 │  ├─ adr/                        # 架构决策记录
-│  └─ research/                   # BOSS 接入和职位标准化研究
+│  ├─ research/                   # BOSS 接入和职位标准化研究
+│  └─ enterprise-readiness-decision-map.md # 企业级演进顺序与验收门槛
 ├─ CONTEXT.md                     # 领域术语和边界
 ├─ DECISION_MAP.md                # 项目决策地图
 ├─ pyproject.toml                 # 依赖和命令入口
@@ -137,7 +145,8 @@ Job-hunting Agent/
 └─ .gitignore                     # 密钥、数据库、缓存和运行数据忽略规则
 ```
 
-`data/` 不提交到代码仓库。首次运行 Web 或 CLI 时会自动生成 SQLite 数据库和 Chroma 索引。
+`data/` 不提交到代码仓库。首次运行 Web 或 CLI 时会自动生成 SQLite 数据库、
+Chroma 索引和简历文件目录。
 
 ## 核心文件说明
 
@@ -147,21 +156,23 @@ Job-hunting Agent/
 - `.env.example`：展示模型、Embedding、记忆和 Cookie 配置项；真实 `.env` 不提交。
 - `src/job_hunting_agent/config.py`：读取并校验环境变量，避免 API Key 写死在代码中。
 - `src/job_hunting_agent/cli.py`：提供数据库初始化、创建管理员、创建档案、职位导入、RAG 重建和 Agent 对话命令。
-- `src/job_hunting_agent/web.py`：提供认证、候选人档案、会话、职位、匹配、管理员和 SSE 聊天 API。
+- `src/job_hunting_agent/web.py`：提供认证、候选人档案、会话、职位、匹配、简历上传/下载、管理员和 SSE 聊天 API。
 
 ### 业务核心
 
-- `agent.py`：创建标准 LangChain Agent，注册档案、项目、职位、简历和 HR 回复工具。
+- `agent.py`：创建标准 LangChain Agent，注册档案、项目、职位、简历文件和 HR 回复工具。
 - `app.py`：组合存储、匹配、RAG、简历和对话服务，作为业务层门面。
 - `models.py`：定义候选人档案、职位、匹配结果、简历草稿、对话和 Token 用量模型。
 - `matcher.py`：执行学历硬门槛、经验差距淘汰、不可接受条件淘汰、技能匹配和普通偏好排序。
 - `job_parser.py`：审核职位文本是否确实包含职位信息，并提取标准化字段。
 - `project_analyzer.py`：只读取候选人指定项目中的必要文件，跳过密钥、缓存、依赖目录、构建产物和大型数据。
-- `resume_writer.py`：根据目标职位生成职位定制简历草稿，保持候选人档案不被覆盖。
+- `resume_document.py`：校验并解析 DOCX、文字 PDF 和扫描 PDF；文件只能写入受控目录。
+- `resume_exporter.py`：把通过真实性检查的职位定制草稿导出为 DOCX 和 PDF。
+- `resume_writer.py`：根据目标职位和上传简历生成证据约束草稿，保持候选人档案不被覆盖。
 
 ### 数据、记忆和模型
 
-- `storage.py`：管理 SQLite 表、账号隔离、候选人档案、聊天消息、职位、简历版本和 Token 用量。
+- `storage.py`：管理 SQLite 表、账号隔离、候选人档案、聊天消息、职位、简历文件版本和 Token 用量。
 - `rag.py`：负责文本切分、Embedding、Chroma 写入、账号过滤和增量索引。
 - `conversation_ingestion.py`：判断当前对话内容应保存为结构化事实、长文本材料、项目确认项或普通聊天。
 - `conversation_memory.py`：从 SQLite 恢复会话，超过阈值时压缩旧消息并保留最近上下文。
@@ -171,9 +182,9 @@ Job-hunting Agent/
 ### 前端和测试
 
 - `web_static/index.html`：登录页、候选人工作台、职位面板和管理员后台的 Vue 模板。
-- `web_static/app.js`：前端状态管理、SSE 消费、Markdown 渲染、档案与职位操作。
+- `web_static/app.js`：前端状态管理、SSE 消费、Markdown 渲染、档案、职位和简历文件操作。
 - `web_static/styles.css`、`web_static/tokens.css`：布局、响应式规则和设计 Token。
-- `tests/`：验证 Agent 工具链、认证、RAG、Embedding、简历草稿、项目分析和 Web 行为。
+- `tests/`：验证 Agent 工具链、认证、RAG、Embedding、简历解析/OCR/导出、项目分析和 Web 行为。
 
 ## 快速开始
 
@@ -201,17 +212,16 @@ JOB_AGENT_LLM_MODEL=deepseek-v4-pro
 JOB_AGENT_LLM_API_KEY=your-api-key
 JOB_AGENT_LLM_BASE_URL=https://api.deepseek.com
 
-JOB_AGENT_EMBEDDING_PROVIDER=openai_compatible
-JOB_AGENT_EMBEDDING_MODEL=text-embedding-3-small
-JOB_AGENT_EMBEDDING_API_KEY=your-embedding-api-key
-JOB_AGENT_EMBEDDING_BASE_URL=https://api.openai.com/v1
+JOB_AGENT_EMBEDDING_PROVIDER=local_hash
+JOB_AGENT_EMBEDDING_MODEL=local-hash
 
 JOB_AGENT_MEMORY_ENABLED=true
 JOB_AGENT_COOKIE_SECURE=false
 ```
 
-聊天模型和 Embedding 模型可以来自不同供应商。部署到 HTTPS 后，把
-`JOB_AGENT_COOKIE_SECURE` 改为 `true`。
+聊天模型和 Embedding 模型可以来自不同供应商。需要真实语义 Embedding 时，按
+`.env.example` 中注释的 OpenAI-compatible 配置替换本地模式。部署到 HTTPS 后，
+把 `JOB_AGENT_COOKIE_SECURE` 改为 `true`。
 
 ### 3. 启动网页
 
@@ -219,7 +229,8 @@ JOB_AGENT_COOKIE_SECURE=false
 python -m job_hunting_agent.web `
   --db data/job_agent.db `
   --env-file .env `
-  --rag-dir data/chroma
+  --rag-dir data/chroma `
+  --resume-dir data/resumes
 ```
 
 浏览器访问：
@@ -272,7 +283,19 @@ python -m job_hunting_agent.cli `
 
 ### 简历和 HR 回复
 
-简历改写保存为职位定制简历草稿或版本，不覆盖候选人原始档案。HR 回复也只生成可编辑草稿，发送动作由候选人自行完成。
+选择候选人档案后，在左侧“简历文件”区域上传 `.docx` 或 `.pdf`：
+
+- DOCX 和文字 PDF 直接提取正文。
+- 没有文本层的扫描 PDF 使用本地 RapidOCR 识别。
+- 原文件、解析元数据和正文来源按账号与候选人保存；正文会增量登记到 RAG。
+- 为原始简历选择已导入职位并点击“生成定制版”，系统会保存独立草稿，并生成可下载的 DOCX/PDF。
+- 每次生成都是新版本，原始简历和候选人结构化档案不会被覆盖。
+- 模型加入无证据技能、成果数字或擅自拔高熟练度时，改写会被丢弃并使用保守回退内容。
+
+HR 回复只生成可编辑草稿，发送动作由候选人自行完成。
+
+企业级 PostgreSQL、pgvector、Alembic、对象存储和容器化的实施顺序见
+[企业级演进决策地图](./docs/enterprise-readiness-decision-map.md)。
 
 ## 准确性要求
 

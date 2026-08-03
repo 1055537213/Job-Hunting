@@ -164,6 +164,44 @@ class ResumeDraftRecord:
 
 
 @dataclass
+class ResumeArtifactRecord:
+    """一份已上传或已生成的简历文件版本。
+
+    SQLite 只保存文件元数据、提取文本和归属关系；二进制文件位于受控文件目录。
+    `parent_artifact_id` 把职位定制文件关联回原始上传文件，避免覆盖源文件。
+    """
+
+    id: int
+    account_id: int | None
+    candidate_id: int
+    job_id: int | None
+    draft_id: int | None
+    parent_artifact_id: int | None
+    version: int
+    artifact_type: str
+    original_filename: str
+    download_filename: str
+    storage_key: str
+    media_type: str
+    file_size: int
+    sha256: str
+    extraction_method: str
+    text_length: int
+    page_count: int | None
+    status: str
+    long_text_id: int | None
+    created_at: str
+
+
+@dataclass
+class TailoredResumeResult:
+    """一次基于上传简历生成职位定制文件的结果。"""
+
+    draft: ResumeDraftRecord
+    artifacts: list[ResumeArtifactRecord]
+
+
+@dataclass
 class LongTextRecord:
     """SQLite `long_texts` 表中的一条长文本材料。
 

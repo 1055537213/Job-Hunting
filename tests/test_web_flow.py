@@ -12,7 +12,7 @@ from langchain_core.messages import AIMessage
 from job_hunting_agent.agent import JobHuntingAgent
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.models import CandidateProfileInput
-from job_hunting_agent.web import create_web_app
+from job_hunting_agent.web import ChatPayload, create_web_app
 
 
 class ToolCallingFakeChatModel(FakeMessagesListChatModel):
@@ -37,6 +37,43 @@ def legacy_client(db_path, rag_dir):
     """旧版 Web 行为测试显式关闭认证，生产默认仍要求登录。"""
 
     return TestClient(create_web_app(db_path=db_path, rag_dir=rag_dir, require_auth=False))
+
+
+def test_web_chat_payload_defaults_to_langchain_agent() -> None:
+    """省略旧开关字段时，后端也必须默认走 LangChain Agent 主流程。"""
+
+    payload = ChatPayload(candidate_id=1, message="你好")
+
+    assert payload.use_env_llm is True
+    assert payload.auto_rag is True
+
+
+def test_secure_cookie_setting_is_loaded_from_project_env(tmp_path, monkeypatch) -> None:
+    """Cookie 安全开关应读取项目 `.env`，而不要求用户额外导出系统变量。"""
+
+    monkeypatch.delenv("JOB_AGENT_COOKIE_SECURE", raising=False)
+    env_path = tmp_path / ".env"
+    env_path.write_text("JOB_AGENT_COOKIE_SECURE=true\n", encoding="utf-8")
+    client = TestClient(
+        create_web_app(
+            db_path=tmp_path / "web.db",
+            env_file=env_path,
+            rag_dir=tmp_path / "chroma",
+            require_auth=True,
+        )
+    )
+    registered = client.post(
+        "/api/auth/register",
+        json={"email": "secure@example.com", "password": "password-123"},
+    )
+    response = client.post(
+        "/api/auth/login",
+        json={"email": "secure@example.com", "password": "password-123"},
+    )
+
+    assert registered.status_code == 200
+    assert response.status_code == 200
+    assert "; secure" in response.headers["set-cookie"].lower()
 
 
 def test_web_home_page_and_assets_are_available(tmp_path):
@@ -73,6 +110,17 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert "Vue" in vue.text
 
 
+def test_web_health_reports_enabled_memory_as_configured(tmp_path):
+    """记忆配置成功且启用时，健康接口不能错误显示为未配置。"""
+
+    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+
+    health = client.get("/api/health")
+
+    assert health.status_code == 200
+    assert health.json()["memory"]["configured"] is True
+
+
 def test_web_auth_bootstrap_does_not_surface_probe_errors_in_login_form(tmp_path):
     """初始化 Session 探测失败时，不应把错误提前显示成登录失败。"""
 
@@ -100,6 +148,35 @@ def test_web_frontend_defaults_to_agent_and_incremental_rag_without_toggles(tmp_
     assert "use_env_llm: DEFAULT_USE_LANGCHAIN_AGENT" in script
     assert "auto_rag: DEFAULT_AUTO_INCREMENTAL_RAG" in script
     assert "this.useLlm =" not in script
+
+
+def test_web_profile_form_uses_recovered_selectors_and_auth_copy(tmp_path):
+    """恢复注册密码显示、学历枚举和单框省市选择等前端约束。"""
+
+    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+
+    home = client.get("/").text
+    script = client.get("/static/app.js").text
+    cities = client.get("/static/china_cities.js")
+
+    assert ':type="authMode === \'register\' ? \'text\' : \'password\'"' in home
+    assert 'placeholder="例如：小林"' not in home
+    assert 'placeholder="Python=项目使用,FastAPI=待确认"' not in home
+    assert 'placeholder="AI Agent 应用开发"' not in home
+    assert "Local Boundary" not in home
+    assert "运行边界" not in home
+    assert home.count("退出所有设备") == 1
+    for education in ("高中及以下", "大专", "本科", "硕士", "博士"):
+        assert f'<option value="{education}">{education}</option>' in home
+    assert 'v-for="province in cityGroups"' in home
+    assert 'v-for="city in province.cities"' in home
+    assert '/static/china_cities.js?v=20260803-cities' in home
+    assert "cityGroups: buildSortedCityGroups()" in script
+    assert "preferred_cities: this.profileForm.city ? [this.profileForm.city] : []" in script
+    assert cities.status_code == 200
+    assert "北京市" in cities.text
+    assert "广州市" in cities.text
+    assert "乌鲁木齐市" in cities.text
 
 
 def test_web_can_create_profile_and_ingest_chat_message_incrementally(tmp_path):
@@ -135,7 +212,7 @@ def test_web_can_create_profile_and_ingest_chat_message_incrementally(tmp_path):
     profile = client.get(f"/api/profiles/{candidate_id}").json()["profile"]
     rag = client.get("/api/rag/search", params={"query": "FastAPI 求职助手"}).json()
 
-    assert chat.status_code == 200
+    assert chat.status_code == 200, chat.text
     assert chat.json()["result"]["rag_update_mode"] == "incremental"
     assert profile["education"] == "本科"
     assert profile["skills"]["Python"] == "待确认"
@@ -416,7 +493,7 @@ def test_web_chat_can_use_langchain_agent_mode(tmp_path):
         },
     )
 
-    assert chat.status_code == 200
+    assert chat.status_code == 200, chat.text
     assert chat.json()["mode"] == "langchain_agent"
     assert "ingest_candidate_message" in chat.json()["used_tools"]
 

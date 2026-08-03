@@ -49,7 +49,7 @@
                 id="authPassword"
                 v-model="authForm.password"
                 class="field"
-                type="password"
+                :type="authMode === 'register' ? 'text' : 'password'"
                 :autocomplete="authMode === 'login' ? 'current-password' : 'new-password'"
                 minlength="8"
                 required
@@ -115,7 +115,6 @@
           </button>
           <button v-if="auth.account && auth.account.role === 'admin'" class="nav-link" type="button" @click="openAdmin">后台</button>
           <button class="nav-link account-link" type="button" @click="logout">{{ auth.account?.display_name || auth.account?.email || "账号" }} · 退出</button>
-          <button class="nav-link account-link" type="button" @click="logoutAll">退出所有设备</button>
         </nav>
       </header>
 
@@ -168,18 +167,23 @@
                   id="profileName"
                   v-model.trim="profileForm.name"
                   class="field"
-                  placeholder="例如：小林"
                 />
               </label>
               <div class="grid-two">
                 <label class="field-group" for="profileEducation">
                   <span>学历</span>
-                  <input
+                  <select
                     id="profileEducation"
-                    v-model.trim="profileForm.education"
+                    v-model="profileForm.education"
                     class="field"
-                    placeholder="本科"
-                  />
+                  >
+                    <option value="">请选择</option>
+                    <option value="高中及以下">高中及以下</option>
+                    <option value="大专">大专</option>
+                    <option value="本科">本科</option>
+                    <option value="硕士">硕士</option>
+                    <option value="博士">博士</option>
+                  </select>
                 </label>
                 <label class="field-group" for="profileYears">
                   <span>经验年限</span>
@@ -200,17 +204,26 @@
                   id="profileSkills"
                   v-model="profileForm.skills"
                   class="field"
-                  placeholder="Python=项目使用,FastAPI=待确认"
                 />
               </label>
               <label class="field-group" for="profileCities">
                 <span>目标城市</span>
-                <input
+                <select
                   id="profileCities"
-                  v-model="profileForm.cities"
+                  v-model="profileForm.city"
                   class="field"
-                  placeholder="杭州,上海"
-                />
+                >
+                  <option value="">请选择</option>
+                  <optgroup
+                    v-for="province in cityGroups"
+                    :key="province.province"
+                    :label="province.province"
+                  >
+                    <option v-for="city in province.cities" :key="city" :value="city">
+                      {{ city }}
+                    </option>
+                  </optgroup>
+                </select>
               </label>
               <label class="field-group" for="profileDirections">
                 <span>求职方向</span>
@@ -218,7 +231,6 @@
                   id="profileDirections"
                   v-model="profileForm.directions"
                   class="field"
-                  placeholder="AI Agent 应用开发"
                 />
               </label>
               <button
@@ -232,15 +244,81 @@
             </form>
           </section>
 
-          <section class="panel boundary-note">
+          <section class="panel" aria-labelledby="resumePanelTitle">
             <div class="panel-title-row">
               <div>
-                <p class="eyebrow">Local Boundary</p>
-                <h2 class="panel-title">运行边界</h2>
+                <p class="eyebrow">Resume Files</p>
+                <h2 id="resumePanelTitle" class="panel-title">简历文件</h2>
               </div>
+              <span class="count-chip">{{ resumeArtifacts.length }} 份</span>
             </div>
-            <p>本页面只使用你主动输入的资料；不会登录 BOSS、不会自动投递、不会自动发送 HR 消息。</p>
+            <input
+              ref="resumeFileInput"
+              class="sr-only"
+              type="file"
+              accept=".docx,.pdf"
+              @change="uploadResume"
+            />
+            <button
+              class="primary-button"
+              type="button"
+              :disabled="!currentProfileId || uploadingResume"
+              :data-state="uploadingResume ? 'loading' : 'idle'"
+              @click="triggerResumeUpload"
+            >
+              {{ uploadingResume ? "解析中" : "上传简历" }}
+            </button>
+            <div v-if="resumeError" class="inline-error" role="alert">{{ resumeError }}</div>
+
+            <div class="resume-artifact-list">
+              <div v-if="!resumeArtifacts.length" class="empty-state compact-empty">
+                <strong>暂无简历文件</strong>
+              </div>
+              <article
+                v-for="artifact in resumeArtifacts"
+                :key="artifact.id"
+                class="resume-artifact-row"
+              >
+                <div class="resume-artifact-head">
+                  <strong>{{ artifact.download_filename }}</strong>
+                  <span class="file-kind">{{ resumeArtifactKind(artifact) }}</span>
+                </div>
+                <span class="resume-artifact-meta">
+                  v{{ artifact.version }} · {{ resumeExtractionLabel(artifact.extraction_method) }} · {{ formatFileSize(artifact.file_size) }}
+                </span>
+                <div v-if="artifact.artifact_type === 'source'" class="resume-tailor-controls">
+                  <select
+                    v-model.number="resumeJobSelections[artifact.id]"
+                    class="field"
+                    :disabled="!jobs.length"
+                    :aria-label="`选择 ${artifact.download_filename} 的目标职位`"
+                  >
+                    <option :value="0">{{ jobs.length ? "选择目标职位" : "请先导入职位" }}</option>
+                    <option v-for="job in jobs" :key="job.id" :value="job.id">
+                      {{ job.title }}
+                    </option>
+                  </select>
+                  <button
+                    class="ghost-button compact"
+                    type="button"
+                    :disabled="!jobs.length || !resumeJobSelections[artifact.id] || tailoringArtifactId === artifact.id"
+                    :data-state="tailoringArtifactId === artifact.id ? 'loading' : 'idle'"
+                    @click="tailorResume(artifact)"
+                  >
+                    {{ tailoringArtifactId === artifact.id ? "生成中" : "生成定制版" }}
+                  </button>
+                </div>
+                <a
+                  class="ghost-button compact resume-download"
+                  :href="artifact.download_url"
+                  :download="artifact.download_filename"
+                >
+                  下载
+                </a>
+              </article>
+            </div>
           </section>
+
         </aside>
 
         <main id="chatPanel" class="chat-column" aria-label="Agent 对话">
@@ -529,6 +607,7 @@
 
     <!-- Vue 3 global build 已放入本地静态目录，避免本地页面依赖外部 CDN。 -->
     <script src="/static/vendor/vue.global.prod.js?v=20260731-auth-admin"></script>
+    <script src="/static/china_cities.js?v=20260803-cities"></script>
     <script src="/static/app.js?v=20260731-auth-admin"></script>
   </body>
 </html>

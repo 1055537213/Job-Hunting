@@ -103,6 +103,54 @@ def test_build_llm_client_returns_langchain_wrapper(tmp_path):
     assert client.model.model_name == "deepseek-v4-pro"
 
 
+def test_custom_relay_provider_uses_openai_compatible_chat_model(tmp_path):
+    """中转站可以使用自定义 provider 标签，不需要修改代码白名单。"""
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_LLM_PROVIDER=my-relay",
+                "JOB_AGENT_LLM_MODEL=relay-model-name",
+                "JOB_AGENT_LLM_API_KEY=sk-relay",
+                "JOB_AGENT_LLM_BASE_URL=https://relay.example.com/v1/chat/completions",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_llm_settings(env_file, environ={})
+    model = build_chat_model(settings)
+
+    assert settings.provider == "my-relay"
+    assert isinstance(model, ChatOpenAI)
+    assert model.model_name == "relay-model-name"
+    assert str(model.openai_api_base) == "https://relay.example.com/v1"
+
+
+def test_generic_openai_aliases_can_configure_local_or_relay_endpoint(tmp_path):
+    """通用 OPENAI_* 键也能配置本地服务或第三方中转站。"""
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_LLM_PROVIDER=custom",
+                "OPENAI_MODEL=custom-chat-model",
+                "OPENAI_API_KEY=sk-compatible",
+                "OPENAI_BASE_URL=https://gateway.example.com/v1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_llm_settings(env_file, environ={})
+
+    assert settings.model == "custom-chat-model"
+    assert settings.api_key == "sk-compatible"
+    assert settings.base_url == "https://gateway.example.com/v1"
+
+
 def test_normalize_openai_compatible_base_url_strips_specific_endpoints():
     """LangChain 需要根 base URL，不应保留 `/chat/completions` 这类具体端点。"""
 

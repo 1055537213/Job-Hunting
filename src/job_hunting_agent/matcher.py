@@ -21,9 +21,11 @@ def match_job(candidate: CandidateProfile, job: ImportedJob) -> MatchResult:
     # 再根据技能、城市、薪资、经验差距等因素加减分。
     score = 60
 
-    # 明确不可接受的城市直接淘汰；普通城市偏好以后可以改成扣分。
+    # `preferred_cities` 是目标城市偏好，不是不可接受清单；不匹配只影响排序。
     if job.city and candidate.preferred_cities and job.city not in candidate.preferred_cities:
-        elimination_reasons.append(f"城市不在可接受范围：职位在 {job.city}")
+        score -= 5
+        deductions.append(f"职位城市 {job.city} 不在目标城市偏好中，扣 5 分")
+        risks.append("职位城市不是目标城市，需要确认是否接受")
 
     # 薪资硬底线来自候选人明确约束：职位薪资上限低于底线时不推荐。
     if (

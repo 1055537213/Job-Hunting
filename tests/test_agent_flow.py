@@ -7,6 +7,9 @@
 - Agent 工具执行后，SQLite / RAG 的业务结果确实落地。
 """
 
+from io import BytesIO
+
+from docx import Document
 from langchain_core.language_models.fake_chat_models import FakeListChatModel, FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import Field
@@ -15,6 +18,17 @@ from job_hunting_agent.config import AgentMemorySettings
 from job_hunting_agent.agent import JobHuntingAgent
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.models import CandidateProfileInput
+
+
+def build_resume_docx_bytes(*paragraphs: str) -> bytes:
+    """创建 Agent 文件工具测试使用的内存 DOCX。"""
+
+    document = Document()
+    for paragraph in paragraphs:
+        document.add_paragraph(paragraph)
+    output = BytesIO()
+    document.save(output)
+    return output.getvalue()
 
 
 class ToolCallingFakeChatModel(FakeMessagesListChatModel):
@@ -248,6 +262,94 @@ def test_langchain_agent_can_loop_across_multiple_tools(tmp_path):
     assert result.used_tools == ["import_job_from_text", "match_all_jobs_for_candidate"]
     assert len(app.list_jobs()) == 1
     assert any(output["tool_name"] == "match_all_jobs_for_candidate" for output in result.tool_outputs)
+
+
+def test_langchain_agent_can_create_downloadable_resume_files_from_upload(tmp_path):
+    """Agent 能先查看上传文件，再生成职位定制 DOCX/PDF 下载版本。"""
+
+    app = JobHuntingApp(
+        tmp_path / "agent.db",
+        resume_dir=tmp_path / "resume-files",
+    )
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="小林",
+            status="离职",
+            education="本科",
+            experience_years=1,
+            skills={"Python": "项目使用"},
+            preferred_cities=["杭州市"],
+            salary_floor_k=10,
+            expected_salary_k=15,
+            target_directions=["Python 后端开发"],
+            unacceptable=[],
+        )
+    )
+    job = app.import_job_text(
+        """
+        Python 后端开发工程师
+        15-20K
+        杭州
+        1-3年
+        本科
+        职位描述：负责 Python 与 FastAPI 后端接口开发。
+        """
+    )
+    source = app.upload_resume_document(
+        candidate_id,
+        "resume.docx",
+        build_resume_docx_bytes("小林", "Python 与 FastAPI 项目经历"),
+    )
+    model = ToolCallingFakeChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_resume_list",
+                        "name": "list_resume_artifacts_for_candidate",
+                        "args": {},
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_resume_tailor",
+                        "name": "create_tailored_resume_from_upload",
+                        "args": {
+                            "source_artifact_id": source.id,
+                            "job_id": job.id,
+                            "use_rag": False,
+                        },
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="已生成职位定制简历，你可以下载 DOCX 或 PDF。"),
+        ]
+    )
+
+    result = JobHuntingAgent(app, rag_dir=tmp_path / "chroma", model=model).chat(
+        "用我上传的简历针对这个 Python 职位生成可下载文件。",
+        candidate_id=candidate_id,
+        session_id="agent-resume-file",
+        use_tool_llm=False,
+    )
+    artifacts = app.list_resume_artifacts(candidate_id)
+
+    assert result.used_tools == [
+        "list_resume_artifacts_for_candidate",
+        "create_tailored_resume_from_upload",
+    ]
+    assert len([item for item in artifacts if item.artifact_type == "tailored"]) == 2
+    generated_output = result.tool_outputs[-1]["data"]
+    assert len(generated_output["artifacts"]) == 2
+    assert all("download_url" in item for item in generated_output["artifacts"])
+    assert all("storage_key" not in item for item in generated_output["artifacts"])
 
 
 def test_langchain_agent_rejects_non_job_text_import(tmp_path):

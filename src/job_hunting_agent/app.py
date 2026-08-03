@@ -26,11 +26,20 @@ from .models import (
     ProjectExperienceRecord,
     RAGIndexStats,
     RAGSearchResult,
+    ResumeArtifactRecord,
     ResumeDraftRecord,
+    TailoredResumeResult,
     UsageEventRecord,
 )
 from .project_analyzer import analyze_project
 from .rag import RAGKnowledgeBase
+from .resume_document import (
+    ResumeFileStore,
+    extract_resume_document,
+    media_type_for_filename,
+    sanitize_download_filename,
+)
+from .resume_exporter import export_tailored_resume_files
 from .resume_writer import build_resume_draft
 from .storage import SQLiteStore
 
@@ -42,13 +51,20 @@ class JobHuntingApp:
     RAG 检索组合到一起。外部入口保持简单，内部能力可以逐步替换升级。
     """
 
-    def __init__(self, db_path: str | Path, env_path: str | Path = DEFAULT_ENV_PATH):
-        """绑定一个 SQLite 数据库路径和项目 `.env` 路径。"""
+    def __init__(
+        self,
+        db_path: str | Path,
+        env_path: str | Path = DEFAULT_ENV_PATH,
+        resume_dir: str | Path | None = None,
+    ):
+        """绑定 SQLite、项目 `.env` 和受控简历文件目录。"""
 
         self.store = SQLiteStore(db_path)
         # Web/CLI 都通过同一认证服务创建账号和 Session，避免重复实现密码逻辑。
         self.auth = AuthService(self.store)
         self.env_path = Path(env_path)
+        default_resume_dir = Path(db_path).parent / "resumes"
+        self.resume_files = ResumeFileStore(resume_dir or default_resume_dir)
 
     def initialize(self) -> None:
         """创建 MVP 需要的数据表。"""
@@ -277,6 +293,183 @@ class JobHuntingApp:
         """列出候选人的职位定制简历草稿版本。"""
 
         return self.store.list_resume_drafts(candidate_id, job_id, account_id=account_id)
+
+    def upload_resume_document(
+        self,
+        candidate_id: int,
+        filename: str,
+        content: bytes,
+        account_id: int | None = None,
+    ) -> ResumeArtifactRecord:
+        """解析并保存候选人上传的原始 DOCX/PDF 简历。
+
+        原文件不会被后续改写覆盖；提取正文登记为 `resume_artifact` 长文本，供调用方
+        继续执行 RAG 增量索引。结构化档案不会从上传简历中自动覆盖。
+        """
+
+        self.store.get_candidate_profile(candidate_id, account_id=account_id)
+        clean_filename = sanitize_download_filename(filename, fallback="resume")
+        extraction = extract_resume_document(clean_filename, content)
+        stored = self.resume_files.save(
+            account_id=account_id,
+            candidate_id=candidate_id,
+            filename=clean_filename,
+            content=content,
+        )
+        try:
+            return self.store.save_resume_artifact(
+                account_id=account_id,
+                candidate_id=candidate_id,
+                artifact_type="source",
+                original_filename=clean_filename,
+                download_filename=clean_filename,
+                storage_key=stored.storage_key,
+                media_type=media_type_for_filename(clean_filename),
+                file_size=stored.file_size,
+                sha256=stored.sha256,
+                extraction_method=extraction.method,
+                extracted_text=extraction.text,
+                page_count=extraction.page_count,
+                register_long_text=True,
+            )
+        except Exception:
+            # SQLite 保存失败时删除刚写入的文件，保持两个存储边界一致。
+            self.resume_files.delete(stored.storage_key)
+            raise
+
+    def get_resume_artifact(
+        self,
+        artifact_id: int,
+        account_id: int | None = None,
+    ) -> ResumeArtifactRecord:
+        """读取一份简历文件元数据，并在 Web 场景执行账号过滤。"""
+
+        return self.store.get_resume_artifact(artifact_id, account_id=account_id)
+
+    def list_resume_artifacts(
+        self,
+        candidate_id: int,
+        account_id: int | None = None,
+    ) -> list[ResumeArtifactRecord]:
+        """列出候选人的原始和职位定制简历文件版本。"""
+
+        # 先读候选人，确保跨账号请求不会仅仅返回一个空列表而掩盖越权访问。
+        self.store.get_candidate_profile(candidate_id, account_id=account_id)
+        return self.store.list_resume_artifacts(candidate_id, account_id=account_id)
+
+    def resume_file_path(self, artifact: ResumeArtifactRecord) -> Path:
+        """把受控存储键解析为文件路径，不接受数据库之外的任意路径。"""
+
+        return self.resume_files.path_for(artifact.storage_key)
+
+    def create_tailored_resume_from_artifact(
+        self,
+        *,
+        candidate_id: int,
+        source_artifact_id: int,
+        job_id: int,
+        llm_client: LLMClient | None = None,
+        rag_persist_directory: str | Path | None = None,
+        rag_query: str | None = None,
+        allow_proficiency_upgrade: bool = False,
+        account_id: int | None = None,
+    ) -> TailoredResumeResult:
+        """基于上传简历和职位生成独立草稿、DOCX 与 PDF 文件版本。"""
+
+        candidate = self.store.get_candidate_profile(candidate_id, account_id=account_id)
+        job = self.store.get_job(job_id, account_id=account_id)
+        source = self.store.get_resume_artifact(source_artifact_id, account_id=account_id)
+        if source.candidate_id != candidate_id or source.artifact_type != "source":
+            raise ValueError("只能使用当前候选人的原始上传简历生成职位定制版本。")
+        source_text = self.store.get_resume_artifact_text(source.id, account_id=account_id)
+        confirmed_project_cards = [
+            record
+            for record in self.store.list_project_cards(candidate_id, account_id=account_id)
+            if record.status == "已确认"
+        ]
+        semantic_evidence: list[str] = []
+        if rag_persist_directory is not None:
+            query = rag_query or f"{job.title}\n{job.description_text}\n{source_text[:2_000]}"
+            semantic_evidence = [
+                format_rag_evidence(result)
+                for result in self.search_rag(
+                    query,
+                    rag_persist_directory,
+                    top_k=6,
+                    entity_types=[
+                        "candidate_profile",
+                        "job",
+                        "project_experience_card",
+                        "resume_artifact",
+                    ],
+                    account_id=account_id,
+                )
+            ]
+
+        draft = build_resume_draft(
+            candidate,
+            job,
+            confirmed_project_cards,
+            llm_client,
+            semantic_evidence,
+            source_resume_text=source_text,
+            allow_proficiency_upgrade=allow_proficiency_upgrade,
+        )
+        draft_record = self.store.save_resume_draft(
+            candidate_id,
+            job_id,
+            draft,
+            account_id=account_id,
+        )
+        generated_files = export_tailored_resume_files(
+            candidate_name=candidate.name,
+            job_title=job.title,
+            draft_version=draft_record.version,
+            content=draft.content,
+        )
+
+        saved_files = []
+        saved_records: list[ResumeArtifactRecord] = []
+        try:
+            for generated in generated_files:
+                stored = self.resume_files.save(
+                    account_id=account_id,
+                    candidate_id=candidate_id,
+                    filename=generated.filename,
+                    content=generated.content,
+                )
+                saved_files.append(stored)
+                saved_records.append(
+                    self.store.save_resume_artifact(
+                        account_id=account_id,
+                        candidate_id=candidate_id,
+                        job_id=job_id,
+                        draft_id=draft_record.id,
+                        parent_artifact_id=source.id,
+                        version=draft_record.version,
+                        artifact_type="tailored",
+                        original_filename=source.original_filename,
+                        download_filename=generated.filename,
+                        storage_key=stored.storage_key,
+                        media_type=generated.media_type,
+                        file_size=stored.file_size,
+                        sha256=stored.sha256,
+                        extraction_method="generated",
+                        extracted_text=draft.content,
+                        page_count=None,
+                        register_long_text=False,
+                    )
+                )
+        except Exception:
+            # 两种导出格式视为一个业务结果；任一失败时补偿删除本批元数据和二进制。
+            self.store.delete_resume_artifacts(
+                [record.id for record in saved_records],
+                account_id=account_id,
+            )
+            for stored in saved_files:
+                self.resume_files.delete(stored.storage_key)
+            raise
+        return TailoredResumeResult(draft=draft_record, artifacts=saved_records)
 
     def rebuild_rag_index(self, persist_directory: str | Path = "data/chroma", account_id: int | None = None) -> RAGIndexStats:
         """把 SQLite `long_texts` 全量同步到本地 Chroma RAG 索引。"""

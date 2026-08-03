@@ -21,7 +21,8 @@ class LLMSettings:
     """LLM 供应商配置。
 
     `api_key` 是敏感字段，只在内存中用于请求头，CLI 和日志都不应该打印它。
-    `base_url` 和 `model` 来自 `.env`，方便后续从 DeepSeek 切换到其他模型。
+    `provider` 是用于日志和计量的标签，不参与供应商白名单判断；只要接口兼容
+    OpenAI Chat Completions，就可以通过 `.env` 切换官方服务、本地服务或中转站。
     """
 
     provider: str
@@ -110,8 +111,8 @@ def load_llm_settings(
 ) -> LLMSettings:
     """从 `.env` 和系统环境变量加载 LLM 配置。
 
-    优先级是系统环境变量高于 `.env`。为了兼容你已有学习项目的命名，本函数同时
-    支持 `JOB_AGENT_LLM_*` 和 `DEEPSEEK_*` 两套键名。
+    优先级是系统环境变量高于 `.env`。项目专用 `JOB_AGENT_LLM_*` 优先，其次兼容
+    通用 `OPENAI_*` 和已有学习项目使用的 `DEEPSEEK_*` 键名。
     """
 
     file_values = load_dotenv_values(env_path)
@@ -128,9 +129,9 @@ def load_llm_settings(
         return default
 
     provider = get("JOB_AGENT_LLM_PROVIDER")
-    model = get("JOB_AGENT_LLM_MODEL", "DEEPSEEK_MODEL")
-    api_key = get("JOB_AGENT_LLM_API_KEY", "DEEPSEEK_API_KEY")
-    base_url = get("JOB_AGENT_LLM_BASE_URL", "DEEPSEEK_BASE_URL")
+    model = get("JOB_AGENT_LLM_MODEL", "OPENAI_MODEL", "DEEPSEEK_MODEL")
+    api_key = get("JOB_AGENT_LLM_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY")
+    base_url = get("JOB_AGENT_LLM_BASE_URL", "OPENAI_BASE_URL", "DEEPSEEK_BASE_URL")
     timeout = int(get("JOB_AGENT_LLM_TIMEOUT_SECONDS", default="60") or 60)
     thinking = get("JOB_AGENT_LLM_THINKING")
     reasoning_effort = get("JOB_AGENT_LLM_REASONING_EFFORT")
@@ -138,9 +139,9 @@ def load_llm_settings(
     if not provider:
         raise ValueError("缺少 LLM provider：请在 .env 中配置 JOB_AGENT_LLM_PROVIDER")
     if not api_key:
-        raise ValueError("缺少 LLM API Key：请在 .env 中配置 JOB_AGENT_LLM_API_KEY 或 DEEPSEEK_API_KEY")
+        raise ValueError("缺少 LLM API Key：请在 .env 中配置 JOB_AGENT_LLM_API_KEY")
     if not base_url:
-        raise ValueError("缺少 LLM base URL：请在 .env 中配置 JOB_AGENT_LLM_BASE_URL 或 DEEPSEEK_BASE_URL")
+        raise ValueError("缺少 LLM base URL：请在 .env 中配置 JOB_AGENT_LLM_BASE_URL")
     if not model:
         raise ValueError("缺少 LLM 模型名：请在 .env 中配置 JOB_AGENT_LLM_MODEL")
 
@@ -305,6 +306,21 @@ def load_agent_memory_settings(
             "JOB_AGENT_MEMORY_SUMMARY_TRIM_TOKENS",
         ),
     )
+
+
+def load_cookie_secure(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """按系统环境变量优先级读取 Session Cookie 的 Secure 开关。"""
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+    raw_value = environment.get("JOB_AGENT_COOKIE_SECURE") or file_values.get(
+        "JOB_AGENT_COOKIE_SECURE",
+        "false",
+    )
+    return parse_bool(raw_value)
 
 
 def masked_agent_memory_settings(settings: AgentMemorySettings) -> dict[str, object]:

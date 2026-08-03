@@ -1,0 +1,412 @@
+"""简历文件上传、解析、改写和导出工作流测试。
+
+这些测试把上传的二进制文件、SQLite 元数据和 RAG 长文本登记视为同一条业务链路，
+同时锁住账号隔离边界：知道别人的文件 ID 也不能列出或下载该文件。
+"""
+
+from __future__ import annotations
+
+import zipfile
+from io import BytesIO
+
+import pytest
+from docx import Document
+from fastapi.testclient import TestClient
+from PIL import Image
+from reportlab.pdfgen import canvas
+
+from job_hunting_agent.app import JobHuntingApp
+from job_hunting_agent.llm import StaticLLMClient
+from job_hunting_agent.models import CandidateProfileInput
+from job_hunting_agent import resume_document
+from job_hunting_agent.resume_document import (
+    ResumeDocumentError,
+    extract_resume_document,
+    sanitize_download_filename,
+)
+from job_hunting_agent.web import create_web_app
+
+
+def build_docx_bytes(*paragraphs: str) -> bytes:
+    """在内存中创建测试 DOCX，避免把测试夹具写进仓库。"""
+
+    document = Document()
+    for paragraph in paragraphs:
+        document.add_paragraph(paragraph)
+    output = BytesIO()
+    document.save(output)
+    return output.getvalue()
+
+
+def build_text_pdf_bytes(text: str) -> bytes:
+    """创建一个包含可直接提取 ASCII 文本的单页 PDF。"""
+
+    output = BytesIO()
+    pdf = canvas.Canvas(output)
+    pdf.drawString(72, 760, text)
+    pdf.save()
+    return output.getvalue()
+
+
+def build_scanned_pdf_bytes() -> bytes:
+    """创建只有图片、没有 PDF 文本层的单页扫描件。"""
+
+    image = Image.new("RGB", (900, 1200), "white")
+    output = BytesIO()
+    image.save(output, format="PDF")
+    return output.getvalue()
+
+
+def profile_input(name: str = "小林") -> CandidateProfileInput:
+    """返回各测试共享的最小候选人结构化档案。"""
+
+    return CandidateProfileInput(
+        name=name,
+        status="离职",
+        education="本科",
+        experience_years=1,
+        skills={"Python": "项目使用"},
+        preferred_cities=["杭州市"],
+        salary_floor_k=10,
+        expected_salary_k=15,
+        target_directions=["Python 后端开发"],
+        unacceptable=[],
+    )
+
+
+def register_and_login(client: TestClient, email: str) -> None:
+    """为需要真实 Session Cookie 的 Web 测试创建并登录普通账号。"""
+
+    password = "password-123"
+    registered = client.post(
+        "/api/auth/register",
+        json={"email": email, "password": password, "display_name": email.split("@")[0]},
+    )
+    assert registered.status_code == 200
+    logged_in = client.post("/api/auth/login", json={"email": email, "password": password})
+    assert logged_in.status_code == 200
+
+
+def create_profile_over_web(client: TestClient, name: str = "小林") -> int:
+    """通过受认证 Web API 创建候选人，返回档案 ID。"""
+
+    response = client.post(
+        "/api/profiles",
+        json={
+            "name": name,
+            "status": "离职",
+            "education": "本科",
+            "experience_years": 1,
+            "skills": {"Python": "项目使用"},
+            "preferred_cities": ["杭州市"],
+            "salary_floor_k": 10,
+            "expected_salary_k": 15,
+            "target_directions": ["Python 后端开发"],
+            "unacceptable": [],
+        },
+    )
+    assert response.status_code == 200
+    return int(response.json()["candidate_id"])
+
+
+def test_resume_parser_handles_docx_text_pdf_and_scanned_pdf() -> None:
+    """解析器应按真实文件内容区分 DOCX、文字 PDF 和需要 OCR 的扫描 PDF。"""
+
+    docx_result = extract_resume_document(
+        "candidate.docx",
+        build_docx_bytes("小林", "Python 与 FastAPI 项目经历"),
+    )
+    text_pdf_result = extract_resume_document(
+        "candidate.pdf",
+        build_text_pdf_bytes("Python backend resume with FastAPI project experience"),
+    )
+    scanned_pdf_result = extract_resume_document(
+        "scan.pdf",
+        build_scanned_pdf_bytes(),
+        ocr_runner=lambda _image: "扫描简历：Python、FastAPI 求职助手项目开发与接口设计经历",
+    )
+
+    assert docx_result.method == "docx"
+    assert "FastAPI" in docx_result.text
+    assert text_pdf_result.method == "pdf_text"
+    assert "backend resume" in text_pdf_result.text
+    assert scanned_pdf_result.method == "pdf_ocr"
+    assert "扫描简历" in scanned_pdf_result.text
+    assert scanned_pdf_result.page_count == 1
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        ("resume.txt", b"plain text is not an accepted resume file"),
+        ("resume.docx", b"not a zip document"),
+        ("resume.pdf", b"not a pdf document"),
+    ],
+)
+def test_resume_parser_rejects_unsupported_or_corrupt_files(filename: str, content: bytes) -> None:
+    """扩展名不支持或文件签名损坏时必须拒绝，不能把任意文本当简历保存。"""
+
+    with pytest.raises(ResumeDocumentError):
+        extract_resume_document(filename, content)
+
+
+def test_docx_parser_rejects_abnormally_large_uncompressed_xml(monkeypatch) -> None:
+    """DOCX 在读取 XML 前必须限制解压大小，避免小压缩包异常膨胀。"""
+
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", "<Types />")
+        archive.writestr(
+            "word/document.xml",
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            + ("A" * 2_000)
+            + "</w:document>",
+        )
+    monkeypatch.setattr(resume_document, "MAX_DOCX_XML_PART_BYTES", 1_000)
+
+    with pytest.raises(ResumeDocumentError, match="结构异常过大"):
+        extract_resume_document("resume.docx", output.getvalue())
+
+
+def test_sanitized_long_resume_filename_keeps_supported_extension() -> None:
+    """超长下载名被截断后仍应保留扩展名，避免合法简历被误判格式。"""
+
+    filename = sanitize_download_filename(("候选人" * 80) + ".docx")
+
+    assert len(filename) <= 120
+    assert filename.endswith(".docx")
+
+
+def test_app_saves_uploaded_resume_as_versioned_artifact_and_rag_source(tmp_path) -> None:
+    """上传简历应同时保存原文件、受控元数据和一条候选人范围的长文本来源。"""
+
+    app = JobHuntingApp(tmp_path / "app.db", resume_dir=tmp_path / "resume-files")
+    app.initialize()
+    account_a = app.auth.register("a@example.com", "password-123")
+    account_b = app.auth.register("b@example.com", "password-123")
+    candidate_id = app.save_candidate_profile(profile_input(), account_id=account_a.id)
+    original = build_docx_bytes("小林", "Python 与 FastAPI 项目经历")
+
+    first = app.upload_resume_document(
+        candidate_id,
+        "小林简历.docx",
+        original,
+        account_id=account_a.id,
+    )
+    second = app.upload_resume_document(
+        candidate_id,
+        "小林简历-更新.docx",
+        build_docx_bytes("小林", "Python、FastAPI 与 LangChain 项目经历"),
+        account_id=account_a.id,
+    )
+
+    assert first.artifact_type == "source"
+    assert first.version == 1
+    assert second.version == 2
+    assert first.sha256 != second.sha256
+    assert app.resume_file_path(first).read_bytes() == original
+    assert [item.id for item in app.list_resume_artifacts(candidate_id, account_id=account_a.id)] == [
+        first.id,
+        second.id,
+    ]
+    indexed_sources = app.store.list_long_texts(
+        entity_types=["resume_artifact"],
+        account_id=account_a.id,
+        candidate_id=candidate_id,
+    )
+    assert len(indexed_sources) == 2
+    assert indexed_sources[0].entity_id == first.id
+    assert "FastAPI" in indexed_sources[0].text
+
+    with pytest.raises(KeyError):
+        app.list_resume_artifacts(candidate_id, account_id=account_b.id)
+    with pytest.raises(KeyError):
+        app.get_resume_artifact(first.id, account_id=account_b.id)
+
+
+def test_web_upload_list_and_download_are_scoped_to_logged_in_account(tmp_path) -> None:
+    """Web 下载接口必须再次校验账号，不能仅凭可枚举的 artifact_id 返回文件。"""
+
+    web_app = create_web_app(
+        db_path=tmp_path / "web.db",
+        rag_dir=tmp_path / "chroma",
+        resume_dir=tmp_path / "resume-files",
+        require_auth=True,
+    )
+    owner = TestClient(web_app)
+    stranger = TestClient(web_app)
+    register_and_login(owner, "owner@example.com")
+    register_and_login(stranger, "stranger@example.com")
+    candidate_id = create_profile_over_web(owner)
+    original = build_docx_bytes("小林", "Python 与 FastAPI 项目经历")
+
+    uploaded = owner.post(
+        "/api/resumes/upload",
+        data={"candidate_id": str(candidate_id)},
+        files={
+            "file": (
+                "resume.docx",
+                original,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+
+    assert uploaded.status_code == 200
+    artifact = uploaded.json()["artifact"]
+    assert artifact["extraction_method"] == "docx"
+    assert artifact["download_url"].endswith(f"/{artifact['id']}/download")
+    assert "storage_key" not in artifact
+    assert "account_id" not in artifact
+    listed = owner.get("/api/resumes", params={"candidate_id": candidate_id})
+    downloaded = owner.get(artifact["download_url"])
+    forbidden = stranger.get(artifact["download_url"])
+
+    assert [item["id"] for item in listed.json()["artifacts"]] == [artifact["id"]]
+    assert downloaded.status_code == 200
+    assert downloaded.content == original
+    assert forbidden.status_code == 404
+
+
+def test_tailored_resume_creates_docx_and_pdf_without_overwriting_profile_or_source(tmp_path) -> None:
+    """职位改写应产出独立草稿和可下载文件，原简历与结构化档案保持不变。"""
+
+    app = JobHuntingApp(tmp_path / "app.db", resume_dir=tmp_path / "resume-files")
+    app.initialize()
+    account = app.auth.register("resume@example.com", "password-123")
+    candidate_id = app.save_candidate_profile(profile_input(), account_id=account.id)
+    job = app.import_job_text(
+        """
+        Python 后端开发工程师
+        15-20K
+        杭州
+        1-3年
+        本科
+        职位描述：负责 Python 与 FastAPI 后端接口开发。
+        """,
+        account_id=account.id,
+    )
+    original = build_docx_bytes("小林", "Python 与 FastAPI 项目经历")
+    source = app.upload_resume_document(
+        candidate_id,
+        "resume.docx",
+        original,
+        account_id=account.id,
+    )
+
+    generated = app.create_tailored_resume_from_artifact(
+        candidate_id=candidate_id,
+        source_artifact_id=source.id,
+        job_id=job.id,
+        llm_client=StaticLLMClient(
+            "# 小林\n\n## 求职目标\nPython 后端开发工程师\n\n## 项目经历\n- 使用 Python 与 FastAPI 开发求职助手。"
+        ),
+        account_id=account.id,
+    )
+
+    assert generated.draft.version == 1
+    assert {artifact.media_type for artifact in generated.artifacts} == {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/pdf",
+    }
+    assert all(artifact.parent_artifact_id == source.id for artifact in generated.artifacts)
+    assert app.resume_file_path(source).read_bytes() == original
+    assert app.get_candidate_profile(candidate_id, account_id=account.id).skills == {"Python": "项目使用"}
+
+    generated_bytes = {
+        artifact.media_type: app.resume_file_path(artifact).read_bytes()
+        for artifact in generated.artifacts
+    }
+    assert generated_bytes["application/pdf"].startswith(b"%PDF")
+    assert generated_bytes[
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ].startswith(b"PK")
+    exported_docx = Document(BytesIO(generated_bytes[
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ]))
+    assert "Python 后端开发工程师" in "\n".join(paragraph.text for paragraph in exported_docx.paragraphs)
+
+
+def test_web_can_tailor_uploaded_resume_and_return_download_urls(tmp_path) -> None:
+    """网页职位定制接口应返回独立草稿和两个可直接下载的文件版本。"""
+
+    web_app = create_web_app(
+        db_path=tmp_path / "web.db",
+        rag_dir=tmp_path / "chroma",
+        resume_dir=tmp_path / "resume-files",
+        resume_llm_client=StaticLLMClient(
+            "# 小林\n\n## 求职目标\nPython 后端开发工程师\n\n## 项目经历\n- 使用 Python 与 FastAPI 开发求职助手。"
+        ),
+        require_auth=True,
+    )
+    client = TestClient(web_app)
+    register_and_login(client, "tailor@example.com")
+    candidate_id = create_profile_over_web(client)
+    job = client.post(
+        "/api/jobs",
+        json={
+            "raw_text": """
+            Python 后端开发工程师
+            15-20K
+            杭州
+            1-3年
+            本科
+            职位描述：负责 Python 与 FastAPI 后端接口开发。
+            """,
+        },
+    ).json()["job"]
+    uploaded = client.post(
+        "/api/resumes/upload",
+        data={"candidate_id": str(candidate_id)},
+        files={
+            "file": (
+                "resume.docx",
+                build_docx_bytes("小林", "Python 与 FastAPI 项目经历"),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    ).json()["artifact"]
+
+    tailored = client.post(
+        f"/api/resumes/{uploaded['id']}/tailor",
+        json={"job_id": job["id"], "use_rag": False},
+    )
+
+    assert tailored.status_code == 200
+    payload = tailored.json()
+    assert payload["draft"]["status"] == "需候选人确认"
+    assert len(payload["artifacts"]) == 2
+    assert all(item["parent_artifact_id"] == uploaded["id"] for item in payload["artifacts"])
+    for artifact in payload["artifacts"]:
+        downloaded = client.get(artifact["download_url"])
+        assert downloaded.status_code == 200
+        assert downloaded.content
+
+
+def test_vue_frontend_exposes_resume_upload_tailor_and_download_workflow(tmp_path) -> None:
+    """Vue 工作台应提供完整文件交互，而不是只存在不可发现的后端 API。"""
+
+    client = TestClient(
+        create_web_app(
+            db_path=tmp_path / "web.db",
+            rag_dir=tmp_path / "chroma",
+            resume_dir=tmp_path / "resume-files",
+            require_auth=False,
+        )
+    )
+
+    home = client.get("/").text
+    script = client.get("/static/app.js").text
+    styles = client.get("/static/styles.css").text
+
+    assert 'ref="resumeFileInput"' in home
+    assert 'accept=".docx,.pdf"' in home
+    assert '@change="uploadResume"' in home
+    assert "简历文件" in home
+    assert "生成定制版" in home
+    assert ':href="artifact.download_url"' in home
+    assert "async uploadResume(event)" in script
+    assert '"/api/resumes/upload"' in script
+    assert "async loadResumeArtifacts()" in script
+    assert "async tailorResume(artifact)" in script
+    assert "resume-artifact-list" in styles
