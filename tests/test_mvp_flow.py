@@ -113,6 +113,43 @@ def test_matcher_applies_experience_and_education_hard_eliminations(tmp_path):
     assert any("学历" in reason for reason in education_match.elimination_reasons)
 
 
+def test_target_city_preference_changes_ranking_without_eliminating_job(tmp_path):
+    """目标城市属于普通偏好，异地职位只能扣分，不能被当成明确拒绝条件。"""
+
+    app = JobHuntingApp(tmp_path / "mvp.db")
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="小林",
+            status="离职",
+            education="本科",
+            experience_years=2,
+            skills={"Python": "项目使用"},
+            preferred_cities=["杭州"],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=["Python 开发"],
+            unacceptable=[],
+        )
+    )
+    job = app.import_job_text(
+        """
+        Python 开发工程师
+        15-20K
+        上海
+        1-3年
+        本科
+        职位描述：负责 Python 后端开发。
+        """
+    )
+
+    result = app.match_job(candidate_id, job.id)
+
+    assert not result.eliminated
+    assert any("目标城市偏好" in item for item in result.deductions)
+    assert any("需要确认是否接受" in item for item in result.risks)
+
+
 def test_project_analysis_outputs_confirmable_card_and_skips_sensitive_files(tmp_path):
     """项目分析会生成待确认卡片，并跳过 .env 等敏感文件。"""
 

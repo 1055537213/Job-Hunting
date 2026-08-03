@@ -35,23 +35,32 @@ def build_resume_draft(
     不能覆盖候选人档案中的结构化事实。
     """
 
-    evidence = collect_evidence(candidate, confirmed_project_cards)
+    # 只有候选人事实和候选人主动上传的原简历可以建立新事实。RAG 结果还可能
+    # 命中职位原文或同账号其它材料，因此只能帮助模型理解上下文，不能放宽校验。
+    factual_evidence = collect_evidence(candidate, confirmed_project_cards)
     normalized_source_resume = (source_resume_text or "").strip()
     if normalized_source_resume:
         # 上传简历是候选人主动提供的既有陈述，可以参与本次改写，但不会反向写入档案。
-        evidence.append("候选人上传简历原文：\n" + normalized_source_resume[:30_000])
-    evidence.extend(semantic_evidence or [])
-    evidence_text = "\n".join(evidence).lower()
+        factual_evidence.append("候选人上传简历原文：\n" + normalized_source_resume[:30_000])
+    contextual_evidence = list(semantic_evidence or [])
+    evidence = [*factual_evidence, *contextual_evidence]
+    factual_evidence_text = "\n".join(factual_evidence).lower()
     matched_skills = [
         skill
         for skill in job.skills
-        if skill in candidate.skills or skill.lower() in evidence_text
+        if skill in candidate.skills or skill.lower() in factual_evidence_text
     ]
     missing_skills = [skill for skill in job.skills if skill not in matched_skills]
     risks = [
         f"职位要求包含未确认技能：{skill}，草稿正文未写入该技能。"
         for skill in missing_skills
     ]
+    for skill in matched_skills:
+        if skill not in candidate.skills:
+            risks.append(f"技能 {skill} 仅来自已提供材料，熟练度仍需候选人确认。")
+    if allow_proficiency_upgrade:
+        # 用户可以明确要求一次性提高草稿措辞，但该选择不会反向修改事实档案。
+        risks.append("本次按候选人明确要求放宽熟练度措辞，发布前仍需再次核对真实性。")
     rewrite_notes = [
         "技能熟练度按候选人档案保守表达，不自动拔高。",
         "项目卡片只使用候选人已确认摘要，待确认线索不进入正文。",
@@ -75,7 +84,7 @@ def build_resume_draft(
             llm_content,
             candidate,
             missing_skills,
-            evidence,
+            factual_evidence,
             allow_proficiency_upgrade=allow_proficiency_upgrade,
         )
         if validation:
@@ -125,10 +134,9 @@ def rule_based_content(
     规则草稿不追求文采，优先保证事实不越界。它也是 LLM 输出不安全时的回退结果。
     """
 
-    skill_lines = [
-        f"- {skill_phrase(skill, candidate.skills[skill])}"
-        for skill in matched_skills
-    ] or ["- 暂未发现职位技能与候选人档案中的已确认技能直接重合。"]
+    skill_lines = [f"- {matched_skill_phrase(skill, candidate)}" for skill in matched_skills] or [
+        "- 暂未发现职位技能与候选人事实材料中的已确认技能直接重合。"
+    ]
     project_lines = []
     for record in confirmed_project_cards:
         if record.confirmed_summary:
@@ -170,6 +178,14 @@ def skill_phrase(skill: str, level: str) -> str:
     if normalized in {"了解", "学习过", "入门"}:
         return f"了解 {skill}，可结合项目继续补充证据"
     return f"{skill}（{normalized}）"
+
+
+def matched_skill_phrase(skill: str, candidate: CandidateProfile) -> str:
+    """为已匹配技能生成不会假设未知熟练度的简历措辞。"""
+
+    if skill in candidate.skills:
+        return skill_phrase(skill, candidate.skills[skill])
+    return f"候选人材料中提及 {skill}（熟练度待确认）"
 
 
 def build_prompt(

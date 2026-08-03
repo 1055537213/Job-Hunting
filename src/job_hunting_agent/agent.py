@@ -82,7 +82,8 @@ AGENT_SYSTEM_PROMPT = """
 - 当用户让你改简历时，先调用 list_resume_artifacts_for_candidate 查看是否有原始上传文件。
 - 如果存在原始上传文件，优先调用 create_tailored_resume_from_upload，并把返回的下载链接告诉用户。
 - 如果没有上传文件，才调用 create_resume_draft_for_job 生成纯文本草稿。
-- `allow_proficiency_upgrade` 只能在用户明确要求提高熟练度措辞时设为 true。
+- 用户要求提高熟练度措辞时，必须先提示真实性风险并等待再次确认；只有确认后的
+  后续工具调用才能把 `allow_proficiency_upgrade` 设为 true。
 
 最终回复请使用中文，先说你已经完成了什么，再简洁说明下一步建议。
 """.strip()
@@ -572,8 +573,8 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
     ) -> str:
         """基于当前候选人的原始上传简历生成职位定制 DOCX/PDF 和独立草稿版本。
 
-        默认不得拔高技能熟练度。只有用户在当前对话中明确要求提高熟练度措辞时，
-        才能把 `allow_proficiency_upgrade` 设为 true；生成结果始终不会覆盖原文件或档案。
+        默认不得拔高技能熟练度。只有已提示风险且用户再次确认提高措辞时，才能把
+        `allow_proficiency_upgrade` 设为 true；生成结果始终不会覆盖原文件或档案。
         """
 
         context = require_runtime_context(runtime)
