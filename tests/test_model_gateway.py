@@ -1,0 +1,166 @@
+"""内部 Model Gateway 的配置、计量和重试回归测试。"""
+
+from __future__ import annotations
+
+from job_hunting_agent.config import (
+    EmbeddingSettings,
+    LLMSettings,
+    ModelGatewaySettings,
+    RerankSettings,
+    load_model_gateway_settings,
+)
+from job_hunting_agent.model_gateway import ModelGateway, extract_provider_request_id
+from job_hunting_agent.rag import EmbeddingRequestError, OpenAICompatibleEmbeddings
+from job_hunting_agent.storage import SQLiteStore
+
+
+def test_gateway_settings_distinguish_runtime_environment_and_retry_policy(tmp_path):
+    """Gateway 配置必须明确标记运行环境，并接受 0 次重试。"""
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_ENVIRONMENT=test",
+                "JOB_AGENT_MODEL_GATEWAY_CHAT_MAX_RETRIES=0",
+                "JOB_AGENT_MODEL_GATEWAY_EMBEDDING_MAX_RETRIES=3",
+                "JOB_AGENT_MODEL_GATEWAY_RERANK_MAX_RETRIES=4",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_model_gateway_settings(env_file, environ={})
+
+    assert settings.environment == "test"
+    assert settings.chat_max_retries == 0
+    assert settings.embedding_max_retries == 3
+    assert settings.rerank_max_retries == 4
+
+
+def test_gateway_records_idempotent_provider_usage_without_prompt_content(tmp_path):
+    """同一 call_id 重复上报时只保留一条可计费流水。"""
+
+    store = SQLiteStore(tmp_path / "gateway.db")
+    store.initialize()
+    account = store.create_account("gateway@example.com", "not-used-by-this-test")
+    gateway = ModelGateway(
+        tmp_path / ".env",
+        usage_store=store,
+        llm_settings=LLMSettings(
+            provider="relay",
+            model="chat-model",
+            api_key="secret-not-persisted",
+            base_url="https://relay.example/v1",
+        ),
+        embedding_settings=EmbeddingSettings(
+            provider="local_hash",
+            model="local-hash",
+            api_key="local",
+            base_url="local",
+        ),
+        settings=ModelGatewaySettings(environment="test"),
+    )
+    context = gateway.new_call_context(
+        "agent_chat",
+        account_id=account.id,
+        root_request_id="request-1",
+        call_id="request-1-agent-chat-1",
+    )
+
+    first = gateway.record_chat_usage_summary(
+        context,
+        {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+    )
+    second = gateway.record_chat_usage_summary(
+        context,
+        {"input_tokens": 999, "output_tokens": 999, "total_tokens": 1998},
+    )
+    events = store.list_usage_events(account_id=account.id)
+
+    assert first["usage_source"] == "provider"
+    assert second["usage_source"] == "provider"
+    assert len(events) == 1
+    assert events[0].call_id == "request-1-agent-chat-1"
+    assert events[0].provider == "relay"
+    assert events[0].model == "chat-model"
+    assert events[0].raw_usage == {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18}
+    assert "secret-not-persisted" not in str(events[0].raw_usage)
+
+
+def test_gateway_extracts_provider_request_id_from_response_headers():
+    """诊断可关联供应商请求，但不需要保存模型响应正文。"""
+
+    request_id = extract_provider_request_id({"headers": {"x-request-id": "upstream-42"}})
+
+    assert request_id == "upstream-42"
+
+
+def test_gateway_records_rerank_usage_under_the_rerank_model_identity(tmp_path):
+    """Rerank 的供应商 Token 用量必须进入现有账号级流水，供后续按量计费。"""
+
+    store = SQLiteStore(tmp_path / "gateway-rerank.db")
+    store.initialize()
+    account = store.create_account("rerank@example.com", "not-used-by-this-test")
+    gateway = ModelGateway(
+        tmp_path / ".env",
+        usage_store=store,
+        rerank_settings=RerankSettings(
+            provider="dashscope",
+            model="qwen3-vl-rerank",
+            api_key="secret-not-persisted",
+            base_url="https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+        ),
+        settings=ModelGatewaySettings(environment="test"),
+    )
+    context = gateway.new_call_context(
+        "rerank_query",
+        account_id=account.id,
+        root_request_id="request-rerank-1",
+        call_id="request-rerank-1-rerank-query-1",
+    )
+
+    summary = gateway.record_rerank_response(
+        context,
+        {
+            "request_id": "dashscope-request-42",
+            "usage": {"input_tokens": 12, "total_tokens": 12},
+        },
+    )
+    events = store.list_usage_events(account_id=account.id)
+
+    assert summary["usage_source"] == "provider"
+    assert len(events) == 1
+    assert events[0].operation == "rerank_query"
+    assert events[0].provider == "dashscope"
+    assert events[0].model == "qwen3-vl-rerank"
+    assert events[0].provider_request_id == "dashscope-request-42"
+    assert events[0].total_tokens == 12
+    assert "secret-not-persisted" not in str(events[0].raw_usage)
+
+
+def test_embedding_adapter_retries_transient_gateway_failure_once():
+    """Embedding 的临时网络异常应遵循 Gateway 指定的有限重试次数。"""
+
+    calls = 0
+
+    def transport(url, headers, payload, timeout):  # noqa: ANN001
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise EmbeddingRequestError("temporary upstream failure")
+        return {
+            "data": [{"index": 0, "embedding": [0.1, 0.2]}],
+            "usage": {"prompt_tokens": 4, "total_tokens": 4},
+        }
+
+    embeddings = OpenAICompatibleEmbeddings(
+        api_key="test-key",
+        base_url="https://embedding.example/v1",
+        model="embedding-model",
+        transport=transport,
+        max_retries=1,
+    )
+
+    assert embeddings.embed_query("候选人项目经历") == [0.1, 0.2]
+    assert calls == 2

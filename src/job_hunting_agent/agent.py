@@ -34,12 +34,11 @@ from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, Huma
 from langgraph.checkpoint.memory import MemorySaver
 
 from .app import JobHuntingApp
-from .auth import utc_now
-from .config import AgentMemorySettings, DEFAULT_ENV_PATH, load_agent_memory_settings, load_llm_settings
+from .config import AgentMemorySettings, DEFAULT_ENV_PATH, load_agent_memory_settings
 from .conversation_memory import build_restored_context_messages
 from .job_parser import InvalidJobTextError
-from .llm import build_chat_model, build_llm_client, extract_message_text
-from .models import AgentChatResult, UsageEventRecord
+from .llm import extract_message_text
+from .models import AgentChatResult
 
 
 class JobHuntingAgentContext(TypedDict):
@@ -122,18 +121,20 @@ class JobHuntingAgent:
         """
 
         self.app = app
+        self.model_gateway = app.model_gateway
         self.env_path = Path(env_path)
         self.rag_dir = Path(rag_dir)
         if model is None:
-            llm_settings = load_llm_settings(self.env_path)
-            self.model = build_chat_model(llm_settings)
+            # Agent 不直接创建供应商 SDK；模型选择、重试策略和后续 usage 统一由
+            # 内部 Model Gateway 收束。
+            self.model = self.model_gateway.chat_model("agent_chat")
             self.tool_llm_available = True
         else:
             self.model = model
             # 注入主模型常用于离线测试或自托管模型。工具内的二次单轮 LLM 仍由
             # `.env` 独立创建；配置不存在时使用规则实现，而不是让整轮 Agent 返回 502。
             try:
-                load_llm_settings(self.env_path)
+                self.model_gateway.llm_settings
             except ValueError:
                 self.tool_llm_available = False
             else:
@@ -142,7 +143,7 @@ class JobHuntingAgent:
         self._restored_sessions: set[tuple[int | None, int | None, str]] = set()
         self.graph = create_agent(
             model=self.model,
-            tools=build_job_hunting_tools(app, self.env_path),
+            tools=build_job_hunting_tools(app),
             system_prompt=AGENT_SYSTEM_PROMPT,
             middleware=build_memory_middleware(self.model, self.memory_settings),
             context_schema=JobHuntingAgentContext,
@@ -177,9 +178,9 @@ class JobHuntingAgent:
             },
         )
         messages = list(result.get("messages", []))
-        usage = record_agent_usage(
-            self.app,
-            messages,
+        usage = self.model_gateway.record_chat_messages(
+            operation="agent_chat",
+            messages=messages,
             account_id=account_id,
             candidate_id=candidate_id,
             session_id=resolved_session_id,
@@ -264,13 +265,16 @@ class JobHuntingAgent:
         reply = extract_final_reply(tool_and_final_messages)
         if reply.startswith("本轮没有生成") and streamed_reply_parts:
             reply = "".join(streamed_reply_parts).strip()
-        usage = record_usage_summary(
-            self.app,
+        usage = self.model_gateway.record_chat_usage_summary(
+            self.model_gateway.new_call_context(
+                "agent_chat",
+                account_id=account_id,
+                candidate_id=candidate_id,
+                session_id=resolved_session_id,
+                root_request_id=root_request_id,
+                call_id=f"{root_request_id}-agent_chat-stream",
+            ),
             streamed_usage,
-            account_id=account_id,
-            candidate_id=candidate_id,
-            session_id=resolved_session_id,
-            root_request_id=root_request_id,
         )
         yield {
             "type": "final",
@@ -344,13 +348,13 @@ def build_memory_middleware(
     ]
 
 
-def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
+def build_job_hunting_tools(app: JobHuntingApp) -> list[object]:
     """构建标准 LangChain Agent 工具列表。"""
 
     @tool
     def ingest_candidate_message(
         message: str,
-        runtime: ToolRuntime,
+        runtime: ToolRuntime[JobHuntingAgentContext, Any],
         auto_rag: bool | None = None,
     ) -> str:
         """当用户补充候选人资料、技能、项目经历或 HR 对话时，自动保存到 SQLite 和 RAG。"""
@@ -359,9 +363,14 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
         candidate_id = require_candidate_id(context)
         account_id = context.get("account_id")
         llm_client = (
-            load_tool_llm_client(
-                env_path,
-                usage_callback=build_tool_usage_callback(app, context, "tool_llm_ingestion"),
+            app.model_gateway.llm_client(
+                app.model_gateway.new_call_context(
+                    "tool_llm_ingestion",
+                    account_id=account_id,
+                    candidate_id=candidate_id,
+                    session_id=context.get("session_id"),
+                    root_request_id=context.get("root_request_id"),
+                )
             )
             if context["use_tool_llm"]
             else None
@@ -385,7 +394,7 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
         )
 
     @tool
-    def get_current_candidate_profile(runtime: ToolRuntime) -> str:
+    def get_current_candidate_profile(runtime: ToolRuntime[JobHuntingAgentContext, Any]) -> str:
         """读取当前候选人的结构化档案，用于回答“我现在的档案里有什么”。"""
 
         context = require_runtime_context(runtime)
@@ -393,7 +402,7 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
         return dumps_tool_output(asdict(app.get_candidate_profile(candidate_id, account_id=context.get("account_id"))))
 
     @tool
-    def list_candidate_profiles(runtime: ToolRuntime) -> str:
+    def list_candidate_profiles(runtime: ToolRuntime[JobHuntingAgentContext, Any]) -> str:
         """列出本地所有候选人档案，适合在用户不确定当前档案时使用。"""
 
         # 同账号内可以共享所有档案，但不能看到其它账号的档案。
@@ -405,7 +414,7 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
     @tool
     def search_candidate_evidence(
         query: str,
-        runtime: ToolRuntime,
+        runtime: ToolRuntime[JobHuntingAgentContext, Any],
         top_k: int = 5,
         entity_types: list[str] | None = None,
     ) -> str:
@@ -424,7 +433,7 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
     @tool
     def import_job_from_text(
         raw_text: str,
-        runtime: ToolRuntime,
+        runtime: ToolRuntime[JobHuntingAgentContext, Any],
         source_url: str | None = None,
     ) -> str:
         """导入用户主动复制回来的职位文本，并解析成标准化职位记录。"""
@@ -437,14 +446,14 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
         return dumps_tool_output({"job": asdict(job)})
 
     @tool
-    def list_imported_jobs(runtime: ToolRuntime) -> str:
+    def list_imported_jobs(runtime: ToolRuntime[JobHuntingAgentContext, Any]) -> str:
         """列出本地已经导入的职位池，供后续匹配或简历改写选择。"""
 
         context = require_runtime_context(runtime)
         return dumps_tool_output({"jobs": [asdict(job) for job in app.list_jobs(account_id=context.get("account_id"))]})
 
     @tool
-    def match_all_jobs_for_candidate(runtime: ToolRuntime) -> str:
+    def match_all_jobs_for_candidate(runtime: ToolRuntime[JobHuntingAgentContext, Any]) -> str:
         """匹配当前候选人与本地全部职位，并返回按推荐顺序排序的结果。"""
 
         context = require_runtime_context(runtime)
@@ -466,7 +475,7 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
         )
 
     @tool
-    def list_project_cards_for_candidate(runtime: ToolRuntime) -> str:
+    def list_project_cards_for_candidate(runtime: ToolRuntime[JobHuntingAgentContext, Any]) -> str:
         """列出当前候选人的项目经历卡片，查看哪些还待确认。"""
 
         context = require_runtime_context(runtime)
@@ -477,7 +486,7 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
     @tool
     def analyze_local_project_for_candidate(
         project_path: str,
-        runtime: ToolRuntime,
+        runtime: ToolRuntime[JobHuntingAgentContext, Any],
     ) -> str:
         """分析本地项目目录并保存成待确认项目经历卡片。"""
 
@@ -489,7 +498,7 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
     @tool
     def confirm_project_card(
         record_id: int,
-        runtime: ToolRuntime,
+        runtime: ToolRuntime[JobHuntingAgentContext, Any],
         confirmed_summary: str | None = None,
     ) -> str:
         """确认一张项目卡片，并把候选人确认摘要保存为后续可检索证据。
@@ -516,7 +525,7 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
     @tool
     def create_resume_draft_for_job(
         job_id: int,
-        runtime: ToolRuntime,
+        runtime: ToolRuntime[JobHuntingAgentContext, Any],
         use_rag: bool = True,
         rag_query: str | None = None,
     ) -> str:
@@ -526,9 +535,14 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
         candidate_id = require_candidate_id(context)
         account_id = context.get("account_id")
         llm_client = (
-            load_tool_llm_client(
-                env_path,
-                usage_callback=build_tool_usage_callback(app, context, "resume_rewrite"),
+            app.model_gateway.llm_client(
+                app.model_gateway.new_call_context(
+                    "resume_rewrite",
+                    account_id=account_id,
+                    candidate_id=candidate_id,
+                    session_id=context.get("session_id"),
+                    root_request_id=context.get("root_request_id"),
+                )
             )
             if context["use_tool_llm"]
             else None
@@ -544,7 +558,7 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
         return dumps_tool_output(asdict(draft))
 
     @tool
-    def list_resume_artifacts_for_candidate(runtime: ToolRuntime) -> str:
+    def list_resume_artifacts_for_candidate(runtime: ToolRuntime[JobHuntingAgentContext, Any]) -> str:
         """列出当前候选人已上传和已生成的简历文件，供改写前选择源文件。"""
 
         context = require_runtime_context(runtime)
@@ -566,7 +580,7 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
     def create_tailored_resume_from_upload(
         source_artifact_id: int,
         job_id: int,
-        runtime: ToolRuntime,
+        runtime: ToolRuntime[JobHuntingAgentContext, Any],
         use_rag: bool = True,
         rag_query: str | None = None,
         allow_proficiency_upgrade: bool = False,
@@ -581,13 +595,14 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
         candidate_id = require_candidate_id(context)
         account_id = context.get("account_id")
         llm_client = (
-            load_tool_llm_client(
-                env_path,
-                usage_callback=build_tool_usage_callback(
-                    app,
-                    context,
+            app.model_gateway.llm_client(
+                app.model_gateway.new_call_context(
                     "resume_document_rewrite",
-                ),
+                    account_id=account_id,
+                    candidate_id=candidate_id,
+                    session_id=context.get("session_id"),
+                    root_request_id=context.get("root_request_id"),
+                )
             )
             if context["use_tool_llm"]
             else None
@@ -630,7 +645,7 @@ def build_job_hunting_tools(app: JobHuntingApp, env_path: Path) -> list[object]:
 
 
 def require_runtime_context(
-    runtime: ToolRuntime,
+    runtime: ToolRuntime[JobHuntingAgentContext, Any],
 ) -> JobHuntingAgentContext:
     """读取工具运行时上下文。"""
 
@@ -648,32 +663,25 @@ def require_candidate_id(context: JobHuntingAgentContext) -> int:
     return candidate_id
 
 
-def load_tool_llm_client(env_path: Path, usage_callback=None):
-    """为工具内部的“单次 prompt”场景构造 LLM 客户端。"""
-
-    return build_llm_client(load_llm_settings(env_path), usage_callback=usage_callback)
-
-
 def build_tool_usage_callback(
     app: JobHuntingApp,
     context: JobHuntingAgentContext,
     operation: str,
 ):
-    """为工具内部的单次 LLM 调用构造用量回调。"""
+    """为兼容旧调用方构造 Gateway 驱动的工具用量回调。"""
+
+    call_context = app.model_gateway.new_call_context(
+        operation,
+        account_id=context.get("account_id"),
+        candidate_id=context.get("candidate_id"),
+        session_id=context.get("session_id"),
+        root_request_id=context.get("root_request_id"),
+    )
 
     def callback(message: object) -> None:
-        """读取一次工具模型响应并追加到账号用量流水。"""
+        """把一次单轮工具调用委托给 Gateway 记录。"""
 
-        record_usage_summary(
-            app,
-            extract_usage_metadata(message),
-            account_id=context.get("account_id"),
-            candidate_id=context.get("candidate_id"),
-            session_id=context.get("session_id", "") or "",
-            root_request_id=context.get("root_request_id", "") or uuid.uuid4().hex,
-            operation=operation,
-            call_id=f"{context.get('root_request_id', uuid.uuid4().hex)}-{operation}-{uuid.uuid4().hex}",
-        )
+        app.model_gateway.record_chat_response(call_context, message)
 
     return callback
 
@@ -732,40 +740,22 @@ def record_usage_summary(
     call_id: str | None = None,
     model: str = "agent",
 ) -> dict[str, int | str]:
-    """把一轮 Agent 主模型 usage 写入追加式流水；无账号的 CLI 不写账单。"""
+    """兼容旧接口，并把汇总 usage 委托给内部 Model Gateway。"""
 
-    normalized = {
-        "input_tokens": max(0, int(usage.get("input_tokens", 0))),
-        "output_tokens": max(0, int(usage.get("output_tokens", 0))),
-        "total_tokens": max(0, int(usage.get("total_tokens", 0))),
-    }
-    source = "provider" if normalized["total_tokens"] > 0 else "missing"
-    if account_id is not None:
-        app.store.record_usage_event(
-            UsageEventRecord(
-                id=0,
-                account_id=account_id,
-                candidate_id=candidate_id,
-                session_id=session_id,
-                root_request_id=root_request_id,
-                call_id=call_id or f"{root_request_id}-{operation}",
-                provider="configured-llm",
-                model=model,
-                operation=operation,
-                input_tokens=normalized["input_tokens"],
-                output_tokens=normalized["output_tokens"],
-                total_tokens=normalized["total_tokens"],
-                usage_source=source,
-                status="succeeded",
-                attempt=1,
-                provider_request_id=None,
-                raw_usage=normalized,
-                created_at=utc_now().isoformat(timespec="seconds"),
-                billable=source == "provider",
-                pricing_version=None,
-            )
-        )
-    return {**normalized, "usage_source": source}
+    context = app.model_gateway.new_call_context(
+        operation,
+        account_id=account_id,
+        candidate_id=candidate_id,
+        session_id=session_id,
+        root_request_id=root_request_id,
+        call_id=call_id,
+    )
+    return app.model_gateway.record_usage(
+        context,
+        usage,
+        provider="configured-llm",
+        model=model,
+    )
 
 
 def record_agent_usage(
@@ -777,17 +767,11 @@ def record_agent_usage(
     session_id: str,
     root_request_id: str,
 ) -> dict[str, int | str]:
-    """汇总非流式 Agent 中各 AI 消息的 usage，并写入当前主模型流水。"""
+    """兼容旧接口，并按每个 AIMessage 拆分为 Gateway 用量流水。"""
 
-    total = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-    for message in messages:
-        if isinstance(message, AIMessage):
-            usage = extract_usage_metadata(message)
-            for key in total:
-                total[key] += usage.get(key, 0)
-    return record_usage_summary(
-        app,
-        total,
+    return app.model_gateway.record_chat_messages(
+        operation="agent_model",
+        messages=messages,
         account_id=account_id,
         candidate_id=candidate_id,
         session_id=session_id,

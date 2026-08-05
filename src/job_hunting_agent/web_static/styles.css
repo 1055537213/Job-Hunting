@@ -1,5 +1,5 @@
-/* Hallmark; pre-emit critique: P5 H5 E4 S5 R5 V5; macrostructure: Index-First; genre: modern-minimal; theme: Coral; tone: utilitarian-technical; anchor hue: warm coral; enrichment: none; nav: N9; footer: Ft1; contrast: pending verification */
-@import url("/static/tokens.css?v=20260728-markdown-tables");
+/* Hallmark; pre-emit critique: P5 H5 E5 S5 R5 V5; macrostructure: Index-First; genre: modern-minimal; theme: Coral; tone: utilitarian-technical; anchor hue: warm coral; enrichment: none; nav: N9; footer: Ft1; contrast: pass (40-41); slop: pass (42-55) */
+@import url("/static/tokens.css?v=20260805-coral-workbench");
 /* Hallmark; page: local job-hunting agent workbench; no fake chrome; no gradient hero; no glassmorphism */
 
 *,
@@ -72,6 +72,16 @@ a {
   gap: var(--space-md);
   padding: var(--space-md);
   margin-inline: auto;
+  background: var(--color-paper);
+}
+
+/* 未登录页面使用整屏背景，避免登录区域外露出工作台的浅灰底色。 */
+#app.auth-page {
+  width: 100%;
+  max-width: none;
+  padding: 0;
+  margin: 0;
+  gap: 0;
 }
 
 .topbar {
@@ -194,7 +204,7 @@ kbd {
   white-space: nowrap;
 }
 
-.quick-nav {
+.topbar-actions {
   min-width: 0;
   display: flex;
   flex-wrap: wrap;
@@ -204,6 +214,7 @@ kbd {
 }
 
 .nav-link,
+.account-badge,
 .primary-button,
 .ghost-button,
 .send-button,
@@ -239,7 +250,8 @@ kbd {
 }
 
 .ghost-button,
-.nav-link {
+.nav-link,
+.account-badge {
   color: var(--color-ink-2);
   background: var(--color-paper-raised);
   border: var(--rule-thin) solid var(--color-rule);
@@ -249,11 +261,13 @@ kbd {
   padding-inline: var(--space-sm);
 }
 
-.account-link {
+.account-badge {
   min-width: 0;
   max-width: 13rem;
+  padding-inline: var(--space-sm);
   overflow: hidden;
   text-overflow: ellipsis;
+  cursor: default;
 }
 
 .send-button {
@@ -462,6 +476,38 @@ textarea:focus-visible,
   color: var(--color-graphite-text);
   background: var(--color-graphite);
   border-color: var(--color-graphite-rule);
+}
+
+/* The dark conversation surface is intentionally warm, with its own contrast pair. */
+.chat-column .chat-head {
+  color: var(--color-graphite-text);
+  background: var(--color-graphite);
+  border-block-end: var(--rule-thin) solid var(--color-graphite-rule);
+}
+
+.chat-column .eyebrow {
+  color: var(--color-graphite-muted);
+}
+
+.chat-column .chat-title {
+  color: var(--color-graphite-text);
+}
+
+.chat-column :focus-visible {
+  outline-color: var(--color-graphite-text);
+}
+
+.chat-session-actions .field,
+.chat-session-actions .ghost-button {
+  color: var(--color-graphite-text);
+  background: var(--color-graphite-3);
+  border-color: var(--color-graphite-rule);
+}
+
+.chat-session-actions .field:focus-visible,
+.chat-session-actions .ghost-button:focus-visible {
+  border-color: var(--color-graphite-muted);
+  outline-color: var(--color-accent);
 }
 
 .messages {
@@ -1086,7 +1132,7 @@ textarea:focus-visible,
     max-width: 12rem;
   }
 
-  .quick-nav {
+  .topbar-actions {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1221,6 +1267,52 @@ textarea:focus-visible,
 .auth-form .field:hover { background: var(--auth-paper-2); }
 .auth-form .field:focus-visible { outline: 2px solid var(--auth-focus); outline-offset: 2px; }
 
+.field-label { cursor: pointer; }
+
+.password-field {
+  position: relative;
+}
+
+.password-field .field {
+  padding-inline-end: calc(var(--size-control) + var(--space-md));
+}
+
+/* Edge/Chromium 的原生密码眼睛由浏览器控制，隐藏后统一使用 Vue 按钮管理状态。 */
+.auth-form input[type="password"]::-ms-reveal,
+.auth-form input[type="password"]::-ms-clear,
+.auth-form input[type="password"]::-webkit-credentials-auto-fill-button {
+  display: none;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.password-toggle {
+  position: absolute;
+  top: 50%;
+  right: var(--space-2xs);
+  width: var(--size-hit);
+  height: var(--size-hit);
+  display: grid;
+  place-items: center;
+  color: var(--auth-muted);
+  background: transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transform: translateY(-50%);
+}
+
+.password-toggle:hover { color: var(--auth-ink); }
+.password-toggle:focus-visible { outline: 2px solid var(--auth-focus); outline-offset: 2px; }
+.password-toggle svg {
+  width: 1.25rem;
+  height: 1.25rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
 .auth-submit {
   width: 100%;
   margin-top: var(--space-sm);
@@ -1244,7 +1336,7 @@ textarea:focus-visible,
 .text-button:hover { color: var(--auth-ink); }
 .text-button:focus-visible { outline: 2px solid var(--auth-focus); outline-offset: 2px; }
 
-.chat-head { padding: var(--space-md) var(--space-lg) 0; }
+.chat-head { padding: var(--space-lg) var(--space-lg) var(--space-md); }
 .chat-title { font-size: var(--text-lg); }
 .chat-session-actions { display: flex; align-items: center; gap: var(--space-xs); min-width: 0; }
 .session-select { min-width: 10rem; max-width: 16rem; }

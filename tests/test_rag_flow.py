@@ -5,7 +5,8 @@ RAG 层只做语义检索索引，不能取代 SQLite 事实源。测试通过 `
 """
 
 from job_hunting_agent.app import JobHuntingApp
-from job_hunting_agent.models import CandidateProfileInput
+from job_hunting_agent.models import CandidateProfileInput, LongTextRecord
+from job_hunting_agent.rag import LocalHashEmbeddings, RAGKnowledgeBase
 
 
 class RecordingLLM:
@@ -103,6 +104,28 @@ def test_rag_can_incrementally_index_new_long_texts_without_rebuild(tmp_path):
     assert second_stats.document_count == 1
     assert any("职位解析" in result.content for result in first_results)
     assert any("RAG 知识库" in result.content for result in second_results)
+
+
+def test_rag_uses_separate_collection_when_embedding_dimensions_conflict(tmp_path):
+    """同一持久化目录切换向量维度时应保留旧集合，并使用兼容的新集合。"""
+
+    rag_dir = tmp_path / "chroma"
+    source = LongTextRecord(
+        id=1,
+        entity_type="candidate_profile",
+        entity_id=1,
+        source_label="skills",
+        text="Python FastAPI 项目经验",
+    )
+    first = RAGKnowledgeBase(rag_dir, embeddings=LocalHashEmbeddings(dimensions=8))
+    first_stats = first.index_long_texts([source])
+
+    second = RAGKnowledgeBase(rag_dir, embeddings=LocalHashEmbeddings(dimensions=16))
+    second_stats = second.index_long_texts([source])
+
+    assert first_stats.collection_name != second_stats.collection_name
+    assert first.search("FastAPI")
+    assert second.search("FastAPI")
 
 
 def test_resume_draft_can_use_rag_evidence_without_treating_it_as_profile_fact(tmp_path):

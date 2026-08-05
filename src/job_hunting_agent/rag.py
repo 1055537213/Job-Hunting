@@ -14,19 +14,59 @@ import re
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
+import chromadb
+from chromadb.errors import NotFoundError
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from .config import DEFAULT_ENV_PATH, EmbeddingSettings, load_embedding_settings
+from .config import (
+    DASHSCOPE_MULTIMODAL_EMBEDDING_URL,
+    DASHSCOPE_RERANK_URL,
+    DEFAULT_ENV_PATH,
+    EmbeddingSettings,
+    RerankSettings,
+    load_embedding_settings,
+    load_rerank_settings,
+)
 from .models import LongTextRecord, RAGIndexStats, RAGSearchResult
 
 
 DEFAULT_RAG_COLLECTION = "job_hunting_agent"
+
+
+class RAGProviderRequestError(RuntimeError):
+    """RAG 依赖的远程模型服务请求失败时抛出的统一业务异常。"""
+
+
+class EmbeddingRequestError(RAGProviderRequestError):
+    """调用真实 Embedding 接口失败时抛出。"""
+
+
+class RerankRequestError(RAGProviderRequestError):
+    """调用 Rerank 接口失败时抛出。"""
+
+
+@dataclass(frozen=True)
+class RerankResult:
+    """一条 Rerank 输出在候选列表中的位置和相关性分数。"""
+
+    index: int
+    relevance_score: float | None = None
+
+
+class Reranker(Protocol):
+    """RAG 重排器的最小接口，避免业务层依赖具体供应商 SDK。"""
+
+    candidate_multiplier: int
+
+    def rerank(self, query: str, documents: list[str], top_n: int) -> list[RerankResult]:
+        """按照查询相关性返回候选文本的排序结果。"""
 
 
 class LocalHashEmbeddings(Embeddings):
@@ -81,6 +121,7 @@ class OpenAICompatibleEmbeddings(Embeddings):
         transport: Callable[[str, dict[str, str], dict[str, object], int], dict[str, object]] | None = None,
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         usage_operation: str = "embedding",
+        max_retries: int = 2,
     ):
         """保存 embedding 调用配置。"""
 
@@ -93,6 +134,8 @@ class OpenAICompatibleEmbeddings(Embeddings):
         self.transport = transport or post_embeddings_json
         self.usage_callback = usage_callback
         self.usage_operation = usage_operation
+        # 由内部 Model Gateway 传入；0 表示失败后不重试。
+        self.max_retries = max(0, max_retries)
         self.embeddings_url = normalize_embeddings_url(base_url)
 
     @classmethod
@@ -101,6 +144,7 @@ class OpenAICompatibleEmbeddings(Embeddings):
         settings: EmbeddingSettings,
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         usage_operation: str = "embedding",
+        max_retries: int = 2,
     ) -> "OpenAICompatibleEmbeddings":
         """从统一配置对象创建 embedding 客户端。"""
 
@@ -113,6 +157,7 @@ class OpenAICompatibleEmbeddings(Embeddings):
             dimensions=settings.dimensions,
             usage_callback=usage_callback,
             usage_operation=usage_operation,
+            max_retries=max_retries,
         )
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -142,21 +187,131 @@ class OpenAICompatibleEmbeddings(Embeddings):
         # OpenAI text-embedding-3 系列支持 dimensions；其它兼容供应商通常会忽略未知字段或自行报错。
         if self.dimensions is not None:
             payload["dimensions"] = self.dimensions
-        response = self.transport(
-            self.embeddings_url,
-            {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            payload,
-            self.timeout_seconds,
-        )
+        response: dict[str, object] | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.transport(
+                    self.embeddings_url,
+                    {
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    payload,
+                    self.timeout_seconds,
+                )
+                break
+            except EmbeddingRequestError:
+                if attempt >= self.max_retries:
+                    raise
+        if response is None:  # pragma: no cover - 防御性兜底，循环应当已成功或抛异常。
+            raise EmbeddingRequestError("Embedding API 未返回响应")
         if self.usage_callback is not None:
             try:
                 self.usage_callback(response)
             except Exception:  # noqa: BLE001 - 计量旁路不能阻断向量索引。
                 pass
         return extract_embedding_vectors(response)
+
+
+class DashScopeMultimodalEmbeddings(Embeddings):
+    """DashScope `MultiModalEmbedding` 的 LangChain 适配器。
+
+    当前 RAG 只发送文本 chunk，但选用多模态模型后，后续可以在不替换检索协议的前提下
+    扩展到简历图片等资料。DashScope 的请求体与 OpenAI Embeddings 不兼容，因此独立实现。
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        timeout_seconds: int = 60,
+        batch_size: int = 16,
+        transport: Callable[[str, dict[str, str], dict[str, object], int], dict[str, object]] | None = None,
+        usage_callback: Callable[[dict[str, object]], None] | None = None,
+        usage_operation: str = "embedding",
+        max_retries: int = 2,
+    ):
+        """保存 DashScope 向量模型配置，不在对象或日志中输出密钥。"""
+
+        self.api_key = api_key
+        self.endpoint = normalize_dashscope_endpoint(base_url, DASHSCOPE_MULTIMODAL_EMBEDDING_URL)
+        self.model = model
+        self.timeout_seconds = timeout_seconds
+        self.batch_size = batch_size
+        self.transport = transport or post_embeddings_json
+        self.usage_callback = usage_callback
+        self.usage_operation = usage_operation
+        self.max_retries = max(0, max_retries)
+
+    @classmethod
+    def from_settings(
+        cls,
+        settings: EmbeddingSettings,
+        usage_callback: Callable[[dict[str, object]], None] | None = None,
+        usage_operation: str = "embedding",
+        max_retries: int = 2,
+    ) -> "DashScopeMultimodalEmbeddings":
+        """从项目 Embedding 配置创建 DashScope 适配器。"""
+
+        return cls(
+            api_key=settings.api_key,
+            base_url=settings.base_url,
+            model=settings.model,
+            timeout_seconds=settings.timeout_seconds,
+            batch_size=settings.batch_size,
+            usage_callback=usage_callback,
+            usage_operation=usage_operation,
+            max_retries=max_retries,
+        )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """以 DashScope 的多模态输入格式批量生成文本向量。"""
+
+        if not texts:
+            return []
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), self.batch_size):
+            vectors.extend(self._embed_batch(texts[start : start + self.batch_size]))
+        return vectors
+
+    def embed_query(self, text: str) -> list[float]:
+        """生成单条查询文本的向量。"""
+
+        return self._embed_batch([text])[0]
+
+    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """调用 DashScope MultiModalEmbedding HTTP 接口，并按输入顺序解析向量。"""
+
+        payload: dict[str, object] = {
+            "model": self.model,
+            # DashScope 原生多模态接口要求把内容放在 input.contents 中。
+            "input": {"contents": [{"text": text} for text in texts]},
+        }
+        response: dict[str, object] | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.transport(
+                    self.endpoint,
+                    {
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    payload,
+                    self.timeout_seconds,
+                )
+                break
+            except EmbeddingRequestError:
+                if attempt >= self.max_retries:
+                    raise
+        if response is None:  # pragma: no cover - 防御性兜底，循环应当已成功或抛异常。
+            raise EmbeddingRequestError("DashScope Embedding API 未返回响应")
+        if self.usage_callback is not None:
+            try:
+                self.usage_callback(response)
+            except Exception:  # noqa: BLE001 - 计量旁路不能阻断 RAG 索引。
+                pass
+        return extract_dashscope_embedding_vectors(response)
 
 
 def tokenize(text: str) -> list[str]:
@@ -191,6 +346,19 @@ def normalize_embeddings_url(base_url: str) -> str:
     return f"{stripped}/embeddings"
 
 
+def normalize_dashscope_endpoint(base_url: str, default_url: str) -> str:
+    """兼容 DashScope 完整端点和以 `/api/v1` 结尾的根地址配置。"""
+
+    stripped = base_url.rstrip()
+    if not stripped:
+        return default_url
+    normalized = stripped.rstrip("/")
+    dashscope_api_root = "https://dashscope.aliyuncs.com/api/v1"
+    if normalized.endswith("/api/v1") and default_url.startswith(dashscope_api_root):
+        return f"{normalized}{default_url.removeprefix(dashscope_api_root)}"
+    return normalized
+
+
 def extract_embedding_vectors(response: dict[str, Any]) -> list[list[float]]:
     """从 OpenAI-compatible embeddings 响应中提取向量列表。"""
 
@@ -209,8 +377,31 @@ def extract_embedding_vectors(response: dict[str, Any]) -> list[list[float]]:
     return [vectors_by_index[index] for index in sorted(vectors_by_index)]
 
 
+def extract_dashscope_embedding_vectors(response: dict[str, Any]) -> list[list[float]]:
+    """从 DashScope MultiModalEmbedding 响应中提取与输入顺序一致的向量。"""
+
+    output = response.get("output")
+    embeddings = output.get("embeddings") if isinstance(output, dict) else None
+    if not isinstance(embeddings, list) or not embeddings:
+        raise EmbeddingRequestError("DashScope Embedding 响应缺少 output.embeddings")
+    vectors_by_index: dict[int, list[float]] = {}
+    for default_index, item in enumerate(embeddings):
+        if not isinstance(item, dict):
+            raise EmbeddingRequestError("DashScope Embedding 响应条目格式异常")
+        raw_index = item.get("text_index", item.get("index", default_index))
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError) as error:
+            raise EmbeddingRequestError("DashScope Embedding 响应缺少有效索引") from error
+        embedding = item.get("embedding")
+        if not isinstance(embedding, list) or not all(isinstance(value, (int, float)) for value in embedding):
+            raise EmbeddingRequestError("DashScope Embedding 响应缺少向量")
+        vectors_by_index[index] = [float(value) for value in embedding]
+    return [vectors_by_index[index] for index in sorted(vectors_by_index)]
+
+
 def extract_embedding_usage(response: dict[str, Any]) -> dict[str, int]:
-    """读取 OpenAI-compatible embedding 响应中的 usage 字段。"""
+    """读取 Embedding 或 Rerank 响应中通用的 usage 字段。"""
 
     usage = response.get("usage")
     if not isinstance(usage, dict):
@@ -225,8 +416,139 @@ def extract_embedding_usage(response: dict[str, Any]) -> dict[str, int]:
     }
 
 
-class EmbeddingRequestError(RuntimeError):
-    """调用真实 embedding 接口失败时抛出的业务异常。"""
+def extract_dashscope_rerank_results(response: dict[str, Any]) -> list[RerankResult]:
+    """从 DashScope rerank 响应提取候选索引顺序，不依赖返回的正文副本。"""
+
+    output = response.get("output")
+    results = output.get("results") if isinstance(output, dict) else None
+    if not isinstance(results, list):
+        raise RerankRequestError("DashScope Rerank 响应缺少 output.results")
+    ranked: list[RerankResult] = []
+    for item in results:
+        if not isinstance(item, dict):
+            raise RerankRequestError("DashScope Rerank 响应条目格式异常")
+        try:
+            index = int(item["index"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RerankRequestError("DashScope Rerank 响应缺少有效索引") from error
+        raw_score = item.get("relevance_score")
+        if raw_score is None:
+            score = None
+        elif isinstance(raw_score, (int, float)):
+            score = float(raw_score)
+        else:
+            raise RerankRequestError("DashScope Rerank 响应相关性分数格式异常")
+        ranked.append(RerankResult(index=index, relevance_score=score))
+    return ranked
+
+
+class DashScopeReranker:
+    """DashScope `qwen3-vl-rerank` 等文本重排模型的适配器。"""
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        timeout_seconds: int = 60,
+        candidate_multiplier: int = 4,
+        transport: Callable[[str, dict[str, str], dict[str, object], int], dict[str, object]] | None = None,
+        usage_callback: Callable[[dict[str, object]], None] | None = None,
+        max_retries: int = 2,
+    ):
+        """保存 Rerank 调用配置；候选倍数控制向量召回后送入模型的数量。"""
+
+        self.api_key = api_key
+        self.endpoint = normalize_dashscope_endpoint(base_url, DASHSCOPE_RERANK_URL)
+        self.model = model
+        self.timeout_seconds = timeout_seconds
+        self.candidate_multiplier = max(1, candidate_multiplier)
+        self.transport = transport or post_rerank_json
+        self.usage_callback = usage_callback
+        self.max_retries = max(0, max_retries)
+
+    @classmethod
+    def from_settings(
+        cls,
+        settings: RerankSettings,
+        usage_callback: Callable[[dict[str, object]], None] | None = None,
+        max_retries: int = 2,
+    ) -> "DashScopeReranker":
+        """从项目 Rerank 配置创建 DashScope 重排器。"""
+
+        return cls(
+            api_key=settings.api_key,
+            base_url=settings.base_url,
+            model=settings.model,
+            timeout_seconds=settings.timeout_seconds,
+            candidate_multiplier=settings.candidate_multiplier,
+            usage_callback=usage_callback,
+            max_retries=max_retries,
+        )
+
+    def rerank(self, query: str, documents: list[str], top_n: int) -> list[RerankResult]:
+        """请求 DashScope 根据查询重排候选文本，返回原候选列表的索引。"""
+
+        if not query.strip() or not documents or top_n <= 0:
+            return []
+        payload: dict[str, object] = {
+            "model": self.model,
+            "input": {"query": query, "documents": documents},
+            "parameters": {
+                # 调用方已有原始 chunk，关闭正文回传可以减小响应体和隐私暴露面。
+                "return_documents": False,
+                "top_n": min(top_n, len(documents)),
+            },
+        }
+        response: dict[str, object] | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.transport(
+                    self.endpoint,
+                    {
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    payload,
+                    self.timeout_seconds,
+                )
+                break
+            except RerankRequestError:
+                if attempt >= self.max_retries:
+                    raise
+        if response is None:  # pragma: no cover - 防御性兜底，循环应当已成功或抛异常。
+            raise RerankRequestError("DashScope Rerank API 未返回响应")
+        if self.usage_callback is not None:
+            try:
+                self.usage_callback(response)
+            except Exception:  # noqa: BLE001 - 计量旁路不能阻断检索。
+                pass
+        return extract_dashscope_rerank_results(response)
+
+
+def post_json(
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, object],
+    timeout: int,
+    *,
+    error_type: type[RAGProviderRequestError],
+    operation_name: str,
+) -> dict[str, object]:
+    """发送 JSON POST 请求，并把网络或上游 HTTP 错误转换为 RAG 领域异常。"""
+
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise error_type(f"{operation_name} API HTTP {error.code}: {detail}") from error
+    except urllib.error.URLError as error:
+        raise error_type(f"{operation_name} API 请求失败：{error.reason}") from error
+    except json.JSONDecodeError as error:
+        raise error_type(f"{operation_name} API 返回了无效 JSON") from error
 
 
 def post_embeddings_json(
@@ -237,22 +559,41 @@ def post_embeddings_json(
 ) -> dict[str, object]:
     """发送 embeddings JSON POST 请求。"""
 
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise EmbeddingRequestError(f"Embedding API HTTP {error.code}: {detail}") from error
-    except urllib.error.URLError as error:
-        raise EmbeddingRequestError(f"Embedding API 请求失败：{error.reason}") from error
+    return post_json(
+        url,
+        headers,
+        payload,
+        timeout,
+        error_type=EmbeddingRequestError,
+        operation_name="Embedding",
+    )
+
+
+def post_rerank_json(
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, object],
+    timeout: int,
+) -> dict[str, object]:
+    """发送 DashScope rerank JSON POST 请求。"""
+
+    return post_json(
+        url,
+        headers,
+        payload,
+        timeout,
+        error_type=RerankRequestError,
+        operation_name="Rerank",
+    )
 
 
 def build_rag_embeddings(
     env_path: str | Path = DEFAULT_ENV_PATH,
     usage_callback: Callable[[dict[str, object]], None] | None = None,
     usage_operation: str = "embedding",
+    *,
+    settings: EmbeddingSettings | None = None,
+    max_retries: int = 2,
 ) -> Embeddings:
     """根据 `.env` 构造 RAG embedding 实现。
 
@@ -260,18 +601,99 @@ def build_rag_embeddings(
     场景仍可运行。
     """
 
-    settings = load_embedding_settings(env_path)
-    if settings is None:
+    resolved_settings = settings if settings is not None else load_embedding_settings(env_path)
+    if resolved_settings is None:
         return LocalHashEmbeddings()
-    if settings.provider in {"local", "local_hash"}:
-        return LocalHashEmbeddings(dimensions=settings.dimensions or 384)
-    if settings.provider in {"openai", "openai_compatible"}:
+    if resolved_settings.provider in {"local", "local_hash"}:
+        return LocalHashEmbeddings(dimensions=resolved_settings.dimensions or 384)
+    if resolved_settings.provider in {"openai", "openai_compatible"}:
         return OpenAICompatibleEmbeddings.from_settings(
-            settings,
+            resolved_settings,
             usage_callback=usage_callback,
             usage_operation=usage_operation,
+            max_retries=max_retries,
         )
-    raise ValueError(f"暂不支持的 embedding provider：{settings.provider}")
+    if resolved_settings.provider in {"dashscope", "dashscope_multimodal"}:
+        return DashScopeMultimodalEmbeddings.from_settings(
+            resolved_settings,
+            usage_callback=usage_callback,
+            usage_operation=usage_operation,
+            max_retries=max_retries,
+        )
+    raise ValueError(f"暂不支持的 embedding provider：{resolved_settings.provider}")
+
+
+def build_reranker(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    usage_callback: Callable[[dict[str, object]], None] | None = None,
+    *,
+    settings: RerankSettings | None = None,
+    max_retries: int = 2,
+) -> Reranker | None:
+    """根据 `.env` 构造可选 Rerank 适配器；未配置时保持纯向量检索。"""
+
+    resolved_settings = settings if settings is not None else load_rerank_settings(env_path)
+    if resolved_settings is None:
+        return None
+    if resolved_settings.provider in {"dashscope", "dashscope_rerank"}:
+        return DashScopeReranker.from_settings(
+            resolved_settings,
+            usage_callback=usage_callback,
+            max_retries=max_retries,
+        )
+    raise ValueError(f"暂不支持的 rerank provider：{resolved_settings.provider}")
+
+
+def resolve_collection_name_for_embeddings(
+    persist_directory: str | Path,
+    collection_name: str,
+    embeddings: Embeddings,
+) -> str:
+    """在已有向量维度不兼容时，为当前 Embedding 选择独立集合。
+
+    Chroma 的同一个 collection 只能保存一种向量维度。真实模型索引与本地 hash
+    fallback 共用持久化目录时，如果仍使用同名 collection，就会在查询或增量写入时
+    抛出维度不一致错误。这里仅在能提前得知当前维度且发现冲突时切换集合，既保留原
+    索引，也让离线 fallback 可以继续工作。
+    """
+
+    expected_dimension = getattr(embeddings, "dimensions", None)
+    if not isinstance(expected_dimension, int) or expected_dimension <= 0:
+        return collection_name
+
+    existing_dimension = read_collection_dimension(persist_directory, collection_name)
+    if existing_dimension is None or existing_dimension == expected_dimension:
+        return collection_name
+
+    model = str(getattr(embeddings, "model", "local-hash"))
+    identity = f"{type(embeddings).__module__}.{type(embeddings).__qualname__}:{model}:{expected_dimension}"
+    identity_suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+    return f"{collection_name}_dim{expected_dimension}_{identity_suffix}"
+
+
+def read_collection_dimension(
+    persist_directory: str | Path,
+    collection_name: str,
+) -> int | None:
+    """读取现有 Chroma 集合首条向量的维度；集合不存在或为空时返回 ``None``。"""
+
+    directory = Path(persist_directory)
+    if not directory.exists():
+        return None
+
+    client = chromadb.PersistentClient(path=str(directory))
+    try:
+        collection = client.get_collection(collection_name)
+    except NotFoundError:
+        return None
+    if collection.count() == 0:
+        return None
+
+    payload = collection.get(limit=1, include=["embeddings"])
+    vectors = payload.get("embeddings")
+    if vectors is None or len(vectors) == 0:
+        return None
+    return len(vectors[0])
 
 
 class RAGKnowledgeBase:
@@ -289,16 +711,27 @@ class RAGKnowledgeBase:
         env_path: str | Path = DEFAULT_ENV_PATH,
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         usage_operation: str = "embedding",
+        *,
+        embedding_settings: EmbeddingSettings | None = None,
+        embedding_max_retries: int = 2,
+        reranker: Reranker | None = None,
     ):
-        """绑定 Chroma 持久化目录、集合名和 embedding 实现。"""
+        """绑定 Chroma 持久化目录、集合名、Embedding 和可选的 Rerank 实现。"""
 
         self.persist_directory = Path(persist_directory)
-        self.collection_name = collection_name
         self.embeddings = embeddings or build_rag_embeddings(
             env_path,
+            settings=embedding_settings,
             usage_callback=usage_callback,
             usage_operation=usage_operation,
+            max_retries=embedding_max_retries,
         )
+        self.collection_name = resolve_collection_name_for_embeddings(
+            self.persist_directory,
+            collection_name,
+            self.embeddings,
+        )
+        self.reranker = reranker
 
     def rebuild(
         self,
@@ -351,8 +784,8 @@ class RAGKnowledgeBase:
         if documents:
             vector_store = self._vector_store()
             ids = [document.metadata["chunk_id"] for document in documents]
-            # Chroma 的 add 是追加语义；先按稳定 ID 删除，保证重复调用不会制造重复 chunk。
-            vector_store.delete(ids=ids)
+            # LangChain Chroma 的 add_documents 最终使用 upsert；稳定 ID 会原位替换旧 chunk。
+            # 不先删除可以避免 Embedding 或写入失败时把上一版可用向量提前移除。
             vector_store.add_documents(documents, ids=ids)
         return RAGIndexStats(
             document_count=len(long_texts),
@@ -375,7 +808,10 @@ class RAGKnowledgeBase:
             return []
         vector_store = self._vector_store()
         # 先多取一些，再在 Python 侧做 entity_type 过滤，避免依赖不同向量库的过滤语法。
-        search_kwargs: dict[str, object] = {"k": max(top_k * 3, top_k)}
+        # 启用 Rerank 时按配置扩展候选池，再将重排后的前 top_k 条返回给调用方。
+        candidate_multiplier = self.reranker.candidate_multiplier if self.reranker is not None else 3
+        candidate_limit = max(top_k * max(1, candidate_multiplier), top_k)
+        search_kwargs: dict[str, object] = {"k": candidate_limit}
         if account_id is not None:
             # 账号 metadata 过滤必须在 Chroma 查询层执行，不能先取全局 top-k 再在 Python 侧过滤。
             search_kwargs["filter"] = {"account_id": account_id}
@@ -397,9 +833,44 @@ class RAGKnowledgeBase:
                     distance=float(distance),
                 )
             )
-            if len(results) >= top_k:
+            if len(results) >= candidate_limit:
                 break
-        return results
+        if self.reranker is None:
+            return results[:top_k]
+        return self._rerank_results(query, results, top_k)
+
+    def _rerank_results(
+        self,
+        query: str,
+        candidates: list[RAGSearchResult],
+        top_k: int,
+    ) -> list[RAGSearchResult]:
+        """将向量召回候选映射回 Rerank 返回的原始索引，保留来源和向量距离。"""
+
+        if not candidates or top_k <= 0 or self.reranker is None:
+            return candidates[:top_k]
+        rankings = self.reranker.rerank(
+            query,
+            [candidate.content for candidate in candidates],
+            top_n=min(top_k, len(candidates)),
+        )
+        selected_indices: set[int] = set()
+        reranked: list[RAGSearchResult] = []
+        for ranking in rankings:
+            if ranking.index in selected_indices or not 0 <= ranking.index < len(candidates):
+                continue
+            selected_indices.add(ranking.index)
+            reranked.append(candidates[ranking.index])
+            if len(reranked) >= top_k:
+                return reranked
+
+        # 上游偶发缺项时仍返回已经可靠召回的证据，避免无故丢失上下文。
+        for index, candidate in enumerate(candidates):
+            if index not in selected_indices:
+                reranked.append(candidate)
+            if len(reranked) >= top_k:
+                break
+        return reranked
 
     def _vector_store(self) -> Chroma:
         """创建 Chroma 向量库对象。"""

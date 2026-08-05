@@ -56,7 +56,7 @@ Model Gateway 是模型供应商与业务代码之间的统一入口，不是新
 
 它负责：
 
-- 根据 operation 选择聊天模型、Embedding 模型和后备模型。
+- 根据 operation 选择聊天模型、Embedding 模型、Rerank 模型和后备模型。
 - 统一超时、重试、并发限制、熔断和供应商错误映射。
 - 统一请求 ID、调用 ID、供应商请求 ID 和 Token usage 采集。
 - 对密钥和 Base URL 做集中配置，业务模块不直接读取供应商密钥。
@@ -69,6 +69,14 @@ Model Gateway 是模型供应商与业务代码之间的统一入口，不是新
 ModelGateway.chat(operation, messages, context)
 ModelGateway.embed(operation, texts, context)
 ```
+
+当前实现状态：
+
+- 已完成：类型化运行环境配置、聊天模型、Embedding 与 Rerank 的统一工厂、有限重试、
+  `root_request_id`/`call_id`、供应商 request ID 提取和不含正文的 usage 流水。
+- 已迁移：LangChain Agent 主聊天、工具内单轮 LLM、网页端简历改写、RAG Embedding 和可选 Rerank。
+- 后续补齐：并发限流、熔断、分布式 trace 和供应商故障告警；这些需要和 Redis、
+  可观测性基础设施一起在后续阶段实施。
 
 只有出现以下任一条件时才考虑拆成独立服务：多个产品共同使用、需要独立扩缩容、
 供应商路由规则频繁变化，或模型调用故障需要与主业务进程隔离。
@@ -91,11 +99,15 @@ ModelGateway.embed(operation, texts, context)
 目标：消除入口各自创建模型、拼接路径或直接访问存储的情况。
 
 - 引入类型化 Settings，区分开发、测试和生产配置。
-- 完成内部 Model Gateway 接口，迁移 Agent、简历改写和 Embedding 调用。
+- 完成内部 Model Gateway 接口，迁移 Agent、简历改写、Embedding 和 Rerank 调用。
 - 为每次上游调用生成幂等 `call_id`，统一记录 provider usage。
 - 把文件目录访问收束到文件存储接口，禁止路由直接拼服务器路径。
 
 完成门槛：业务层不依赖具体模型 SDK；切换 OpenAI-compatible 中转站只改配置。
+
+实施状态：核心模型边界已完成。`model_gateway.py` 是当前模块化单体中的唯一模型
+入口，`JOB_AGENT_ENVIRONMENT` 可显式选择 development/test/production，现有业务调用
+已迁移到 Gateway；并发控制与熔断留待 Redis 和可观测性阶段实现。
 
 ### 阶段 2：PostgreSQL、pgvector 与 Alembic
 
@@ -140,7 +152,7 @@ ModelGateway.embed(operation, texts, context)
 目标：把已有用量流水升级为可对账的计费基础，而不是直接按页面显示数字收费。
 
 - 建立不可变 usage ledger、供应商价格版本和账期快照。
-- 区分输入、输出、缓存、推理和 Embedding Token；保留供应商原始 usage 摘要。
+- 区分输入、输出、缓存、推理、Embedding 和 Rerank Token；保留供应商原始 usage 摘要。
 - 增加账号额度、预警阈值、并发限制和超额处理策略。
 - 重试只对真实成功的上游调用计费，使用 `call_id` 保证幂等。
 - 账单汇总必须能反查到调用流水，但不能向管理员暴露候选人正文。
@@ -187,7 +199,7 @@ Kubernetes 不是上线前置条件。只有出现以下需求时再进入该阶
 
 ## 7. 当前恢复状态
 
-- 已有：账号/Session、候选人多档案、多会话、Token 用量流水、LangChain Agent、RAG、职位匹配。
+- 已有：账号/Session、候选人多档案、多会话、Token 用量流水、LangChain Agent、RAG、职位匹配、内部 Model Gateway，以及可选 DashScope Embedding/Rerank。
 - 本轮恢复：DOCX/PDF 上传、文字层解析、扫描 PDF OCR、简历文件版本、职位定制 DOCX/PDF 和鉴权下载。
 - 尚未实施：SQLAlchemy/Alembic、PostgreSQL/pgvector、对象存储、任务队列、生产可观测性和容器编排文件。
 

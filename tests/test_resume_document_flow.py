@@ -407,6 +407,6 @@ def test_vue_frontend_exposes_resume_upload_tailor_and_download_workflow(tmp_pat
     assert ':href="artifact.download_url"' in home
     assert "async uploadResume(event)" in script
     assert '"/api/resumes/upload"' in script
-    assert "async loadResumeArtifacts()" in script
+    assert "async loadResumeArtifacts(signal = null)" in script
     assert "async tailorResume(artifact)" in script
     assert "resume-artifact-list" in styles

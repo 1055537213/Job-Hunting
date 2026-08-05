@@ -7,6 +7,7 @@
 - Agent 工具执行后，SQLite / RAG 的业务结果确实落地。
 """
 
+import warnings
 from io import BytesIO
 
 from docx import Document
@@ -119,6 +120,56 @@ def test_langchain_agent_can_call_ingest_tool_and_update_profile(tmp_path):
     assert profile.skills["Python"] == "待确认"
     assert any(item["tool_name"] == "ingest_candidate_message" for item in result.tool_outputs)
     assert any("FastAPI" in item.content for item in rag_results)
+
+
+def test_langchain_agent_context_schema_does_not_emit_serializer_warning(tmp_path):
+    """工具收到运行时上下文时，不应把字典按 None 类型序列化。"""
+
+    app = JobHuntingApp(tmp_path / "agent.db")
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="小林",
+            status="待补充",
+            education="大专",
+            experience_years=0,
+            skills={},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        )
+    )
+    model = ToolCallingFakeChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "context-warning-call",
+                        "name": "ingest_candidate_message",
+                        "args": {"message": "我是本科，1年经验，会 Python。", "auto_rag": True},
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="已保存。"),
+        ]
+    )
+    agent = JobHuntingAgent(app, rag_dir=tmp_path / "chroma", model=model)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = agent.chat(
+            "我是本科，1年经验，会 Python。",
+            candidate_id=candidate_id,
+            session_id="context-warning",
+            use_tool_llm=False,
+        )
+
+    assert result.reply == "已保存。"
+    assert not any("Pydantic serializer warnings" in str(item.message) for item in caught)
 
 
 def test_langchain_agent_can_stream_reply_events(tmp_path):

@@ -89,6 +89,7 @@ def test_web_home_page_and_assets_are_available(tmp_path):
 
     assert home.status_code == 200
     assert "Job Hunting Agent" in home.text
+    assert "syncAuthPageClass" in script.text
     assert '/static/app.js?v=20260731-auth-admin' in home.text
     assert '/static/styles.css?v=20260731-auth-admin' in home.text
     assert "本地运行 · 用户复制职位文本" not in home.text
@@ -103,6 +104,8 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert script.headers["cache-control"] == "no-store, max-age=0"
     assert styles.status_code == 200
     assert styles.headers["cache-control"] == "no-store, max-age=0"
+    assert "#app.auth-page" in styles.text
+    assert "max-width: none" in styles.text
     assert tokens.status_code == 200
     assert "Hallmark · tokens" in tokens.text
     assert "oklch(" in tokens.text
@@ -158,8 +161,14 @@ def test_web_profile_form_uses_recovered_selectors_and_auth_copy(tmp_path):
     home = client.get("/").text
     script = client.get("/static/app.js").text
     cities = client.get("/static/china_cities.js")
+    styles = client.get("/static/styles.css").text
 
-    assert ':type="authMode === \'register\' ? \'text\' : \'password\'"' in home
+    assert ':type="authMode === \'register\' || authPasswordVisible ? \'text\' : \'password\'"' in home
+    assert 'class="password-toggle"' in home
+    assert ':aria-label="authPasswordVisible ? \'隐藏密码\' : \'显示密码\'"' in home
+    assert "authPasswordVisible: false" in script
+    assert "toggleAuthPassword()" in script
+    assert "::-ms-reveal" in styles
     assert 'placeholder="例如：小林"' not in home
     assert 'placeholder="Python=项目使用,FastAPI=待确认"' not in home
     assert 'placeholder="AI Agent 应用开发"' not in home
@@ -381,7 +390,7 @@ def test_web_frontend_loads_persisted_jobs_on_page_open(tmp_path):
 
     assert jobs[0]["title"] == "Java AI Gateway 工程师"
     assert 'id="jobList"' in home
-    assert "async loadJobs()" in script
+    assert "async loadJobs(signal = null)" in script
     assert "await this.loadJobs();" in script
     assert "jobImportError" in script
 
@@ -626,6 +635,22 @@ def test_web_chat_bubble_uses_markdown_renderer(tmp_path):
     assert "splitStreamDisplayChunks(content)" in script
     assert "requestAnimationFrame" in script
     assert "v-cloak" in home
+
+
+def test_web_chat_stream_has_timeout_and_cancel_path(tmp_path):
+    """模型或网络长时间无响应时，前端必须能超时或主动停止生成。"""
+
+    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    script = client.get("/static/app.js").text
+    home = client.get("/").text
+
+    assert "CHAT_STREAM_TIMEOUT_MS" in script
+    assert "chatAbortController" in script
+    assert "cancelChat()" in script
+    assert "controller.abort()" in script
+    assert "reader.cancel()" in script
+    assert "ChatStreamTimeoutError" in script
+    assert "停止生成" in home
 
 
 def test_web_stream_message_keeps_vue_reactive_proxy(tmp_path):

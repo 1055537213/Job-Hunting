@@ -7,7 +7,7 @@ CLI 是当前教学 MVP 最直接的使用入口，所以这里用真实命令�
 import json
 
 from job_hunting_agent.app import JobHuntingApp
-from job_hunting_agent.cli import main
+from job_hunting_agent.cli import create_admin_account, main
 
 
 def test_cli_can_create_profile_import_job_and_match_all(tmp_path, capsys):
@@ -60,6 +60,29 @@ def test_cli_can_create_profile_import_job_and_match_all(tmp_path, capsys):
     assert match_output["candidate_id"] == candidate_id
     assert match_output["matches"][0]["job"]["id"] == imported_job["id"]
     assert match_output["matches"][0]["match"]["tier"] in {"强推荐", "可投递"}
+
+
+def test_cli_create_admin_reads_password_with_visible_input(tmp_path, monkeypatch, capsys):
+    """终端创建管理员时使用普通 input，密码字符由终端直接回显。"""
+
+    app = JobHuntingApp(tmp_path / "admin.db")
+    app.initialize()
+    answers = iter(["admin@example.com", "password-123", "password-123"])
+    prompts = []
+
+    def visible_input(prompt):
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr("builtins.input", visible_input)
+
+    create_admin_account(app)
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["status"] == "ok"
+    assert output["account"]["role"] == "admin"
+    assert "输入内容会显示" in prompts[1]
+    assert "输入内容会显示" in prompts[2]
 
 
 def test_cli_can_create_rule_based_resume_draft(tmp_path, capsys):
@@ -169,6 +192,33 @@ def test_cli_can_show_masked_embedding_config(tmp_path, capsys):
     assert "sk-embed-secret" not in output_text
 
 
+def test_cli_can_show_masked_rerank_config(tmp_path, capsys):
+    """命令行可以展示 Rerank 是否可用，同时不会输出共享 DashScope 密钥。"""
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "DASHSCOPE_API_KEY=test-dashscope-secret",
+                "JOB_AGENT_RERANK_PROVIDER=dashscope",
+                "JOB_AGENT_RERANK_MODEL=qwen3-vl-rerank",
+                "JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER=5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    main(["--env-file", str(env_file), "rerank-config"])
+    output_text = capsys.readouterr().out
+    output = json.loads(output_text)
+
+    assert output["provider"] == "dashscope"
+    assert output["model"] == "qwen3-vl-rerank"
+    assert output["api_key_set"] is True
+    assert output["candidate_multiplier"] == 5
+    assert "test-dashscope-secret" not in output_text
+
+
 def test_cli_can_ingest_conversation_message(tmp_path, capsys):
     """命令行可以把一段自然语言资料自动保存到 SQLite 和长文本材料库。"""
 
@@ -254,6 +304,8 @@ def test_cli_agent_chat_fallback_persists_history(tmp_path, capsys):
             str(db_path),
             "--env-file",
             str(tmp_path / "missing.env"),
+            "--rag-dir",
+            str(tmp_path / "chroma"),
             "agent-chat",
             str(candidate_id),
             "我是本科，1年经验，会 Python。",

@@ -23,7 +23,7 @@
             <div class="auth-form-head">
               <div>
                 <p class="eyebrow">{{ authMode === "login" ? "Welcome back" : "Create account" }}</p>
-                <h2>{{ authMode === "login" ? "登录工作区" : "创建普通账号" }}</h2>
+                <h2>{{ authMode === "login" ? "登录工作区" : "创建账号" }}</h2>
               </div>
               <button class="text-button" type="button" @click="toggleAuthMode">
                 {{ authMode === "login" ? "注册" : "返回登录" }}
@@ -43,20 +43,42 @@
                 aria-describedby="authError"
               />
             </label>
-            <label class="field-group" for="authPassword">
-              <span>密码</span>
-              <input
-                id="authPassword"
-                v-model="authForm.password"
-                class="field"
-                :type="authMode === 'register' ? 'text' : 'password'"
-                :autocomplete="authMode === 'login' ? 'current-password' : 'new-password'"
-                minlength="8"
-                required
-                :aria-invalid="String(Boolean(authError))"
-                aria-describedby="authError"
-              />
-            </label>
+            <div class="field-group">
+              <span><label class="field-label" for="authPassword">密码</label></span>
+              <div class="password-field">
+                <input
+                  id="authPassword"
+                  v-model="authForm.password"
+                  class="field"
+                  :type="authMode === 'register' || authPasswordVisible ? 'text' : 'password'"
+                  :autocomplete="authMode === 'login' ? 'current-password' : 'new-password'"
+                  minlength="8"
+                  required
+                  :aria-invalid="String(Boolean(authError))"
+                  aria-describedby="authError"
+                />
+                <button
+                  v-if="authMode === 'login'"
+                  class="password-toggle"
+                  type="button"
+                  :aria-label="authPasswordVisible ? '隐藏密码' : '显示密码'"
+                  :aria-pressed="String(authPasswordVisible)"
+                  :title="authPasswordVisible ? '隐藏密码' : '显示密码'"
+                  @click="toggleAuthPassword"
+                >
+                  <svg v-if="authPasswordVisible" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z" />
+                    <circle cx="12" cy="12" r="2.5" />
+                  </svg>
+                  <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M3 3 21 21" />
+                    <path d="M9.88 9.88a3 3 0 1 0 4.24 4.24" />
+                    <path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68" />
+                    <path d="M6.61 6.61A13.53 13.53 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61" />
+                  </svg>
+                </button>
+              </div>
+            </div>
             <label v-if="authMode === 'register'" class="field-group" for="authDisplayName">
               <span>显示名称（可选）</span>
               <input
@@ -101,21 +123,17 @@
           <span class="kbd" aria-hidden="true">Ctrl K</span>
         </button>
 
-        <nav class="quick-nav" aria-label="常用操作">
-          <button class="nav-link" type="button" @click="focusMessageInput">补资料</button>
-          <button class="nav-link" type="button" @click="focusJobImport">导入职位</button>
-          <button
-            class="primary-button compact"
-            type="button"
-            :disabled="loadingMatches"
-            :data-state="loadingMatches ? 'loading' : 'idle'"
-            @click="matchJobs(false)"
-          >
-            {{ loadingMatches ? "匹配中" : "匹配职位" }}
-          </button>
+        <div class="topbar-actions">
           <button v-if="auth.account && auth.account.role === 'admin'" class="nav-link" type="button" @click="openAdmin">后台</button>
-          <button class="nav-link account-link" type="button" @click="logout">{{ auth.account?.display_name || auth.account?.email || "账号" }} · 退出</button>
-        </nav>
+          <span
+            class="account-badge"
+            :title="auth.account?.display_name || auth.account?.email || '账号'"
+            aria-label="当前登录账号"
+          >
+            {{ auth.account?.display_name || auth.account?.email || "账号" }}
+          </span>
+          <button class="nav-link logout-link" type="button" @click="logout">退出</button>
+        </div>
       </header>
 
       <div v-if="auth.authenticated && activeView === 'workspace'" class="workspace-grid">
@@ -373,11 +391,11 @@
               ></textarea>
               <button
                 class="send-button"
-                type="submit"
-                :disabled="sending"
+                :type="sending ? 'button' : 'submit'"
+                @click="sending ? cancelChat() : null"
                 :data-state="sending ? 'loading' : 'idle'"
               >
-                {{ sending ? "生成中" : "发送" }}
+                {{ sending ? "停止生成" : "发送" }}
               </button>
             </form>
           </footer>

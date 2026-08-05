@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .agent import JobHuntingAgent, build_tool_usage_callback, load_tool_llm_client
+from .agent import JobHuntingAgent
 from .app import JobHuntingApp
 from .auth import (
     hash_password,
@@ -37,16 +37,18 @@ from .auth import (
 from .config import (
     load_agent_memory_settings,
     load_embedding_settings,
+    load_rerank_settings,
     load_cookie_secure,
     load_llm_settings,
     masked_agent_memory_settings,
     masked_embedding_settings,
     masked_llm_settings,
+    masked_rerank_settings,
 )
 from .models import AccountRecord, CandidateProfileInput, ResumeArtifactRecord
 from .job_parser import InvalidJobTextError
 from .llm import LLMClient, LLMRequestError
-from .rag import EmbeddingRequestError
+from .rag import RAGProviderRequestError
 from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
 
 
@@ -328,6 +330,10 @@ def create_web_app(
         except ValueError as error:
             embedding_config = {"configured": False, "error": str(error)}
         try:
+            rerank_config = masked_rerank_settings(load_rerank_settings(env_path))
+        except ValueError as error:
+            rerank_config = {"configured": False, "error": str(error)}
+        try:
             memory_config = masked_agent_memory_settings(load_agent_memory_settings(env_path))
         except ValueError as error:
             memory_config = {"configured": False, "error": str(error)}
@@ -337,6 +343,7 @@ def create_web_app(
                 "agent": {"configured": chat_agent is not None},
                 "llm": {"configured": bool(llm_config.get("configured"))},
                 "embedding": {"configured": bool(embedding_config.get("configured"))},
+                "rerank": {"configured": bool(rerank_config.get("configured"))},
                 "memory": {"configured": bool(memory_config.get("enabled"))},
             }
         return {
@@ -345,6 +352,7 @@ def create_web_app(
             "rag_dir": str(rag_path),
             "llm": llm_config,
             "embedding": embedding_config,
+            "rerank": rerank_config,
             "memory": memory_config,
             "agent": {
                 "configured": chat_agent is not None,
@@ -490,7 +498,7 @@ def create_web_app(
                     auto_rag=payload.auto_rag,
                     account_id=account_id,
                 )
-            except EmbeddingRequestError as error:
+            except RAGProviderRequestError as error:
                 raise HTTPException(status_code=502, detail=str(error)) from error
             except Exception as error:  # noqa: BLE001 - 对 Web 层统一转成可读错误。
                 raise HTTPException(status_code=502, detail=str(error)) from error
@@ -530,7 +538,7 @@ def create_web_app(
                 auto_rebuild_rag=payload.auto_rag,
                 account_id=account_id,
             )
-        except EmbeddingRequestError as error:
+        except RAGProviderRequestError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         tool_outputs = [{"tool_name": "ingest_conversation_message", "data": asdict(result)}]
         display_reply = format_web_chat_reply(
@@ -698,7 +706,7 @@ def create_web_app(
                         account_id=account_id,
                     )
                 )
-            except EmbeddingRequestError as error:
+            except RAGProviderRequestError as error:
                 # 文件与 SQLite 正文已经安全保存；索引失败单独告知，避免用户重复上传。
                 rag_warning = f"简历已保存，但 RAG 增量索引失败：{error}"
         return {
@@ -774,13 +782,14 @@ def create_web_app(
                 "default_auto_rag": True,
             }
             try:
-                active_llm = load_tool_llm_client(
-                    env_path,
-                    usage_callback=build_tool_usage_callback(
-                        backend,
-                        context,
+                active_llm = backend.model_gateway.llm_client(
+                    backend.model_gateway.new_call_context(
                         "resume_document_rewrite",
-                    ),
+                        account_id=account_id,
+                        candidate_id=source.candidate_id,
+                        session_id=context["session_id"],
+                        root_request_id=request_id,
+                    )
                 )
             except ValueError as error:
                 raise HTTPException(status_code=400, detail=f"简历改写模型未就绪：{error}") from error
@@ -800,7 +809,7 @@ def create_web_app(
             raise HTTPException(status_code=404, detail="职位、候选人或简历文件不存在。") from error
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
-        except (EmbeddingRequestError, LLMRequestError) as error:
+        except (RAGProviderRequestError, LLMRequestError) as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         return {
             "draft": asdict(result.draft),
@@ -814,7 +823,7 @@ def create_web_app(
         account = current_account(request)
         try:
             results = backend.search_rag(query, rag_path, top_k, account_id=account.id if account else None)
-        except EmbeddingRequestError as error:
+        except RAGProviderRequestError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         return {"query": query, "results": [asdict(result) for result in results]}
 
@@ -941,7 +950,7 @@ def stream_web_chat_events(
                             "profile": asdict(backend.get_candidate_profile(payload.candidate_id, account_id=account_id)),
                         },
                     )
-        except EmbeddingRequestError as error:
+        except RAGProviderRequestError as error:
             yield sse_event("error", {"detail": str(error)})
         except Exception as error:  # noqa: BLE001 - SSE 内统一返回可读错误事件。
             yield sse_event("error", {"detail": str(error)})
@@ -956,7 +965,7 @@ def stream_web_chat_events(
             auto_rebuild_rag=payload.auto_rag,
             account_id=account_id,
         )
-    except EmbeddingRequestError as error:
+    except RAGProviderRequestError as error:
         yield sse_event("error", {"detail": str(error)})
         return
 

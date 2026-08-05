@@ -7,10 +7,9 @@
 
 from __future__ import annotations
 
-import uuid
 from pathlib import Path
 
-from .auth import AuthService, utc_now
+from .auth import AuthService
 from .config import DEFAULT_ENV_PATH
 from .conversation_ingestion import decide_conversation_ingestion
 from .llm import LLMClient
@@ -29,8 +28,8 @@ from .models import (
     ResumeArtifactRecord,
     ResumeDraftRecord,
     TailoredResumeResult,
-    UsageEventRecord,
 )
+from .model_gateway import ModelGateway
 from .project_analyzer import analyze_project
 from .rag import RAGKnowledgeBase
 from .resume_document import (
@@ -63,6 +62,9 @@ class JobHuntingApp:
         # Web/CLI 都通过同一认证服务创建账号和 Session，避免重复实现密码逻辑。
         self.auth = AuthService(self.store)
         self.env_path = Path(env_path)
+        # 所有真实模型/Embedding 调用都通过内部 Gateway 构造和计量；它是惰性加载的，
+        # 所以纯本地规则和离线测试不需要在创建 App 时提供 API Key。
+        self.model_gateway = ModelGateway(self.env_path, usage_store=self.store)
         default_resume_dir = Path(db_path).parent / "resumes"
         self.resume_files = ResumeFileStore(resume_dir or default_resume_dir)
 
@@ -474,11 +476,13 @@ class JobHuntingApp:
     def rebuild_rag_index(self, persist_directory: str | Path = "data/chroma", account_id: int | None = None) -> RAGIndexStats:
         """把 SQLite `long_texts` 全量同步到本地 Chroma RAG 索引。"""
 
+        call_context = self.model_gateway.new_call_context(
+            "embedding_rebuild",
+            account_id=account_id,
+        )
         knowledge_base = RAGKnowledgeBase(
             persist_directory,
-            env_path=self.env_path,
-            usage_callback=self._embedding_usage_callback(account_id, "embedding_rebuild"),
-            usage_operation="embedding_rebuild",
+            embeddings=self.model_gateway.embeddings(call_context),
         )
         return knowledge_base.rebuild(self.store.list_long_texts(account_id=account_id), account_id=account_id)
 
@@ -494,11 +498,13 @@ class JobHuntingApp:
         适合对话式自动入库后的即时检索。
         """
 
+        call_context = self.model_gateway.new_call_context(
+            "embedding_index",
+            account_id=account_id,
+        )
         knowledge_base = RAGKnowledgeBase(
             persist_directory,
-            env_path=self.env_path,
-            usage_callback=self._embedding_usage_callback(account_id, "embedding_index"),
-            usage_operation="embedding_index",
+            embeddings=self.model_gateway.embeddings(call_context),
         )
         return knowledge_base.index_long_texts(self.store.get_long_texts_by_ids(long_text_ids, account_id=account_id), account_id=account_id)
 
@@ -512,55 +518,20 @@ class JobHuntingApp:
     ) -> list[RAGSearchResult]:
         """从本地 Chroma RAG 索引检索带来源的证据片段。"""
 
+        call_context = self.model_gateway.new_call_context(
+            "embedding_query",
+            account_id=account_id,
+        )
+        rerank_context = self.model_gateway.new_call_context(
+            "rerank_query",
+            account_id=account_id,
+        )
         knowledge_base = RAGKnowledgeBase(
             persist_directory,
-            env_path=self.env_path,
-            usage_callback=self._embedding_usage_callback(account_id, "embedding_query"),
-            usage_operation="embedding_query",
+            embeddings=self.model_gateway.embeddings(call_context),
+            reranker=self.model_gateway.reranker(rerank_context),
         )
         return knowledge_base.search(query, top_k, entity_types, account_id=account_id)
-
-    def _embedding_usage_callback(self, account_id: int | None, operation: str):
-        """构造远程 embedding 用量记录回调。
-
-        本地 hash embedding 不会触发该回调，因此不会产生虚假的供应商 Token；
-        远程接口没有返回 usage 时仍保留一条 `missing` 明细，但不进入账单汇总。
-        """
-
-        if account_id is None:
-            return None
-
-        def callback(response: dict[str, object]) -> None:
-            from .rag import extract_embedding_usage
-
-            usage = extract_embedding_usage(response)
-            source = "provider" if usage.get("total_tokens", 0) > 0 else "missing"
-            self.store.record_usage_event(
-                UsageEventRecord(
-                    id=0,
-                    account_id=account_id,
-                    candidate_id=None,
-                    session_id=None,
-                    root_request_id=None,
-                    call_id=f"{operation}-{uuid.uuid4().hex}",
-                    provider="configured-embedding",
-                    model="embedding",
-                    operation=operation,
-                    input_tokens=usage.get("input_tokens", 0),
-                    output_tokens=usage.get("output_tokens", 0),
-                    total_tokens=usage.get("total_tokens", 0),
-                    usage_source=source,
-                    status="succeeded",
-                    attempt=1,
-                    provider_request_id=None,
-                    raw_usage=usage,
-                    created_at=utc_now().isoformat(timespec="seconds"),
-                    billable=source == "provider",
-                    pricing_version=None,
-                )
-            )
-
-        return callback
 
 
 def format_rag_evidence(result: RAGSearchResult) -> str:

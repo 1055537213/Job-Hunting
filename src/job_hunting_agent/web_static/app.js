@@ -15,6 +15,8 @@ if (!window.Vue) {
   const { createApp, nextTick } = window.Vue;
   const DEFAULT_USE_LANGCHAIN_AGENT = true;
   const DEFAULT_AUTO_INCREMENTAL_RAG = true;
+  // 模型或网络无响应时，前端最多等待三分钟；用户也可以提前停止生成。
+  const CHAT_STREAM_TIMEOUT_MS = 180000;
   const PINYIN_COLLATOR = new Intl.Collator("zh-CN-u-co-pinyin");
 
   /** 克隆并按拼音排列省份和城市，避免改变静态数据源。 */
@@ -44,6 +46,7 @@ if (!window.Vue) {
           password: "",
           displayName: "",
         },
+        authPasswordVisible: false,
         authLoading: false,
         authSuccess: false,
         authError: "",
@@ -90,6 +93,7 @@ if (!window.Vue) {
         tailoringArtifactId: 0,
         resumeError: "",
         sending: false,
+        chatAbortController: null,
         jobImportError: "",
         commandPaletteOpen: false,
         commandQuery: "",
@@ -188,6 +192,14 @@ if (!window.Vue) {
     },
 
     watch: {
+      /** 登录状态变化时同步根容器布局，登录页才能真正使用整屏背景。 */
+      "auth.authenticated": {
+        immediate: true,
+        handler(authenticated) {
+          this.syncAuthPageClass(authenticated);
+        },
+      },
+
       /** 查询变化后重置高亮项，避免键盘选择停在不存在的结果上。 */
       commandQuery() {
         this.activeCommandIndex = 0;
@@ -195,6 +207,7 @@ if (!window.Vue) {
     },
 
     mounted() {
+      this.syncAuthPageClass(this.auth.authenticated);
       this.checkAuth();
       document.addEventListener("keydown", this.handleGlobalShortcut);
     },
@@ -205,6 +218,11 @@ if (!window.Vue) {
     },
 
     methods: {
+      /** 给 Vue 挂载容器切换登录页全宽布局；工作台恢复原有边距和最大宽度。 */
+      syncAuthPageClass(authenticated) {
+        document.getElementById("app")?.classList.toggle("auth-page", !authenticated);
+      },
+
       /** 先读取服务端 Session；未登录时不请求任何候选人或职位数据。 */
       async checkAuth() {
         try {
@@ -227,6 +245,14 @@ if (!window.Vue) {
         this.authError = "";
         this.authSuccess = false;
         this.authForm.password = "";
+        this.authPasswordVisible = false;
+      },
+
+      /** 切换登录密码的显示状态；注册模式始终直接显示密码。 */
+      toggleAuthPassword() {
+        if (this.authMode === "login") {
+          this.authPasswordVisible = !this.authPasswordVisible;
+        }
       },
 
       /** 提交登录或普通用户注册。 */
@@ -249,12 +275,14 @@ if (!window.Vue) {
             this.authSuccess = true;
             this.authError = "账号已创建，请登录。";
             this.authForm.password = "";
+            this.authPasswordVisible = false;
             return;
           }
           this.auth.authenticated = true;
           this.auth.account = data.account || null;
           this.activeView = "workspace";
           this.authForm.password = "";
+          this.authPasswordVisible = false;
           await this.initialize();
           await nextTick();
           document.querySelector("#chatPanel")?.focus?.();
@@ -361,6 +389,10 @@ if (!window.Vue) {
 
       /** 监听全局 Ctrl/Cmd+K 和 Esc，提供类似工作台的快速动作入口。 */
       handleGlobalShortcut(event) {
+        // 键盘事件可能由扩展、自动化脚本或其他页面代码转发；缺少 key 时直接忽略。
+        if (!event || typeof event.key !== "string") {
+          return;
+        }
         const key = event.key.toLowerCase();
         if ((event.ctrlKey || event.metaKey) && key === "k") {
           event.preventDefault();
@@ -469,8 +501,9 @@ if (!window.Vue) {
           const agentText = data.agent?.configured ? "Agent 已就绪" : "Agent 未启用";
           const llmText = data.llm?.configured ? "LLM 已配置" : "LLM 未配置";
           const embeddingText = data.embedding?.configured ? "Embedding 真实" : "Embedding 本地";
+          const rerankText = data.rerank?.configured ? "Rerank 已启用" : "Rerank 未启用";
           this.health = {
-            text: `${agentText} · ${llmText} · ${embeddingText}`,
+            text: `${agentText} · ${llmText} · ${embeddingText} · ${rerankText}`,
             error: false,
             agentConfigured: Boolean(data.agent?.configured),
           };
@@ -673,6 +706,8 @@ if (!window.Vue) {
         this.messageInput = "";
         this.appendUser(message);
         const assistantMessage = this.appendAssistant("");
+        const abortController = new AbortController();
+        this.chatAbortController = abortController;
         this.sending = true;
         try {
           const data = await this.streamChatReply(
@@ -683,7 +718,8 @@ if (!window.Vue) {
               auto_rag: DEFAULT_AUTO_INCREMENTAL_RAG,
               session_id: this.currentSessionId,
             },
-            assistantMessage
+            assistantMessage,
+            { signal: abortController.signal }
           );
           this.updateMessage(
             assistantMessage,
@@ -692,15 +728,27 @@ if (!window.Vue) {
           if (data.profile) {
             this.updateProfileInState(data.profile);
           }
-          await this.loadJobs();
+          await this.loadJobs(abortController.signal);
           // Agent 可能在本轮生成了职位定制文件，侧栏必须同步刷新版本列表。
-          await this.loadResumeArtifacts();
-          await this.matchJobs(true);
+          await this.loadResumeArtifacts(abortController.signal);
+          await this.matchJobs(true, abortController.signal);
         } catch (error) {
-          this.updateMessage(assistantMessage, error.message, true);
+          const wasCancelled = error?.name === "AbortError";
+          const messageText = wasCancelled
+            ? "已停止生成。"
+            : error?.message || "聊天请求失败，请稍后重试。";
+          this.updateMessage(assistantMessage, messageText, !wasCancelled);
         } finally {
+          if (this.chatAbortController === abortController) {
+            this.chatAbortController = null;
+          }
           this.sending = false;
         }
+      },
+
+      /** 主动取消当前模型请求，避免网络异常时只能等待超时。 */
+      cancelChat() {
+        this.chatAbortController?.abort();
       },
 
       /**
@@ -709,119 +757,162 @@ if (!window.Vue) {
        * token 事件只负责增量显示，final 事件才包含完整持久化展示文本、
        * 工具摘要和最新候选人档案。
        */
-      async streamChatReply(payload, assistantMessage) {
-        const response = await fetch("/api/chat/stream", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          throw new Error(data.detail || `请求失败：${response.status}`);
-        }
-        if (!response.body) {
-          throw new Error("当前浏览器不支持流式响应读取。");
-        }
+      async streamChatReply(payload, assistantMessage, options = {}) {
+        const externalSignal = options?.signal || null;
+        const requestedTimeout = Number(options?.timeoutMs);
+        const timeoutMs = requestedTimeout > 0 ? requestedTimeout : CHAT_STREAM_TIMEOUT_MS;
+        const controller = new AbortController();
+        let timeoutReached = false;
+        let reader = null;
+        let relayAbort = null;
+        const timeoutId = window.setTimeout(() => {
+          timeoutReached = true;
+          controller.abort();
+        }, timeoutMs);
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let buffer = "";
-        let streamedText = "";
-        let visibleText = "";
-        let finalPayload = null;
-        let renderFrameId = null;
-        const tokenQueue = [];
-        const drainResolvers = [];
-
-        // 浏览器可能把多个 SSE token 合并进同一次 read。这里把收到的内容先排队，
-        // 再按动画帧刷新到气泡，避免 Vue 在同一轮事件循环里只渲染最后状态。
-        const scheduleTokenRender = () => {
-          if (renderFrameId !== null) {
-            return;
-          }
-          const schedule = window.requestAnimationFrame
-            ? (callback) => window.requestAnimationFrame(callback)
-            : (callback) => window.setTimeout(callback, 16);
-          renderFrameId = schedule(flushQueuedTokens);
-        };
-
-        // 每帧至少刷一个片段；积压较多时自适应加速，兼顾“能看见流动”和“不拖太久”。
-        const flushQueuedTokens = () => {
-          renderFrameId = null;
-          if (!tokenQueue.length) {
-            this.resolveStreamDrainWaiters(drainResolvers);
-            return;
-          }
-
-          const tokensThisFrame = tokenQueue.length > 90 ? Math.ceil(tokenQueue.length / 45) : 1;
-          visibleText += tokenQueue.splice(0, tokensThisFrame).join("");
-          this.updateMessage(assistantMessage, visibleText || "生成中...");
-
-          if (tokenQueue.length) {
-            scheduleTokenRender();
+        if (externalSignal) {
+          relayAbort = () => controller.abort();
+          if (externalSignal.aborted) {
+            relayAbort();
           } else {
-            this.resolveStreamDrainWaiters(drainResolvers);
+            externalSignal.addEventListener("abort", relayAbort, { once: true });
           }
-        };
+        }
 
-        // final 事件可能和最后一批 token 在同一个网络块里到达；返回前先等动画队列刷完。
-        const waitForTokenQueue = () => {
-          if (!tokenQueue.length && renderFrameId === null) {
-            return Promise.resolve();
-          }
-          return new Promise((resolve) => {
-            drainResolvers.push(resolve);
+        try {
+          const response = await fetch("/api/chat/stream", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+            signal: controller.signal,
           });
-        };
-
-        const enqueueTokenContent = (content) => {
-          if (!content) {
-            return;
+          if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.detail || `请求失败：${response.status}`);
           }
-          streamedText += content;
-          tokenQueue.push(...this.splitStreamDisplayChunks(content));
-          scheduleTokenRender();
-        };
-
-        const handleStreamEvent = (event) => {
-          if (event.event === "token") {
-            enqueueTokenContent(event.data.content || "");
-          } else if (event.event === "status" && !streamedText && !visibleText) {
-            this.updateMessage(assistantMessage, event.data.content || "正在调用工具...");
-          } else if (event.event === "final") {
-            finalPayload = event.data;
-          } else if (event.event === "error") {
-            throw new Error(event.data.detail || "流式请求失败。");
+          if (!response.body) {
+            throw new Error("当前浏览器不支持流式响应读取。");
           }
-        };
 
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) {
-            break;
+          reader = response.body.getReader();
+          const decoder = new TextDecoder("utf-8");
+          let buffer = "";
+          let streamedText = "";
+          let visibleText = "";
+          let finalPayload = null;
+          let renderFrameId = null;
+          const tokenQueue = [];
+          const drainResolvers = [];
+
+          // 浏览器可能把多个 SSE token 合并进同一次 read。这里把收到的内容先排队，
+          // 再按动画帧刷新到气泡，避免 Vue 在同一轮事件循环里只渲染最后状态。
+          const scheduleTokenRender = () => {
+            if (renderFrameId !== null) {
+              return;
+            }
+            const schedule = window.requestAnimationFrame
+              ? (callback) => window.requestAnimationFrame(callback)
+              : (callback) => window.setTimeout(callback, 16);
+            renderFrameId = schedule(flushQueuedTokens);
+          };
+
+          // 每帧至少刷一个片段；积压较多时自适应加速，兼顾“能看见流动”和“不拖太久”。
+          const flushQueuedTokens = () => {
+            renderFrameId = null;
+            if (!tokenQueue.length) {
+              this.resolveStreamDrainWaiters(drainResolvers);
+              return;
+            }
+
+            const tokensThisFrame = tokenQueue.length > 90 ? Math.ceil(tokenQueue.length / 45) : 1;
+            visibleText += tokenQueue.splice(0, tokensThisFrame).join("");
+            this.updateMessage(assistantMessage, visibleText || "生成中...");
+
+            if (tokenQueue.length) {
+              scheduleTokenRender();
+            } else {
+              this.resolveStreamDrainWaiters(drainResolvers);
+            }
+          };
+
+          // final 事件可能和最后一批 token 在同一个网络块里到达；返回前先等动画队列刷完。
+          const waitForTokenQueue = () => {
+            if (!tokenQueue.length && renderFrameId === null) {
+              return Promise.resolve();
+            }
+            return new Promise((resolve) => {
+              drainResolvers.push(resolve);
+            });
+          };
+
+          const enqueueTokenContent = (content) => {
+            if (!content) {
+              return;
+            }
+            streamedText += content;
+            tokenQueue.push(...this.splitStreamDisplayChunks(content));
+            scheduleTokenRender();
+          };
+
+          const handleStreamEvent = (event) => {
+            if (event.event === "token") {
+              enqueueTokenContent(event.data.content || "");
+            } else if (event.event === "status" && !streamedText && !visibleText) {
+              this.updateMessage(assistantMessage, event.data.content || "正在调用工具...");
+            } else if (event.event === "final") {
+              finalPayload = event.data;
+            } else if (event.event === "error") {
+              throw new Error(event.data.detail || "流式请求失败。");
+            }
+          };
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) {
+              break;
+            }
+            buffer += decoder.decode(value, { stream: true });
+            const parsed = this.consumeSseBuffer(buffer);
+            buffer = parsed.remaining;
+            for (const event of parsed.events) {
+              handleStreamEvent(event);
+            }
           }
-          buffer += decoder.decode(value, { stream: true });
-          const parsed = this.consumeSseBuffer(buffer);
-          buffer = parsed.remaining;
+
+          buffer += decoder.decode();
+          const parsed = this.consumeSseBuffer(buffer, true);
           for (const event of parsed.events) {
             handleStreamEvent(event);
           }
-        }
 
-        buffer += decoder.decode();
-        const parsed = this.consumeSseBuffer(buffer, true);
-        for (const event of parsed.events) {
-          handleStreamEvent(event);
+          if (!finalPayload) {
+            throw new Error("流式响应结束时没有收到 final 事件。");
+          }
+          if (!streamedText) {
+            enqueueTokenContent(finalPayload.display_reply || this.buildChatReply(finalPayload));
+          }
+          await waitForTokenQueue();
+          return finalPayload;
+        } catch (error) {
+          if (timeoutReached) {
+            const timeoutError = new Error("模型响应超时，请检查网络后重试，或点击‘停止生成’。");
+            timeoutError.name = "ChatStreamTimeoutError";
+            throw timeoutError;
+          }
+          throw error;
+        } finally {
+          window.clearTimeout(timeoutId);
+          if (externalSignal && relayAbort) {
+            externalSignal.removeEventListener("abort", relayAbort);
+          }
+          if (reader) {
+            try {
+              await reader.cancel();
+            } catch (_error) {
+              // 读取器已经结束或被取消时无需重复提示用户。
+            }
+          }
         }
-
-        if (!finalPayload) {
-          throw new Error("流式响应结束时没有收到 final 事件。");
-        }
-        if (!streamedText) {
-          enqueueTokenContent(finalPayload.display_reply || this.buildChatReply(finalPayload));
-        }
-        await waitForTokenQueue();
-        return finalPayload;
       },
 
       /** 把较大的网络片段拆成较小显示片段，防止被浏览器合并后整段闪现。 */
@@ -984,7 +1075,7 @@ if (!window.Vue) {
       },
 
       /** 恢复当前候选人的原始和职位定制简历文件列表。 */
-      async loadResumeArtifacts() {
+      async loadResumeArtifacts(signal = null) {
         if (!this.currentProfileId) {
           this.resumeArtifacts = [];
           this.resumeJobSelections = {};
@@ -992,7 +1083,8 @@ if (!window.Vue) {
         }
         try {
           const data = await this.requestJson(
-            `/api/resumes?candidate_id=${encodeURIComponent(this.currentProfileId)}`
+            `/api/resumes?candidate_id=${encodeURIComponent(this.currentProfileId)}`,
+            signal ? { signal } : {}
           );
           this.resumeArtifacts = data.artifacts || [];
           const activeSourceIds = new Set(
@@ -1121,10 +1213,10 @@ if (!window.Vue) {
       },
 
       /** 加载已导入职位列表。 */
-      async loadJobs() {
+      async loadJobs(signal = null) {
         this.loadingJobs = true;
         try {
-          const data = await this.requestJson("/api/jobs");
+          const data = await this.requestJson("/api/jobs", signal ? { signal } : {});
           this.jobs = data.jobs || [];
         } finally {
           this.loadingJobs = false;
@@ -1132,7 +1224,7 @@ if (!window.Vue) {
       },
 
       /** 请求当前候选人的职位匹配结果。 */
-      async matchJobs(silent = false) {
+      async matchJobs(silent = false, signal = null) {
         if (!this.currentProfileId) {
           this.matches = [];
           if (!silent) {
@@ -1143,7 +1235,10 @@ if (!window.Vue) {
 
         this.loadingMatches = true;
         try {
-          const data = await this.requestJson(`/api/matches/${this.currentProfileId}`);
+          const data = await this.requestJson(
+            `/api/matches/${this.currentProfileId}`,
+            signal ? { signal } : {}
+          );
           this.matches = data.matches || [];
         } finally {
           this.loadingMatches = false;

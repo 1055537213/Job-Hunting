@@ -7,7 +7,6 @@ CLI 只负责把用户输入转成应用服务调用，并把结果打印成 JSO
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -18,10 +17,12 @@ from .auth import hash_password
 from .config import (
     load_embedding_settings,
     load_llm_settings,
+    load_rerank_settings,
     masked_embedding_settings,
     masked_llm_settings,
+    masked_rerank_settings,
 )
-from .llm import LLMClient, StaticLLMClient, build_llm_client
+from .llm import LLMClient, StaticLLMClient
 from .models import CandidateProfileInput
 
 
@@ -40,6 +41,7 @@ def main(argv: list[str] | None = None) -> None:
     subparsers.add_parser("init")
     subparsers.add_parser("llm-config")
     subparsers.add_parser("embedding-config")
+    subparsers.add_parser("rerank-config")
     subparsers.add_parser("create-admin")
 
     web_parser = subparsers.add_parser("web")
@@ -147,6 +149,8 @@ def main(argv: list[str] | None = None) -> None:
         print_json(masked_llm_settings(load_llm_settings(args.env_file)))
     elif args.command == "embedding-config":
         print_json(masked_embedding_settings(load_embedding_settings(args.env_file)))
+    elif args.command == "rerank-config":
+        print_json(masked_rerank_settings(load_rerank_settings(args.env_file)))
     elif args.command == "web":
         run_web_server(args)
     elif args.command == "create-profile":
@@ -159,7 +163,7 @@ def main(argv: list[str] | None = None) -> None:
                 app.ingest_conversation_message(
                     args.candidate_id,
                     read_ingestion_message(args),
-                    llm_client=build_cli_llm(args),
+                    llm_client=build_cli_llm(app, args, "tool_llm_ingestion"),
                     rag_persist_directory=args.rag_dir,
                     auto_rebuild_rag=args.auto_rag,
                 )
@@ -262,7 +266,7 @@ def main(argv: list[str] | None = None) -> None:
                 app.create_resume_draft(
                     args.candidate_id,
                     args.job_id,
-                    build_cli_llm(args),
+                    build_cli_llm(app, args, "resume_rewrite"),
                     rag_persist_directory=args.rag_dir if args.use_rag else None,
                     rag_query=args.rag_query,
                 )
@@ -473,7 +477,11 @@ def split_job_texts(raw_text: str, separator: str) -> list[str]:
     return [chunk for chunk in chunks if chunk]
 
 
-def build_cli_llm(args: argparse.Namespace) -> LLMClient | None:
+def build_cli_llm(
+    app: JobHuntingApp,
+    args: argparse.Namespace,
+    operation: str,
+) -> LLMClient | None:
     """根据 CLI 参数构造 LLM 客户端。
 
     默认返回 None，表示使用本地规则逻辑；传入 `--use-env-llm` 时才会读取
@@ -489,7 +497,9 @@ def build_cli_llm(args: argparse.Namespace) -> LLMClient | None:
     if static_response:
         return StaticLLMClient(static_response)
     if use_env_llm:
-        return build_llm_client(load_llm_settings(args.env_file))
+        return app.model_gateway.llm_client(
+            app.model_gateway.new_call_context(operation)
+        )
     return None
 
 
@@ -566,11 +576,12 @@ def run_web_server(args: argparse.Namespace) -> None:
 
 
 def create_admin_account(app: JobHuntingApp) -> None:
-    """交互式创建管理员账号，不把管理员密码写入代码或命令历史。"""
+    """交互式创建管理员账号；终端密码会直接回显，便于核对输入。"""
 
     email = input("管理员邮箱: ").strip().lower()
-    password = getpass.getpass("管理员密码（至少 8 位）: ")
-    password_again = getpass.getpass("再次输入密码: ")
+    # 这是本地初始化命令，按用户要求使用普通 input，让密码字符直接显示在终端。
+    password = input("管理员密码（至少 8 位，输入内容会显示）: ")
+    password_again = input("再次输入密码（输入内容会显示）: ")
     if password != password_again:
         raise SystemExit("两次密码不一致。")
     try:

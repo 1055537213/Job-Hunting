@@ -15,6 +15,14 @@ from typing import Mapping
 
 DEFAULT_ENV_PATH = Path(".env")
 
+# DashScope 原生多模态向量与文本重排接口不是 OpenAI-compatible 端点。
+# 保留为可覆盖的默认值，方便本地调试、专有网络或后续的兼容网关接入。
+DASHSCOPE_MULTIMODAL_EMBEDDING_URL = (
+    "https://dashscope.aliyuncs.com/api/v1/services/embeddings/"
+    "multimodal-embedding/multimodal-embedding"
+)
+DASHSCOPE_RERANK_URL = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+
 
 @dataclass(frozen=True)
 class LLMSettings:
@@ -35,6 +43,21 @@ class LLMSettings:
 
 
 @dataclass(frozen=True)
+class ModelGatewaySettings:
+    """内部 Model Gateway 的运行配置。
+
+    这里的 ``environment`` 让同一套业务代码能明确区分本地开发、测试和生产运行，
+    而不再依赖调用方自己猜测。模型供应商的密钥仍然由 ``LLMSettings`` 和
+    ``EmbeddingSettings`` 管理，Gateway 只负责调用策略和统一入口。
+    """
+
+    environment: str = "development"
+    chat_max_retries: int = 2
+    embedding_max_retries: int = 2
+    rerank_max_retries: int = 2
+
+
+@dataclass(frozen=True)
 class EmbeddingSettings:
     """Embedding 供应商配置。
 
@@ -49,6 +72,22 @@ class EmbeddingSettings:
     timeout_seconds: int = 60
     batch_size: int = 64
     dimensions: int | None = None
+
+
+@dataclass(frozen=True)
+class RerankSettings:
+    """Rerank 供应商配置。
+
+    Rerank 只在向量检索拿到候选证据后调用，用于按“查询 + 证据正文”重新排序；
+    它不参与 Chroma 建库，因此更换 rerank 模型无需重建向量索引。
+    """
+
+    provider: str
+    model: str
+    api_key: str
+    base_url: str
+    timeout_seconds: int = 60
+    candidate_multiplier: int = 4
 
 
 @dataclass(frozen=True)
@@ -170,6 +209,63 @@ def masked_llm_settings(settings: LLMSettings) -> dict[str, object]:
     }
 
 
+def load_model_gateway_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> ModelGatewaySettings:
+    """读取内部 Model Gateway 的非敏感运行策略。
+
+    ``JOB_AGENT_ENVIRONMENT`` 目前支持 ``development``、``test`` 和
+    ``production``。重试次数可设为 0，表示只尝试一次；它们只控制 Gateway
+    自己管理的调用，具体模型供应商仍会保留其 SDK 的必要保护逻辑。
+    """
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(*keys: str, default: str | None = None) -> str | None:
+        """按系统环境变量优先级读取 Gateway 配置。"""
+
+        for key in keys:
+            if key in environment and environment[key]:
+                return environment[key]
+            if key in file_values and file_values[key]:
+                return file_values[key]
+        return default
+
+    runtime_environment = (get("JOB_AGENT_ENVIRONMENT", default="development") or "development").lower()
+    if runtime_environment not in {"development", "test", "production"}:
+        raise ValueError(
+            "JOB_AGENT_ENVIRONMENT 只能是 development、test 或 production"
+        )
+    return ModelGatewaySettings(
+        environment=runtime_environment,
+        chat_max_retries=parse_non_negative_int(
+            get("JOB_AGENT_MODEL_GATEWAY_CHAT_MAX_RETRIES", default="2"),
+            "JOB_AGENT_MODEL_GATEWAY_CHAT_MAX_RETRIES",
+        ),
+        embedding_max_retries=parse_non_negative_int(
+            get("JOB_AGENT_MODEL_GATEWAY_EMBEDDING_MAX_RETRIES", default="2"),
+            "JOB_AGENT_MODEL_GATEWAY_EMBEDDING_MAX_RETRIES",
+        ),
+        rerank_max_retries=parse_non_negative_int(
+            get("JOB_AGENT_MODEL_GATEWAY_RERANK_MAX_RETRIES", default="2"),
+            "JOB_AGENT_MODEL_GATEWAY_RERANK_MAX_RETRIES",
+        ),
+    )
+
+
+def masked_model_gateway_settings(settings: ModelGatewaySettings) -> dict[str, object]:
+    """返回可安全展示的 Gateway 配置摘要。"""
+
+    return {
+        "environment": settings.environment,
+        "chat_max_retries": settings.chat_max_retries,
+        "embedding_max_retries": settings.embedding_max_retries,
+        "rerank_max_retries": settings.rerank_max_retries,
+    }
+
+
 def load_embedding_settings(
     env_path: str | Path = DEFAULT_ENV_PATH,
     environ: Mapping[str, str] | None = None,
@@ -195,20 +291,21 @@ def load_embedding_settings(
 
     provider = get("JOB_AGENT_EMBEDDING_PROVIDER")
     model = get("JOB_AGENT_EMBEDDING_MODEL")
-    api_key = get("JOB_AGENT_EMBEDDING_API_KEY", "OPENAI_API_KEY")
-    base_url = get("JOB_AGENT_EMBEDDING_BASE_URL", "OPENAI_BASE_URL")
+    explicit_api_key = get("JOB_AGENT_EMBEDDING_API_KEY")
+    explicit_base_url = get("JOB_AGENT_EMBEDDING_BASE_URL")
     timeout = int(get("JOB_AGENT_EMBEDDING_TIMEOUT_SECONDS", default="60") or 60)
     batch_size = int(get("JOB_AGENT_EMBEDDING_BATCH_SIZE", default="64") or 64)
     dimensions = get("JOB_AGENT_EMBEDDING_DIMENSIONS")
 
-    if not any([provider, model, api_key, base_url, dimensions]):
+    if not any([provider, model, explicit_api_key, explicit_base_url, dimensions]):
         return None
     if not provider:
         raise ValueError("缺少 embedding provider：请在 .env 中配置 JOB_AGENT_EMBEDDING_PROVIDER")
-    if provider.lower() in {"local", "local_hash"}:
+    normalized_provider = provider.lower()
+    if normalized_provider in {"local", "local_hash"}:
         parsed_dimensions = int(dimensions) if dimensions else None
         return EmbeddingSettings(
-            provider=provider.lower(),
+            provider=normalized_provider,
             model=model or "local-hash",
             api_key="local",
             base_url="local",
@@ -216,6 +313,13 @@ def load_embedding_settings(
             batch_size=batch_size,
             dimensions=parsed_dimensions,
         )
+    if normalized_provider in {"dashscope", "dashscope_multimodal"}:
+        # DashScope 官方 SDK 和控制台使用 DASHSCOPE_API_KEY；显式的项目配置优先。
+        api_key = explicit_api_key or get("JOB_AGENT_DASHSCOPE_API_KEY", "DASHSCOPE_API_KEY")
+        base_url = explicit_base_url or DASHSCOPE_MULTIMODAL_EMBEDDING_URL
+    else:
+        api_key = explicit_api_key or get("OPENAI_API_KEY")
+        base_url = explicit_base_url or get("OPENAI_BASE_URL")
     if not model:
         raise ValueError("缺少 embedding 模型名：请在 .env 中配置 JOB_AGENT_EMBEDDING_MODEL")
     if not api_key:
@@ -224,7 +328,7 @@ def load_embedding_settings(
         raise ValueError("缺少 embedding base URL：请在 .env 中配置 JOB_AGENT_EMBEDDING_BASE_URL")
 
     return EmbeddingSettings(
-        provider=provider.lower(),
+        provider=normalized_provider,
         model=model,
         api_key=api_key,
         base_url=base_url,
@@ -248,6 +352,80 @@ def masked_embedding_settings(settings: EmbeddingSettings | None) -> dict[str, o
         "batch_size": settings.batch_size,
         "dimensions": settings.dimensions,
         "configured": settings.provider not in {"local", "local_hash"},
+    }
+
+
+def load_rerank_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> RerankSettings | None:
+    """从 `.env` 读取可选的 Rerank 配置。
+
+    未提供任何 Rerank 字段时返回 ``None``，RAG 保持纯向量召回，保证现有离线场景
+    和未开通重排服务的部署不会被配置升级打断。
+    """
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(*keys: str, default: str | None = None) -> str | None:
+        """按系统环境变量优先级读取 Rerank 配置。"""
+
+        for key in keys:
+            if key in environment and environment[key]:
+                return environment[key]
+            if key in file_values and file_values[key]:
+                return file_values[key]
+        return default
+
+    provider = get("JOB_AGENT_RERANK_PROVIDER")
+    model = get("JOB_AGENT_RERANK_MODEL")
+    explicit_api_key = get("JOB_AGENT_RERANK_API_KEY")
+    explicit_base_url = get("JOB_AGENT_RERANK_BASE_URL")
+    timeout = int(get("JOB_AGENT_RERANK_TIMEOUT_SECONDS", default="60") or 60)
+    candidate_multiplier = parse_positive_int(
+        get("JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER", default="4"),
+        "JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER",
+    )
+
+    if not any([provider, model, explicit_api_key, explicit_base_url]):
+        return None
+    if not provider:
+        raise ValueError("缺少 rerank provider：请在 .env 中配置 JOB_AGENT_RERANK_PROVIDER")
+    normalized_provider = provider.lower()
+    if normalized_provider in {"disabled", "none", "off"}:
+        return None
+    if normalized_provider not in {"dashscope", "dashscope_rerank"}:
+        raise ValueError(f"暂不支持的 rerank provider：{normalized_provider}")
+    if not model:
+        raise ValueError("缺少 rerank 模型名：请在 .env 中配置 JOB_AGENT_RERANK_MODEL")
+    api_key = explicit_api_key or get("JOB_AGENT_DASHSCOPE_API_KEY", "DASHSCOPE_API_KEY")
+    if not api_key:
+        raise ValueError("缺少 rerank API Key：请在 .env 中配置 JOB_AGENT_RERANK_API_KEY 或 DASHSCOPE_API_KEY")
+
+    return RerankSettings(
+        provider=normalized_provider,
+        model=model,
+        api_key=api_key,
+        base_url=explicit_base_url or DASHSCOPE_RERANK_URL,
+        timeout_seconds=timeout,
+        candidate_multiplier=candidate_multiplier,
+    )
+
+
+def masked_rerank_settings(settings: RerankSettings | None) -> dict[str, object]:
+    """返回不含 API Key 的 Rerank 配置摘要，供 CLI 和健康检查展示。"""
+
+    if settings is None:
+        return {"provider": "disabled", "configured": False}
+    return {
+        "provider": settings.provider,
+        "model": settings.model,
+        "base_url": settings.base_url,
+        "api_key_set": bool(settings.api_key),
+        "timeout_seconds": settings.timeout_seconds,
+        "candidate_multiplier": settings.candidate_multiplier,
+        "configured": True,
     }
 
 
@@ -360,4 +538,16 @@ def parse_positive_int(value: str | None, field_name: str) -> int:
         raise ValueError(f"{field_name} 必须是正整数") from error
     if parsed <= 0:
         raise ValueError(f"{field_name} 必须大于 0")
+    return parsed
+
+
+def parse_non_negative_int(value: str | None, field_name: str) -> int:
+    """解析允许为 0 的非负整数配置。"""
+
+    try:
+        parsed = int(value or "")
+    except ValueError as error:
+        raise ValueError(f"{field_name} 必须是非负整数") from error
+    if parsed < 0:
+        raise ValueError(f"{field_name} 不能小于 0")
     return parsed

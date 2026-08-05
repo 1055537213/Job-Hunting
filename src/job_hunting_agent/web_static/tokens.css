@@ -1,36 +1,37 @@
-/* Hallmark · tokens: Cobalt workbench · exported 2026-07-27 */
+/* Hallmark · tokens: Coral workbench · exported 2026-08-05 */
 :root {
   color-scheme: light;
 
-  --color-paper: oklch(98.5% 0.004 250);
-  --color-paper-2: oklch(96.4% 0.006 250);
-  --color-paper-3: oklch(92.8% 0.01 252);
-  --color-paper-raised: oklch(99% 0.003 250);
-  --color-ink: oklch(22% 0.018 258);
-  --color-ink-2: oklch(33% 0.018 257);
-  --color-muted: oklch(48% 0.016 256);
-  --color-muted-2: oklch(62% 0.014 255);
-  --color-rule: oklch(88% 0.011 252);
-  --color-rule-strong: oklch(76% 0.015 254);
-  --color-accent: oklch(54% 0.19 256);
-  --color-accent-2: oklch(47% 0.18 256);
-  --color-accent-soft: oklch(93.8% 0.035 256);
-  --color-accent-ink: oklch(98.5% 0.004 250);
-  --color-focus: oklch(58% 0.20 256);
-  --color-graphite: oklch(21% 0.016 260);
-  --color-graphite-2: oklch(26% 0.018 260);
-  --color-graphite-3: oklch(31% 0.018 260);
-  --color-graphite-text: oklch(93% 0.008 252);
-  --color-graphite-muted: oklch(73% 0.014 252);
-  --color-graphite-rule: oklch(39% 0.02 258);
+  /* Shared Coral palette keeps the authenticated workspace and login surface related. */
+  --color-paper: oklch(96% 0.018 80);
+  --color-paper-2: oklch(93.5% 0.02 80);
+  --color-paper-3: oklch(89.5% 0.028 78);
+  --color-paper-raised: oklch(98% 0.01 78);
+  --color-ink: oklch(20% 0.018 55);
+  --color-ink-2: oklch(24% 0.02 58);
+  --color-muted: oklch(28% 0.022 65);
+  --color-muted-2: oklch(38% 0.018 68);
+  --color-rule: oklch(82% 0.025 75);
+  --color-rule-strong: oklch(70% 0.03 70);
+  --color-accent: oklch(34% 0.14 70);
+  --color-accent-2: oklch(28% 0.13 62);
+  --color-accent-soft: oklch(90% 0.05 72);
+  --color-accent-ink: oklch(98% 0.012 75);
+  --color-focus: oklch(34% 0.12 55);
+  --color-graphite: oklch(27% 0.02 55);
+  --color-graphite-2: oklch(32% 0.022 55);
+  --color-graphite-3: oklch(37% 0.022 55);
+  --color-graphite-text: oklch(94% 0.012 75);
+  --color-graphite-muted: oklch(88% 0.018 72);
+  --color-graphite-rule: oklch(45% 0.028 58);
   --color-success: oklch(44% 0.12 150);
   --color-success-soft: oklch(94% 0.04 150);
   --color-error: oklch(52% 0.18 28);
   --color-error-soft: oklch(95% 0.04 28);
   --color-warning: oklch(58% 0.13 78);
   --color-warning-soft: oklch(94% 0.04 78);
-  --color-backdrop: oklch(18% 0.018 258 / 0.38);
-  --color-shadow: oklch(22% 0.018 258 / 0.08);
+  --color-backdrop: oklch(24% 0.018 55 / 0.42);
+  --color-shadow: oklch(24% 0.018 55 / 0.1);
 
   --font-display: "Space Grotesk", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   --font-body: "IBM Plex Sans", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -85,10 +86,10 @@
   /* Coral surface tokens for authentication and account operations. */
   --auth-paper: oklch(96% 0.018 80);
   --auth-paper-2: oklch(93.5% 0.02 80);
-  --auth-ink: oklch(24% 0.018 55);
-  --auth-muted: oklch(48% 0.022 65);
+  --auth-ink: oklch(20% 0.018 55);
+  --auth-muted: oklch(28% 0.022 65);
   --auth-rule: oklch(82% 0.025 75);
-  --auth-accent: oklch(58% 0.16 70);
+  --auth-accent: oklch(34% 0.14 70);
   --auth-accent-ink: oklch(98% 0.012 75);
-  --auth-focus: oklch(48% 0.15 55);
+  --auth-focus: oklch(34% 0.12 55);
 }

@@ -90,7 +90,11 @@ def build_llm_client(
     return LangChainLLMClient(build_chat_model(settings), usage_callback=usage_callback)
 
 
-def build_chat_model(settings: LLMSettings, temperature: float = 0) -> BaseChatModel:
+def build_chat_model(
+    settings: LLMSettings,
+    temperature: float = 0,
+    max_retries: int = 2,
+) -> BaseChatModel:
     """根据 `.env` 配置创建标准 LangChain ChatModel。
 
     项目统一使用 `langchain_openai.ChatOpenAI` 适配 OpenAI-compatible 接口。
@@ -109,7 +113,8 @@ def build_chat_model(settings: LLMSettings, temperature: float = 0) -> BaseChatM
         base_url=normalize_openai_compatible_base_url(settings.base_url),
         timeout=settings.timeout_seconds,
         temperature=temperature,
-        max_retries=2,
+        # 重试策略由内部 Model Gateway 传入；保留默认值以兼容直接调用本函数的测试。
+        max_retries=max(0, max_retries),
         reasoning_effort=settings.reasoning_effort,
         extra_body=extra_body or None,
         # 当前接入的是 OpenAI-compatible 提供商，强制走 Chat Completions 更稳。

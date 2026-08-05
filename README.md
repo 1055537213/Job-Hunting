@@ -28,8 +28,9 @@
 - 开发语言：Python 3.12 及以上。
 - Web 服务：FastAPI、Uvicorn。
 - Agent 编排：LangChain 1.x、LangGraph。
-- 聊天模型：DeepSeek 或其他 OpenAI-compatible Chat API，通过 `.env` 配置。
-- Embedding：OpenAI-compatible Embedding API；未配置时支持本地回退 embedding。
+- 模型接入：内部 Model Gateway 统一调用 DeepSeek 或其他 OpenAI-compatible Chat API，并支持 DashScope 原生 RAG 接口，通过 `.env` 配置。
+- Embedding：支持 OpenAI-compatible Embedding API、DashScope `qwen3-vl-embedding`；未配置时回退到本地 hash embedding。
+- Rerank：可选接入 DashScope `qwen3-vl-rerank`，对向量召回候选再次排序；未配置时保持纯向量检索。
 - 结构化存储：SQLite。
 - 语义检索：Chroma、LangChain Chroma 集成、LangChain 文本切分器。
 - 简历文档：python-docx、pdfplumber、PDFium、RapidOCR、ONNX Runtime、ReportLab。
@@ -53,6 +54,10 @@ JobHuntingAgent
   LangGraph 会话状态
           |
           v
+内部 Model Gateway
+  模型配置、重试策略、call_id、Token 用量
+          |
+          v
 工具层
   档案工具
   项目分析工具
@@ -74,9 +79,10 @@ SQLite 结构化事实源       Chroma RAG 索引          受控文件目录
 2. 用户输入资料、职位文本、项目目录、简历文件或 HR 问题。
 3. LangChain Agent 判断需要调用的工具。
 4. 工具把可精确比较的字段写入 SQLite，把长文本切分后写入 Chroma。
-5. 匹配、简历改写和回复草稿同时读取 SQLite 事实、上传简历正文与 RAG 证据。
-6. 模型输出经过事实边界检查；不安全时回退到规则版草稿。
-7. Agent 和 embedding 的 token usage 按账号写入 `usage_events`，供后台统计和后续计费。
+5. 查询先由 Chroma 召回证据候选；启用 Rerank 后，再按“查询 + 候选正文”重排并选出最终证据。
+6. 匹配、简历改写和回复草稿同时读取 SQLite 事实、上传简历正文与 RAG 证据。
+7. 模型输出经过事实边界检查；不安全时回退到规则版草稿。
+8. Agent、Embedding 和 Rerank 的供应商 Token usage 按账号写入 `usage_events`，供后台统计和后续计费。
 
 ### 存储边界
 
@@ -116,8 +122,9 @@ Job-hunting Agent/
 │     ├─ conversation_ingestion.py# 对话内容分类与自动入库
 │     ├─ conversation_memory.py   # 持久化记忆和上下文压缩
 │     ├─ job_parser.py            # BOSS 职位文本解析与校验
-│     ├─ llm.py                   # Chat/Embedding 模型适配
+│     ├─ llm.py                   # LangChain ChatModel 适配
 │     ├─ matcher.py               # 职位匹配、淘汰和排序规则
+│     ├─ model_gateway.py         # 统一模型调用、用量和调用 ID
 │     ├─ models.py                # 数据模型和领域对象
 │     ├─ project_analyzer.py      # 本地项目最小必要读取与分析
 │     ├─ rag.py                   # LangChain + Chroma RAG
@@ -173,10 +180,11 @@ Chroma 索引和简历文件目录。
 ### 数据、记忆和模型
 
 - `storage.py`：管理 SQLite 表、账号隔离、候选人档案、聊天消息、职位、简历文件版本和 Token 用量。
-- `rag.py`：负责文本切分、Embedding、Chroma 写入、账号过滤和增量索引。
+- `rag.py`：负责文本切分、Embedding、Chroma 写入、账号过滤、增量索引和可选 Rerank 重排。
 - `conversation_ingestion.py`：判断当前对话内容应保存为结构化事实、长文本材料、项目确认项或普通聊天。
 - `conversation_memory.py`：从 SQLite 恢复会话，超过阈值时压缩旧消息并保留最近上下文。
-- `llm.py`：封装聊天模型和 Embedding 模型，统一 OpenAI-compatible 接口和 usage 回调。
+- `model_gateway.py`：为聊天、Embedding 和 Rerank 调用统一创建配置、有限重试、`call_id` 和不含正文的 Token 用量流水。
+- `llm.py`：封装 LangChain ChatModel 与 OpenAI-compatible 接口细节。
 - `auth.py`：实现 Argon2id 密码哈希、Session 滑动过期、最长有效期和退出所有设备。
 
 ### 前端和测试
@@ -196,12 +204,6 @@ Chroma 索引和简历文件目录。
 python -m pip install -e .
 ```
 
-如果使用当前 LangChain 学习环境，可以把 `python` 替换为：
-
-```powershell
-E:\Anaconda\envs\langchain1.2\python.exe
-```
-
 ### 2. 配置模型
 
 复制 `.env.example` 为 `.env`，填写真实模型配置：
@@ -211,6 +213,10 @@ JOB_AGENT_LLM_PROVIDER=deepseek
 JOB_AGENT_LLM_MODEL=deepseek-v4-pro
 JOB_AGENT_LLM_API_KEY=your-api-key
 JOB_AGENT_LLM_BASE_URL=https://api.deepseek.com
+JOB_AGENT_ENVIRONMENT=development
+JOB_AGENT_MODEL_GATEWAY_CHAT_MAX_RETRIES=2
+JOB_AGENT_MODEL_GATEWAY_EMBEDDING_MAX_RETRIES=2
+JOB_AGENT_MODEL_GATEWAY_RERANK_MAX_RETRIES=2
 
 JOB_AGENT_EMBEDDING_PROVIDER=local_hash
 JOB_AGENT_EMBEDDING_MODEL=local-hash
@@ -219,9 +225,46 @@ JOB_AGENT_MEMORY_ENABLED=true
 JOB_AGENT_COOKIE_SECURE=false
 ```
 
-聊天模型和 Embedding 模型可以来自不同供应商。需要真实语义 Embedding 时，按
-`.env.example` 中注释的 OpenAI-compatible 配置替换本地模式。部署到 HTTPS 后，
+聊天模型、Embedding 模型和 Rerank 模型可以来自不同供应商。需要真实语义 Embedding 时，按
+`.env.example` 中注释的 OpenAI-compatible 或 DashScope 配置替换本地模式。部署到 HTTPS 后，
 把 `JOB_AGENT_COOKIE_SECURE` 改为 `true`。
+
+### 使用 Qwen Embedding 与 Rerank
+
+在千问控制台新建密钥后，只把新密钥写入本机 `.env`，不要提交到 Git 或发送到聊天记录。以下配置
+让 `qwen3-vl-embedding` 和 `qwen3-vl-rerank` 共用一把 DashScope 密钥：
+
+```dotenv
+DASHSCOPE_API_KEY=your-new-dashscope-api-key
+
+JOB_AGENT_EMBEDDING_PROVIDER=dashscope
+JOB_AGENT_EMBEDDING_MODEL=qwen3-vl-embedding
+JOB_AGENT_EMBEDDING_BATCH_SIZE=16
+
+JOB_AGENT_RERANK_PROVIDER=dashscope
+JOB_AGENT_RERANK_MODEL=qwen3-vl-rerank
+JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER=4
+```
+
+启动前可确认配置已经被识别，命令只显示脱敏摘要：
+
+```powershell
+python -m job_hunting_agent.cli --env-file .env embedding-config
+python -m job_hunting_agent.cli --env-file .env rerank-config
+```
+
+更换 Embedding 模型后，必须停止网页服务并对所有账号做一次全量 RAG 重建。Chroma 的一个集合
+不能混存不同维度或不同语义空间的向量；仅做增量索引会留下旧向量，导致查询失败或结果失真。
+
+```powershell
+python -m job_hunting_agent.cli `
+  --db data/job_agent.db `
+  --env-file .env `
+  --rag-dir data/chroma `
+  rag-rebuild
+```
+
+Rerank 不参与建库，因此以后只更换 Rerank 模型时不需要重建 Chroma 索引。
 
 ### 3. 启动网页
 
@@ -246,6 +289,8 @@ python -m job_hunting_agent.cli `
   --db data/job_agent.db `
   create-admin
 ```
+
+该命令会直接回显管理员密码，便于核对输入，请只在私密终端中使用；网页端登录仍会以星号隐藏密码。
 
 ### 4. 停止服务
 
