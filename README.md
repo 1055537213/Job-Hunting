@@ -386,6 +386,13 @@ python -m pytest -q
 python -m compileall src tests
 ```
 
+运行前端快捷键和 SSE 流式超时回归检查（需要 Node.js）：
+
+```powershell
+node tests/frontend_shortcut_regression.mjs
+node tests/frontend_stream_timeout_regression.mjs
+```
+
 检查 Git 差异中的空白错误：
 
 ```powershell
