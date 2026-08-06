@@ -1,0 +1,29 @@
+# API Key 和其它本地配置只在容器运行时以只读文件挂载，绝不能打进镜像。
+.env
+.env.*
+!.env.example
+
+# SQLite、Chroma、上传简历和导出文件都是运行时数据，不参与镜像构建。
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Git、IDE 和 Python 缓存会增加构建上下文，且不属于应用运行时。
+.git/
+.gitignore
+.idea/
+.codex/
+.agents/
+.hallmark/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 测试与文档不参与运行镜像；它们仍保留在代码仓库中供本地验证。
+tests/
+docs/
+CONTEXT.md
+DECISION_MAP.md

@@ -1,0 +1,27 @@
+# 当前 Compose 只承载本地 SQLite + Chroma 版本。PostgreSQL、Redis 和 MinIO
+# 会在对应迁移阶段单独加入，避免把尚未使用的生产组件混入当前开发环境。
+name: job-hunting-agent
+
+services:
+  web:
+    # 使用项目根目录构建可复现的 Python 运行镜像。
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: job-hunting-agent:web-dev
+    # 容器异常退出时自动重启；手动 docker compose stop 不会造成循环启动。
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    # .env 只读挂载给应用解析，data 绑定到宿主机以保留数据库、向量索引和文件。
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+    healthcheck:
+      # /api/health 不要求登录，可用于 Docker 判断 Web 进程是否已经监听并能响应。
+      test:
+        ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

@@ -36,6 +36,7 @@
 - 简历文档：python-docx、pdfplumber、PDFium、RapidOCR、ONNX Runtime、ReportLab。
 - 前端：Vue 3 本地静态构建、SSE 流式聊天、Markdown 渲染。
 - 认证：Argon2id 密码哈希、HttpOnly Session Cookie。
+- 容器化：Docker、Docker Compose；当前用于复现 SQLite + Chroma 本地开发环境。
 - 测试：pytest。
 
 ## 项目架构
@@ -143,11 +144,15 @@ Job-hunting Agent/
 ├─ tests/                         # 单元测试和 Web/API 回归测试
 ├─ docs/
 │  ├─ adr/                        # 架构决策记录
+│  ├─ learning/                   # 面向初学者的技术栈与操作说明
 │  ├─ research/                   # BOSS 接入和职位标准化研究
 │  └─ enterprise-readiness-decision-map.md # 企业级演进顺序与验收门槛
 ├─ CONTEXT.md                     # 领域术语和边界
 ├─ DECISION_MAP.md                # 项目决策地图
 ├─ pyproject.toml                 # 依赖和命令入口
+├─ Dockerfile                    # Python Web 运行镜像构建步骤
+├─ compose.yaml                  # Docker Compose 本地开发服务
+├─ .dockerignore                 # Docker 构建上下文排除规则
 ├─ .env.example                   # 模型配置模板
 └─ .gitignore                     # 密钥、数据库、缓存和运行数据忽略规则
 ```
@@ -296,6 +301,32 @@ python -m job_hunting_agent.cli `
 
 在启动服务的终端按 `Ctrl+C`。如果服务由后台进程启动，需要结束对应的
 `python -m job_hunting_agent.web` 进程。
+
+### 5. 使用 Docker Compose 启动
+
+如果不想在本机安装 Python 依赖，可以使用项目提供的 Docker 开发环境。第一次使用时，
+确保项目根目录存在真实 `.env`；`.env` 只会以只读文件挂载到容器，不会打进镜像。
+
+```powershell
+docker compose build
+docker compose up -d
+docker compose ps
+```
+
+浏览器仍然访问 `http://127.0.0.1:8000`。查看日志、停止和删除容器：
+
+```powershell
+docker compose logs -f web
+docker compose stop
+docker compose down
+```
+
+`data/` 是宿主机绑定目录，保存 SQLite、Chroma、上传简历和导出文件；`down` 不会删除
+这些数据。完整的 Docker 技术栈解释、首次启动步骤和后续扩展顺序见
+[Docker 本地开发环境学习说明](./docs/learning/docker-environment.md)。
+
+当前 Compose 只包含 `web` 服务，与本地 SQLite + Chroma 实现对应。PostgreSQL、pgvector、
+Redis、Worker、MinIO 和反向代理会在完成相应代码和迁移后再加入。
 
 ## 常用功能
 

@@ -201,7 +201,9 @@ Kubernetes 不是上线前置条件。只有出现以下需求时再进入该阶
 
 - 已有：账号/Session、候选人多档案、多会话、Token 用量流水、LangChain Agent、RAG、职位匹配、内部 Model Gateway，以及可选 provider-native Embedding/Rerank。
 - 本轮恢复：DOCX/PDF 上传、文字层解析、扫描 PDF OCR、简历文件版本、职位定制 DOCX/PDF 和鉴权下载。
-- 尚未实施：SQLAlchemy/Alembic、PostgreSQL/pgvector、对象存储、任务队列、生产可观测性和容器编排文件。
+- 本轮新增：Dockerfile 和 Docker Compose 本地开发环境；它只封装当前 SQLite + Chroma Web 服务，
+  不代表 PostgreSQL、对象存储、任务队列或生产可观测性已经完成。
+- 尚未实施：SQLAlchemy/Alembic、PostgreSQL/pgvector、对象存储、任务队列和生产可观测性。
 
 后续改造必须按上述阶段逐步提交。不能在尚未建立迁移和回滚能力时，直接把本地 SQLite
 数据路径替换成生产 PostgreSQL，也不能在文件仍依赖单机目录时先做多副本部署。
