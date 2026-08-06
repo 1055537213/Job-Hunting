@@ -193,15 +193,17 @@ def test_cli_can_show_masked_embedding_config(tmp_path, capsys):
 
 
 def test_cli_can_show_masked_rerank_config(tmp_path, capsys):
-    """命令行可以展示 Rerank 是否可用，同时不会输出共享 DashScope 密钥。"""
+    """命令行可以展示通用 Rerank 配置，同时不会输出 API 密钥。"""
 
     env_file = tmp_path / ".env"
     env_file.write_text(
         "\n".join(
             [
-                "DASHSCOPE_API_KEY=test-dashscope-secret",
-                "JOB_AGENT_RERANK_PROVIDER=dashscope",
-                "JOB_AGENT_RERANK_MODEL=qwen3-vl-rerank",
+                "JOB_AGENT_RERANK_PROVIDER=rerank-provider",
+                "JOB_AGENT_RERANK_API_STYLE=standard",
+                "JOB_AGENT_RERANK_MODEL=rerank-model",
+                "JOB_AGENT_RERANK_API_KEY=test-rerank-secret",
+                "JOB_AGENT_RERANK_BASE_URL=https://rerank.example/v1",
                 "JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER=5",
             ]
         ),
@@ -212,11 +214,12 @@ def test_cli_can_show_masked_rerank_config(tmp_path, capsys):
     output_text = capsys.readouterr().out
     output = json.loads(output_text)
 
-    assert output["provider"] == "dashscope"
-    assert output["model"] == "qwen3-vl-rerank"
+    assert output["provider"] == "rerank-provider"
+    assert output["api_style"] == "standard"
+    assert output["model"] == "rerank-model"
     assert output["api_key_set"] is True
     assert output["candidate_multiplier"] == 5
-    assert "test-dashscope-secret" not in output_text
+    assert "test-rerank-secret" not in output_text
 
 
 def test_cli_can_ingest_conversation_message(tmp_path, capsys):

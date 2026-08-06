@@ -106,10 +106,10 @@ def test_gateway_records_rerank_usage_under_the_rerank_model_identity(tmp_path):
         tmp_path / ".env",
         usage_store=store,
         rerank_settings=RerankSettings(
-            provider="dashscope",
-            model="qwen3-vl-rerank",
+            provider="rerank-provider",
+            model="rerank-model",
             api_key="secret-not-persisted",
-            base_url="https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+            base_url="https://rerank.example/v1/rerank",
         ),
         settings=ModelGatewaySettings(environment="test"),
     )
@@ -123,7 +123,7 @@ def test_gateway_records_rerank_usage_under_the_rerank_model_identity(tmp_path):
     summary = gateway.record_rerank_response(
         context,
         {
-            "request_id": "dashscope-request-42",
+            "request_id": "rerank-request-42",
             "usage": {"input_tokens": 12, "total_tokens": 12},
         },
     )
@@ -132,9 +132,9 @@ def test_gateway_records_rerank_usage_under_the_rerank_model_identity(tmp_path):
     assert summary["usage_source"] == "provider"
     assert len(events) == 1
     assert events[0].operation == "rerank_query"
-    assert events[0].provider == "dashscope"
-    assert events[0].model == "qwen3-vl-rerank"
-    assert events[0].provider_request_id == "dashscope-request-42"
+    assert events[0].provider == "rerank-provider"
+    assert events[0].model == "rerank-model"
+    assert events[0].provider_request_id == "rerank-request-42"
     assert events[0].total_tokens == 12
     assert "secret-not-persisted" not in str(events[0].raw_usage)
 

@@ -15,13 +15,7 @@ from typing import Mapping
 
 DEFAULT_ENV_PATH = Path(".env")
 
-# DashScope 原生多模态向量与文本重排接口不是 OpenAI-compatible 端点。
-# 保留为可覆盖的默认值，方便本地调试、专有网络或后续的兼容网关接入。
-DASHSCOPE_MULTIMODAL_EMBEDDING_URL = (
-    "https://dashscope.aliyuncs.com/api/v1/services/embeddings/"
-    "multimodal-embedding/multimodal-embedding"
-)
-DASHSCOPE_RERANK_URL = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+# 向量和重排接口的请求结构通过 `.env` 中的 API_STYLE 显式选择，地址由用户配置。
 
 
 @dataclass(frozen=True)
@@ -70,6 +64,8 @@ class EmbeddingSettings:
     api_key: str
     base_url: str
     timeout_seconds: int = 60
+    # provider 只作为计量标签；api_style 决定 HTTP 请求/响应结构。
+    api_style: str = "openai_compatible"
     batch_size: int = 64
     dimensions: int | None = None
 
@@ -86,6 +82,8 @@ class RerankSettings:
     model: str
     api_key: str
     base_url: str
+    # Rerank 没有跨供应商统一标准，必须声明端点采用的协议样式。
+    api_style: str = "standard"
     timeout_seconds: int = 60
     candidate_multiplier: int = 4
 
@@ -266,6 +264,49 @@ def masked_model_gateway_settings(settings: ModelGatewaySettings) -> dict[str, o
     }
 
 
+def normalize_embedding_api_style(value: str | None) -> str:
+    """把 Embedding 协议别名归一化为内部适配器名称。"""
+
+    normalized = (value or "openai_compatible").strip().lower().replace("-", "_")
+    aliases = {
+        "openai": "openai_compatible",
+        "openai_compatible": "openai_compatible",
+        "embeddings": "openai_compatible",
+        "native": "native_multimodal",
+        "native_multimodal": "native_multimodal",
+        "multimodal": "native_multimodal",
+        "local": "local_hash",
+        "local_hash": "local_hash",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as error:
+        raise ValueError(
+            "不支持的 Embedding API_STYLE："
+            f"{value}；可选 openai_compatible、native_multimodal 或 local_hash"
+        ) from error
+
+
+def normalize_rerank_api_style(value: str | None) -> str:
+    """把 Rerank 协议别名归一化为内部适配器名称。"""
+
+    normalized = (value or "standard").strip().lower().replace("-", "_")
+    aliases = {
+        "standard": "standard",
+        "standard_rerank": "standard",
+        "rerank": "standard",
+        "native": "native",
+        "provider_native": "native",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as error:
+        raise ValueError(
+            "不支持的 Rerank API_STYLE："
+            f"{value}；可选 standard 或 native"
+        ) from error
+
+
 def load_embedding_settings(
     env_path: str | Path = DEFAULT_ENV_PATH,
     environ: Mapping[str, str] | None = None,
@@ -293,33 +334,49 @@ def load_embedding_settings(
     model = get("JOB_AGENT_EMBEDDING_MODEL")
     explicit_api_key = get("JOB_AGENT_EMBEDDING_API_KEY")
     explicit_base_url = get("JOB_AGENT_EMBEDDING_BASE_URL")
-    timeout = int(get("JOB_AGENT_EMBEDDING_TIMEOUT_SECONDS", default="60") or 60)
-    batch_size = int(get("JOB_AGENT_EMBEDDING_BATCH_SIZE", default="64") or 64)
+    api_style = normalize_embedding_api_style(get("JOB_AGENT_EMBEDDING_API_STYLE"))
+    timeout = parse_positive_int(
+        get("JOB_AGENT_EMBEDDING_TIMEOUT_SECONDS", default="60"),
+        "JOB_AGENT_EMBEDDING_TIMEOUT_SECONDS",
+    )
+    batch_size = parse_positive_int(
+        get("JOB_AGENT_EMBEDDING_BATCH_SIZE", default="64"),
+        "JOB_AGENT_EMBEDDING_BATCH_SIZE",
+    )
     dimensions = get("JOB_AGENT_EMBEDDING_DIMENSIONS")
 
-    if not any([provider, model, explicit_api_key, explicit_base_url, dimensions]):
+    if not any(
+        [
+            provider,
+            model,
+            explicit_api_key,
+            explicit_base_url,
+            dimensions,
+            get("JOB_AGENT_EMBEDDING_API_STYLE"),
+        ]
+    ):
         return None
     if not provider:
         raise ValueError("缺少 embedding provider：请在 .env 中配置 JOB_AGENT_EMBEDDING_PROVIDER")
-    normalized_provider = provider.lower()
-    if normalized_provider in {"local", "local_hash"}:
-        parsed_dimensions = int(dimensions) if dimensions else None
+    normalized_provider = provider.strip().lower()
+    if normalized_provider in {"local", "local_hash"} or api_style == "local_hash":
+        parsed_dimensions = (
+            parse_positive_int(dimensions, "JOB_AGENT_EMBEDDING_DIMENSIONS")
+            if dimensions
+            else None
+        )
         return EmbeddingSettings(
             provider=normalized_provider,
             model=model or "local-hash",
             api_key="local",
             base_url="local",
+            api_style="local_hash",
             timeout_seconds=timeout,
             batch_size=batch_size,
             dimensions=parsed_dimensions,
         )
-    if normalized_provider in {"dashscope", "dashscope_multimodal"}:
-        # DashScope 官方 SDK 和控制台使用 DASHSCOPE_API_KEY；显式的项目配置优先。
-        api_key = explicit_api_key or get("JOB_AGENT_DASHSCOPE_API_KEY", "DASHSCOPE_API_KEY")
-        base_url = explicit_base_url or DASHSCOPE_MULTIMODAL_EMBEDDING_URL
-    else:
-        api_key = explicit_api_key or get("OPENAI_API_KEY")
-        base_url = explicit_base_url or get("OPENAI_BASE_URL")
+    api_key = explicit_api_key or get("OPENAI_API_KEY")
+    base_url = explicit_base_url or get("OPENAI_BASE_URL")
     if not model:
         raise ValueError("缺少 embedding 模型名：请在 .env 中配置 JOB_AGENT_EMBEDDING_MODEL")
     if not api_key:
@@ -332,9 +389,14 @@ def load_embedding_settings(
         model=model,
         api_key=api_key,
         base_url=base_url,
+        api_style=api_style,
         timeout_seconds=timeout,
         batch_size=batch_size,
-        dimensions=int(dimensions) if dimensions else None,
+        dimensions=(
+            parse_positive_int(dimensions, "JOB_AGENT_EMBEDDING_DIMENSIONS")
+            if dimensions
+            else None
+        ),
     )
 
 
@@ -351,6 +413,7 @@ def masked_embedding_settings(settings: EmbeddingSettings | None) -> dict[str, o
         "timeout_seconds": settings.timeout_seconds,
         "batch_size": settings.batch_size,
         "dimensions": settings.dimensions,
+        "api_style": settings.api_style,
         "configured": settings.provider not in {"local", "local_hash"},
     }
 
@@ -382,32 +445,50 @@ def load_rerank_settings(
     model = get("JOB_AGENT_RERANK_MODEL")
     explicit_api_key = get("JOB_AGENT_RERANK_API_KEY")
     explicit_base_url = get("JOB_AGENT_RERANK_BASE_URL")
-    timeout = int(get("JOB_AGENT_RERANK_TIMEOUT_SECONDS", default="60") or 60)
+    api_style = normalize_rerank_api_style(
+        get("JOB_AGENT_RERANK_API_STYLE", "JOB_AGENT_RERANK_PROTOCOL")
+    )
+    timeout = parse_positive_int(
+        get("JOB_AGENT_RERANK_TIMEOUT_SECONDS", default="60"),
+        "JOB_AGENT_RERANK_TIMEOUT_SECONDS",
+    )
     candidate_multiplier = parse_positive_int(
         get("JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER", default="4"),
         "JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER",
     )
 
-    if not any([provider, model, explicit_api_key, explicit_base_url]):
+    if not any(
+        [
+            provider,
+            model,
+            explicit_api_key,
+            explicit_base_url,
+            get("JOB_AGENT_RERANK_API_STYLE"),
+            get("JOB_AGENT_RERANK_PROTOCOL"),
+        ]
+    ):
         return None
     if not provider:
         raise ValueError("缺少 rerank provider：请在 .env 中配置 JOB_AGENT_RERANK_PROVIDER")
-    normalized_provider = provider.lower()
+    normalized_provider = provider.strip().lower()
     if normalized_provider in {"disabled", "none", "off"}:
         return None
-    if normalized_provider not in {"dashscope", "dashscope_rerank"}:
-        raise ValueError(f"暂不支持的 rerank provider：{normalized_provider}")
     if not model:
         raise ValueError("缺少 rerank 模型名：请在 .env 中配置 JOB_AGENT_RERANK_MODEL")
-    api_key = explicit_api_key or get("JOB_AGENT_DASHSCOPE_API_KEY", "DASHSCOPE_API_KEY")
+    api_key = explicit_api_key or get("OPENAI_API_KEY")
     if not api_key:
-        raise ValueError("缺少 rerank API Key：请在 .env 中配置 JOB_AGENT_RERANK_API_KEY 或 DASHSCOPE_API_KEY")
+        raise ValueError("缺少 rerank API Key：请在 .env 中配置 JOB_AGENT_RERANK_API_KEY")
+    if not explicit_base_url:
+        raise ValueError("缺少 rerank base URL：请在 .env 中配置 JOB_AGENT_RERANK_BASE_URL")
 
+    base_url = explicit_base_url
+    assert base_url is not None
     return RerankSettings(
         provider=normalized_provider,
         model=model,
         api_key=api_key,
-        base_url=explicit_base_url or DASHSCOPE_RERANK_URL,
+        base_url=base_url,
+        api_style=api_style,
         timeout_seconds=timeout,
         candidate_multiplier=candidate_multiplier,
     )
@@ -420,6 +501,7 @@ def masked_rerank_settings(settings: RerankSettings | None) -> dict[str, object]
         return {"provider": "disabled", "configured": False}
     return {
         "provider": settings.provider,
+        "api_style": settings.api_style,
         "model": settings.model,
         "base_url": settings.base_url,
         "api_key_set": bool(settings.api_key),

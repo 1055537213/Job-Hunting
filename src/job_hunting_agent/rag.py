@@ -26,8 +26,6 @@ from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from .config import (
-    DASHSCOPE_MULTIMODAL_EMBEDDING_URL,
-    DASHSCOPE_RERANK_URL,
     DEFAULT_ENV_PATH,
     EmbeddingSettings,
     RerankSettings,
@@ -213,11 +211,11 @@ class OpenAICompatibleEmbeddings(Embeddings):
         return extract_embedding_vectors(response)
 
 
-class DashScopeMultimodalEmbeddings(Embeddings):
-    """DashScope `MultiModalEmbedding` 的 LangChain 适配器。
+class NativeMultimodalEmbeddings(Embeddings):
+    """通用 provider-native 多模态 Embedding 协议的 LangChain 适配器。
 
-    当前 RAG 只发送文本 chunk，但选用多模态模型后，后续可以在不替换检索协议的前提下
-    扩展到简历图片等资料。DashScope 的请求体与 OpenAI Embeddings 不兼容，因此独立实现。
+    该协议把文本放在 ``input.contents``，并从 ``output.embeddings`` 读取结果；
+    供应商标签、模型名和完整端点都由配置提供，业务层不绑定具体厂商。
     """
 
     def __init__(
@@ -232,10 +230,10 @@ class DashScopeMultimodalEmbeddings(Embeddings):
         usage_operation: str = "embedding",
         max_retries: int = 2,
     ):
-        """保存 DashScope 向量模型配置，不在对象或日志中输出密钥。"""
+        """保存 provider-native 向量模型配置，不在对象或日志中输出密钥。"""
 
         self.api_key = api_key
-        self.endpoint = normalize_dashscope_endpoint(base_url, DASHSCOPE_MULTIMODAL_EMBEDDING_URL)
+        self.endpoint = normalize_native_endpoint(base_url)
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.batch_size = batch_size
@@ -251,8 +249,8 @@ class DashScopeMultimodalEmbeddings(Embeddings):
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         usage_operation: str = "embedding",
         max_retries: int = 2,
-    ) -> "DashScopeMultimodalEmbeddings":
-        """从项目 Embedding 配置创建 DashScope 适配器。"""
+    ) -> "NativeMultimodalEmbeddings":
+        """从项目 Embedding 配置创建 provider-native 适配器。"""
 
         return cls(
             api_key=settings.api_key,
@@ -266,7 +264,7 @@ class DashScopeMultimodalEmbeddings(Embeddings):
         )
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """以 DashScope 的多模态输入格式批量生成文本向量。"""
+        """以 provider-native 多模态输入格式批量生成文本向量。"""
 
         if not texts:
             return []
@@ -281,11 +279,11 @@ class DashScopeMultimodalEmbeddings(Embeddings):
         return self._embed_batch([text])[0]
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """调用 DashScope MultiModalEmbedding HTTP 接口，并按输入顺序解析向量。"""
+        """调用 provider-native 多模态接口，并按输入顺序解析向量。"""
 
         payload: dict[str, object] = {
             "model": self.model,
-            # DashScope 原生多模态接口要求把内容放在 input.contents 中。
+            # provider-native 多模态协议要求把内容放在 input.contents 中。
             "input": {"contents": [{"text": text} for text in texts]},
         }
         response: dict[str, object] | None = None
@@ -305,13 +303,13 @@ class DashScopeMultimodalEmbeddings(Embeddings):
                 if attempt >= self.max_retries:
                     raise
         if response is None:  # pragma: no cover - 防御性兜底，循环应当已成功或抛异常。
-            raise EmbeddingRequestError("DashScope Embedding API 未返回响应")
+            raise EmbeddingRequestError("Native Embedding API 未返回响应")
         if self.usage_callback is not None:
             try:
                 self.usage_callback(response)
             except Exception:  # noqa: BLE001 - 计量旁路不能阻断 RAG 索引。
                 pass
-        return extract_dashscope_embedding_vectors(response)
+        return extract_native_multimodal_embedding_vectors(response)
 
 
 def tokenize(text: str) -> list[str]:
@@ -346,16 +344,23 @@ def normalize_embeddings_url(base_url: str) -> str:
     return f"{stripped}/embeddings"
 
 
-def normalize_dashscope_endpoint(base_url: str, default_url: str) -> str:
-    """兼容 DashScope 完整端点和以 `/api/v1` 结尾的根地址配置。"""
+def normalize_native_endpoint(base_url: str) -> str:
+    """规范化 provider-native 配置的完整 HTTP 端点。"""
 
-    stripped = base_url.rstrip()
-    if not stripped:
-        return default_url
-    normalized = stripped.rstrip("/")
-    dashscope_api_root = "https://dashscope.aliyuncs.com/api/v1"
-    if normalized.endswith("/api/v1") and default_url.startswith(dashscope_api_root):
-        return f"{normalized}{default_url.removeprefix(dashscope_api_root)}"
+    normalized = base_url.strip().rstrip("/")
+    if not normalized:
+        raise ValueError("provider-native API 端点不能为空")
+    return normalized
+
+
+def normalize_rerank_endpoint(base_url: str, api_style: str) -> str:
+    """根据协议样式规范化 Rerank HTTP 端点。"""
+
+    normalized = base_url.strip().rstrip("/")
+    if not normalized:
+        raise ValueError("Rerank API 端点不能为空")
+    if api_style == "standard" and not normalized.endswith("/rerank"):
+        return f"{normalized}/rerank"
     return normalized
 
 
@@ -377,25 +382,25 @@ def extract_embedding_vectors(response: dict[str, Any]) -> list[list[float]]:
     return [vectors_by_index[index] for index in sorted(vectors_by_index)]
 
 
-def extract_dashscope_embedding_vectors(response: dict[str, Any]) -> list[list[float]]:
-    """从 DashScope MultiModalEmbedding 响应中提取与输入顺序一致的向量。"""
+def extract_native_multimodal_embedding_vectors(response: dict[str, Any]) -> list[list[float]]:
+    """从 provider-native 多模态响应中提取与输入顺序一致的向量。"""
 
     output = response.get("output")
     embeddings = output.get("embeddings") if isinstance(output, dict) else None
     if not isinstance(embeddings, list) or not embeddings:
-        raise EmbeddingRequestError("DashScope Embedding 响应缺少 output.embeddings")
+        raise EmbeddingRequestError("Native Embedding 响应缺少 output.embeddings")
     vectors_by_index: dict[int, list[float]] = {}
     for default_index, item in enumerate(embeddings):
         if not isinstance(item, dict):
-            raise EmbeddingRequestError("DashScope Embedding 响应条目格式异常")
+            raise EmbeddingRequestError("Native Embedding 响应条目格式异常")
         raw_index = item.get("text_index", item.get("index", default_index))
         try:
             index = int(raw_index)
         except (TypeError, ValueError) as error:
-            raise EmbeddingRequestError("DashScope Embedding 响应缺少有效索引") from error
+            raise EmbeddingRequestError("Native Embedding 响应缺少有效索引") from error
         embedding = item.get("embedding")
         if not isinstance(embedding, list) or not all(isinstance(value, (int, float)) for value in embedding):
-            raise EmbeddingRequestError("DashScope Embedding 响应缺少向量")
+            raise EmbeddingRequestError("Native Embedding 响应缺少向量")
         vectors_by_index[index] = [float(value) for value in embedding]
     return [vectors_by_index[index] for index in sorted(vectors_by_index)]
 
@@ -416,34 +421,46 @@ def extract_embedding_usage(response: dict[str, Any]) -> dict[str, int]:
     }
 
 
-def extract_dashscope_rerank_results(response: dict[str, Any]) -> list[RerankResult]:
-    """从 DashScope rerank 响应提取候选索引顺序，不依赖返回的正文副本。"""
+def _parse_rerank_results(results: object, response_label: str) -> list[RerankResult]:
+    """解析通用重排结果数组，并统一不同协议的分数字段名称。"""
 
-    output = response.get("output")
-    results = output.get("results") if isinstance(output, dict) else None
     if not isinstance(results, list):
-        raise RerankRequestError("DashScope Rerank 响应缺少 output.results")
+        raise RerankRequestError(f"{response_label} 响应缺少 results")
     ranked: list[RerankResult] = []
     for item in results:
         if not isinstance(item, dict):
-            raise RerankRequestError("DashScope Rerank 响应条目格式异常")
+            raise RerankRequestError(f"{response_label} 响应条目格式异常")
         try:
             index = int(item["index"])
         except (KeyError, TypeError, ValueError) as error:
-            raise RerankRequestError("DashScope Rerank 响应缺少有效索引") from error
-        raw_score = item.get("relevance_score")
+            raise RerankRequestError(f"{response_label} 响应缺少有效索引") from error
+        raw_score = item.get("relevance_score", item.get("score"))
         if raw_score is None:
             score = None
         elif isinstance(raw_score, (int, float)):
             score = float(raw_score)
         else:
-            raise RerankRequestError("DashScope Rerank 响应相关性分数格式异常")
+            raise RerankRequestError(f"{response_label} 响应相关性分数格式异常")
         ranked.append(RerankResult(index=index, relevance_score=score))
     return ranked
 
 
-class DashScopeReranker:
-    """DashScope `qwen3-vl-rerank` 等文本重排模型的适配器。"""
+def extract_standard_rerank_results(response: dict[str, Any]) -> list[RerankResult]:
+    """从常见 `/rerank` 响应中提取候选索引和相关性分数。"""
+
+    return _parse_rerank_results(response.get("results"), "Standard Rerank")
+
+
+def extract_native_rerank_results(response: dict[str, Any]) -> list[RerankResult]:
+    """从 provider-native 响应的 `output.results` 中提取重排结果。"""
+
+    output = response.get("output")
+    results = output.get("results") if isinstance(output, dict) else None
+    return _parse_rerank_results(results, "Native Rerank")
+
+
+class HttpReranker:
+    """通过配置化 HTTP 协议调用重排模型的 LangChain 无关适配器。"""
 
     def __init__(
         self,
@@ -452,6 +469,7 @@ class DashScopeReranker:
         model: str,
         timeout_seconds: int = 60,
         candidate_multiplier: int = 4,
+        api_style: str = "standard",
         transport: Callable[[str, dict[str, str], dict[str, object], int], dict[str, object]] | None = None,
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         max_retries: int = 2,
@@ -459,7 +477,8 @@ class DashScopeReranker:
         """保存 Rerank 调用配置；候选倍数控制向量召回后送入模型的数量。"""
 
         self.api_key = api_key
-        self.endpoint = normalize_dashscope_endpoint(base_url, DASHSCOPE_RERANK_URL)
+        self.api_style = api_style
+        self.endpoint = normalize_rerank_endpoint(base_url, api_style)
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.candidate_multiplier = max(1, candidate_multiplier)
@@ -473,8 +492,8 @@ class DashScopeReranker:
         settings: RerankSettings,
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         max_retries: int = 2,
-    ) -> "DashScopeReranker":
-        """从项目 Rerank 配置创建 DashScope 重排器。"""
+    ) -> "HttpReranker":
+        """从项目 Rerank 配置创建 HTTP 重排适配器。"""
 
         return cls(
             api_key=settings.api_key,
@@ -482,24 +501,36 @@ class DashScopeReranker:
             model=settings.model,
             timeout_seconds=settings.timeout_seconds,
             candidate_multiplier=settings.candidate_multiplier,
+            api_style=settings.api_style,
             usage_callback=usage_callback,
             max_retries=max_retries,
         )
 
     def rerank(self, query: str, documents: list[str], top_n: int) -> list[RerankResult]:
-        """请求 DashScope 根据查询重排候选文本，返回原候选列表的索引。"""
+        """根据查询重排候选文本，返回原候选列表的索引。"""
 
         if not query.strip() or not documents or top_n <= 0:
             return []
-        payload: dict[str, object] = {
-            "model": self.model,
-            "input": {"query": query, "documents": documents},
-            "parameters": {
-                # 调用方已有原始 chunk，关闭正文回传可以减小响应体和隐私暴露面。
-                "return_documents": False,
+        if self.api_style == "standard":
+            payload: dict[str, object] = {
+                "model": self.model,
+                "query": query,
+                "documents": documents,
                 "top_n": min(top_n, len(documents)),
-            },
-        }
+                "return_documents": False,
+            }
+        elif self.api_style == "native":
+            payload = {
+                "model": self.model,
+                "input": {"query": query, "documents": documents},
+                "parameters": {
+                    # 调用方已有原始 chunk，关闭正文回传可以减小响应体和隐私暴露面。
+                    "return_documents": False,
+                    "top_n": min(top_n, len(documents)),
+                },
+            }
+        else:  # pragma: no cover - 配置加载器已提前完成协议归一化。
+            raise RerankRequestError(f"不支持的 Rerank API_STYLE：{self.api_style}")
         response: dict[str, object] | None = None
         for attempt in range(self.max_retries + 1):
             try:
@@ -517,13 +548,15 @@ class DashScopeReranker:
                 if attempt >= self.max_retries:
                     raise
         if response is None:  # pragma: no cover - 防御性兜底，循环应当已成功或抛异常。
-            raise RerankRequestError("DashScope Rerank API 未返回响应")
+            raise RerankRequestError("Rerank API 未返回响应")
         if self.usage_callback is not None:
             try:
                 self.usage_callback(response)
             except Exception:  # noqa: BLE001 - 计量旁路不能阻断检索。
                 pass
-        return extract_dashscope_rerank_results(response)
+        if self.api_style == "standard":
+            return extract_standard_rerank_results(response)
+        return extract_native_rerank_results(response)
 
 
 def post_json(
@@ -575,7 +608,7 @@ def post_rerank_json(
     payload: dict[str, object],
     timeout: int,
 ) -> dict[str, object]:
-    """发送 DashScope rerank JSON POST 请求。"""
+    """发送通用 Rerank JSON POST 请求。"""
 
     return post_json(
         url,
@@ -604,23 +637,23 @@ def build_rag_embeddings(
     resolved_settings = settings if settings is not None else load_embedding_settings(env_path)
     if resolved_settings is None:
         return LocalHashEmbeddings()
-    if resolved_settings.provider in {"local", "local_hash"}:
+    if resolved_settings.api_style == "local_hash":
         return LocalHashEmbeddings(dimensions=resolved_settings.dimensions or 384)
-    if resolved_settings.provider in {"openai", "openai_compatible"}:
+    if resolved_settings.api_style == "openai_compatible":
         return OpenAICompatibleEmbeddings.from_settings(
             resolved_settings,
             usage_callback=usage_callback,
             usage_operation=usage_operation,
             max_retries=max_retries,
         )
-    if resolved_settings.provider in {"dashscope", "dashscope_multimodal"}:
-        return DashScopeMultimodalEmbeddings.from_settings(
+    if resolved_settings.api_style == "native_multimodal":
+        return NativeMultimodalEmbeddings.from_settings(
             resolved_settings,
             usage_callback=usage_callback,
             usage_operation=usage_operation,
             max_retries=max_retries,
         )
-    raise ValueError(f"暂不支持的 embedding provider：{resolved_settings.provider}")
+    raise ValueError(f"暂不支持的 Embedding API_STYLE：{resolved_settings.api_style}")
 
 
 def build_reranker(
@@ -635,13 +668,13 @@ def build_reranker(
     resolved_settings = settings if settings is not None else load_rerank_settings(env_path)
     if resolved_settings is None:
         return None
-    if resolved_settings.provider in {"dashscope", "dashscope_rerank"}:
-        return DashScopeReranker.from_settings(
-            resolved_settings,
-            usage_callback=usage_callback,
-            max_retries=max_retries,
-        )
-    raise ValueError(f"暂不支持的 rerank provider：{resolved_settings.provider}")
+    if resolved_settings.api_style not in {"standard", "native"}:
+        raise ValueError(f"暂不支持的 Rerank API_STYLE：{resolved_settings.api_style}")
+    return HttpReranker.from_settings(
+        resolved_settings,
+        usage_callback=usage_callback,
+        max_retries=max_retries,
+    )
 
 
 def resolve_collection_name_for_embeddings(

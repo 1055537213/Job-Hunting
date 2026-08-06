@@ -28,9 +28,9 @@
 - 开发语言：Python 3.12 及以上。
 - Web 服务：FastAPI、Uvicorn。
 - Agent 编排：LangChain 1.x、LangGraph。
-- 模型接入：内部 Model Gateway 统一调用 DeepSeek 或其他 OpenAI-compatible Chat API，并支持 DashScope 原生 RAG 接口，通过 `.env` 配置。
-- Embedding：支持 OpenAI-compatible Embedding API、DashScope `qwen3-vl-embedding`；未配置时回退到本地 hash embedding。
-- Rerank：可选接入 DashScope `qwen3-vl-rerank`，对向量召回候选再次排序；未配置时保持纯向量检索。
+- 模型接入：内部 Model Gateway 统一调用 OpenAI-compatible Chat API，通过 `.env` 配置供应商标签、模型、密钥和地址。
+- Embedding：支持 OpenAI-compatible、provider-native 多模态协议；未配置时回退到本地 hash embedding。
+- Rerank：支持常见 `/rerank` 协议或 provider-native 协议，对向量召回候选再次排序；未配置时保持纯向量检索。
 - 结构化存储：SQLite。
 - 语义检索：Chroma、LangChain Chroma 集成、LangChain 文本切分器。
 - 简历文档：python-docx、pdfplumber、PDFium、RapidOCR、ONNX Runtime、ReportLab。
@@ -209,10 +209,10 @@ python -m pip install -e .
 复制 `.env.example` 为 `.env`，填写真实模型配置：
 
 ```dotenv
-JOB_AGENT_LLM_PROVIDER=deepseek
-JOB_AGENT_LLM_MODEL=deepseek-v4-pro
+JOB_AGENT_LLM_PROVIDER=your-chat-provider
+JOB_AGENT_LLM_MODEL=your-chat-model
 JOB_AGENT_LLM_API_KEY=your-api-key
-JOB_AGENT_LLM_BASE_URL=https://api.deepseek.com
+JOB_AGENT_LLM_BASE_URL=https://api.example.com/v1
 JOB_AGENT_ENVIRONMENT=development
 JOB_AGENT_MODEL_GATEWAY_CHAT_MAX_RETRIES=2
 JOB_AGENT_MODEL_GATEWAY_EMBEDDING_MAX_RETRIES=2
@@ -226,25 +226,25 @@ JOB_AGENT_COOKIE_SECURE=false
 ```
 
 聊天模型、Embedding 模型和 Rerank 模型可以来自不同供应商。需要真实语义 Embedding 时，按
-`.env.example` 中注释的 OpenAI-compatible 或 DashScope 配置替换本地模式。部署到 HTTPS 后，
-把 `JOB_AGENT_COOKIE_SECURE` 改为 `true`。
+`.env.example` 中的通用协议配置替换本地模式；部署到 HTTPS 后，把 `JOB_AGENT_COOKIE_SECURE` 改为 `true`。
 
-### 使用 Qwen Embedding 与 Rerank
+Embedding 支持以下协议样式：
 
-在千问控制台新建密钥后，只把新密钥写入本机 `.env`，不要提交到 Git 或发送到聊天记录。以下配置
-让 `qwen3-vl-embedding` 和 `qwen3-vl-rerank` 共用一把 DashScope 密钥：
+| `JOB_AGENT_EMBEDDING_API_STYLE` | 请求/响应约定 |
+| --- | --- |
+| `openai_compatible` | `POST {base_url}/embeddings`，读取 `data[].embedding` |
+| `native_multimodal` | 发送 `input.contents`，读取 `output.embeddings` |
+| `local_hash` | 本地离线 fallback，不访问网络 |
 
-```dotenv
-DASHSCOPE_API_KEY=your-new-dashscope-api-key
+Rerank 支持以下协议样式：
 
-JOB_AGENT_EMBEDDING_PROVIDER=dashscope
-JOB_AGENT_EMBEDDING_MODEL=qwen3-vl-embedding
-JOB_AGENT_EMBEDDING_BATCH_SIZE=16
+| `JOB_AGENT_RERANK_API_STYLE` | 请求/响应约定 |
+| --- | --- |
+| `standard` | `POST {base_url}/rerank`，发送 `query/documents`，读取 `results[]` |
+| `native` | 发送 `input.query/documents` 与 `parameters`，读取 `output.results` |
 
-JOB_AGENT_RERANK_PROVIDER=dashscope
-JOB_AGENT_RERANK_MODEL=qwen3-vl-rerank
-JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER=4
-```
+Rerank 没有跨供应商统一标准。若目标服务使用不同字段或响应结构，应在 `rag.py` 中新增独立协议适配器，
+而不是把供应商名称写进业务层。
 
 启动前可确认配置已经被识别，命令只显示脱敏摘要：
 

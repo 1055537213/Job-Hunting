@@ -199,7 +199,7 @@ Kubernetes 不是上线前置条件。只有出现以下需求时再进入该阶
 
 ## 7. 当前恢复状态
 
-- 已有：账号/Session、候选人多档案、多会话、Token 用量流水、LangChain Agent、RAG、职位匹配、内部 Model Gateway，以及可选 DashScope Embedding/Rerank。
+- 已有：账号/Session、候选人多档案、多会话、Token 用量流水、LangChain Agent、RAG、职位匹配、内部 Model Gateway，以及可选 provider-native Embedding/Rerank。
 - 本轮恢复：DOCX/PDF 上传、文字层解析、扫描 PDF OCR、简历文件版本、职位定制 DOCX/PDF 和鉴权下载。
 - 尚未实施：SQLAlchemy/Alembic、PostgreSQL/pgvector、对象存储、任务队列、生产可观测性和容器编排文件。
 
