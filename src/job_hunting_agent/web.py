@@ -45,7 +45,7 @@ from .config import (
     masked_llm_settings,
     masked_rerank_settings,
 )
-from .models import AccountRecord, CandidateProfileInput, ResumeArtifactRecord
+from .models import AccountRecord, CandidateProfileInput, ResumeArtifactRecord, SkillRequirement
 from .job_parser import InvalidJobTextError
 from .llm import LLMClient, LLMRequestError
 from .rag import RAGProviderRequestError
@@ -82,6 +82,7 @@ class ProfilePayload(BaseModel):
     experience_years: float = 0
     skills: dict[str, str] = Field(default_factory=dict)
     preferred_cities: list[str] = Field(default_factory=list)
+    acceptable_cities: list[str] = Field(default_factory=list)
     salary_floor_k: int | None = None
     expected_salary_k: int | None = None
     target_directions: list[str] = Field(default_factory=list)
@@ -109,6 +110,21 @@ class JobPayload(BaseModel):
 
     raw_text: str
     source_url: str | None = None
+
+
+class JobSkillRequirementPayload(BaseModel):
+    """职位已有技能的人工分类输入。"""
+
+    name: str
+    category: str = "general"
+    confidence: float = 0.5
+    evidence: str = ""
+
+
+class JobSkillRequirementsPayload(BaseModel):
+    """批量保存一个职位的技能分类。"""
+
+    requirements: list[JobSkillRequirementPayload] = Field(default_factory=list)
 
 
 class RegisterPayload(BaseModel):
@@ -382,6 +398,7 @@ def create_web_app(
                 experience_years=payload.experience_years,
                 skills=clean_string_dict(payload.skills),
                 preferred_cities=clean_string_list(payload.preferred_cities),
+                acceptable_cities=clean_string_list(payload.acceptable_cities),
                 salary_floor_k=payload.salary_floor_k,
                 expected_salary_k=payload.expected_salary_k,
                 target_directions=clean_string_list(payload.target_directions),
@@ -681,6 +698,36 @@ def create_web_app(
         account = current_account(request)
         return {"jobs": [asdict(job) for job in backend.list_jobs(account_id=account.id if account else None)]}
 
+    @web_app.put("/api/jobs/{job_id}/skill-requirements")
+    def update_job_skill_requirements(
+        job_id: int,
+        payload: JobSkillRequirementsPayload,
+        request: Request,
+    ) -> dict[str, object]:
+        """保存职位技能分类的人工校正，并返回更新后的职位。"""
+
+        account = current_account(request)
+        requirements = [
+            SkillRequirement(
+                name=item.name,
+                category=item.category,
+                confidence=item.confidence,
+                evidence=item.evidence,
+            )
+            for item in payload.requirements
+        ]
+        try:
+            job = backend.update_job_skill_requirements(
+                job_id,
+                requirements,
+                account_id=account.id if account else None,
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="职位不存在。") from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"job": asdict(job)}
+
     @web_app.delete("/api/jobs/{job_id}")
     def delete_job(job_id: int, request: Request) -> dict[str, object]:
         """删除当前账号导入的职位及其职位相关文件。"""
@@ -773,6 +820,28 @@ def create_web_app(
         except KeyError as error:
             raise HTTPException(status_code=404, detail="候选人档案不存在。") from error
         return {"artifacts": [serialize_resume_artifact(item) for item in artifacts]}
+
+    @web_app.delete("/api/resumes/{artifact_id}")
+    def delete_resume(artifact_id: int, request: Request) -> dict[str, object]:
+        """删除当前账号的一份原始或职位定制简历文件。"""
+
+        account = current_account(request)
+        account_id = account.id if account else None
+        try:
+            result = backend.delete_resume_artifact(
+                artifact_id,
+                rag_persist_directory=rag_path,
+                account_id=account_id,
+            )
+        except KeyError as error:
+            # 不区分“不存在”和“属于其他账号”，避免通过 ID 探测文件归属。
+            raise HTTPException(status_code=404, detail="简历文件不存在。") from error
+        return {
+            "artifact_id": artifact_id,
+            "deleted": True,
+            "rag_deleted_chunks": result.get("rag_deleted_chunks", 0),
+            "rag_warning": result.get("rag_warning"),
+        }
 
     @web_app.get("/api/resumes/{artifact_id}/download")
     def download_resume(artifact_id: int, request: Request) -> FileResponse:

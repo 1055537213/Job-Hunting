@@ -10,10 +10,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from .auth import AuthService
-from .config import DEFAULT_ENV_PATH
+from .config import DEFAULT_ENV_PATH, load_semantic_matching_enabled
 from .conversation_ingestion import decide_conversation_ingestion
 from .llm import LLMClient
-from .matcher import match_job
+from .matcher import match_job, semantic_direction_score
 from .models import (
     CandidateProfile,
     CandidateProfileInput,
@@ -27,6 +27,7 @@ from .models import (
     RAGSearchResult,
     ResumeArtifactRecord,
     ResumeDraftRecord,
+    SkillRequirement,
     TailoredResumeResult,
 )
 from .model_gateway import ModelGateway
@@ -55,6 +56,7 @@ class JobHuntingApp:
         db_path: str | Path,
         env_path: str | Path = DEFAULT_ENV_PATH,
         resume_dir: str | Path | None = None,
+        semantic_matching: bool | None = None,
     ):
         """绑定 SQLite、项目 `.env` 和受控简历文件目录。"""
 
@@ -62,6 +64,13 @@ class JobHuntingApp:
         # Web/CLI 都通过同一认证服务创建账号和 Session，避免重复实现密码逻辑。
         self.auth = AuthService(self.store)
         self.env_path = Path(env_path)
+        # 语义方向匹配涉及外部 Embedding/Rerank 请求，默认按 `.env` 显式开关；
+        # 测试和离线模式可通过构造参数强制关闭或打开。
+        self.semantic_matching_enabled = (
+            load_semantic_matching_enabled(self.env_path)
+            if semantic_matching is None
+            else bool(semantic_matching)
+        )
         # 所有真实模型/Embedding 调用都通过内部 Gateway 构造和计量；它是惰性加载的，
         # 所以纯本地规则和离线测试不需要在创建 App 时提供 API Key。
         self.model_gateway = ModelGateway(self.env_path, usage_store=self.store)
@@ -174,15 +183,42 @@ class JobHuntingApp:
         raw_text: str,
         source_url: str | None = None,
         account_id: int | None = None,
+        classify_with_llm: bool = True,
     ) -> ImportedJob:
         """导入候选人主动带回的职位原文，并保存标准化结果。"""
 
-        return self.store.save_job_text(raw_text, source_url, account_id=account_id)
+        llm_client = None
+        if classify_with_llm:
+            try:
+                # 职位技能分类是可选增强；没有 .env 或模型不可用时由规则分类兜底。
+                call_context = self.model_gateway.new_call_context(
+                    "job_skill_classification",
+                    account_id=account_id,
+                )
+                llm_client = self.model_gateway.llm_client(call_context)
+            except (ValueError, TypeError):
+                llm_client = None
+        return self.store.save_job_text(
+            raw_text,
+            source_url,
+            account_id=account_id,
+            llm_client=llm_client,
+        )
 
     def list_jobs(self, account_id: int | None = None) -> list[ImportedJob]:
         """列出候选人已经主动导入的所有职位。"""
 
         return self.store.list_jobs(account_id=account_id)
+
+    def update_job_skill_requirements(
+        self,
+        job_id: int,
+        requirements: list[SkillRequirement],
+        account_id: int | None = None,
+    ) -> ImportedJob:
+        """保存候选人对职位技能重要性分类的人工校正。"""
+
+        return self.store.update_job_skill_requirements(job_id, requirements, account_id=account_id)
 
     def delete_job(
         self,
@@ -294,7 +330,8 @@ class JobHuntingApp:
 
         candidate = self.store.get_candidate_profile(candidate_id, account_id=account_id)
         job = self.store.get_job(job_id, account_id=account_id)
-        return match_job(candidate, job)
+        direction_scorer = self._build_direction_scorer(account_id=account_id)
+        return match_job(candidate, job, direction_scorer=direction_scorer)
 
     def match_all_jobs(self, candidate_id: int, account_id: int | None = None) -> list[MatchResult]:
         """对当前本地职位池做批量匹配，并按推荐顺序返回结果。
@@ -304,8 +341,38 @@ class JobHuntingApp:
         """
 
         candidate = self.store.get_candidate_profile(candidate_id, account_id=account_id)
-        matches = [match_job(candidate, job) for job in self.store.list_jobs(account_id=account_id)]
+        direction_scorer = self._build_direction_scorer(account_id=account_id)
+        matches = [
+            match_job(candidate, job, direction_scorer=direction_scorer)
+            for job in self.store.list_jobs(account_id=account_id)
+        ]
         return sorted(matches, key=lambda result: (result.eliminated, -result.score, result.job_id))
+
+    def _build_direction_scorer(self, account_id: int | None = None):
+        """按需构造一次方向语义评分器，失败时让匹配器回退本地规则。"""
+
+        if not self.semantic_matching_enabled:
+            return None
+        try:
+            embedding_context = self.model_gateway.new_call_context(
+                "matching_embedding",
+                account_id=account_id,
+            )
+            rerank_context = self.model_gateway.new_call_context(
+                "matching_rerank",
+                account_id=account_id,
+            )
+            embeddings = self.model_gateway.embeddings(embedding_context)
+            reranker = self.model_gateway.reranker(rerank_context)
+        except Exception:  # noqa: BLE001 - 配置错误时由匹配器继续使用规则回退。
+            return None
+
+        def score(candidate: CandidateProfile, job: ImportedJob) -> float | None:
+            """调用统一的 Embedding/Rerank 协议适配器。"""
+
+            return semantic_direction_score(candidate, job, embeddings, reranker)
+
+        return score
 
     def create_resume_draft(
         self,
@@ -418,6 +485,19 @@ class JobHuntingApp:
         # 先读候选人，确保跨账号请求不会仅仅返回一个空列表而掩盖越权访问。
         self.store.get_candidate_profile(candidate_id, account_id=account_id)
         return self.store.list_resume_artifacts(candidate_id, account_id=account_id)
+
+    def delete_resume_artifact(
+        self,
+        artifact_id: int,
+        rag_persist_directory: str | Path | None = None,
+        account_id: int | None = None,
+    ) -> dict[str, object]:
+        """删除单个原始或职位定制简历，并同步清理受控文件和 RAG 证据。"""
+
+        result = self.store.delete_resume_artifact(artifact_id, account_id=account_id)
+        for storage_key in result.get("storage_keys", []):
+            self.resume_files.delete(str(storage_key))
+        return self._finish_deletion_cleanup(result, rag_persist_directory, account_id)
 
     def resume_file_path(self, artifact: ResumeArtifactRecord) -> Path:
         """把受控存储键解析为文件路径，不接受数据库之外的任意路径。"""

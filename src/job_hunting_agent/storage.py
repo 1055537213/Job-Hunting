@@ -18,7 +18,8 @@ from datetime import datetime
 from pathlib import Path
 
 from .auth import AuthSession, AuthUser, is_session_expired, session_expiry, session_token_hash, utc_now
-from .job_parser import parse_job_text, validate_job_text
+from .city_catalog import normalize_city_list
+from .job_parser import classify_skill_requirements, parse_job_text, validate_job_text
 from .models import (
     AccountRecord,
     AuthSessionRecord,
@@ -34,7 +35,9 @@ from .models import (
     ResumeArtifactRecord,
     ResumeDraft,
     ResumeDraftRecord,
+    SkillRequirement,
     UsageEventRecord,
+    sanitize_preference_weights,
 )
 
 
@@ -173,6 +176,8 @@ class SQLiteStore:
                     expected_salary_k INTEGER,
                     skills_json TEXT NOT NULL,
                     preferred_cities_json TEXT NOT NULL,
+                    acceptable_cities_json TEXT NOT NULL DEFAULT '[]',
+                    preference_weights_json TEXT NOT NULL DEFAULT '{}',
                     target_directions_json TEXT NOT NULL,
                     unacceptable_json TEXT NOT NULL,
                     FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
@@ -194,11 +199,12 @@ class SQLiteStore:
                     experience_max_years REAL,
                     experience_label TEXT,
                     education TEXT,
-                    company_name TEXT,
-                    industry TEXT,
-                    company_size TEXT,
-                    skills_json TEXT NOT NULL,
-                    description_text TEXT NOT NULL,
+                     company_name TEXT,
+                     industry TEXT,
+                     company_size TEXT,
+                     skills_json TEXT NOT NULL,
+                     skill_requirements_json TEXT NOT NULL DEFAULT '[]',
+                     description_text TEXT NOT NULL,
                     field_confidence_json TEXT NOT NULL,
                     uncertainty_notes_json TEXT NOT NULL,
                     FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
@@ -308,6 +314,25 @@ class SQLiteStore:
 
             # 账号是共享访问和统一计费边界；旧测试数据库没有 account_id 时补充可空列。
             self._ensure_column(conn, "candidate_profiles", "account_id", "INTEGER")
+            # 新增城市偏好分类时兼容已经存在的本地数据库。
+            self._ensure_column(
+                conn,
+                "candidate_profiles",
+                "acceptable_cities_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
+            self._ensure_column(
+                conn,
+                "candidate_profiles",
+                "preference_weights_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            )
+            self._ensure_column(
+                conn,
+                "jobs",
+                "skill_requirements_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
             self._ensure_column(conn, "jobs", "account_id", "INTEGER")
             self._ensure_column(conn, "long_texts", "account_id", "INTEGER")
             self._ensure_column(conn, "long_texts", "candidate_id", "INTEGER")
@@ -826,14 +851,22 @@ class SQLiteStore:
     ) -> int:
         """保存候选人结构化档案，返回新建档案 ID。"""
 
+        preferred_cities = normalize_city_list(profile.preferred_cities)
+        acceptable_cities = [
+            city
+            for city in normalize_city_list(profile.acceptable_cities)
+            if city not in preferred_cities
+        ]
+        preference_weights = sanitize_preference_weights(profile.preference_weights)
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO candidate_profiles (
                     account_id, name, status, education, experience_years, salary_floor_k,
                     expected_salary_k, skills_json, preferred_cities_json,
+                    acceptable_cities_json, preference_weights_json,
                     target_directions_json, unacceptable_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     account_id,
@@ -844,7 +877,9 @@ class SQLiteStore:
                     profile.salary_floor_k,
                     profile.expected_salary_k,
                     json.dumps(profile.skills, ensure_ascii=False),
-                    json.dumps(profile.preferred_cities, ensure_ascii=False),
+                    json.dumps(preferred_cities, ensure_ascii=False),
+                    json.dumps(acceptable_cities, ensure_ascii=False),
+                    json.dumps(preference_weights, ensure_ascii=False),
                     json.dumps(profile.target_directions, ensure_ascii=False),
                     json.dumps(profile.unacceptable, ensure_ascii=False),
                 ),
@@ -905,7 +940,7 @@ class SQLiteStore:
     ) -> list[str]:
         """按 patch 局部更新候选人档案，返回实际更新的字段名。
 
-        自动入库只合并消息中明确出现的字段：标量字段覆盖，列表字段去重追加，
+        自动入库只处理消息中明确出现的字段：标量和首选城市覆盖，其他列表去重追加，
         技能字段按技能名合并/更新熟练度。
         """
 
@@ -919,6 +954,8 @@ class SQLiteStore:
         expected_salary_k = current.expected_salary_k
         skills = dict(current.skills)
         preferred_cities = list(current.preferred_cities)
+        acceptable_cities = list(current.acceptable_cities)
+        preference_weights = sanitize_preference_weights(current.preference_weights)
         target_directions = list(current.target_directions)
         unacceptable = list(current.unacceptable)
 
@@ -940,9 +977,33 @@ class SQLiteStore:
         if patch.skills:
             skills.update(patch.skills)
             updated_fields.append("skills")
-        if patch.preferred_cities:
-            preferred_cities = merge_unique(preferred_cities, patch.preferred_cities)
+        if patch.clear_preferred_cities:
+            preferred_cities = []
             updated_fields.append("preferred_cities")
+        elif patch.replace_preferred_cities or patch.preferred_cities:
+            # 最新一次明确的首选城市意向覆盖旧值，而不是无限追加。
+            preferred_cities = normalize_city_list(patch.preferred_cities)
+            updated_fields.append("preferred_cities")
+        if patch.clear_acceptable_cities:
+            acceptable_cities = []
+            updated_fields.append("acceptable_cities")
+        if patch.acceptable_cities:
+            acceptable_cities = merge_unique(
+                acceptable_cities,
+                normalize_city_list(patch.acceptable_cities),
+            )
+            updated_fields.append("acceptable_cities")
+        # 同一城市不能同时属于首选和其他可接受集合；首选级别始终优先。
+        disjoint_acceptable = [city for city in acceptable_cities if city not in preferred_cities]
+        if disjoint_acceptable != acceptable_cities:
+            acceptable_cities = disjoint_acceptable
+            if "acceptable_cities" not in updated_fields:
+                updated_fields.append("acceptable_cities")
+        if patch.preference_weights:
+            for key, value in patch.preference_weights.items():
+                if key in preference_weights:
+                    preference_weights[key] = sanitize_preference_weights({key: value})[key]
+            updated_fields.append("preference_weights")
         if patch.target_directions:
             target_directions = merge_unique(target_directions, patch.target_directions)
             updated_fields.append("target_directions")
@@ -960,6 +1021,7 @@ class SQLiteStore:
                 SET status = ?, education = ?, experience_years = ?,
                     salary_floor_k = ?, expected_salary_k = ?,
                     skills_json = ?, preferred_cities_json = ?,
+                    acceptable_cities_json = ?, preference_weights_json = ?,
                     target_directions_json = ?, unacceptable_json = ?
                 WHERE id = ? AND (? IS NULL OR account_id = ?)
                 """,
@@ -971,6 +1033,8 @@ class SQLiteStore:
                     expected_salary_k,
                     json.dumps(skills, ensure_ascii=False),
                     json.dumps(preferred_cities, ensure_ascii=False),
+                    json.dumps(acceptable_cities, ensure_ascii=False),
+                    json.dumps(preference_weights, ensure_ascii=False),
                     json.dumps(target_directions, ensure_ascii=False),
                     json.dumps(unacceptable, ensure_ascii=False),
                     candidate_id,
@@ -995,6 +1059,7 @@ class SQLiteStore:
         raw_text: str,
         source_url: str | None = None,
         account_id: int | None = None,
+        llm_client=None,  # noqa: ANN001 - 保持存储层只依赖最小 complete 协议
     ) -> ImportedJob:
         """保存一段职位原文。
 
@@ -1003,6 +1068,12 @@ class SQLiteStore:
         """
 
         parsed = parse_job_text(raw_text, source_url=source_url)
+        if llm_client is not None:
+            parsed.skill_requirements = classify_skill_requirements(
+                parsed.raw_text,
+                parsed.skills,
+                llm_client,
+            )
         with self.connect() as conn:
             cursor = conn.execute(
                 """
@@ -1011,8 +1082,9 @@ class SQLiteStore:
                     salary_months, salary_unit, experience_min_years,
                     experience_max_years, experience_label, education,
                     company_name, industry, company_size, skills_json,
-                    description_text, field_confidence_json, uncertainty_notes_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    skill_requirements_json, description_text, field_confidence_json,
+                    uncertainty_notes_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     account_id,
@@ -1032,6 +1104,7 @@ class SQLiteStore:
                     parsed.industry,
                     parsed.company_size,
                     json.dumps(parsed.skills, ensure_ascii=False),
+                    json.dumps([asdict(item) for item in parsed.skill_requirements], ensure_ascii=False),
                     parsed.description_text,
                     json.dumps(parsed.field_confidence, ensure_ascii=False),
                     json.dumps(parsed.uncertainty_notes, ensure_ascii=False),
@@ -1083,6 +1156,62 @@ class SQLiteStore:
         # 旧版本可能已经把普通聊天、项目日志或测试文本误写进 jobs 表；
         # 列表和批量匹配只暴露通过当前审核规则的记录，避免继续把脏数据当职位打分。
         return [job for job in jobs if validate_job_text(job.raw_text).is_valid]
+
+    def update_job_skill_requirements(
+        self,
+        job_id: int,
+        requirements: list[SkillRequirement],
+        account_id: int | None = None,
+    ) -> ImportedJob:
+        """保存职位已有技能的人工分类，不允许凭空增加技能名称。"""
+
+        current = self.get_job(job_id, account_id=account_id)
+        allowed = {skill.lower(): skill for skill in current.skills}
+        existing = {item.name.lower(): item for item in current.skill_requirements}
+        normalized: dict[str, SkillRequirement] = {}
+        valid_categories = {"core", "general", "bonus", "uncertain"}
+        for item in requirements:
+            canonical_name = allowed.get(str(item.name).strip().lower())
+            if canonical_name is None:
+                raise ValueError(f"技能不在职位原始技能列表中：{item.name}")
+            category = str(item.category or "general").strip().lower()
+            if category not in valid_categories:
+                raise ValueError(f"不支持的技能分类：{item.category}")
+            try:
+                confidence = max(0.0, min(1.0, float(item.confidence)))
+            except (TypeError, ValueError):
+                confidence = 0.5
+            normalized[canonical_name.lower()] = SkillRequirement(
+                name=canonical_name,
+                category=category,
+                confidence=confidence,
+                evidence=str(item.evidence or "").strip(),
+            )
+
+        # 前端可以只提交部分技能；未提交项沿用旧值，避免误删职位要求。
+        merged: list[SkillRequirement] = []
+        for skill in current.skills:
+            key = skill.lower()
+            merged.append(
+                normalized.get(
+                    key,
+                    existing.get(
+                        key,
+                        SkillRequirement(name=skill, category="general", confidence=0.5),
+                    ),
+                )
+            )
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET skill_requirements_json = ? WHERE id = ? AND (? IS NULL OR account_id = ?)",
+                (
+                    json.dumps([asdict(item) for item in merged], ensure_ascii=False),
+                    job_id,
+                    account_id,
+                    account_id,
+                ),
+            )
+        return self.get_job(job_id, account_id=account_id)
 
     def delete_candidate_profile(
         self,
@@ -1723,6 +1852,115 @@ class SQLiteStore:
                 ).fetchall()
         return [self._resume_artifact_from_row(row) for row in rows]
 
+    def delete_resume_artifact(
+        self,
+        artifact_id: int,
+        account_id: int | None = None,
+    ) -> dict[str, object]:
+        """删除一份简历文件及其不再需要的草稿/长文本元数据。
+
+        原始简历和职位定制简历都按单个文件删除。删除原始简历时保留已经生成的
+        定制文件，只解除它们对原始文件的父级引用；删除某个定制文件时，只有当
+        该草稿已经没有其他导出文件时才一并清理草稿记录。
+        """
+
+        artifact = self.get_resume_artifact(artifact_id, account_id=account_id)
+        owner_clause = ""
+        owner_parameters: tuple[object, ...] = ()
+        if account_id is not None:
+            owner_clause = " AND account_id = ?"
+            owner_parameters = (account_id,)
+
+        long_text_ids: set[int] = set()
+        if artifact.long_text_id is not None:
+            long_text_ids.add(int(artifact.long_text_id))
+
+        with self.connect() as conn:
+            # 兼容旧数据：即使 resume_artifacts.long_text_id 没有回填，也按实体关系寻找来源文本。
+            artifact_long_text_rows = conn.execute(
+                f"""
+                SELECT id
+                FROM long_texts
+                WHERE (id = ? OR (entity_type = 'resume_artifact' AND entity_id = ?))
+                {owner_clause}
+                """,
+                (artifact.long_text_id or -1, artifact.id, *owner_parameters),
+            ).fetchall()
+            long_text_ids.update(int(row["id"]) for row in artifact_long_text_rows)
+
+            # 定制简历通常会同时生成 DOCX/PDF 两个文件；只有最后一个文件被删除时，
+            # 才移除它们共享的草稿和草稿长文本。
+            should_delete_draft = False
+            if artifact.draft_id is not None:
+                sibling_row = conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS sibling_count
+                    FROM resume_artifacts
+                    WHERE draft_id = ? AND id <> ?{owner_clause}
+                    """,
+                    (artifact.draft_id, artifact.id, *owner_parameters),
+                ).fetchone()
+                should_delete_draft = int(sibling_row["sibling_count"]) == 0
+                if should_delete_draft:
+                    draft_long_text_rows = conn.execute(
+                        f"""
+                        SELECT id
+                        FROM long_texts
+                        WHERE entity_type = 'resume_draft' AND entity_id = ?{owner_clause}
+                        """,
+                        (artifact.draft_id, *owner_parameters),
+                    ).fetchall()
+                    long_text_ids.update(int(row["id"]) for row in draft_long_text_rows)
+
+            # 允许删除原始文件而不破坏仍保留的定制文件。
+            conn.execute(
+                f"""
+                UPDATE resume_artifacts
+                SET parent_artifact_id = NULL
+                WHERE parent_artifact_id = ?{owner_clause}
+                """,
+                (artifact.id, *owner_parameters),
+            )
+            cursor = conn.execute(
+                f"DELETE FROM resume_artifacts WHERE id = ?{owner_clause}",
+                (artifact.id, *owner_parameters),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Resume artifact not found: {artifact_id}")
+
+            conn.execute(
+                f"""
+                DELETE FROM long_texts
+                WHERE (
+                    id IN ({", ".join("?" for _ in long_text_ids) or "NULL"})
+                    OR (entity_type = 'resume_artifact' AND entity_id = ?)
+                ){owner_clause}
+                """,
+                (
+                    *sorted(long_text_ids),
+                    artifact.id,
+                    *owner_parameters,
+                ),
+            )
+
+            if should_delete_draft and artifact.draft_id is not None:
+                conn.execute(
+                    f"DELETE FROM long_texts WHERE entity_type = 'resume_draft' AND entity_id = ?{owner_clause}",
+                    (artifact.draft_id, *owner_parameters),
+                )
+                conn.execute(
+                    f"DELETE FROM resume_drafts WHERE id = ?{owner_clause}",
+                    (artifact.draft_id, *owner_parameters),
+                )
+
+        return {
+            "artifact_id": artifact.id,
+            "candidate_id": artifact.candidate_id,
+            "storage_keys": [artifact.storage_key],
+            "long_text_ids": sorted(long_text_ids),
+            "draft_id": artifact.draft_id if should_delete_draft else None,
+        }
+
     def delete_resume_artifacts(
         self,
         artifact_ids: list[int],
@@ -1768,6 +2006,13 @@ class SQLiteStore:
             industry=row["industry"],
             company_size=row["company_size"],
             skills=json.loads(row["skills_json"]),
+            skill_requirements=[
+                SkillRequirement(**item)
+                for item in json.loads(row["skill_requirements_json"] or "[]")
+                if isinstance(item, dict)
+            ]
+            if "skill_requirements_json" in row.keys()
+            else [],
             description_text=row["description_text"],
             field_confidence=json.loads(row["field_confidence_json"]),
             uncertainty_notes=json.loads(row["uncertainty_notes_json"]),
@@ -2047,9 +2292,19 @@ def candidate_profile_from_row(row: sqlite3.Row) -> CandidateProfile:
         salary_floor_k=row["salary_floor_k"],
         expected_salary_k=row["expected_salary_k"],
         skills=json.loads(row["skills_json"]),
-        preferred_cities=json.loads(row["preferred_cities_json"]),
+        preferred_cities=normalize_city_list(json.loads(row["preferred_cities_json"] or "[]")),
         target_directions=json.loads(row["target_directions_json"]),
         unacceptable=json.loads(row["unacceptable_json"]),
+        acceptable_cities=normalize_city_list(
+            json.loads(row["acceptable_cities_json"] or "[]")
+            if "acceptable_cities_json" in row.keys()
+            else []
+        ),
+        preference_weights=sanitize_preference_weights(
+            json.loads(row["preference_weights_json"] or "{}")
+            if "preference_weights_json" in row.keys()
+            else {}
+        ),
     )
 
 

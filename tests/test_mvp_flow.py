@@ -5,7 +5,8 @@
 """
 
 from job_hunting_agent.app import JobHuntingApp
-from job_hunting_agent.models import CandidateProfileInput
+from job_hunting_agent.matcher import match_job, semantic_direction_score
+from job_hunting_agent.models import CandidateProfileInput, SkillRequirement
 
 
 def test_candidate_can_import_job_and_get_explainable_match(tmp_path):
@@ -148,6 +149,228 @@ def test_target_city_preference_changes_ranking_without_eliminating_job(tmp_path
     assert not result.eliminated
     assert any("目标城市偏好" in item for item in result.deductions)
     assert any("需要确认是否接受" in item for item in result.risks)
+
+
+def test_salary_below_floor_lowers_score_without_hard_elimination(tmp_path):
+    """职位月薪低于底线时只降薪资维度分，不触发硬性淘汰。"""
+
+    app = JobHuntingApp(tmp_path / "salary.db")
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="薪资测试",
+            status="在职",
+            education="本科",
+            experience_years=2,
+            skills={"Python": "项目使用"},
+            preferred_cities=["杭州"],
+            salary_floor_k=15,
+            expected_salary_k=20,
+            target_directions=["Python 后端"],
+            unacceptable=[],
+        )
+    )
+    job = app.import_job_text(
+        """
+        Python 后端开发工程师
+        10-12K
+        杭州
+        1-3年
+        本科
+        职位描述：负责 Python 后端服务开发。
+        """,
+        classify_with_llm=False,
+    )
+
+    result = app.match_job(candidate_id, job.id)
+
+    assert not result.eliminated
+    assert result.dimension_scores["salary"] < 60
+    assert any("低于最低接受线" in item for item in result.deductions)
+
+
+def test_bonus_skill_missing_does_not_reduce_skill_score(tmp_path):
+    """职位的加分技能没有掌握时，不应把核心技能得分再压低。"""
+
+    app = JobHuntingApp(tmp_path / "skills.db")
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="技能测试",
+            status="在职",
+            education="本科",
+            experience_years=2,
+            skills={"Python": "项目使用"},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        )
+    )
+    job = app.import_job_text(
+        """
+        Python 后端开发工程师
+        15-20K
+        杭州
+        1-3年
+        本科
+        职位描述：必须掌握 Python；有 Docker 经验者优先。
+        """,
+        classify_with_llm=False,
+    )
+    # 这里直接注入已确认的技能分类，隔离测试“缺少加分技能不扣分”本身，
+    # 不让规则分类窗口影响评分断言。
+    job.skill_requirements = [
+        SkillRequirement(name="Python", category="core", confidence=1.0),
+        SkillRequirement(name="Docker", category="bonus", confidence=1.0),
+    ]
+    result = match_job(app.get_candidate_profile(candidate_id), job)
+
+    assert any(item.name == "Docker" and item.category == "bonus" for item in job.skill_requirements)
+    assert result.dimension_scores["skills"] >= 65
+    assert not any("Docker" in item for item in result.deductions)
+
+
+def test_direction_score_uses_30_percent_title_and_70_percent_description(tmp_path):
+    """岗位方向匹配中，职位描述正文应比标题承担更高权重。"""
+
+    app = JobHuntingApp(tmp_path / "direction.db")
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="方向测试",
+            status="在职",
+            education="本科",
+            experience_years=2,
+            skills={"Python": "项目使用"},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=["Python 后端开发"],
+            unacceptable=[],
+        )
+    )
+    title_only = app.import_job_text(
+        """
+        Python 后端开发工程师
+        15-20K
+        杭州
+        1-3年
+        本科
+        职位描述：负责数据分析和报表制作。
+        """,
+        classify_with_llm=False,
+    )
+    body_only = app.import_job_text(
+        """
+        数据平台工程师
+        15-20K
+        杭州
+        1-3年
+        本科
+        职位描述：负责 Python 后端开发和服务接口维护。
+        """,
+        classify_with_llm=False,
+    )
+
+    title_result = app.match_job(candidate_id, title_only.id)
+    body_result = app.match_job(candidate_id, body_only.id)
+
+    assert title_result.dimension_scores["direction"] == 30
+    assert body_result.dimension_scores["direction"] == 70
+
+
+def test_semantic_direction_score_combines_embedding_and_rerank_protocols(tmp_path):
+    """语义方向评分只依赖通用协议，并按正文 70% 计算。"""
+
+    class FakeEmbeddings:
+        """让查询和职位正文相似、标题不相似的离线替身。"""
+
+        def embed_documents(self, texts):  # noqa: ANN001
+            return [
+                [1.0, 0.0] if index in {0, 2} else [0.0, 1.0]
+                for index, _ in enumerate(texts)
+            ]
+
+    class FakeReranker:
+        """返回与正文更相关的重排分数。"""
+
+        def rerank(self, query, documents, top_n):  # noqa: ANN001
+            from job_hunting_agent.rag import RerankResult
+
+            return [RerankResult(index=0, relevance_score=0.2), RerankResult(index=1, relevance_score=0.9)]
+
+    app = JobHuntingApp(tmp_path / "semantic.db")
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="语义测试",
+            status="在职",
+            education="本科",
+            experience_years=2,
+            skills={},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=["目标方向"],
+            unacceptable=[],
+        )
+    )
+    job = app.import_job_text(
+        """
+        数据开发工程师
+        15-20K
+        杭州
+        1-3年
+        本科
+        职位描述：负责目标方向相关工作。
+        """,
+        classify_with_llm=False,
+    )
+    candidate = app.get_candidate_profile(candidate_id)
+
+    embedding_only = semantic_direction_score(candidate, job, FakeEmbeddings())
+    combined = semantic_direction_score(candidate, job, FakeEmbeddings(), FakeReranker())
+
+    assert embedding_only == 85.0
+    assert combined == 77.0
+
+
+def test_job_skill_categories_can_be_corrected_without_adding_new_skills(tmp_path):
+    """人工分类只能调整已解析技能，不能向职位要求中凭空增加技能。"""
+
+    app = JobHuntingApp(tmp_path / "skill-edit.db")
+    app.initialize()
+    job = app.import_job_text(
+        """
+        Python 后端开发工程师
+        15-20K
+        杭州
+        1-3年
+        本科
+        职位描述：负责 Python 和 Docker 后端服务开发。
+        """,
+        classify_with_llm=False,
+    )
+
+    updated = app.update_job_skill_requirements(
+        job.id,
+        [SkillRequirement(name="Python", category="core", confidence=1.0)],
+    )
+
+    assert updated.skill_requirements[0].category == "core"
+    assert {item.name for item in updated.skill_requirements} == set(job.skills)
+
+    try:
+        app.update_job_skill_requirements(
+            job.id,
+            [SkillRequirement(name="不存在的技能", category="core", confidence=1.0)],
+        )
+    except ValueError as error:
+        assert "不在职位原始技能列表" in str(error)
+    else:  # pragma: no cover - 失败时给出更清晰的断言信息。
+        raise AssertionError("不应允许人工增加职位原始技能之外的名称")
 
 
 def test_project_analysis_outputs_confirmable_card_and_skips_sensitive_files(tmp_path):

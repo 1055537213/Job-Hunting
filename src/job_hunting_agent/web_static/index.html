@@ -4,11 +4,11 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>求职助手 Agent</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260731-auth-admin" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260806-multi-city" />
   </head>
   <body>
     <!-- Vue 还没有挂载完成时隐藏模板，避免用户短暂看到未编译的 {{ }}。 -->
-    <div id="app" class="app-shell" v-cloak>
+    <div id="app" class="app-shell" v-cloak @click="closeSessionMenu">
       <main v-if="!auth.authenticated" class="auth-shell" aria-labelledby="authTitle">
         <section class="auth-frame">
           <div class="auth-intro">
@@ -172,11 +172,11 @@
             <button
               class="danger-button"
               type="button"
-              :disabled="!currentProfileId || deletingProfileId === currentProfileId"
-              :data-state="deletingProfileId === currentProfileId ? 'loading' : 'idle'"
+              :disabled="!currentProfileId || isDeletingCurrentProfile"
+              :data-state="isDeletingCurrentProfile ? 'loading' : 'idle'"
               @click="deleteCurrentProfile"
             >
-              {{ deletingProfileId === currentProfileId ? "删除中" : "删除当前档案" }}
+              {{ isDeletingCurrentProfile ? "删除中" : "删除当前档案" }}
             </button>
           </section>
 
@@ -233,14 +233,15 @@
                   class="field"
                 />
               </label>
-              <label class="field-group" for="profileCities">
-                <span>目标城市</span>
+              <div class="field-group">
+                <label class="field-label" for="profileCities">首选城市</label>
                 <select
                   id="profileCities"
-                  v-model="profileForm.city"
+                  v-model="profileForm.citySelection"
                   class="field"
+                  @change="addPreferredCity"
                 >
-                  <option value="">请选择</option>
+                  <option value="">选择并添加城市</option>
                   <optgroup
                     v-for="province in cityGroups"
                     :key="province.province"
@@ -251,7 +252,25 @@
                     </option>
                   </optgroup>
                 </select>
-              </label>
+                <div v-if="profileForm.preferredCities.length" class="city-token-list">
+                  <span
+                    v-for="city in profileForm.preferredCities"
+                    :key="city"
+                    class="city-token"
+                  >
+                    <span>{{ city }}</span>
+                    <button
+                      class="city-token-remove"
+                      type="button"
+                      :aria-label="`移除首选城市 ${city}`"
+                      :title="`移除 ${city}`"
+                      @click="removePreferredCity(city)"
+                    >
+                      &times;
+                    </button>
+                  </span>
+                </div>
+              </div>
               <label class="field-group" for="profileDirections">
                 <span>求职方向</span>
                 <input
@@ -335,13 +354,24 @@
                     {{ tailoringArtifactId === artifact.id ? "生成中" : "生成定制版" }}
                   </button>
                 </div>
-                <a
-                  class="ghost-button compact resume-download"
-                  :href="artifact.download_url"
-                  :download="artifact.download_filename"
-                >
-                  下载
-                </a>
+                <div class="resume-file-actions">
+                  <a
+                    class="ghost-button compact resume-download"
+                    :href="artifact.download_url"
+                    :download="artifact.download_filename"
+                  >
+                    下载
+                  </a>
+                  <button
+                    class="danger-button compact resume-delete"
+                    type="button"
+                    :disabled="deletingResumeArtifactId === artifact.id"
+                    :data-state="deletingResumeArtifactId === artifact.id ? 'loading' : 'idle'"
+                    @click="deleteResumeArtifact(artifact)"
+                  >
+                    {{ deletingResumeArtifactId === artifact.id ? "删除中" : "删除" }}
+                  </button>
+                </div>
               </article>
             </div>
           </section>
@@ -355,58 +385,55 @@
               <h1 class="chat-title">{{ currentProfile ? `${currentProfile.name} 的求职对话` : "选择一个档案开始" }}</h1>
             </div>
             <div class="chat-session-actions">
-              <label class="sr-only" for="sessionSelect">当前会话</label>
-              <select
-                id="sessionSelect"
-                v-model="activeSessionId"
-                class="field session-select"
-                :disabled="!currentProfileId || !sessions.length"
-                @change="switchChatSession"
-              >
-                <option v-if="!sessions.length" value="">暂无会话</option>
-                <option v-for="session in sessions" :key="session.session_id" :value="session.session_id">
-                  {{ session.title }}
-                </option>
-              </select>
+              <div class="session-picker" @click.stop>
+                <span class="sr-only" id="sessionPickerLabel">当前会话</span>
+                <button
+                  class="session-trigger"
+                  type="button"
+                  :disabled="!currentProfileId || !sessions.length"
+                  :aria-expanded="String(sessionMenuOpen)"
+                  aria-haspopup="listbox"
+                  aria-labelledby="sessionPickerLabel"
+                  @click="toggleSessionMenu"
+                >
+                  <span class="session-trigger-label">{{ currentSessionTitle }}</span>
+                  <span class="session-trigger-icon" aria-hidden="true">⌄</span>
+                </button>
+                <div v-if="sessionMenuOpen" class="session-menu" role="listbox" aria-label="会话列表">
+                  <div
+                    v-for="session in sessions"
+                    :key="session.session_id"
+                    class="session-option-row"
+                    :class="{ active: session.session_id === activeSessionId }"
+                    role="option"
+                    :aria-selected="String(session.session_id === activeSessionId)"
+                  >
+                    <button
+                      class="session-option-button"
+                      type="button"
+                      @click.stop="selectChatSession(session.session_id)"
+                    >
+                      <span class="session-option-copy">
+                        <strong>{{ session.title }}</strong>
+                        <small>{{ formatDate(session.updated_at) }}</small>
+                      </span>
+                    </button>
+                    <button
+                      class="session-option-delete"
+                      type="button"
+                      :disabled="deletingSessionId === session.session_id"
+                      :aria-label="`删除会话：${session.title}`"
+                      :title="deletingSessionId === session.session_id ? '删除中' : '删除会话'"
+                      @click.stop="deleteSession(session)"
+                    >
+                      {{ deletingSessionId === session.session_id ? "删除中" : "删除" }}
+                    </button>
+                  </div>
+                </div>
+              </div>
               <button class="ghost-button compact" type="button" :disabled="!currentProfileId" @click="createChatSession">新对话</button>
-              <button
-                class="danger-button compact"
-                type="button"
-                :disabled="!activeSessionId || deletingSessionId === activeSessionId"
-                :data-state="deletingSessionId === activeSessionId ? 'loading' : 'idle'"
-                @click="deleteCurrentSession"
-              >
-                {{ deletingSessionId === activeSessionId ? "删除中" : "删除对话" }}
-              </button>
             </div>
           </header>
-          <section v-if="sessions.length" class="session-list" aria-label="当前档案的全部对话">
-            <div
-              v-for="session in sessions"
-              :key="session.session_id"
-              class="session-row"
-              :class="{ active: session.session_id === activeSessionId }"
-            >
-              <button
-                class="session-select-button"
-                type="button"
-                :aria-current="session.session_id === activeSessionId ? 'true' : undefined"
-                @click="selectChatSession(session.session_id)"
-              >
-                <strong>{{ session.title }}</strong>
-                <span>{{ formatDate(session.updated_at) }}</span>
-              </button>
-              <button
-                class="danger-button compact session-delete-button"
-                type="button"
-                :disabled="deletingSessionId === session.session_id"
-                :data-state="deletingSessionId === session.session_id ? 'loading' : 'idle'"
-                @click="deleteSession(session)"
-              >
-                {{ deletingSessionId === session.session_id ? "删除中" : "删除" }}
-              </button>
-            </div>
-          </section>
           <section ref="messages" class="messages" aria-live="polite">
             <div
               v-for="message in messages"
@@ -541,6 +568,28 @@
                 </div>
                 <div class="job-card-meta">{{ formatJobMeta(job) }}</div>
                 <p class="job-card-desc">{{ trimText(job.description_text || job.raw_text || "", 110) }}</p>
+                <details v-if="job.skill_requirements?.length" class="job-skill-editor">
+                  <summary>调整技能重要性</summary>
+                  <div class="job-skill-editor-list">
+                    <label v-for="requirement in job.skill_requirements" :key="requirement.name" class="job-skill-row">
+                      <span>{{ requirement.name }}</span>
+                      <select v-model="requirement.category" class="field compact-field">
+                        <option value="core">核心</option>
+                        <option value="general">一般</option>
+                        <option value="bonus">加分</option>
+                        <option value="uncertain">不确定</option>
+                      </select>
+                    </label>
+                    <button
+                      class="ghost-button compact"
+                      type="button"
+                      :disabled="savingJobSkillsId === job.id"
+                      @click="saveJobSkillRequirements(job)"
+                    >
+                      {{ savingJobSkillsId === job.id ? "保存中" : "保存分类" }}
+                    </button>
+                  </div>
+                </details>
               </article>
             </div>
           </section>
@@ -576,6 +625,11 @@
                 </div>
                 <div class="match-meta">
                   {{ item.match.eliminated ? "已淘汰：" : "理由：" }} {{ matchReason(item) }}
+                </div>
+                <div v-if="matchDimensionRows(item.match).length" class="match-breakdown" aria-label="匹配分数构成">
+                  <span v-for="row in matchDimensionRows(item.match)" :key="row.key" class="match-breakdown-item">
+                    {{ row.label }} {{ row.score }}分 · 权重 {{ row.weight }}
+                  </span>
                 </div>
               </article>
             </div>
@@ -682,6 +736,6 @@
     <!-- Vue 3 global build 已放入本地静态目录，避免本地页面依赖外部 CDN。 -->
     <script src="/static/vendor/vue.global.prod.js?v=20260731-auth-admin"></script>
     <script src="/static/china_cities.js?v=20260803-cities"></script>
-    <script src="/static/app.js?v=20260731-auth-admin"></script>
+    <script src="/static/app.js?v=20260806-multi-city"></script>
   </body>
 </html>

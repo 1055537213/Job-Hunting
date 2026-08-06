@@ -583,6 +583,25 @@ def load_cookie_secure(
     return parse_bool(raw_value)
 
 
+def load_semantic_matching_enabled(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """读取职位方向语义匹配开关。
+
+    语义匹配会调用 Embedding/Rerank 供应商接口，默认关闭以保证离线测试、
+    本地规则模式和没有模型配置的开发环境不会意外发起外部请求。
+    """
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+    raw_value = environment.get("JOB_AGENT_MATCHING_SEMANTIC") or file_values.get(
+        "JOB_AGENT_MATCHING_SEMANTIC",
+        "false",
+    )
+    return parse_bool(raw_value)
+
+
 def masked_agent_memory_settings(settings: AgentMemorySettings) -> dict[str, object]:
     """返回适合 Web/CLI 展示的 Agent 记忆配置。"""
 

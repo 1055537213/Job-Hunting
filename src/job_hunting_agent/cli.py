@@ -56,6 +56,7 @@ def main(argv: list[str] | None = None) -> None:
     create_parser.add_argument("--experience-years", type=float)
     create_parser.add_argument("--skills")
     create_parser.add_argument("--cities")
+    create_parser.add_argument("--acceptable-cities")
     create_parser.add_argument("--salary-floor-k", type=int)
     create_parser.add_argument("--expected-salary-k", type=int)
     create_parser.add_argument("--directions")
@@ -307,7 +308,14 @@ def build_profile_from_cli(args: argparse.Namespace) -> CandidateProfileInput:
         preferred_cities=first_present(
             split_items(args.cities),
             data.get("preferred_cities"),
-            lambda: split_items(prompt_optional("可接受城市，逗号分隔，例如 杭州,上海")),
+            lambda: split_items(prompt_optional("首选城市，逗号分隔，例如 杭州,上海")),
+        )
+        or [],
+        acceptable_cities=first_present(
+            split_items(args.acceptable_cities),
+            data.get("acceptable_cities"),
+            # 兼容旧版 JSON：文件未包含新字段时按空列表处理，不突然进入交互输入。
+            [] if args.from_json else lambda: split_items(prompt_optional("其他可接受城市，逗号分隔，可留空")),
         )
         or [],
         salary_floor_k=first_present(

@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from job_hunting_agent.config import load_embedding_settings
+from job_hunting_agent.config import load_embedding_settings, load_semantic_matching_enabled
 from job_hunting_agent.rag import (
     LocalHashEmbeddings,
     OpenAICompatibleEmbeddings,
@@ -58,6 +58,17 @@ def test_load_embedding_settings_returns_none_when_not_configured(tmp_path):
 
     assert settings is None
     assert isinstance(build_rag_embeddings(env_file), LocalHashEmbeddings)
+
+
+def test_semantic_matching_flag_defaults_off_and_can_be_enabled(tmp_path):
+    """方向语义匹配必须显式开启，避免离线环境意外调用远程模型。"""
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("JOB_AGENT_MATCHING_SEMANTIC=true\n", encoding="utf-8")
+
+    assert load_semantic_matching_enabled(tmp_path / "missing.env", environ={}) is False
+    assert load_semantic_matching_enabled(env_file, environ={}) is True
+    assert load_semantic_matching_enabled(env_file, environ={"JOB_AGENT_MATCHING_SEMANTIC": "false"}) is False
 
 
 def test_build_rag_embeddings_uses_real_provider_when_configured(tmp_path):

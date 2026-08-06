@@ -267,6 +267,17 @@ def test_web_upload_list_and_download_are_scoped_to_logged_in_account(tmp_path) 
     assert downloaded.content == original
     assert forbidden.status_code == 404
 
+    stranger_delete = stranger.delete(f"/api/resumes/{artifact['id']}")
+    deleted = owner.delete(f"/api/resumes/{artifact['id']}")
+    listed_after_delete = owner.get("/api/resumes", params={"candidate_id": candidate_id})
+    missing_download = owner.get(artifact["download_url"])
+
+    assert stranger_delete.status_code == 404
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+    assert listed_after_delete.json()["artifacts"] == []
+    assert missing_download.status_code == 404
+
 
 def test_tailored_resume_creates_docx_and_pdf_without_overwriting_profile_or_source(tmp_path) -> None:
     """职位改写应产出独立草稿和可下载文件，原简历与结构化档案保持不变。"""
@@ -326,6 +337,13 @@ def test_tailored_resume_creates_docx_and_pdf_without_overwriting_profile_or_sou
     ]))
     assert "Python 后端开发工程师" in "\n".join(paragraph.text for paragraph in exported_docx.paragraphs)
 
+    deleted_source = app.delete_resume_artifact(source.id, account_id=account.id)
+    remaining_artifacts = app.list_resume_artifacts(candidate_id, account_id=account.id)
+
+    assert deleted_source["artifact_id"] == source.id
+    assert [artifact.id for artifact in remaining_artifacts] == [item.id for item in generated.artifacts]
+    assert app.resume_file_path(generated.artifacts[0]).read_bytes() == generated_bytes[generated.artifacts[0].media_type]
+
 
 def test_web_can_tailor_uploaded_resume_and_return_download_urls(tmp_path) -> None:
     """网页职位定制接口应返回独立草稿和两个可直接下载的文件版本。"""
@@ -382,6 +400,14 @@ def test_web_can_tailor_uploaded_resume_and_return_download_urls(tmp_path) -> No
         assert downloaded.status_code == 200
         assert downloaded.content
 
+    generated_ids = [item["id"] for item in payload["artifacts"]]
+    deleted_tailored = client.delete(f"/api/resumes/{generated_ids[0]}")
+    remaining = client.get("/api/resumes", params={"candidate_id": candidate_id})
+
+    assert deleted_tailored.status_code == 200
+    assert deleted_tailored.json()["deleted"] is True
+    assert [item["id"] for item in remaining.json()["artifacts"]] == [uploaded["id"], generated_ids[1]]
+
 
 def test_vue_frontend_exposes_resume_upload_tailor_and_download_workflow(tmp_path) -> None:
     """Vue 工作台应提供完整文件交互，而不是只存在不可发现的后端 API。"""
@@ -409,4 +435,7 @@ def test_vue_frontend_exposes_resume_upload_tailor_and_download_workflow(tmp_pat
     assert '"/api/resumes/upload"' in script
     assert "async loadResumeArtifacts(signal = null)" in script
     assert "async tailorResume(artifact)" in script
+    assert "async deleteResumeArtifact(artifact)" in script
+    assert "/api/resumes/${encodeURIComponent(artifact.id)}" in script
+    assert "resume-delete" in home
     assert "resume-artifact-list" in styles

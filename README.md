@@ -4,7 +4,7 @@
 
 求职助手 Agent 是一个面向 BOSS 直聘求职场景的本地求职辅助系统。它把候选人的结构化档案、项目证据、职位信息和求职对话组织到同一个工作区中，帮助候选人完成以下工作：
 
-- 保存学历、经验年限、技能、证书、城市偏好、薪资要求和不可接受条件。
+- 保存学历、经验年限、技能、证书、首选城市、其他可接受城市、薪资要求和不可接受条件。
 - 读取候选人主动提供的本地项目目录，分析技术栈、功能线索和项目经历草稿。
 - 保存候选人主动复制的 BOSS 职位文本，解析职位名称、城市、薪资、学历、经验和技能要求。
 - 按硬性条件和普通偏好计算职位匹配结果，并解释淘汰原因、短板和风险。
@@ -119,6 +119,7 @@ Job-hunting Agent/
 │     ├─ app.py                   # 业务应用门面
 │     ├─ auth.py                  # 注册、登录和 Session
 │     ├─ cli.py                   # CLI 入口
+│     ├─ city_catalog.py          # 全国城市规范化和可替换的邻近城市目录
 │     ├─ config.py                # .env 和运行配置
 │     ├─ conversation_ingestion.py# 对话内容分类与自动入库
 │     ├─ conversation_memory.py   # 持久化记忆和上下文压缩
@@ -222,6 +223,7 @@ JOB_AGENT_ENVIRONMENT=development
 JOB_AGENT_MODEL_GATEWAY_CHAT_MAX_RETRIES=2
 JOB_AGENT_MODEL_GATEWAY_EMBEDDING_MAX_RETRIES=2
 JOB_AGENT_MODEL_GATEWAY_RERANK_MAX_RETRIES=2
+JOB_AGENT_MATCHING_SEMANTIC=false
 
 JOB_AGENT_EMBEDDING_PROVIDER=local_hash
 JOB_AGENT_EMBEDDING_MODEL=local-hash
@@ -270,6 +272,11 @@ python -m job_hunting_agent.cli `
 ```
 
 Rerank 不参与建库，因此以后只更换 Rerank 模型时不需要重建 Chroma 索引。
+
+职位匹配的方向维度可以选择启用 Embedding/Rerank 语义评分：将
+`JOB_AGENT_MATCHING_SEMANTIC` 设为 `true` 后，职位标题占 30%，职位描述正文占 70%，
+多个目标方向取最高分。未启用、模型配置不完整或上游调用失败时，系统回退到同一比例的
+关键词评分，并在匹配风险中标记回退原因；不会因为语义服务故障阻断职位匹配。
 
 ### 3. 启动网页
 
@@ -355,6 +362,8 @@ Redis、Worker、MinIO 和反向代理会在完成相应代码和迁移后再加
 - 实际经验与职位要求相差超过 3 年时直接淘汰。
 - 候选人明确不可接受的条件直接淘汰。
 - 普通偏好只影响分数和排序。
+- 新建档案可以连续添加多个首选城市；对话中明确表示“也可以”的城市单独保存为其他可接受城市。
+- “邻近城市也可以”只使用本地已确认的常见城市关系；无法可靠解析时不会把整省城市当作邻近城市。
 - 技能熟练度只按候选人真实等级生成简历措辞，不自动夸大。
 
 ### 简历和 HR 回复

@@ -130,6 +130,7 @@ def test_conversation_ingestion_can_use_llm_json_decision(tmp_path):
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
+            preference_weights={"salary": 2.0},
         )
     )
 
@@ -142,4 +143,37 @@ def test_conversation_ingestion_can_use_llm_json_decision(tmp_path):
     assert updated_profile.education == "硕士"
     assert updated_profile.skills["LangChain"] == "项目使用"
     assert updated_profile.target_directions == ["AI Agent 应用开发"]
+    # LLM 本轮没有返回偏好字段时，不能把档案中已有的薪资权重重置为默认值。
+    assert updated_profile.preference_weights["salary"] == 2.0
     assert result.saved_long_text_ids
+
+
+def test_conversation_persists_only_explicit_preference_weight_updates(tmp_path):
+    """明确优先级只覆盖提到的维度，不能把默认权重误写成更新。"""
+
+    app = JobHuntingApp(tmp_path / "weights.db")
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="权重测试",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={},
+            preferred_cities=["杭州"],
+            salary_floor_k=10,
+            expected_salary_k=15,
+            target_directions=["Python 后端"],
+            unacceptable=[],
+        )
+    )
+
+    result = app.ingest_conversation_message(candidate_id, "我最看重薪资，城市无所谓。")
+    profile = app.get_candidate_profile(candidate_id)
+
+    assert profile.preference_weights["salary"] == 2.0
+    assert profile.preference_weights["city"] == 1.0
+    assert "preference_weights" in result.saved_structured_fields
+    assert profile.preference_weights["skills"] == 1.0
+    assert profile.preferred_cities == []
+    assert profile.acceptable_cities == []

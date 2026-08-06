@@ -5,6 +5,8 @@
 边界不变。
 """
 
+import re
+
 from fastapi.testclient import TestClient
 from langchain_core.language_models.fake_chat_models import FakeListChatModel, FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
@@ -90,8 +92,8 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert home.status_code == 200
     assert "Job Hunting Agent" in home.text
     assert "syncAuthPageClass" in script.text
-    assert '/static/app.js?v=20260731-auth-admin' in home.text
-    assert '/static/styles.css?v=20260731-auth-admin' in home.text
+    assert '/static/app.js?v=20260806-multi-city' in home.text
+    assert '/static/styles.css?v=20260806-multi-city' in home.text
     assert "本地运行 · 用户复制职位文本" not in home.text
     assert "Conversation Workspace" not in home.text
     assert "整理求职证据" not in home.text
@@ -100,8 +102,10 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert "自动增量 RAG" not in home.text
     assert "使用 LangChain Agent（需 .env）" not in home.text
     assert "删除当前档案" in home.text
-    assert "deleteCurrentSession" in home.text
-    assert "deleteSession(session)" in home.text
+    assert "session-picker" in home.text
+    assert "session-option-delete" in home.text
+    assert "deleteCurrentSession" not in home.text
+    assert "session-list" not in home.text
     assert "deleteJob(job)" in home.text
     assert home.headers["cache-control"] == "no-store, max-age=0"
     assert script.status_code == 200
@@ -115,6 +119,24 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert "oklch(" in tokens.text
     assert vue.status_code == 200
     assert "Vue" in vue.text
+
+
+def test_profile_delete_button_is_idle_without_a_selected_profile(tmp_path):
+    """空档案状态不能把两个默认值 0 误判为正在删除。"""
+
+    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    home = client.get("/").text
+    script = client.get("/static/app.js").text
+    button = re.search(
+        r'<button\b[^>]*@click="deleteCurrentProfile"[^>]*>[\s\S]*?</button>',
+        home,
+    )
+
+    assert button is not None
+    assert "isDeletingCurrentProfile" in button.group(0)
+    assert "deletingProfileId === currentProfileId" not in button.group(0)
+    assert "isDeletingCurrentProfile()" in script
+    assert "return Boolean(this.currentProfileId) && this.deletingProfileId === this.currentProfileId;" in script
 
 
 def test_web_health_reports_enabled_memory_as_configured(tmp_path):
@@ -158,7 +180,7 @@ def test_web_frontend_defaults_to_agent_and_incremental_rag_without_toggles(tmp_
 
 
 def test_web_profile_form_uses_recovered_selectors_and_auth_copy(tmp_path):
-    """恢复注册密码显示、学历枚举和单框省市选择等前端约束。"""
+    """保留认证与学历约束，并支持按省份连续添加多个首选城市。"""
 
     client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
 
@@ -185,7 +207,11 @@ def test_web_profile_form_uses_recovered_selectors_and_auth_copy(tmp_path):
     assert 'v-for="city in province.cities"' in home
     assert '/static/china_cities.js?v=20260803-cities' in home
     assert "cityGroups: buildSortedCityGroups()" in script
-    assert "preferred_cities: this.profileForm.city ? [this.profileForm.city] : []" in script
+    assert 'v-model="profileForm.citySelection"' in home
+    assert 'v-for="city in profileForm.preferredCities"' in home
+    assert "preferred_cities: [...this.profileForm.preferredCities]" in script
+    assert "addPreferredCity()" in script
+    assert "removePreferredCity(city)" in script
     assert cities.status_code == 200
     assert "北京市" in cities.text
     assert "广州市" in cities.text
@@ -475,6 +501,39 @@ def test_web_frontend_loads_persisted_jobs_on_page_open(tmp_path):
     assert "async loadJobs(signal = null)" in script
     assert "await this.loadJobs();" in script
     assert "jobImportError" in script
+
+
+def test_web_can_save_manual_job_skill_categories(tmp_path):
+    """网页可以调整已有职位技能分类，并通过接口返回更新后的职位。"""
+
+    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    job = client.post(
+        "/api/jobs",
+        json={
+            "raw_text": """
+            Python 后端开发工程师
+            15-20K
+            杭州
+            1-3年
+            本科
+            职位描述：负责 Python 和 Docker 后端服务开发。
+            """,
+        },
+    ).json()["job"]
+
+    requirements = [
+        {**item, "category": "core" if item["name"] == "Python" else "bonus"}
+        for item in job["skill_requirements"]
+    ]
+    response = client.put(
+        f"/api/jobs/{job['id']}/skill-requirements",
+        json={"requirements": requirements},
+    )
+
+    assert response.status_code == 200
+    updated = response.json()["job"]["skill_requirements"]
+    assert any(item["name"] == "Python" and item["category"] == "core" for item in updated)
+    assert any(item["name"] == "Docker" and item["category"] == "bonus" for item in updated)
 
 
 def test_web_chat_history_survives_page_reopen(tmp_path):

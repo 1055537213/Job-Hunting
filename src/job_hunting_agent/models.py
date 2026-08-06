@@ -9,6 +9,31 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+# 动态匹配的默认权重；用户在对话中明确表达优先级后，按字段覆盖。
+DEFAULT_PREFERENCE_WEIGHTS = {
+    "city": 1.0,
+    "salary": 1.0,
+    "skills": 1.0,
+    "direction": 1.0,
+    "experience": 1.0,
+}
+
+
+def sanitize_preference_weights(values: dict[str, float] | None) -> dict[str, float]:
+    """只保留支持的维度，并把权重限制在约定的 1.0-2.0 范围。"""
+
+    result = dict(DEFAULT_PREFERENCE_WEIGHTS)
+    for key, value in (values or {}).items():
+        if key not in result:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        result[key] = max(1.0, min(2.0, numeric))
+    return result
+
+
 @dataclass
 class CandidateProfileInput:
     """创建候选人档案时需要的输入数据。
@@ -27,6 +52,12 @@ class CandidateProfileInput:
     expected_salary_k: int | None
     target_directions: list[str]
     unacceptable: list[str] = field(default_factory=list)
+    # 首选城市和其他可接受城市分开保存，便于匹配器区分优先级。
+    acceptable_cities: list[str] = field(default_factory=list)
+    # 用户在对话中表达的长期排序偏好，例如 city=2.0、salary=1.5。
+    preference_weights: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_PREFERENCE_WEIGHTS)
+    )
 
 
 @dataclass
@@ -37,6 +68,16 @@ class CandidateProfile(CandidateProfileInput):
     """
 
     id: int = 0
+
+
+@dataclass
+class SkillRequirement:
+    """职位技能及其重要性分类。"""
+
+    name: str
+    category: str
+    confidence: float
+    evidence: str = ""
 
 
 @dataclass
@@ -68,6 +109,8 @@ class ImportedJob:
     description_text: str
     field_confidence: dict[str, float]
     uncertainty_notes: list[str]
+    # 由规则或 LLM 分类后的技能要求；旧职位没有该字段时使用规则回退。
+    skill_requirements: list[SkillRequirement] = field(default_factory=list)
 
 
 @dataclass
@@ -89,6 +132,9 @@ class MatchResult:
     risks: list[str]
     uncertainty_notes: list[str]
     resume_suggestions: list[str]
+    # 每个维度的标准化得分和本轮实际参与计算的权重，便于前端解释。
+    dimension_scores: dict[str, float] = field(default_factory=dict)
+    applied_weights: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -284,6 +330,14 @@ class CandidateProfilePatch:
     expected_salary_k: int | None = None
     target_directions: list[str] = field(default_factory=list)
     unacceptable: list[str] = field(default_factory=list)
+    # 对话中明确表示“也可以”的城市，不会覆盖首选城市。
+    acceptable_cities: list[str] = field(default_factory=list)
+    # 空列表本身表示“没有提取到城市”；这些标记用于表达明确清除意图。
+    replace_preferred_cities: bool = False
+    clear_preferred_cities: bool = False
+    clear_acceptable_cities: bool = False
+    # 只保存本轮明确表达的维度，未出现的维度不覆盖档案原值。
+    preference_weights: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass

@@ -7,11 +7,14 @@ LLM 再补充职责、要求、技能和不确定说明。
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
 
-from .models import ImportedJob
+from .city_catalog import all_cities, cities_in_text, normalize_city_name
+from .llm import LLMClient
+from .models import ImportedJob, SkillRequirement
 
 
 EDUCATION_ORDER = {
@@ -113,26 +116,8 @@ JOB_DESCRIPTION_KEYWORDS = (
     "工作内容",
 )
 
-KNOWN_CITIES = (
-    "北京",
-    "上海",
-    "杭州",
-    "深圳",
-    "广州",
-    "成都",
-    "南京",
-    "武汉",
-    "西安",
-    "苏州",
-    "长沙",
-    "天津",
-    "重庆",
-    "厦门",
-    "合肥",
-    "郑州",
-    "青岛",
-    "宁波",
-)
+# 职位审核和城市解析共用全国目录，避免网页能选但后端无法识别。
+KNOWN_CITIES = all_cities()
 
 
 class InvalidJobTextError(ValueError):
@@ -184,6 +169,7 @@ def parse_job_text(raw_text: str, job_id: int = 0, source_url: str | None = None
     city = parse_city(lines)
     company, industry, company_size = parse_company(lines, education)
     skills = extract_skills(compact_text)
+    skill_requirements = rule_based_skill_requirements(compact_text, skills)
     field_confidence = {
         # 置信度用于提醒后续匹配器：字段缺失或解析弱时不要装作确定。
         "title": 0.9 if title != "未命名职位" else 0.2,
@@ -220,7 +206,121 @@ def parse_job_text(raw_text: str, job_id: int = 0, source_url: str | None = None
         description_text=compact_text,
         field_confidence=field_confidence,
         uncertainty_notes=uncertainty_notes,
+        skill_requirements=skill_requirements,
     )
+
+
+SKILL_CATEGORY_ALIASES = {
+    "核心": "core",
+    "核心技能": "core",
+    "core": "core",
+    "必选": "core",
+    "一般": "general",
+    "一般技能": "general",
+    "普通": "general",
+    "general": "general",
+    "加分": "bonus",
+    "加分技能": "bonus",
+    "优先": "bonus",
+    "bonus": "bonus",
+    "不确定": "uncertain",
+    "不明确": "uncertain",
+    "uncertain": "uncertain",
+}
+
+
+def rule_based_skill_requirements(raw_text: str, skills: list[str]) -> list[SkillRequirement]:
+    """根据技能附近的招聘措辞生成保守分类。"""
+
+    requirements: list[SkillRequirement] = []
+    core_markers = ("必须", "必备", "核心", "硬性要求", "务必")
+    bonus_markers = ("优先", "加分", "有经验者优先", "更佳")
+    for skill in skills:
+        position = raw_text.lower().find(skill.lower())
+        # 只看技能附近的短窗口，避免“必须 Python；Docker 经验优先”中
+        # Python 的硬性措辞串到 Docker，导致回退分类失真。
+        context = raw_text[max(0, position - 24) : position + len(skill) + 24]
+        if any(marker in context for marker in core_markers):
+            category, confidence = "core", 0.9
+        elif any(marker in context for marker in bonus_markers):
+            category, confidence = "bonus", 0.9
+        else:
+            category, confidence = "general", 0.65
+        requirements.append(
+            SkillRequirement(
+                name=skill,
+                category=category,
+                confidence=confidence,
+                evidence=context.replace("\n", " ").strip(),
+            )
+        )
+    return requirements
+
+
+def classify_skill_requirements(
+    raw_text: str,
+    skills: list[str],
+    llm_client: LLMClient | None = None,
+) -> list[SkillRequirement]:
+    """用 LLM 分类职位技能，失败时回退到规则分类。
+
+    LLM 只能在已经抽取出的技能集合中选择，不能凭空添加技能；这样分类结果
+    可以被本地算法验证，也不会把模型幻觉变成匹配事实。
+    """
+
+    fallback = rule_based_skill_requirements(raw_text, skills)
+    if llm_client is None or not skills:
+        return fallback
+    prompt = f"""
+你是招聘职位技能分类器。请只对给定技能进行分类，不要新增技能。
+分类只能使用 core、general、bonus、uncertain：
+- core：职位明确必须、必备或核心技能
+- general：普通任职要求中的技能
+- bonus：优先、加分或有经验者优先
+- uncertain：上下文不足，无法判断
+只返回 JSON，不要 Markdown：
+{{"requirements":[{{"name":"Python","category":"core","confidence":0.9,"evidence":"原文依据"}}]}}
+
+给定技能：{json.dumps(skills, ensure_ascii=False)}
+职位原文：
+{raw_text}
+""".strip()
+    try:
+        response = llm_client.complete(prompt)
+        payload = response.strip()
+        if payload.startswith("```"):
+            payload = re.sub(r"^```(?:json)?", "", payload).strip()
+            payload = re.sub(r"```$", "", payload).strip()
+        start, end = payload.find("{"), payload.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("skill classification JSON missing")
+        data = json.loads(payload[start : end + 1])
+        allowed = {skill.lower(): skill for skill in skills}
+        parsed: dict[str, SkillRequirement] = {}
+        for item in data.get("requirements") or []:
+            if not isinstance(item, dict):
+                continue
+            name = allowed.get(str(item.get("name") or "").strip().lower())
+            category = SKILL_CATEGORY_ALIASES.get(str(item.get("category") or "").strip().lower())
+            if not name or category is None:
+                continue
+            try:
+                confidence = max(0.0, min(1.0, float(item.get("confidence", 0.5))))
+            except (TypeError, ValueError):
+                confidence = 0.5
+            parsed[name] = SkillRequirement(
+                name=name,
+                category=category,
+                confidence=confidence,
+                evidence=str(item.get("evidence") or "").strip(),
+            )
+        if not parsed:
+            return fallback
+        fallback_by_name = {item.name: item for item in fallback}
+        return [parsed.get(name, fallback_by_name[name]) for name in skills]
+    except Exception:
+        # 分类是增强能力；网络、协议或模型异常时必须回退规则结果，不能阻断职位导入。
+        return fallback
 
 
 def ensure_valid_job_text(raw_text: str) -> JobTextValidationResult:
@@ -390,13 +490,25 @@ def parse_city(lines: list[str]) -> str | None:
     BOSS 风格职位文本通常把城市放在薪资、经验、学历附近；这里先做保守猜测。
     """
 
+    city_set = set(KNOWN_CITIES)
+    # “工作地点：杭州市”这类带标签文本优先级最高。
+    for line in lines[:10]:
+        if any(marker in line for marker in ("工作地点", "工作城市", "职位地点", "工作地址")):
+            mentioned = cities_in_text(line)
+            if mentioned:
+                return mentioned[0]
+
+    # BOSS 职位卡片常把城市单独放在一行；只接受全国目录内的精确城市名。
+    for line in lines[:10]:
+        canonical = normalize_city_name(line)
+        if canonical in city_set:
+            return canonical
+
+    # 最后允许从前几行的复合文本中识别，例如“杭州·余杭区”。
     for line in lines[:8]:
-        if re.fullmatch(r"[\u4e00-\u9fa5]{2,8}(?:[\u4e00-\u9fa5]{1,6})?", line):
-            if line not in EDUCATION_ORDER and "年" not in line and "薪" not in line:
-                return line[:2] if len(line) > 2 and line[:2] in line else line
-    for city in ("北京", "上海", "杭州", "深圳", "广州", "成都", "南京", "武汉", "西安", "苏州"):
-        if any(city in line for line in lines[:8]):
-            return city
+        mentioned = cities_in_text(line)
+        if mentioned:
+            return mentioned[0]
     return None
 
 

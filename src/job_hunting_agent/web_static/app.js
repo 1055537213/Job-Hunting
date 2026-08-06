@@ -30,6 +30,17 @@ if (!window.Vue) {
       .sort((left, right) => PINYIN_COLLATOR.compare(left.province, right.province));
   }
 
+  /** 统一网页城市值，确保“杭州市”和职位解析得到的“杭州”可以比较。 */
+  function normalizeCityName(value) {
+    const suffixes = ["特别行政区", "自治州", "地区", "盟", "市", "县"];
+    let city = String(value || "").trim();
+    const suffix = suffixes.find((item) => city.endsWith(item) && city.length > item.length);
+    if (suffix) {
+      city = city.slice(0, -suffix.length);
+    }
+    return city;
+  }
+
   const WELCOME_MESSAGE =
     "你好，我会默认通过标准 LangChain Agent 来处理你的聊天请求，并自动把新增长文本增量同步到 RAG。\n你可以先在左侧创建档案，然后直接发资料；如果模型、.env 或 embedding 配置有问题，页面会直接显示后端返回的原因。";
 
@@ -53,6 +64,7 @@ if (!window.Vue) {
         activeView: "workspace",
         sessions: [],
         activeSessionId: "",
+        sessionMenuOpen: false,
         admin: {
           accounts: [],
           events: [],
@@ -72,7 +84,8 @@ if (!window.Vue) {
           education: "",
           experienceYears: 0,
           skills: "",
-          city: "",
+          citySelection: "",
+          preferredCities: [],
           directions: "",
         },
         jobForm: {
@@ -91,8 +104,10 @@ if (!window.Vue) {
         deletingJobId: 0,
         importingJob: false,
         loadingMatches: false,
+        savingJobSkillsId: 0,
         uploadingResume: false,
         tailoringArtifactId: 0,
+        deletingResumeArtifactId: 0,
         resumeError: "",
         sending: false,
         chatAbortController: null,
@@ -111,6 +126,11 @@ if (!window.Vue) {
         return this.profiles.find((profile) => profile.id === this.currentProfileId) || null;
       },
 
+      /** 只有已选中的真实档案正在请求删除时，才显示“删除中”。 */
+      isDeletingCurrentProfile() {
+        return Boolean(this.currentProfileId) && this.deletingProfileId === this.currentProfileId;
+      },
+
       /** 把结构化档案转换成右侧摘要框中的可读文本。 */
       profileSummary() {
         const profile = this.currentProfile;
@@ -123,7 +143,8 @@ if (!window.Vue) {
           `学历：${profile.education}`,
           `经验：${profile.experience_years} 年`,
           `技能：${this.formatDict(profile.skills) || "暂无"}`,
-          `城市：${profile.preferred_cities.join("、") || "暂无"}`,
+          `首选城市：${profile.preferred_cities.join("、") || "暂无"}`,
+          `其他可接受城市：${profile.acceptable_cities?.join("、") || "暂无"}`,
           `方向：${profile.target_directions.join("、") || "暂无"}`,
           `不可接受：${profile.unacceptable.join("、") || "暂无"}`,
         ].join("\n");
@@ -132,6 +153,14 @@ if (!window.Vue) {
       /** 当前档案的活动会话；首次聊天时会自动创建默认会话。 */
       currentSessionId() {
         return this.activeSessionId || `account-${this.auth.account?.id || "legacy"}-candidate-${this.currentProfileId}`;
+      },
+
+      /** 返回会话选择器当前显示的标题，避免原生 select 挤占聊天头部空间。 */
+      currentSessionTitle() {
+        return (
+          this.sessions.find((session) => session.session_id === this.activeSessionId)?.title ||
+          (this.sessions.length ? "选择会话" : "暂无会话")
+        );
       },
 
       /** 命令面板展示的动作清单；只调用已有页面方法，不绕过后端接口边界。 */
@@ -404,9 +433,26 @@ if (!window.Vue) {
           } else {
             this.openCommandPalette();
           }
-        } else if (event.key === "Escape" && this.commandPaletteOpen) {
-          this.closeCommandPalette();
+        } else if (event.key === "Escape") {
+          if (this.sessionMenuOpen) {
+            this.closeSessionMenu();
+          } else if (this.commandPaletteOpen) {
+            this.closeCommandPalette();
+          }
         }
+      },
+
+      /** 展开或收起当前档案的会话菜单。 */
+      toggleSessionMenu() {
+        if (!this.currentProfileId || !this.sessions.length) {
+          return;
+        }
+        this.sessionMenuOpen = !this.sessionMenuOpen;
+      },
+
+      /** 关闭会话菜单；根节点点击和 Escape 都会调用此方法。 */
+      closeSessionMenu() {
+        this.sessionMenuOpen = false;
       },
 
       /** 打开命令面板，并把焦点交给搜索输入框。 */
@@ -570,6 +616,7 @@ if (!window.Vue) {
         if (!this.currentProfileId) {
           this.sessions = [];
           this.activeSessionId = "";
+          this.closeSessionMenu();
           return;
         }
         const data = await this.requestJson(`/api/chat/sessions?candidate_id=${this.currentProfileId}`);
@@ -580,6 +627,9 @@ if (!window.Vue) {
           : this.sessions[0]?.session_id || "";
         if (this.activeSessionId) {
           localStorage.setItem(`activeSessionId:${this.auth.account?.id || "legacy"}:${this.currentProfileId}`, this.activeSessionId);
+        }
+        if (!this.sessions.length) {
+          this.closeSessionMenu();
         }
       },
 
@@ -593,6 +643,7 @@ if (!window.Vue) {
           });
           this.activeSessionId = data.session.session_id;
           this.sessions = [data.session, ...this.sessions];
+          this.closeSessionMenu();
           localStorage.setItem(`activeSessionId:${this.auth.account?.id}:${this.currentProfileId}`, this.activeSessionId);
           this.setWelcomeMessage();
         } catch (error) {
@@ -609,6 +660,7 @@ if (!window.Vue) {
       /** 从会话列表选择一段对话并恢复其消息。 */
       async selectChatSession(sessionId) {
         this.activeSessionId = sessionId;
+        this.closeSessionMenu();
         await this.switchChatSession();
       },
 
@@ -617,6 +669,7 @@ if (!window.Vue) {
         if (!session || !window.confirm(`确定删除“${session.title || "当前对话"}”吗？\n该对话的历史消息将被永久删除。`)) {
           return;
         }
+        this.closeSessionMenu();
         const sessionId = session.session_id;
         this.deletingSessionId = sessionId;
         try {
@@ -677,7 +730,8 @@ if (!window.Vue) {
             education: this.profileForm.education.trim() || "待补充",
             experience_years: Number(this.profileForm.experienceYears || 0),
             skills: this.parseSkills(this.profileForm.skills),
-            preferred_cities: this.profileForm.city ? [this.profileForm.city] : [],
+            preferred_cities: [...this.profileForm.preferredCities],
+            acceptable_cities: [],
             salary_floor_k: null,
             expected_salary_k: null,
             target_directions: this.splitItems(this.profileForm.directions),
@@ -696,13 +750,32 @@ if (!window.Vue) {
             education: "",
             experienceYears: 0,
             skills: "",
-            city: "",
+            citySelection: "",
+            preferredCities: [],
             directions: "",
           };
         } catch (error) {
           this.appendAssistant(error.message, true);
         } finally {
           this.creatingProfile = false;
+        }
+      },
+
+      /** 把省市下拉选中的城市加入首选列表。 */
+      addPreferredCity() {
+        const city = normalizeCityName(this.profileForm.citySelection);
+        if (city && !this.profileForm.preferredCities.includes(city)) {
+          this.profileForm.preferredCities.push(city);
+        }
+      },
+
+      /** 从新建档案表单中移除一个首选城市。 */
+      removePreferredCity(city) {
+        this.profileForm.preferredCities = this.profileForm.preferredCities.filter(
+          (item) => item !== city
+        );
+        if (normalizeCityName(this.profileForm.citySelection) === city) {
+          this.profileForm.citySelection = "";
         }
       },
 
@@ -1200,6 +1273,31 @@ if (!window.Vue) {
         }
       },
 
+      /** 删除当前候选人的一份原始或职位定制简历文件。 */
+      async deleteResumeArtifact(artifact) {
+        if (
+          !artifact ||
+          !window.confirm(
+            `确定删除“${artifact.download_filename || "这份简历"}”吗？\n删除后文件和对应的下载记录将无法恢复。`
+          )
+        ) {
+          return;
+        }
+
+        this.deletingResumeArtifactId = artifact.id;
+        this.resumeError = "";
+        try {
+          await this.requestJson(`/api/resumes/${encodeURIComponent(artifact.id)}`, { method: "DELETE" });
+          delete this.resumeJobSelections[artifact.id];
+          await this.loadResumeArtifacts();
+        } catch (error) {
+          this.resumeError = error.message || "简历删除失败。";
+          this.appendAssistant(this.resumeError, true);
+        } finally {
+          this.deletingResumeArtifactId = 0;
+        }
+      },
+
       /** 用选定职位改写原始简历，并刷新 DOCX/PDF 下载版本。 */
       async tailorResume(artifact) {
         const jobId = Number(this.resumeJobSelections[artifact.id] || 0);
@@ -1314,6 +1412,30 @@ if (!window.Vue) {
         }
       },
 
+      /** 保存用户对职位技能重要性分类的人工校正。 */
+      async saveJobSkillRequirements(job) {
+        if (!job || !Array.isArray(job.skill_requirements)) {
+          return;
+        }
+        this.savingJobSkillsId = job.id;
+        try {
+          const data = await this.requestJson(`/api/jobs/${encodeURIComponent(job.id)}/skill-requirements`, {
+            method: "PUT",
+            body: JSON.stringify({ requirements: job.skill_requirements }),
+          });
+          const index = this.jobs.findIndex((item) => Number(item.id) === Number(job.id));
+          if (index >= 0 && data.job) {
+            this.jobs[index] = data.job;
+          }
+          await this.matchJobs(true);
+          this.appendAssistant(`已保存“${job.title}”的技能重要性分类，并重新计算匹配度。`);
+        } catch (error) {
+          this.appendAssistant(`技能分类保存失败：${error.message || "未知错误"}`, true);
+        } finally {
+          this.savingJobSkillsId = 0;
+        }
+      },
+
       /** 删除一个已导入职位及其职位定制简历文件。 */
       async deleteJob(job) {
         if (
@@ -1424,6 +1546,27 @@ if (!window.Vue) {
           item.match.reasons?.[0] ||
           "暂无"
         );
+      },
+
+      /** 把后端返回的维度分数和动态权重转成紧凑的可读摘要。 */
+      matchDimensionRows(match) {
+        const labels = {
+          city: "城市",
+          salary: "薪资",
+          skills: "技能",
+          direction: "方向",
+          experience: "经验",
+        };
+        const scores = match?.dimension_scores || {};
+        const weights = match?.applied_weights || {};
+        return Object.keys(scores)
+          .filter((key) => Object.prototype.hasOwnProperty.call(weights, key))
+          .map((key) => ({
+            key,
+            label: labels[key] || key,
+            score: Math.round(Number(scores[key]) || 0),
+            weight: Number(weights[key]).toFixed(1),
+          }));
       },
 
       /** 格式化职位卡片的摘要信息。 */
