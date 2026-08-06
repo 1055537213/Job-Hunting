@@ -631,6 +631,12 @@
                     {{ row.label }} {{ row.score }}分 · 权重 {{ row.weight }}
                   </span>
                 </div>
+                <div v-if="matchDetailGroups(item.match).length" class="match-detail-groups">
+                  <div v-for="group in matchDetailGroups(item.match)" :key="group.key" class="match-detail-group">
+                    <strong>{{ group.label }}</strong>
+                    <span v-for="entry in group.items" :key="entry">{{ entry }}</span>
+                  </div>
+                </div>
               </article>
             </div>
           </section>

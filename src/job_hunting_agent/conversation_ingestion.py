@@ -246,11 +246,19 @@ def extract_skills_from_message(text: str) -> dict[str, str]:
     """从消息中提取明确出现的技能词。"""
 
     lower_text = text.lower()
-    return {
-        skill: "待确认"
-        for skill in KNOWN_SKILLS
-        if skill.lower() in lower_text
-    }
+    result: dict[str, str] = {}
+    for skill in KNOWN_SKILLS:
+        skill_text = re.escape(skill.lower())
+        if skill.lower() not in lower_text:
+            continue
+        negative_before = rf"(?:不会|没有|不具备|缺少|缺失)\s*{skill_text}"
+        negative_after = rf"{skill_text}\s*(?:不会|没有|不具备|缺少|缺失)"
+        result[skill] = (
+            "不会"
+            if re.search(negative_before, lower_text) or re.search(negative_after, lower_text)
+            else "待确认"
+        )
+    return result
 
 
 def extract_city_preferences(

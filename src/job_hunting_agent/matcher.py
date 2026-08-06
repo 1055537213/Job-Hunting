@@ -34,6 +34,7 @@ SKILL_PROFICIENCY_SCORE = {
     "入门": 40.0,
     "待确认": 30.0,
 }
+CONFIRMED_MISSING_LEVELS = {"明确不会", "不会", "不具备", "缺失", "没有", "无"}
 
 
 DirectionScorer = Callable[[CandidateProfile, ImportedJob], float | None]
@@ -82,6 +83,21 @@ def match_job(
         if unacceptable and unacceptable in job.raw_text:
             elimination_reasons.append(f"包含明确不可接受条件：{unacceptable}")
 
+    # 候选人在档案里显式确认“不会”的核心技能，可以触发更强淘汰。
+    core_skill_names = {
+        requirement.name.lower()
+        for requirement in (job.skill_requirements or [])
+        if requirement.category == "core"
+    }
+    confirmed_missing_core = [
+        name
+        for name, level in candidate.skills.items()
+        if str(level).strip().lower() in CONFIRMED_MISSING_LEVELS
+        and name.lower() in core_skill_names
+    ]
+    if confirmed_missing_core:
+        elimination_reasons.append("职位明确必须且候选人确认不具备：" + "、".join(confirmed_missing_core))
+
     # 经验规则：低于职位最低经验 3 年及以上直接淘汰，小于 3 年按比例扣分。
     if job.experience_min_years is not None:
         gap = job.experience_min_years - candidate.experience_years
@@ -100,8 +116,11 @@ def match_job(
         risks.append("职位未明确经验要求，经验匹配信息不完整")
 
     # 学历规则来自 #7：候选人学历必须大于或等于职位学历要求。
-    if job.education and education_rank(candidate.education) < education_rank(job.education):
+    education_confidence = float(job.field_confidence.get("education", 1.0) or 0)
+    if job.education and education_confidence >= 0.5 and education_rank(candidate.education) < education_rank(job.education):
         elimination_reasons.append(f"学历低于职位要求：候选人 {candidate.education}，职位要求 {job.education}")
+    elif job.education and education_confidence < 0.5:
+        risks.append("职位学历字段置信度较低，暂不执行学历硬性淘汰")
 
     # 技能先按核心/一般/加分分组，避免职位列出大量非核心技能时把分数拉低。
     dimension_scores["skills"] = skill_score(candidate, job, reasons, deductions, risks)
@@ -315,11 +334,16 @@ def skill_score(
         # 避免异常数据直接中断整批职位匹配。
         category = requirement.category if requirement.category in grouped else "uncertain"
         level = candidate_skills.get(requirement.name.lower())
-        if level is None:
+        is_confirmed_missing = level is None or str(level).strip().lower() in CONFIRMED_MISSING_LEVELS
+        if is_confirmed_missing:
+            if category == "uncertain":
+                # 不确定技能只提示或少扣分：完全不参与分数计算，保留不确定风险即可。
+                risks.append("职位存在不确定技能要求：" + requirement.name)
+                continue
             value = 0.0
             if category == "core":
                 missing_core.append(requirement.name)
-            elif category in {"general", "uncertain"}:
+            elif category == "general":
                 missing_general.append(requirement.name)
         else:
             value = proficiency_score(level)

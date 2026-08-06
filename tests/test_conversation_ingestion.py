@@ -6,7 +6,7 @@ SQLite 结构化事实、哪些内容进入 RAG 长文本知识库”。这一�
 """
 
 from job_hunting_agent.app import JobHuntingApp
-from job_hunting_agent.models import CandidateProfileInput
+from job_hunting_agent.models import CandidateProfileInput, sanitize_preference_weights
 
 
 def test_conversation_message_auto_saves_structured_facts_and_long_text(tmp_path):
@@ -177,3 +177,39 @@ def test_conversation_persists_only_explicit_preference_weight_updates(tmp_path)
     assert profile.preference_weights["skills"] == 1.0
     assert profile.preferred_cities == []
     assert profile.acceptable_cities == []
+
+
+def test_preference_weights_are_limited_to_discrete_levels():
+    """外部或旧数据中的任意小数权重会被归一化到三个支持等级。"""
+
+    weights = sanitize_preference_weights({"salary": 1.7, "city": 1.2})
+
+    assert weights["salary"] == 1.5
+    assert weights["city"] == 1.0
+
+
+def test_rule_based_ingestion_preserves_explicit_missing_skill(tmp_path):
+    """候选人明确说不会某技能时，结构化档案需要保留负向事实。"""
+
+    app = JobHuntingApp(tmp_path / "missing-skill.db")
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="负向技能测试",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        )
+    )
+
+    app.ingest_conversation_message(candidate_id, "我不会 Docker，但会 Python。")
+
+    profile = app.get_candidate_profile(candidate_id)
+    assert profile.skills["Docker"] == "不会"
+    assert profile.skills["Python"] == "待确认"

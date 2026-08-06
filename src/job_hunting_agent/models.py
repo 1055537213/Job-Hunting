@@ -20,9 +20,10 @@ DEFAULT_PREFERENCE_WEIGHTS = {
 
 
 def sanitize_preference_weights(values: dict[str, float] | None) -> dict[str, float]:
-    """只保留支持的维度，并把权重限制在约定的 1.0-2.0 范围。"""
+    """只保留支持的维度，并归一化到约定的 1.0/1.5/2.0。"""
 
     result = dict(DEFAULT_PREFERENCE_WEIGHTS)
+    allowed_weights = (1.0, 1.5, 2.0)
     for key, value in (values or {}).items():
         if key not in result:
             continue
@@ -30,7 +31,7 @@ def sanitize_preference_weights(values: dict[str, float] | None) -> dict[str, fl
             numeric = float(value)
         except (TypeError, ValueError):
             continue
-        result[key] = max(1.0, min(2.0, numeric))
+        result[key] = min(allowed_weights, key=lambda allowed: abs(allowed - numeric))
     return result
 
 

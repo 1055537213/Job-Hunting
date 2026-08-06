@@ -1569,6 +1569,18 @@ if (!window.Vue) {
           }));
       },
 
+      /** 返回完整的匹配解释，避免页面只显示一条理由而隐藏风险和改写建议。 */
+      matchDetailGroups(match) {
+        const groups = [
+          { key: "elimination", label: "淘汰原因", items: match?.elimination_reasons || [] },
+          { key: "deductions", label: "扣分项", items: match?.deductions || [] },
+          { key: "risks", label: "风险", items: match?.risks || [] },
+          { key: "uncertainty", label: "字段不确定", items: match?.uncertainty_notes || [] },
+          { key: "resume", label: "简历建议", items: match?.resume_suggestions || [] },
+        ];
+        return groups.filter((group) => Array.isArray(group.items) && group.items.length);
+      },
+
       /** 格式化职位卡片的摘要信息。 */
       formatJobMeta(job) {
         const salary = this.formatSalary(job);

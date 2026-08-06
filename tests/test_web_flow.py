@@ -501,6 +501,8 @@ def test_web_frontend_loads_persisted_jobs_on_page_open(tmp_path):
     assert "async loadJobs(signal = null)" in script
     assert "await this.loadJobs();" in script
     assert "jobImportError" in script
+    assert "matchDetailGroups(match)" in script
+    assert "匹配分数构成" in home
 
 
 def test_web_can_save_manual_job_skill_categories(tmp_path):

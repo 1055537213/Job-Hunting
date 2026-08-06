@@ -236,10 +236,23 @@ def rule_based_skill_requirements(raw_text: str, skills: list[str]) -> list[Skil
     core_markers = ("必须", "必备", "核心", "硬性要求", "务必")
     bonus_markers = ("优先", "加分", "有经验者优先", "更佳")
     for skill in skills:
-        position = raw_text.lower().find(skill.lower())
-        # 只看技能附近的短窗口，避免“必须 Python；Docker 经验优先”中
-        # Python 的硬性措辞串到 Docker，导致回退分类失真。
-        context = raw_text[max(0, position - 24) : position + len(skill) + 24]
+        positions = [match.start() for match in re.finditer(re.escape(skill), raw_text, re.IGNORECASE)]
+        if not positions:
+            continue
+        # 技能可能同时出现在标题和任职要求中；优先选择带有明确招聘措辞的出现位置，
+        # 避免标题里的 Python 把正文“必须掌握 Python”遮掉。
+        contexts = [
+            raw_text[max(0, position - 24) : position + len(skill) + 24]
+            for position in positions
+        ]
+        context = next(
+            (
+                item
+                for item in contexts
+                if any(marker in item for marker in core_markers + bonus_markers)
+            ),
+            contexts[-1],
+        )
         if any(marker in context for marker in core_markers):
             category, confidence = "core", 0.9
         elif any(marker in context for marker in bonus_markers):

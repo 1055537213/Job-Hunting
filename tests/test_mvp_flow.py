@@ -373,6 +373,120 @@ def test_job_skill_categories_can_be_corrected_without_adding_new_skills(tmp_pat
         raise AssertionError("不应允许人工增加职位原始技能之外的名称")
 
 
+def test_confirmed_missing_core_skill_can_trigger_hard_elimination(tmp_path):
+    """只有候选人明确确认不具备核心技能时，技能门槛才淘汰职位。"""
+
+    app = JobHuntingApp(tmp_path / "missing-core.db")
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="核心技能测试",
+            status="在职",
+            education="本科",
+            experience_years=2,
+            skills={"Python": "不会"},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        )
+    )
+    job = app.import_job_text(
+        """
+        Python 后端开发工程师
+        15-20K
+        杭州
+        1-3年
+        本科
+        职位描述：必须掌握 Python，负责后端服务开发。
+        """,
+        classify_with_llm=False,
+    )
+
+    result = app.match_job(candidate_id, job.id)
+
+    assert result.eliminated
+    assert any("确认不具备" in item for item in result.elimination_reasons)
+
+
+def test_uncertain_skill_gap_is_not_scored_as_zero(tmp_path):
+    """不确定技能缺失只保留风险，不把技能维度直接压成 0。"""
+
+    app = JobHuntingApp(tmp_path / "uncertain-skill.db")
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="不确定技能测试",
+            status="在职",
+            education="本科",
+            experience_years=2,
+            skills={"Python": "项目使用"},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        )
+    )
+    job = app.import_job_text(
+        """
+        Python 后端开发工程师
+        15-20K
+        杭州
+        1-3年
+        本科
+        职位描述：负责 Python 和 Docker 后端服务开发。
+        """,
+        classify_with_llm=False,
+    )
+    job.skill_requirements = [
+        SkillRequirement(name="Python", category="core", confidence=1.0),
+        SkillRequirement(name="Docker", category="uncertain", confidence=0.2),
+    ]
+    result = match_job(app.get_candidate_profile(candidate_id), job)
+
+    assert result.dimension_scores["skills"] >= 65
+    assert any("不确定技能要求" in item for item in result.risks)
+
+
+def test_low_confidence_education_does_not_trigger_hard_elimination(tmp_path):
+    """学历字段置信度不足时只提示，不执行硬性学历淘汰。"""
+
+    app = JobHuntingApp(tmp_path / "education-confidence.db")
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="学历置信度测试",
+            status="在职",
+            education="大专",
+            experience_years=2,
+            skills={},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        )
+    )
+    job = app.import_job_text(
+        """
+        Python 后端开发工程师
+        15-20K
+        杭州
+        1-3年
+        本科
+        职位描述：负责后端服务开发。
+        """,
+        classify_with_llm=False,
+    )
+    job.field_confidence["education"] = 0.2
+    result = match_job(app.get_candidate_profile(candidate_id), job)
+
+    assert not result.eliminated
+    assert any("学历字段置信度较低" in item for item in result.risks)
+
+
 def test_project_analysis_outputs_confirmable_card_and_skips_sensitive_files(tmp_path):
     """项目分析会生成待确认卡片，并跳过 .env 等敏感文件。"""
 
