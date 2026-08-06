@@ -91,6 +91,24 @@ class JobHuntingApp:
 
         return self.store.list_candidate_profiles(account_id=account_id)
 
+    def delete_candidate_profile(
+        self,
+        candidate_id: int,
+        rag_persist_directory: str | Path | None = None,
+        account_id: int | None = None,
+    ) -> dict[str, object]:
+        """删除候选人档案及其从属数据，并尽量同步移除 RAG 证据。"""
+
+        result = self.store.delete_candidate_profile(candidate_id, account_id=account_id)
+        for storage_key in result.get("storage_keys", []):
+            self.resume_files.delete(str(storage_key))
+        return self._finish_deletion_cleanup(result, rag_persist_directory, account_id)
+
+    def delete_chat_session(self, session_id: str, account_id: int) -> dict[str, object]:
+        """永久删除一段网页对话及其消息。"""
+
+        return self.store.delete_chat_session(session_id, account_id)
+
     def ingest_conversation_message(
         self,
         candidate_id: int,
@@ -165,6 +183,48 @@ class JobHuntingApp:
         """列出候选人已经主动导入的所有职位。"""
 
         return self.store.list_jobs(account_id=account_id)
+
+    def delete_job(
+        self,
+        job_id: int,
+        rag_persist_directory: str | Path | None = None,
+        account_id: int | None = None,
+    ) -> dict[str, object]:
+        """删除职位及其职位定制文件，并尽量同步移除 RAG 证据。"""
+
+        result = self.store.delete_job(job_id, account_id=account_id)
+        for storage_key in result.get("storage_keys", []):
+            self.resume_files.delete(str(storage_key))
+        return self._finish_deletion_cleanup(result, rag_persist_directory, account_id)
+
+    def _finish_deletion_cleanup(
+        self,
+        result: dict[str, object],
+        rag_persist_directory: str | Path | None,
+        account_id: int | None,
+    ) -> dict[str, object]:
+        """清理 RAG chunk；SQLite 删除已经完成时，向调用方返回可读警告。"""
+
+        long_text_ids = [int(item_id) for item_id in result.get("long_text_ids", [])]
+        result["rag_deleted_chunks"] = 0
+        if not long_text_ids or rag_persist_directory is None:
+            return result
+        try:
+            call_context = self.model_gateway.new_call_context(
+                "embedding_delete",
+                account_id=account_id,
+            )
+            knowledge_base = RAGKnowledgeBase(
+                rag_persist_directory,
+                embeddings=self.model_gateway.embeddings(call_context),
+            )
+            result["rag_deleted_chunks"] = knowledge_base.delete_long_texts(
+                long_text_ids,
+                account_id=account_id,
+            )
+        except Exception as error:  # noqa: BLE001 - 数据删除成功后返回可修复的索引警告。
+            result["rag_warning"] = str(error)
+        return result
 
     def save_chat_message(
         self,

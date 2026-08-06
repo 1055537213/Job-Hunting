@@ -99,6 +99,10 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert "mini-metrics" not in home.text
     assert "自动增量 RAG" not in home.text
     assert "使用 LangChain Agent（需 .env）" not in home.text
+    assert "删除当前档案" in home.text
+    assert "deleteCurrentSession" in home.text
+    assert "deleteSession(session)" in home.text
+    assert "deleteJob(job)" in home.text
     assert home.headers["cache-control"] == "no-store, max-age=0"
     assert script.status_code == 200
     assert script.headers["cache-control"] == "no-store, max-age=0"
@@ -267,6 +271,84 @@ def test_web_can_import_job_and_return_matches(tmp_path):
     assert matches
     assert matches[0]["job"]["id"] == imported["id"]
     assert matches[0]["match"]["tier"] in {"强推荐", "可投递"}
+
+
+def test_web_can_delete_profiles_sessions_and_jobs_with_account_scoping(tmp_path):
+    """网页删除接口应清理从属数据，并拒绝其他账号跨边界删除。"""
+
+    db_path = tmp_path / "delete.db"
+    rag_dir = tmp_path / "chroma"
+    client_a = TestClient(create_web_app(db_path=db_path, rag_dir=rag_dir, require_auth=True))
+    client_b = TestClient(create_web_app(db_path=db_path, rag_dir=rag_dir, require_auth=True))
+
+    for client, email in ((client_a, "delete-a@example.com"), (client_b, "delete-b@example.com")):
+        assert client.post(
+            "/api/auth/register",
+            json={"email": email, "password": "password-123"},
+        ).status_code == 200
+        assert client.post(
+            "/api/auth/login",
+            json={"email": email, "password": "password-123"},
+        ).status_code == 200
+
+    candidate_id = client_a.post(
+        "/api/profiles",
+        json={
+            "name": "待删除档案",
+            "status": "待补充",
+            "education": "本科",
+            "experience_years": 1,
+            "skills": {"Python": "熟悉"},
+            "preferred_cities": ["杭州"],
+            "target_directions": ["后端开发"],
+            "unacceptable": [],
+        },
+    ).json()["candidate_id"]
+    job = client_a.post(
+        "/api/jobs",
+        json={
+            "raw_text": """
+            Python 后端开发工程师
+            15-20K
+            杭州
+            1-3年
+            本科
+            职位描述：负责 Python 和 FastAPI 后端开发。
+            """,
+        },
+    ).json()["job"]
+    session_id = client_a.post(
+        "/api/chat/sessions",
+        json={"candidate_id": candidate_id, "title": "待删除对话", "job_id": job["id"]},
+    ).json()["session"]["session_id"]
+    chat = client_a.post(
+        "/api/chat",
+        json={
+            "candidate_id": candidate_id,
+            "session_id": session_id,
+            "message": "我是本科，有 Python 项目经验。",
+            "use_env_llm": False,
+            "auto_rag": False,
+        },
+    )
+    assert chat.status_code == 200, chat.text
+    assert client_a.get("/api/chat/history", params={"candidate_id": candidate_id, "session_id": session_id}).json()["messages"]
+
+    assert client_b.delete(f"/api/profiles/{candidate_id}").status_code == 404
+    assert client_b.delete(f"/api/jobs/{job['id']}").status_code == 404
+
+    deleted_session = client_a.delete(f"/api/chat/sessions/{session_id}")
+    assert deleted_session.status_code == 200, deleted_session.text
+    assert client_a.get(f"/api/chat/sessions?candidate_id={candidate_id}").json()["sessions"] == []
+
+    deleted_profile = client_a.delete(f"/api/profiles/{candidate_id}")
+    assert deleted_profile.status_code == 200, deleted_profile.text
+    assert client_a.get("/api/profiles").json()["profiles"] == []
+    assert client_a.get("/api/jobs").json()["jobs"] == [job]
+
+    deleted_job = client_a.delete(f"/api/jobs/{job['id']}")
+    assert deleted_job.status_code == 200, deleted_job.text
+    assert client_a.get("/api/jobs").json()["jobs"] == []
 
 
 def test_web_rejects_non_job_text_before_saving(tmp_path):

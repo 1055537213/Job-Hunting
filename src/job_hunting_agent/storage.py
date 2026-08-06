@@ -659,6 +659,34 @@ class SQLiteStore:
                 raise KeyError(f"Chat session not found: {session_id}")
         return self.get_chat_session_by_key(session_id, account_id)
 
+    def delete_chat_session(self, session_id: str, account_id: int) -> dict[str, object]:
+        """永久删除当前账号的一段对话及其消息，但保留用量流水。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, candidate_id
+                FROM chat_sessions
+                WHERE session_id = ? AND account_id = ?
+                """,
+                (session_id, account_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Chat session not found: {session_id}")
+            candidate_id = int(row["candidate_id"])
+            conn.execute(
+                """
+                DELETE FROM chat_messages
+                WHERE session_id = ? AND account_id = ? AND candidate_id = ?
+                """,
+                (session_id, account_id, candidate_id),
+            )
+            conn.execute("DELETE FROM chat_sessions WHERE id = ?", (int(row["id"]),))
+        return {
+            "session_id": session_id,
+            "candidate_id": candidate_id,
+        }
+
     def record_usage_event(self, event: UsageEventRecord) -> UsageEventRecord:
         """追加一条用量流水；相同 `call_id` 重复上报时保持幂等。"""
 
@@ -1055,6 +1083,143 @@ class SQLiteStore:
         # 旧版本可能已经把普通聊天、项目日志或测试文本误写进 jobs 表；
         # 列表和批量匹配只暴露通过当前审核规则的记录，避免继续把脏数据当职位打分。
         return [job for job in jobs if validate_job_text(job.raw_text).is_valid]
+
+    def delete_candidate_profile(
+        self,
+        candidate_id: int,
+        account_id: int | None = None,
+    ) -> dict[str, object]:
+        """删除候选人档案及其所有从属资料，返回需要清理的文件和 RAG 长文本 ID。"""
+
+        self.get_candidate_profile(candidate_id, account_id=account_id)
+        owner_clause = ""
+        owner_parameters: tuple[object, ...] = ()
+        if account_id is not None:
+            owner_clause = " AND account_id = ?"
+            owner_parameters = (account_id,)
+
+        with self.connect() as conn:
+            artifact_rows = conn.execute(
+                f"""
+                SELECT storage_key
+                FROM resume_artifacts
+                WHERE candidate_id = ?{owner_clause}
+                """,
+                (candidate_id, *owner_parameters),
+            ).fetchall()
+            long_text_rows = conn.execute(
+                f"""
+                SELECT id
+                FROM long_texts
+                WHERE (candidate_id = ? OR (entity_type = 'candidate_profile' AND entity_id = ?))
+                {owner_clause}
+                """,
+                (candidate_id, candidate_id, *owner_parameters),
+            ).fetchall()
+            delete_owner_clause = owner_clause
+            delete_owner_parameters = owner_parameters
+
+            # 先解除简历派生文件的自引用，再按从属关系逆序删除，避免旧数据库的外键约束阻止清理。
+            conn.execute(
+                f"UPDATE resume_artifacts SET parent_artifact_id = NULL "
+                f"WHERE candidate_id = ?{delete_owner_clause}",
+                (candidate_id, *delete_owner_parameters),
+            )
+            conn.execute(
+                f"DELETE FROM resume_artifacts WHERE candidate_id = ?{delete_owner_clause}",
+                (candidate_id, *delete_owner_parameters),
+            )
+            conn.execute(
+                f"DELETE FROM resume_drafts WHERE candidate_id = ?{delete_owner_clause}",
+                (candidate_id, *delete_owner_parameters),
+            )
+            conn.execute(
+                f"DELETE FROM project_experience_cards WHERE candidate_id = ?{delete_owner_clause}",
+                (candidate_id, *delete_owner_parameters),
+            )
+            conn.execute(
+                f"DELETE FROM chat_messages WHERE candidate_id = ?{delete_owner_clause}",
+                (candidate_id, *delete_owner_parameters),
+            )
+            conn.execute(
+                f"DELETE FROM chat_sessions WHERE candidate_id = ?{delete_owner_clause}",
+                (candidate_id, *delete_owner_parameters),
+            )
+            conn.execute(
+                f"""
+                DELETE FROM long_texts
+                WHERE (candidate_id = ? OR (entity_type = 'candidate_profile' AND entity_id = ?))
+                {delete_owner_clause}
+                """,
+                (candidate_id, candidate_id, *delete_owner_parameters),
+            )
+            cursor = conn.execute(
+                f"DELETE FROM candidate_profiles WHERE id = ?{delete_owner_clause}",
+                (candidate_id, *delete_owner_parameters),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Candidate profile not found: {candidate_id}")
+
+        return {
+            "candidate_id": candidate_id,
+            "storage_keys": [str(row["storage_key"]) for row in artifact_rows],
+            "long_text_ids": [int(row["id"]) for row in long_text_rows],
+        }
+
+    def delete_job(self, job_id: int, account_id: int | None = None) -> dict[str, object]:
+        """删除职位及其长文本、职位定制简历，并解除已有会话的职位关联。"""
+
+        self.get_job(job_id, account_id=account_id)
+        owner_clause = ""
+        owner_parameters: tuple[object, ...] = ()
+        if account_id is not None:
+            owner_clause = " AND account_id = ?"
+            owner_parameters = (account_id,)
+
+        with self.connect() as conn:
+            artifact_rows = conn.execute(
+                f"SELECT storage_key FROM resume_artifacts WHERE job_id = ?{owner_clause}",
+                (job_id, *owner_parameters),
+            ).fetchall()
+            long_text_rows = conn.execute(
+                f"""
+                SELECT id FROM long_texts
+                WHERE entity_type = 'job' AND entity_id = ?{owner_clause}
+                """,
+                (job_id, *owner_parameters),
+            ).fetchall()
+            conn.execute(
+                f"UPDATE chat_sessions SET job_id = NULL WHERE job_id = ?{owner_clause}",
+                (job_id, *owner_parameters),
+            )
+            conn.execute(
+                f"UPDATE resume_artifacts SET parent_artifact_id = NULL WHERE job_id = ?{owner_clause}",
+                (job_id, *owner_parameters),
+            )
+            conn.execute(
+                f"DELETE FROM resume_artifacts WHERE job_id = ?{owner_clause}",
+                (job_id, *owner_parameters),
+            )
+            conn.execute(
+                f"DELETE FROM resume_drafts WHERE job_id = ?{owner_clause}",
+                (job_id, *owner_parameters),
+            )
+            conn.execute(
+                f"DELETE FROM long_texts WHERE entity_type = 'job' AND entity_id = ?{owner_clause}",
+                (job_id, *owner_parameters),
+            )
+            cursor = conn.execute(
+                f"DELETE FROM jobs WHERE id = ?{owner_clause}",
+                (job_id, *owner_parameters),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Job not found: {job_id}")
+
+        return {
+            "job_id": job_id,
+            "storage_keys": [str(row["storage_key"]) for row in artifact_rows],
+            "long_text_ids": [int(row["id"]) for row in long_text_rows],
+        }
 
     def save_chat_message(
         self,

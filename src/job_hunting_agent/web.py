@@ -398,6 +398,21 @@ def create_web_app(
         account = current_account(request)
         return {"profile": asdict(get_profile_or_404(backend, candidate_id, account.id if account else None))}
 
+    @web_app.delete("/api/profiles/{candidate_id}")
+    def delete_profile(candidate_id: int, request: Request) -> dict[str, object]:
+        """删除当前账号的候选人档案及其从属数据。"""
+
+        account = current_account(request)
+        try:
+            result = backend.delete_candidate_profile(
+                candidate_id,
+                rag_persist_directory=rag_path,
+                account_id=account.id if account else None,
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="候选人档案不存在。") from error
+        return {"deleted": True, **result}
+
     @web_app.post("/api/chat/sessions")
     def create_chat_session(payload: ChatSessionPayload, request: Request) -> dict[str, object]:
         """创建一个绑定当前账号和候选人档案的独立会话。"""
@@ -465,6 +480,18 @@ def create_web_app(
         except KeyError as error:
             raise HTTPException(status_code=404, detail="会话不存在。") from error
         return {"session": asdict(record)}
+
+    @web_app.delete("/api/chat/sessions/{session_id}")
+    def delete_chat_session(session_id: str, request: Request) -> dict[str, object]:
+        """永久删除当前账号的一段对话及其消息。"""
+
+        account = current_account(request)
+        assert account is not None
+        try:
+            result = backend.delete_chat_session(session_id, account.id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="会话不存在。") from error
+        return {"deleted": True, **result}
 
     @web_app.post("/api/chat")
     def chat(payload: ChatPayload, request: Request) -> dict[str, object]:
@@ -653,6 +680,21 @@ def create_web_app(
 
         account = current_account(request)
         return {"jobs": [asdict(job) for job in backend.list_jobs(account_id=account.id if account else None)]}
+
+    @web_app.delete("/api/jobs/{job_id}")
+    def delete_job(job_id: int, request: Request) -> dict[str, object]:
+        """删除当前账号导入的职位及其职位相关文件。"""
+
+        account = current_account(request)
+        try:
+            result = backend.delete_job(
+                job_id,
+                rag_persist_directory=rag_path,
+                account_id=account.id if account else None,
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="职位不存在。") from error
+        return {"deleted": True, **result}
 
     @web_app.get("/api/matches/{candidate_id}")
     def list_matches(candidate_id: int, request: Request) -> dict[str, object]:

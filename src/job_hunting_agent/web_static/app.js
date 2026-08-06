@@ -86,7 +86,9 @@ if (!window.Vue) {
         },
         loadingProfiles: false,
         creatingProfile: false,
+        deletingProfileId: 0,
         loadingJobs: false,
+        deletingJobId: 0,
         importingJob: false,
         loadingMatches: false,
         uploadingResume: false,
@@ -94,6 +96,7 @@ if (!window.Vue) {
         resumeError: "",
         sending: false,
         chatAbortController: null,
+        deletingSessionId: "",
         jobImportError: "",
         commandPaletteOpen: false,
         commandQuery: "",
@@ -603,6 +606,62 @@ if (!window.Vue) {
         await this.loadChatHistory();
       },
 
+      /** 从会话列表选择一段对话并恢复其消息。 */
+      async selectChatSession(sessionId) {
+        this.activeSessionId = sessionId;
+        await this.switchChatSession();
+      },
+
+      /** 删除会话列表中的指定对话，删除当前会话时同步清空消息区。 */
+      async deleteSession(session) {
+        if (!session || !window.confirm(`确定删除“${session.title || "当前对话"}”吗？\n该对话的历史消息将被永久删除。`)) {
+          return;
+        }
+        const sessionId = session.session_id;
+        this.deletingSessionId = sessionId;
+        try {
+          await this.requestJson(`/api/chat/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+          const wasActive = this.activeSessionId === sessionId;
+          localStorage.removeItem(`activeSessionId:${this.auth.account?.id || "legacy"}:${this.currentProfileId}`);
+          if (wasActive) {
+            this.activeSessionId = "";
+            this.messages = [];
+          }
+          await this.loadChatSessions();
+          if (wasActive) {
+            await this.loadChatHistory();
+          }
+        } catch (error) {
+          this.appendAssistant(`删除对话失败：${error.message || "未知错误"}`, true);
+        } finally {
+          this.deletingSessionId = "";
+        }
+      },
+
+      /** 永久删除当前对话及其消息，不影响候选人档案事实和计费流水。 */
+      async deleteCurrentSession() {
+        if (!this.activeSessionId) return;
+        const session = this.sessions.find((item) => item.session_id === this.activeSessionId);
+        const title = session?.title || "当前对话";
+        if (!window.confirm(`确定删除“${title}”吗？\n该对话的历史消息将被永久删除。`)) {
+          return;
+        }
+        const sessionId = this.activeSessionId;
+        this.deletingSessionId = sessionId;
+        try {
+          await this.requestJson(`/api/chat/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+          localStorage.removeItem(`activeSessionId:${this.auth.account?.id || "legacy"}:${this.currentProfileId}`);
+          this.activeSessionId = "";
+          this.messages = [];
+          await this.loadChatSessions();
+          await this.loadChatHistory();
+        } catch (error) {
+          this.appendAssistant(`删除对话失败：${error.message || "未知错误"}`, true);
+        } finally {
+          this.deletingSessionId = "";
+        }
+      },
+
       /** 创建候选人档案并自动切换到新档案。 */
       async createProfile() {
         if (!this.profileForm.name.trim()) {
@@ -743,6 +802,38 @@ if (!window.Vue) {
             this.chatAbortController = null;
           }
           this.sending = false;
+        }
+      },
+
+      /** 删除当前候选人档案；后端会级联清理档案下的会话、资料和文件。 */
+      async deleteCurrentProfile() {
+        const profile = this.currentProfile;
+        if (
+          !profile ||
+          !window.confirm(
+            `确定删除档案“${profile.name}”吗？\n该档案下的对话、项目经历和简历文件也会被删除。`
+          )
+        ) {
+          return;
+        }
+        const candidateId = this.currentProfileId;
+        this.deletingProfileId = candidateId;
+        try {
+          await this.requestJson(`/api/profiles/${candidateId}`, { method: "DELETE" });
+          localStorage.removeItem("currentProfileId");
+          localStorage.removeItem(`activeSessionId:${this.auth.account?.id || "legacy"}:${candidateId}`);
+          this.currentProfileId = 0;
+          this.activeSessionId = "";
+          this.sessions = [];
+          this.messages = [];
+          this.matches = [];
+          this.resumeArtifacts = [];
+          this.resumeJobSelections = {};
+          await this.loadProfiles();
+        } catch (error) {
+          this.appendAssistant(`删除档案失败：${error.message || "未知错误"}`, true);
+        } finally {
+          this.deletingProfileId = 0;
         }
       },
 
@@ -1220,6 +1311,34 @@ if (!window.Vue) {
           this.jobs = data.jobs || [];
         } finally {
           this.loadingJobs = false;
+        }
+      },
+
+      /** 删除一个已导入职位及其职位定制简历文件。 */
+      async deleteJob(job) {
+        if (
+          !job ||
+          !window.confirm(`确定删除职位“${job.title}”吗？\n该职位的定制简历和匹配结果也会被移除。`)
+        ) {
+          return;
+        }
+        this.deletingJobId = job.id;
+        try {
+          await this.requestJson(`/api/jobs/${job.id}`, { method: "DELETE" });
+          await this.loadJobs();
+          this.matches = this.matches.filter((item) => Number(item.job?.id) !== Number(job.id));
+          Object.keys(this.resumeJobSelections).forEach((artifactId) => {
+            if (Number(this.resumeJobSelections[artifactId]) === Number(job.id)) {
+              this.resumeJobSelections[artifactId] = 0;
+            }
+          });
+          if (this.currentProfileId) {
+            await this.matchJobs(true);
+          }
+        } catch (error) {
+          this.appendAssistant(`删除职位失败：${error.message || "未知错误"}`, true);
+        } finally {
+          this.deletingJobId = 0;
         }
       },
 

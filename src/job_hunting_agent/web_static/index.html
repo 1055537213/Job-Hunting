@@ -169,6 +169,15 @@
             >
               {{ loadingProfiles ? "刷新中" : "刷新档案" }}
             </button>
+            <button
+              class="danger-button"
+              type="button"
+              :disabled="!currentProfileId || deletingProfileId === currentProfileId"
+              :data-state="deletingProfileId === currentProfileId ? 'loading' : 'idle'"
+              @click="deleteCurrentProfile"
+            >
+              {{ deletingProfileId === currentProfileId ? "删除中" : "删除当前档案" }}
+            </button>
           </section>
 
           <section class="panel">
@@ -360,8 +369,44 @@
                 </option>
               </select>
               <button class="ghost-button compact" type="button" :disabled="!currentProfileId" @click="createChatSession">新对话</button>
+              <button
+                class="danger-button compact"
+                type="button"
+                :disabled="!activeSessionId || deletingSessionId === activeSessionId"
+                :data-state="deletingSessionId === activeSessionId ? 'loading' : 'idle'"
+                @click="deleteCurrentSession"
+              >
+                {{ deletingSessionId === activeSessionId ? "删除中" : "删除对话" }}
+              </button>
             </div>
           </header>
+          <section v-if="sessions.length" class="session-list" aria-label="当前档案的全部对话">
+            <div
+              v-for="session in sessions"
+              :key="session.session_id"
+              class="session-row"
+              :class="{ active: session.session_id === activeSessionId }"
+            >
+              <button
+                class="session-select-button"
+                type="button"
+                :aria-current="session.session_id === activeSessionId ? 'true' : undefined"
+                @click="selectChatSession(session.session_id)"
+              >
+                <strong>{{ session.title }}</strong>
+                <span>{{ formatDate(session.updated_at) }}</span>
+              </button>
+              <button
+                class="danger-button compact session-delete-button"
+                type="button"
+                :disabled="deletingSessionId === session.session_id"
+                :data-state="deletingSessionId === session.session_id ? 'loading' : 'idle'"
+                @click="deleteSession(session)"
+              >
+                {{ deletingSessionId === session.session_id ? "删除中" : "删除" }}
+              </button>
+            </div>
+          </section>
           <section ref="messages" class="messages" aria-live="polite">
             <div
               v-for="message in messages"
@@ -482,7 +527,18 @@
                 <span>把 BOSS 职位详情文本粘贴到上方后，会显示在这里。</span>
               </div>
               <article v-for="job in jobs" :key="job.id" class="job-card">
-                <h3 class="job-card-title">{{ job.title }}</h3>
+                <div class="job-card-head">
+                  <h3 class="job-card-title">{{ job.title }}</h3>
+                  <button
+                    class="danger-button compact"
+                    type="button"
+                    :disabled="deletingJobId === job.id"
+                    :data-state="deletingJobId === job.id ? 'loading' : 'idle'"
+                    @click="deleteJob(job)"
+                  >
+                    {{ deletingJobId === job.id ? "删除中" : "删除" }}
+                  </button>
+                </div>
                 <div class="job-card-meta">{{ formatJobMeta(job) }}</div>
                 <p class="job-card-desc">{{ trimText(job.description_text || job.raw_text || "", 110) }}</p>
               </article>

@@ -217,6 +217,7 @@ kbd {
 .account-badge,
 .primary-button,
 .ghost-button,
+.danger-button,
 .send-button,
 .cmdk-item {
   min-height: var(--size-hit);
@@ -255,6 +256,18 @@ kbd {
   color: var(--color-ink-2);
   background: var(--color-paper-raised);
   border: var(--rule-thin) solid var(--color-rule);
+}
+
+.danger-button {
+  padding-inline: var(--space-sm);
+  color: var(--color-error);
+  background: var(--color-error-soft);
+  border: var(--rule-thin) solid color-mix(in oklch, var(--color-error) 48%, var(--color-rule));
+}
+
+.danger-button:hover {
+  color: var(--color-error);
+  background: color-mix(in oklch, var(--color-error-soft) 82%, var(--color-error));
 }
 
 .nav-link {
@@ -498,10 +511,68 @@ textarea:focus-visible,
 }
 
 .chat-session-actions .field,
-.chat-session-actions .ghost-button {
+.chat-session-actions .ghost-button,
+.chat-session-actions .danger-button {
   color: var(--color-graphite-text);
   background: var(--color-graphite-3);
   border-color: var(--color-graphite-rule);
+}
+
+.chat-session-actions .danger-button {
+  color: oklch(86% 0.12 28);
+  border-color: oklch(58% 0.12 28);
+}
+
+.session-list {
+  display: grid;
+  gap: 1px;
+  max-height: 12rem;
+  overflow-y: auto;
+  padding: var(--space-xs) var(--space-lg);
+  background: var(--color-graphite-rule);
+}
+
+.session-row {
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  gap: var(--space-xs);
+  background: var(--color-graphite-2);
+}
+
+.session-row.active {
+  background: var(--color-graphite-3);
+}
+
+.session-select-button {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: grid;
+  gap: var(--space-3xs);
+  padding: var(--space-xs) var(--space-sm);
+  color: var(--color-graphite-text);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-select-button strong,
+.session-select-button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-select-button span {
+  color: var(--color-graphite-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.session-delete-button {
+  flex: 0 0 auto;
+  align-self: center;
+  margin-inline-end: var(--space-xs);
 }
 
 .chat-session-actions .field:focus-visible,
@@ -854,6 +925,18 @@ textarea:focus-visible,
 .job-card-title {
   font-size: var(--text-md);
   line-height: 1.25;
+}
+
+.job-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+
+.job-card-head .job-card-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .job-card-meta,
@@ -1409,6 +1492,7 @@ textarea:focus-visible,
   .chat-session-actions { justify-content: stretch; }
   .admin-actions > *,
   .chat-session-actions > * { flex: 1 1 auto; }
+  .session-list { padding-inline: var(--space-md); }
   .session-select { max-width: none; }
   .admin-metrics { grid-template-columns: 1fr; }
 }

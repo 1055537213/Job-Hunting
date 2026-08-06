@@ -828,6 +828,47 @@ class RAGKnowledgeBase:
             mode="incremental",
         )
 
+    def delete_long_texts(
+        self,
+        long_text_ids: list[int],
+        account_id: int | None = None,
+    ) -> int:
+        """删除指定长文本对应的 Chroma chunk，不调用 Embedding API。"""
+
+        normalized_ids = sorted({int(item_id) for item_id in long_text_ids if int(item_id) > 0})
+        if not normalized_ids:
+            return 0
+        vector_store = self._vector_store()
+        where: dict[str, object] = {"long_text_id": {"$in": normalized_ids}}
+        if account_id is not None:
+            where = {
+                "$and": [
+                    {"long_text_id": {"$in": normalized_ids}},
+                    {"account_id": account_id},
+                ]
+            }
+        try:
+            payload = vector_store.get(where=where)
+        except (TypeError, ValueError):
+            # 兼容旧版 Chroma 的过滤语法，退回到本地 metadata 过滤。
+            payload = vector_store.get()
+            ids = payload.get("ids", [])
+            metadatas = payload.get("metadatas", [])
+            matched_ids = [
+                chunk_id
+                for chunk_id, metadata in zip(ids, metadatas)
+                if isinstance(metadata, dict)
+                and int(metadata.get("long_text_id", -1)) in normalized_ids
+                and (account_id is None or int(metadata.get("account_id", -1)) == account_id)
+            ]
+            if matched_ids:
+                vector_store.delete(ids=matched_ids)
+            return len(matched_ids)
+        matched_ids = [str(chunk_id) for chunk_id in payload.get("ids", [])]
+        if matched_ids:
+            vector_store.delete(ids=matched_ids)
+        return len(matched_ids)
+
     def search(
         self,
         query: str,
