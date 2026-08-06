@@ -53,6 +53,17 @@ docker compose build
 docker compose up -d
 ```
 
+如果 Docker Hub 在当前网络中无法访问，可以临时使用一个兼容的 Python 基础镜像源：
+
+```powershell
+$env:JOB_AGENT_DOCKER_BASE_IMAGE = "dockerproxy.net/library/python:3.12-slim"
+docker compose build
+Remove-Item Env:JOB_AGENT_DOCKER_BASE_IMAGE
+```
+
+这个变量只影响基础镜像下载，不会改变应用使用的 LLM、Embedding 或 RAG 配置。
+如果没有网络限制，不需要设置它，默认仍使用官方 `python:3.12-slim`。
+
 查看容器状态：
 
 ```powershell
@@ -102,4 +113,5 @@ Redis、MinIO 和 Worker 现在全部加入 Compose，会让你同时面对数�
 - `docker compose down` 不等于删除业务数据；`data/` 仍在宿主机。
 - 删除或移动 `data/` 会丢失当前本地 SQLite、Chroma 和上传文件，操作前要备份。
 - `.env` 只挂载到容器，不会复制进镜像；不要把真实 API Key 写入 `compose.yaml`。
+- `JOB_AGENT_DOCKER_BASE_IMAGE` 只用于解决镜像下载网络问题，不要把带有账号密码的私有镜像地址写进仓库。
 - 这是本地开发环境，不代表已经具备企业生产部署所需的 HTTPS、备份、监控和高可用。

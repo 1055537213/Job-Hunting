@@ -1,5 +1,7 @@
 # 使用与项目要求一致的 Python 3.12 运行时，保证本地环境与容器环境尽量一致。
-FROM python:3.12-slim
+# 默认使用 Docker Hub 官方镜像；网络受限时可通过 BASE_IMAGE 切换到兼容镜像源。
+ARG BASE_IMAGE=python:3.12-slim
+FROM ${BASE_IMAGE}
 
 # 这些环境变量让 Python 在容器中直接输出日志，并把源码目录加入模块搜索路径。
 ENV PYTHONDONTWRITEBYTECODE=1 \
