@@ -167,6 +167,8 @@ Chroma 索引和简历文件目录。
 ### 项目入口和配置
 
 - `pyproject.toml`：声明 Python 版本、LangChain/FastAPI/Chroma/Argon2id 依赖，以及 `job-agent` 和 `job-agent-web` 命令。
+- `compose.yaml`：提供稳定、可复现的 Docker Web 服务配置；源码通过构建写入镜像。
+- `compose.dev.yaml`：仅在本机开发时叠加源码挂载和 Uvicorn 重载，不应直接用于部署环境。
 - `.env.example`：展示模型、Embedding、记忆和 Cookie 配置项；真实 `.env` 不提交。
 - `src/job_hunting_agent/config.py`：读取并校验环境变量，避免 API Key 写死在代码中。
 - `src/job_hunting_agent/cli.py`：提供数据库初始化、创建管理员、创建档案、职位导入、RAG 重建和 Agent 对话命令。

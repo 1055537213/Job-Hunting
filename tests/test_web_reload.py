@@ -44,45 +44,59 @@ def test_web_cli_reload_uses_an_importable_factory_and_watches_requested_directo
         calls.append((app, kwargs))
 
     monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=fake_run))
-    monkeypatch.delenv(web.WEB_RELOAD_DB_ENV, raising=False)
-    monkeypatch.delenv(web.WEB_RELOAD_ENV_FILE_ENV, raising=False)
-    monkeypatch.delenv(web.WEB_RELOAD_RAG_DIR_ENV, raising=False)
-    monkeypatch.delenv(web.WEB_RELOAD_RESUME_DIR_ENV, raising=False)
-
-    watch_dir = tmp_path / "source"
-    web.main(
-        [
-            "--db",
-            str(tmp_path / "agent.db"),
-            "--env-file",
-            str(tmp_path / ".env"),
-            "--rag-dir",
-            str(tmp_path / "chroma"),
-            "--resume-dir",
-            str(tmp_path / "resumes"),
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "8123",
-            "--reload",
-            "--reload-dir",
-            str(watch_dir),
-        ]
+    reload_env_keys = (
+        web.WEB_RELOAD_DB_ENV,
+        web.WEB_RELOAD_ENV_FILE_ENV,
+        web.WEB_RELOAD_RAG_DIR_ENV,
+        web.WEB_RELOAD_RESUME_DIR_ENV,
     )
+    original_environment = {key: os.environ.get(key) for key in reload_env_keys}
 
-    assert calls == [
-        (
-            "job_hunting_agent.web:create_reloadable_web_app",
-            {
-                "factory": True,
-                "host": "0.0.0.0",
-                "port": 8123,
-                "reload": True,
-                "reload_dirs": [str(watch_dir)],
-            },
+    try:
+        for key in reload_env_keys:
+            os.environ.pop(key, None)
+
+        watch_dir = tmp_path / "source"
+        web.main(
+            [
+                "--db",
+                str(tmp_path / "agent.db"),
+                "--env-file",
+                str(tmp_path / ".env"),
+                "--rag-dir",
+                str(tmp_path / "chroma"),
+                "--resume-dir",
+                str(tmp_path / "resumes"),
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "8123",
+                "--reload",
+                "--reload-dir",
+                str(watch_dir),
+            ]
         )
-    ]
-    assert os.environ[web.WEB_RELOAD_DB_ENV] == str(tmp_path / "agent.db")
-    assert os.environ[web.WEB_RELOAD_ENV_FILE_ENV] == str(tmp_path / ".env")
-    assert os.environ[web.WEB_RELOAD_RAG_DIR_ENV] == str(tmp_path / "chroma")
-    assert os.environ[web.WEB_RELOAD_RESUME_DIR_ENV] == str(tmp_path / "resumes")
+
+        assert calls == [
+            (
+                "job_hunting_agent.web:create_reloadable_web_app",
+                {
+                    "factory": True,
+                    "host": "0.0.0.0",
+                    "port": 8123,
+                    "reload": True,
+                    "reload_dirs": [str(watch_dir)],
+                },
+            )
+        ]
+        assert os.environ[web.WEB_RELOAD_DB_ENV] == str(tmp_path / "agent.db")
+        assert os.environ[web.WEB_RELOAD_ENV_FILE_ENV] == str(tmp_path / ".env")
+        assert os.environ[web.WEB_RELOAD_RAG_DIR_ENV] == str(tmp_path / "chroma")
+        assert os.environ[web.WEB_RELOAD_RESUME_DIR_ENV] == str(tmp_path / "resumes")
+    finally:
+        # 生产入口会为重载子进程保留变量；测试必须自行恢复，避免污染后续用例。
+        for key, value in original_environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
