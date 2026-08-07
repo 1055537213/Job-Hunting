@@ -11,7 +11,7 @@
 - 上传 DOCX、文字 PDF 或扫描 PDF 简历，扫描件通过本地 OCR 提取文字。
 - 根据目标职位生成证据约束的简历草稿和独立 DOCX/PDF 文件，不覆盖候选人档案或原文件。
 - 根据候选人主动带回的 HR 问题生成可编辑回复草稿。
-- 在对话中自动判断内容应保存到 SQLite 结构化存储还是长文本 RAG 知识库。
+- 在对话中自动判断内容应保存到 PostgreSQL 结构化存储还是长文本 RAG 知识库。
 
 系统的外部操作边界如下：
 
@@ -31,12 +31,12 @@
 - 模型接入：内部 Model Gateway 统一调用 OpenAI-compatible Chat API，通过 `.env` 配置供应商标签、模型、密钥和地址。
 - Embedding：支持 OpenAI-compatible、provider-native 多模态协议；未配置时回退到本地 hash embedding。
 - Rerank：支持常见 `/rerank` 协议或 provider-native 协议，对向量召回候选再次排序；未配置时保持纯向量检索。
-- 结构化存储：SQLite。
-- 语义检索：Chroma、LangChain Chroma 集成、LangChain 文本切分器。
+- 结构化存储：PostgreSQL、SQLAlchemy、Alembic；SQLite 仅保留给迁移和单元测试适配。
+- 语义检索：生产环境使用 PostgreSQL + pgvector 的 `rag_chunks`，文本切分使用 LangChain；Chroma 仅保留给 SQLite 离线测试回退。
 - 简历文档：python-docx、pdfplumber、PDFium、RapidOCR、ONNX Runtime、ReportLab。
 - 前端：Vue 3 本地静态构建、SSE 流式聊天、Markdown 渲染。
 - 认证：Argon2id 密码哈希、HttpOnly Session Cookie。
-- 容器化：Docker、Docker Compose；当前用于复现 SQLite + Chroma 本地开发环境。
+- 容器化：Docker、Docker Compose；默认启动 PostgreSQL + pgvector、Alembic 迁移和 Web 服务。
 - 测试：pytest。
 
 ## 项目架构
@@ -69,9 +69,11 @@ JobHuntingAgent
           +----------------------+
           |                      |
           v                      v
-SQLite 结构化事实源       Chroma RAG 索引          受控文件目录
+PostgreSQL 事实源          pgvector RAG 索引        受控文件目录
 学历、经验、技能、证书     项目描述、成果材料、       原始 DOCX/PDF、
 偏好、职位字段、文件元数据  职位全文、简历片段         职位定制 DOCX/PDF
+          |
+          +--> long_texts 事实源 -> rag_chunks 派生向量索引
 ```
 
 ### 数据流
@@ -79,15 +81,15 @@ SQLite 结构化事实源       Chroma RAG 索引          受控文件目录
 1. 用户登录后选择候选人档案和求职会话。
 2. 用户输入资料、职位文本、项目目录、简历文件或 HR 问题。
 3. LangChain Agent 判断需要调用的工具。
-4. 工具把可精确比较的字段写入 SQLite，把长文本切分后写入 Chroma。
-5. 查询先由 Chroma 召回证据候选；启用 Rerank 后，再按“查询 + 候选正文”重排并选出最终证据。
-6. 匹配、简历改写和回复草稿同时读取 SQLite 事实、上传简历正文与 RAG 证据。
+4. 工具把可精确比较的字段写入 PostgreSQL，把长文本登记到 `long_texts` 并切分、嵌入到 `rag_chunks`。
+5. 查询先在 PostgreSQL 中按账号过滤并用 pgvector 召回证据候选；启用 Rerank 后，再按“查询 + 候选正文”重排并选出最终证据。
+6. 匹配、简历改写和回复草稿同时读取 PostgreSQL 事实、上传简历正文与 RAG 证据。
 7. 模型输出经过事实边界检查；不安全时回退到规则版草稿。
 8. Agent、Embedding 和 Rerank 的供应商 Token usage 按账号写入 `usage_events`，供后台统计和后续计费。
 
 ### 存储边界
 
-SQLite 是结构化事实源，适合精确过滤和比较：
+PostgreSQL 是结构化事实源，适合精确过滤和比较：
 
 - 学历。
 - 工作和项目经验年限。
@@ -98,7 +100,7 @@ SQLite 是结构化事实源，适合精确过滤和比较：
 - 账号、Session、候选人档案、对话和 Token 用量。
 - 简历文件版本、文件哈希、解析方式、源文件与定制文件关系。
 
-Chroma 是派生的语义检索索引，适合长文本召回：
+`rag_chunks` 是 PostgreSQL 中由 pgvector 支撑的派生语义检索索引，适合长文本召回：
 
 - 项目描述和成果材料。
 - 本地项目分析摘要。
@@ -107,7 +109,8 @@ Chroma 是派生的语义检索索引，适合长文本召回：
 - 上传简历中提取的正文。
 - HR 对话上下文。
 
-向量库不是唯一事实源。结构化字段和候选人确认状态始终以 SQLite 为准。
+向量索引不是唯一事实源。结构化字段和候选人确认状态始终以 PostgreSQL 为准；SQLite
+离线测试仍可使用 Chroma 回退，但生产 Web 不会读写 `data/chroma`。
 
 ## 目录结构
 
@@ -121,6 +124,8 @@ Job-hunting Agent/
 │     ├─ cli.py                   # CLI 入口
 │     ├─ city_catalog.py          # 全国城市规范化和可替换的邻近城市目录
 │     ├─ config.py                # .env 和运行配置
+│     ├─ database_migrations.py   # Alembic 升级、回退和版本检查入口
+│     ├─ database_schema.py       # PostgreSQL/pgvector 目标 schema
 │     ├─ conversation_ingestion.py# 对话内容分类与自动入库
 │     ├─ conversation_memory.py   # 持久化记忆和上下文压缩
 │     ├─ job_parser.py            # BOSS 职位文本解析与校验
@@ -129,11 +134,13 @@ Job-hunting Agent/
 │     ├─ model_gateway.py         # 统一模型调用、用量和调用 ID
 │     ├─ models.py                # 数据模型和领域对象
 │     ├─ project_analyzer.py      # 本地项目最小必要读取与分析
-│     ├─ rag.py                   # LangChain + Chroma RAG
+│     ├─ rag.py                   # Embedding、文本切分、Rerank 与 Chroma 测试回退
+│     ├─ pgvector_rag.py           # PostgreSQL pgvector RAG 索引与检索
 │     ├─ resume_document.py       # DOCX/PDF 解析、扫描 PDF OCR 和受控文件存储
 │     ├─ resume_exporter.py       # 职位定制 DOCX/PDF 导出
 │     ├─ resume_writer.py         # 证据约束的简历草稿
-│     ├─ storage.py               # SQLite 持久化和查询
+│     ├─ storage.py               # 领域持久化逻辑与 SQLite 测试适配器
+│     ├─ sqlalchemy_store.py      # SQLAlchemy/PostgreSQL 生产仓储适配层
 │     ├─ web.py                   # FastAPI API 和 SSE
 │     └─ web_static/
 │        ├─ index.html            # Vue 3 页面结构
@@ -143,6 +150,8 @@ Job-hunting Agent/
 │        ├─ tokens.css            # 前端设计 Token
 │        └─ vendor/vue.global.prod.js
 ├─ tests/                         # 单元测试和 Web/API 回归测试
+├─ alembic/                       # 冻结的数据库版本迁移脚本
+├─ alembic.ini                    # Alembic 运行配置
 ├─ docs/
 │  ├─ adr/                        # 架构决策记录
 │  ├─ learning/                   # 面向初学者的技术栈与操作说明
@@ -159,19 +168,22 @@ Job-hunting Agent/
 └─ .gitignore                     # 密钥、数据库、缓存和运行数据忽略规则
 ```
 
-`data/` 不提交到代码仓库。首次运行 Web 或 CLI 时会自动生成 SQLite 数据库、
-Chroma 索引和简历文件目录。
+`data/` 不提交到代码仓库。生产 Web 数据在 Docker named volume `postgres_data` 中；
+`data/` 只保留上传简历、导出文件和可选的 SQLite/Chroma 测试回退目录。生产向量索引保存在
+`postgres_data` volume 中；SQLite 文件仅用于自动化测试。
 
 ## 核心文件说明
 
 ### 项目入口和配置
 
-- `pyproject.toml`：声明 Python 版本、LangChain/FastAPI/Chroma/Argon2id 依赖，以及 `job-agent` 和 `job-agent-web` 命令。
-- `compose.yaml`：提供稳定、可复现的 Docker Web 服务配置；源码通过构建写入镜像。
+- `pyproject.toml`：声明 Python 版本、LangChain/FastAPI/SQLAlchemy/Alembic/pgvector 依赖，以及 `job-agent` 和 `job-agent-web` 命令。
+- `compose.yaml`：按 `postgres -> migrate -> web` 顺序启动 PostgreSQL、Alembic 和 Web；源码通过构建写入镜像。
 - `compose.dev.yaml`：仅在本机开发时叠加源码挂载和 Uvicorn 重载，不应直接用于部署环境。
 - `.env.example`：展示模型、Embedding、记忆和 Cookie 配置项；真实 `.env` 不提交。
 - `src/job_hunting_agent/config.py`：读取并校验环境变量，避免 API Key 写死在代码中。
-- `src/job_hunting_agent/cli.py`：提供数据库初始化、创建管理员、创建档案、职位导入、RAG 重建和 Agent 对话命令。
+- `src/job_hunting_agent/cli.py`：提供数据库配置检查、升级、创建管理员、创建档案、职位导入、RAG 重建和 Agent 对话命令。
+- `src/job_hunting_agent/database_schema.py`、`database_migrations.py`：定义生产目标表和可追踪的 Alembic 迁移入口。
+- `src/job_hunting_agent/sqlalchemy_store.py`：将既有业务仓储接口接到 SQLAlchemy/PostgreSQL，并阻止 Web 在启动时自行建表。
 - `src/job_hunting_agent/web.py`：提供认证、候选人档案、会话、职位、匹配、简历上传/下载、管理员和 SSE 聊天 API。
 
 ### 业务核心
@@ -188,10 +200,11 @@ Chroma 索引和简历文件目录。
 
 ### 数据、记忆和模型
 
-- `storage.py`：管理 SQLite 表、账号隔离、候选人档案、聊天消息、职位、简历文件版本和 Token 用量。
-- `rag.py`：负责文本切分、Embedding、Chroma 写入、账号过滤、增量索引和可选 Rerank 重排。
+- `storage.py`：保留领域读写逻辑和 SQLite 测试适配器；生产 Web 通过 `sqlalchemy_store.py` 使用 PostgreSQL。
+- `rag.py`：负责文本切分、Embedding 身份、可选 Rerank 和 Chroma 测试回退。
+- `pgvector_rag.py`：在 PostgreSQL 中执行账号过滤、稳定 chunk upsert、余弦检索和模型/维度隔离。
 - `conversation_ingestion.py`：判断当前对话内容应保存为结构化事实、长文本材料、项目确认项或普通聊天。
-- `conversation_memory.py`：从 SQLite 恢复会话，超过阈值时压缩旧消息并保留最近上下文。
+- `conversation_memory.py`：从持久化会话恢复上下文，超过阈值时压缩旧消息并保留最近上下文。
 - `model_gateway.py`：为聊天、Embedding 和 Rerank 调用统一创建配置、有限重试、`call_id` 和不含正文的 Token 用量流水。
 - `llm.py`：封装 LangChain ChatModel 与 OpenAI-compatible 接口细节。
 - `auth.py`：实现 Argon2id 密码哈希、Session 滑动过期、最长有效期和退出所有设备。
@@ -233,6 +246,9 @@ JOB_AGENT_EMBEDDING_MODEL=local-hash
 
 JOB_AGENT_MEMORY_ENABLED=true
 JOB_AGENT_COOKIE_SECURE=false
+
+# 仅在宿主机直接启动 Web/CLI 时配置；Docker Compose 会自动使用容器内地址。
+JOB_AGENT_DATABASE_URL=postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent
 ```
 
 聊天模型、Embedding 模型和 Rerank 模型可以来自不同供应商。需要真实语义 Embedding 时，按
@@ -263,31 +279,50 @@ python -m job_hunting_agent.cli --env-file .env embedding-config
 python -m job_hunting_agent.cli --env-file .env rerank-config
 ```
 
-更换 Embedding 模型后，必须停止网页服务并对所有账号做一次全量 RAG 重建。Chroma 的一个集合
-不能混存不同维度或不同语义空间的向量；仅做增量索引会留下旧向量，导致查询失败或结果失真。
+更换 Embedding 模型、端点或维度后，必须停止网页服务并对所有账号做一次全量 RAG 重建。
+pgvector 会用不含密钥的模型身份和维度隔离旧向量，避免混用不同语义空间；仅做增量索引会让
+旧材料不再被当前模型召回。
 
 ```powershell
 python -m job_hunting_agent.cli `
   --db data/job_agent.db `
   --env-file .env `
-  --rag-dir data/chroma `
+  --account-id 1 `
   rag-rebuild
 ```
 
-Rerank 不参与建库，因此以后只更换 Rerank 模型时不需要重建 Chroma 索引。
+生产 PostgreSQL 会忽略 `--rag-dir`；该参数只为 SQLite/Chroma 离线测试回退保留。生产 CLI
+中所有读取或写入账号数据的命令都必须在子命令前传入 `--account-id <账号 ID>`，避免跨账号访问。
+Rerank 不参与建库，因此以后只更换 Rerank 模型时不需要重建 RAG 索引。
 
 职位匹配的方向维度可以选择启用 Embedding/Rerank 语义评分：将
 `JOB_AGENT_MATCHING_SEMANTIC` 设为 `true` 后，职位标题占 30%，职位描述正文占 70%，
 多个目标方向取最高分。未启用、模型配置不完整或上游调用失败时，系统回退到同一比例的
 关键词评分，并在匹配风险中标记回退原因；不会因为语义服务故障阻断职位匹配。
 
-### 3. 启动网页
+### 3. 本机直接启动网页（可选）
+
+先确保本机 PostgreSQL 已启动并把 schema 升级到最新版本。使用 Docker 提供的数据库时，
+先只启动 `postgres` 服务，再从宿主机执行迁移：
+
+```powershell
+docker compose up -d postgres
+python -m job_hunting_agent.cli --env-file .env database-upgrade
+```
+
+可以先检查脱敏后的连接和当前迁移版本：
+
+```powershell
+python -m job_hunting_agent.cli --env-file .env database-config
+python -m job_hunting_agent.cli --env-file .env database-current
+```
+
+然后启动网页：
 
 ```powershell
 python -m job_hunting_agent.web `
   --db data/job_agent.db `
   --env-file .env `
-  --rag-dir data/chroma `
   --resume-dir data/resumes
 ```
 
@@ -312,13 +347,12 @@ python -m job_hunting_agent.cli `
 在启动服务的终端按 `Ctrl+C`。如果服务由后台进程启动，需要结束对应的
 `python -m job_hunting_agent.web` 进程。
 
-### 5. 使用 Docker Compose 启动
+### 5. 使用 Docker Compose 启动完整本地环境
 
 如果不想在本机安装 Python 依赖，可以使用项目提供的 Docker 开发环境。第一次使用时，
 确保项目根目录存在真实 `.env`；`.env` 只会以只读文件挂载到容器，不会打进镜像。
 
 ```powershell
-docker compose build
 docker compose up -d
 docker compose ps
 ```
@@ -326,17 +360,20 @@ docker compose ps
 浏览器仍然访问 `http://127.0.0.1:8000`。查看日志、停止和删除容器：
 
 ```powershell
+docker compose logs -f migrate
 docker compose logs -f web
 docker compose stop
 docker compose down
 ```
 
-`data/` 是宿主机绑定目录，保存 SQLite、Chroma、上传简历和导出文件；`down` 不会删除
-这些数据。完整的 Docker 技术栈解释、首次启动步骤和后续扩展顺序见
+Compose 会依次启动 `postgres`、执行一次 `migrate`、再启动 `web`。`migrate` 显示
+`Exited (0)` 表示迁移已完成，不是故障。`postgres_data` 是 Docker named volume，`down` 不会删除
+数据库；`data/` 是宿主机绑定目录，保存上传简历和导出文件；生产 RAG 向量保存在 PostgreSQL。完整的 Docker 技术栈解释、首次启动步骤和后续扩展顺序见
 [Docker 本地开发环境学习说明](./docs/learning/docker-environment.md)。
 
-当前 Compose 只包含 `web` 服务，与本地 SQLite + Chroma 实现对应。PostgreSQL、pgvector、
-Redis、Worker、MinIO 和反向代理会在完成相应代码和迁移后再加入。
+本地开发使用 `POSTGRES_HOST_AUTH_METHOD=trust`，并且端口只绑定 `127.0.0.1`；它只适合这台
+开发机。生产部署必须改为密码/Secret 管理、受限网络和 TLS。当前 Web 已将 RAG 读写切换到
+PostgreSQL + pgvector；SQLite/Chroma 只用于离线兼容和自动化测试。
 
 ### 5.1 本机开发时启用源码热更新
 
@@ -421,7 +458,7 @@ HR 回复只生成可编辑草稿，发送动作由候选人自行完成。
 6. 不把测试数据、临时日志、截图和本机路径当成正式运行依赖。
 7. 不在文档中写入 API Key、密码、Session、个人简历或职位隐私内容。
 8. 对 BOSS 直聘的接入边界、候选人确认和人工发送动作必须明确说明。
-9. 对 SQLite 事实源、RAG 派生索引和职位定制简历版本之间的关系必须保持一致。
+9. 对 PostgreSQL 事实源、RAG 派生索引和职位定制简历版本之间的关系必须保持一致。
 
 ## 结构要求
 

@@ -18,8 +18,10 @@ from job_hunting_agent.rag import (
     NativeMultimodalEmbeddings,
     RAGKnowledgeBase,
     RerankResult,
+    OpenAICompatibleEmbeddings,
     build_rag_embeddings,
     build_reranker,
+    rag_embedding_model_name,
 )
 
 
@@ -71,6 +73,30 @@ def test_native_settings_load_explicit_protocols_and_mask_key(tmp_path):
     assert "test-rag-key" not in str(masked_rerank_settings(rerank))
     assert isinstance(build_rag_embeddings(env_file), NativeMultimodalEmbeddings)
     assert isinstance(build_reranker(env_file), HttpReranker)
+
+
+def test_embedding_identity_separates_same_named_models_from_different_endpoints():
+    """相同模型名但不同供应商端点的向量不能被 pgvector 当作同一语义空间。"""
+
+    first = OpenAICompatibleEmbeddings(
+        api_key="first-secret-key",
+        base_url="https://first-provider.example/v1",
+        model="shared-embedding-model",
+        dimensions=1024,
+    )
+    second = OpenAICompatibleEmbeddings(
+        api_key="second-secret-key",
+        base_url="https://second-provider.example/v1",
+        model="shared-embedding-model",
+        dimensions=1024,
+    )
+
+    first_identity = rag_embedding_model_name(first)
+    second_identity = rag_embedding_model_name(second)
+
+    assert first_identity != second_identity
+    assert "secret" not in first_identity
+    assert "secret" not in second_identity
 
 
 def test_native_multimodal_embeddings_use_native_payload_and_restore_input_order():

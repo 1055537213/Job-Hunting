@@ -16,8 +16,8 @@
 
 | 领域 | 本地开发/测试 | 线上生产 | 迁移策略 |
 |---|---|---|---|
-| 关系数据库 | SQLite | PostgreSQL | Alembic 管理版本，不在请求启动时临时改生产表 |
-| 向量检索 | Chroma 可继续用于教学和离线测试 | PostgreSQL + pgvector | 先双写/回填校验，再切读路径 |
+| 关系数据库 | PostgreSQL + pgvector Compose 开发库；SQLite 仅用于自动化测试 | PostgreSQL | Alembic 管理版本，不在请求启动时临时改生产表 |
+| 向量检索 | PostgreSQL + pgvector；Chroma 仅用于 SQLite 离线测试回退 | PostgreSQL + pgvector | 测试数据可丢弃，真实旧数据才需要回填校验 |
 | 模型接入 | `.env` 配置 OpenAI-compatible 接口 | 内部 Model Gateway 模块 | 先保留在模块化单体内，达到拆分条件后再独立服务 |
 | 文件存储 | 本地受控目录 | S3-compatible 对象存储 | 数据库只存对象键、哈希、版本和归属 |
 | 本地编排 | Docker Compose | Docker Compose 可用于单机早期环境 | 多副本和弹性需求出现后再引入 Kubernetes |
@@ -115,12 +115,17 @@ ModelGateway.embed(operation, texts, context)
 
 - 引入 SQLAlchemy 2.x 数据访问层和 Alembic。
 - 创建 PostgreSQL schema，保留 `account_id`、外键、唯一约束和必要索引。
-- 将 SQLite 作为本地适配器，不用 SQLite 特有语义污染领域接口。
-- 将 Chroma 文档 ID、chunk metadata 和向量迁移到 pgvector。
-- 编写 SQLite 到 PostgreSQL 的一次性导入和校验脚本。
+- 将 SQLite 作为测试适配器，不用 SQLite 特有语义污染领域接口。
+- 将稳定 chunk ID、chunk metadata 和向量写入 pgvector。
+- 若存在真实旧数据，编写一次性 SQLite 到 PostgreSQL 的导入和校验脚本。
+
+当前状态：已完成 SQLAlchemy Engine/事务边界、冻结初始 Alembic revision、PostgreSQL +
+pgvector Compose 启动链、Web 对 PostgreSQL 的结构化读写，以及 pgvector 的全量重建、增量
+upsert、账号隔离检索、删除级联和真实 PostgreSQL 回归。当前测试数据允许丢弃，因此不实施
+SQLite 或 Chroma 数据导入。
 
 完成门槛：空库可由 Alembic 升级到最新；生产启动不执行 `CREATE TABLE IF NOT EXISTS`；
-回填后记录数、归属关系、向量检索样本和哈希校验一致。
+RAG 在数据库内按账号隔离检索，重复增量索引不产生重复 chunk，删除事实源会级联删除向量。
 
 ### 阶段 3：对象存储与后台任务
 
@@ -201,9 +206,9 @@ Kubernetes 不是上线前置条件。只有出现以下需求时再进入该阶
 
 - 已有：账号/Session、候选人多档案、多会话、Token 用量流水、LangChain Agent、RAG、职位匹配、内部 Model Gateway，以及可选 provider-native Embedding/Rerank。
 - 本轮恢复：DOCX/PDF 上传、文字层解析、扫描 PDF OCR、简历文件版本、职位定制 DOCX/PDF 和鉴权下载。
-- 本轮新增：Dockerfile 和 Docker Compose 本地开发环境；它只封装当前 SQLite + Chroma Web 服务，
-  不代表 PostgreSQL、对象存储、任务队列或生产可观测性已经完成。
-- 尚未实施：SQLAlchemy/Alembic、PostgreSQL/pgvector、对象存储、任务队列和生产可观测性。
+- 本轮新增：SQLAlchemy、Alembic、PostgreSQL + pgvector Compose 服务、冻结的生产 schema，
+  以及 `postgres -> migrate -> web` 启动链。Web 的结构化业务读写已切换到 PostgreSQL。
+- 尚未实施：对象存储、任务队列和生产可观测性。
 
-后续改造必须按上述阶段逐步提交。不能在尚未建立迁移和回滚能力时，直接把本地 SQLite
-数据路径替换成生产 PostgreSQL，也不能在文件仍依赖单机目录时先做多副本部署。
+后续改造必须按上述阶段逐步提交。当前 pgvector RAG 已进入生产读写路径；Chroma 保留为
+SQLite 离线测试回退。在文件仍依赖单机目录时，不能先做多副本部署。

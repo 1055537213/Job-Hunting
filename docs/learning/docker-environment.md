@@ -1,144 +1,166 @@
-# Docker 本地开发环境学习说明
+# Docker 与 PostgreSQL 本地开发环境
 
 ## 这次改进解决什么问题
 
-之前启动项目依赖本机的 Python、虚拟环境和已经安装的第三方包。换一台电脑时，
-即使源码相同，也可能因为 Python 版本、系统库或依赖版本不同而启动失败。
+以前网页服务把结构化数据写入 `data/job_agent.db` 的 SQLite 文件。现在这些数据只包含
+测试内容，所以没有设计旧数据导入，而是直接把实际 Web 服务切换到 PostgreSQL。这样账号、
+候选人档案、会话、职位、简历元数据和 Token 用量能使用外键、约束、事务和版本化迁移。
 
-这次把当前“SQLite + Chroma + 本地文件目录”的开发版封装为一个可重复启动的
-Docker 服务。容器删除不会删除宿主机 `data/` 中的测试数据。
+Docker Compose 现在不只是启动一个 Web 容器，而是按下面的顺序启动：
+
+```text
+postgres healthy
+      |
+      v
+migrate runs Alembic upgrade
+      |
+      v
+web starts FastAPI + Vue
+```
+
+Web 启动时只验证 Alembic revision，不会自行执行 `CREATE TABLE`。这让数据库结构变化
+始终有一个可追踪、可回退的版本记录。
 
 ## 本次使用的技术栈
 
-| 技术 | 作用 | 为什么现在选用 |
+| 技术 | 在项目中的作用 | 为什么现在选用 |
 | --- | --- | --- |
-| Docker | 把 Python、依赖和启动命令封装成镜像 | 让项目在不同电脑上拥有一致的运行环境 |
-| Dockerfile | 描述镜像如何一步步构建 | 构建过程可审查、可复现，适合学习容器基础 |
-| Docker Compose | 用 YAML 声明服务、端口、挂载和健康检查 | 当前只有一个 Web 容器，但以后可以自然扩展 PostgreSQL、Redis 和 Worker |
-| `python:3.12-slim` | Python 运行时基础镜像 | 与 `pyproject.toml` 的 Python 要求一致，同时比完整系统镜像更小 |
-| Bind mount | 把宿主机 `data/` 映射到容器 `/app/data` | SQLite、Chroma 和简历文件需要在容器重建后继续保留 |
-| Healthcheck | 定期请求 `/api/health` | “进程启动了”和“服务真的能响应”是两件事，健康检查能区分它们 |
-| `.dockerignore` | 排除密钥、数据库、缓存和 Git 文件 | 降低构建上下文大小，避免把敏感数据复制进镜像 |
+| Docker | 封装 Python、OCR/PDF 依赖和启动命令 | 不同电脑可以使用相同运行环境 |
+| Dockerfile | 构建同时含应用代码和 Alembic 脚本的镜像 | Web 与迁移使用同一版本，避免代码和表结构错配 |
+| Docker Compose | 声明 `postgres`、`migrate`、`web` 的网络、卷和依赖顺序 | 比手工启动三个进程更可复现，适合当前单机开发 |
+| PostgreSQL 16 | 保存账号、档案、会话、职位、文件元数据和用量账本 | 支持事务、外键、JSONB、严格约束和生产级运维能力 |
+| pgvector | 提供 PostgreSQL 的 `vector` 列类型和余弦距离查询 | RAG 分块、账号过滤和结构化事实可在同一个事务型数据库中管理 |
+| SQLAlchemy 2.x | 创建 Engine、连接池和跨数据库的执行边界 | 业务层不直接绑定 psycopg 或 SQLite 驱动 |
+| Alembic | 管理 `20260807_0001` 等数据库版本 | 新增字段、索引或表时能升级、审计和回退 |
+| Psycopg 3 | SQLAlchemy 连接 PostgreSQL 的驱动 | SQLAlchemy 2.x 官方支持良好，支持 PostgreSQL 类型 |
+| Docker named volume | 保存 PostgreSQL 数据目录 | 容器重建后数据库不会消失 |
+| Bind mount | 把宿主机 `data/` 映射到容器 | 上传简历和导出文件可在容器重建后保留 |
+| Healthcheck | 检查 PostgreSQL 可连接和 Web `/api/health` 可响应 | 区分“进程已启动”和“服务确实可用” |
 
-## 文件之间的关系
+## 当前数据边界
 
-```text
-compose.yaml
-    | 读取 Dockerfile、挂载 .env 和 data/
-    v
-Dockerfile
-    | 构建 Python 3.12 + 项目依赖
-    v
-job-agent-web
-    | 监听容器 8000 端口
-    v
-宿主机 http://127.0.0.1:8000
-
-宿主机 data/ <----> 容器 /app/data
-  SQLite / Chroma / resumes
-```
+- PostgreSQL 是结构化事实源，也是 Web 服务实际使用的数据库。
+- `data/` 只保存上传简历、导出文件和可选的 SQLite/Chroma 测试回退，不再作为生产 SQLite 数据库位置。
+- SQLite 仍保留在单元测试和 Alembic 迁移测试中，用于快速、隔离地验证 SQL 兼容性。
+- PostgreSQL 的 `rag_chunks.embedding` 已由 pgvector 实际读写；检索先在数据库内按账号过滤，
+  再按余弦距离排序。Chroma 只保留给 SQLite 离线测试回退。
 
 ## 第一次启动
 
-确认项目根目录有 `.env`。如果是从 GitHub 新下载的项目，先复制模板并填写模型配置：
+确认项目根目录存在真实 `.env`。如果是从 GitHub 新下载的项目，先复制模板并填写模型配置：
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-然后构建并后台启动：
+默认使用 Docker Hub 镜像：
 
 ```powershell
-docker compose build
-docker compose up -d
-```
-
-如果 Docker Hub 在当前网络中无法访问，可以临时使用一个兼容的 Python 基础镜像源：
-
-```powershell
-$env:JOB_AGENT_DOCKER_BASE_IMAGE = "dockerproxy.net/library/python:3.12-slim"
-docker compose build
-Remove-Item Env:JOB_AGENT_DOCKER_BASE_IMAGE
-```
-
-这个变量只影响基础镜像下载，不会改变应用使用的 LLM、Embedding 或 RAG 配置。
-如果没有网络限制，不需要设置它，默认仍使用官方 `python:3.12-slim`。
-
-查看容器状态：
-
-```powershell
+docker compose up -d --build
 docker compose ps
 ```
 
-当 `web` 的状态显示 `healthy` 后，在浏览器打开：
+网络无法访问 Docker Hub 时，可以只在当前 PowerShell 会话使用镜像镜像源：
+
+```powershell
+$env:JOB_AGENT_DOCKER_BASE_IMAGE = "dockerproxy.net/library/python:3.12-slim"
+$env:JOB_AGENT_POSTGRES_IMAGE = "dockerproxy.net/pgvector/pgvector:pg16"
+docker compose up -d --build
+Remove-Item Env:JOB_AGENT_DOCKER_BASE_IMAGE
+Remove-Item Env:JOB_AGENT_POSTGRES_IMAGE
+```
+
+`postgres` 应显示 `healthy`，`migrate` 应显示 `Exited (0)`，`web` 应显示 `healthy`。
+迁移日志可以确认 revision：
+
+```powershell
+docker compose logs migrate
+```
+
+浏览器访问：
 
 ```text
 http://127.0.0.1:8000
 ```
 
+## 本机直接运行 Python
+
+如果不使用 Web 容器，而是在宿主机运行 `python -m job_hunting_agent.web`，先启动数据库：
+
+```powershell
+docker compose up -d postgres
+```
+
+在 `.env` 增加本机连接地址，再执行迁移：
+
+```dotenv
+JOB_AGENT_DATABASE_URL=postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent
+```
+
+```powershell
+python -m job_hunting_agent.cli --env-file .env database-upgrade
+python -m job_hunting_agent.web --env-file .env
+```
+
+Docker 中的 Web 不使用这个 `127.0.0.1` 地址，Compose 会将其覆盖为 `postgres` 服务名。
+
 ## 常用操作
 
 ```powershell
-# 查看实时日志
+# 查看 PostgreSQL、迁移和网页日志
+docker compose logs -f postgres
+docker compose logs migrate
 docker compose logs -f web
 
-# 修改 Python 代码或依赖后重新构建并启动
-docker compose up -d --build
-
-# 停止服务，但保留 data/ 中的数据库、向量索引和简历文件
+# 停止容器，但保留 PostgreSQL volume 和 data/ 文件
 docker compose stop
 
-# 停止并删除容器；由于 data/ 是绑定挂载，宿主机数据仍会保留
+# 删除容器与网络，仍保留 PostgreSQL volume 和 data/ 文件
 docker compose down
 
-# 查看健康检查返回值
+# 查看 Web 健康检查
 Invoke-WebRequest http://127.0.0.1:8000/api/health | Select-Object -ExpandProperty Content
+
+# 仅查看脱敏后的数据库配置和当前 revision
+python -m job_hunting_agent.cli --env-file .env database-config
+python -m job_hunting_agent.cli --env-file .env database-current
 ```
+
+当前数据库数据是测试数据时，可重新创建 PostgreSQL：
+
+```powershell
+docker compose down -v
+docker compose up -d
+```
+
+`down -v` 会删除 `postgres_data`，其中也包含生产 RAG 向量；不会删除宿主机 `data/` 中的
+简历文件或可选的 Chroma 测试回退。存在需要保留的数据库数据或简历文件时，不应执行此命令。
 
 ## 开发模式：源码热更新
 
-默认的 `compose.yaml` 用于验证可复现镜像：源码在构建时复制到镜像，因此修改 Python 或前端文件后需要重新执行
-`docker compose up -d --build`。本项目额外提供 `compose.dev.yaml`，它只在本机开发时把 `src/` 以只读方式挂载到
-容器，并让 Uvicorn 监听 `/app/src`。
+默认 `compose.yaml` 使用镜像中的固定源码，适合检查可复现部署。修改 Python、Alembic、
+依赖或 Dockerfile 后需要重新构建：
 
-第一次进入开发模式或修改依赖、`Dockerfile` 后，先构建一次：
+```powershell
+docker compose up -d --build
+```
+
+日常改动 `src/` 下的 Python、Vue JS 或 CSS 时，可以叠加本机开发配置：
 
 ```powershell
 docker compose -f compose.yaml -f compose.dev.yaml up -d --build
 ```
 
-之后修改 `src/` 中的内容时，不需要再次构建镜像：Python 文件变化会自动重启 Web 子进程；Vue 静态 JS/CSS 文件在浏览器刷新后
-即可读取新版本。查看开发服务日志：
-
-```powershell
-docker compose -f compose.yaml -f compose.dev.yaml logs -f web
-```
-
-`.env` 仍在应用启动时读取，修改后需要重启开发服务：
+Python 文件变动会触发 Uvicorn 重载；前端静态文件刷新浏览器即可读取。`.env` 变化后仍需：
 
 ```powershell
 docker compose -f compose.yaml -f compose.dev.yaml restart web
 ```
 
-热更新仅限本机开发。部署环境应继续使用不叠加 `compose.dev.yaml` 的固定镜像，避免宿主机代码变化直接影响线上服务。
+## 安全边界
 
-## 现在为什么只有一个 `web` 服务
-
-当前项目本地开发仍使用 SQLite、Chroma 和本地文件目录。把 PostgreSQL、pgvector、
-Redis、MinIO 和 Worker 现在全部加入 Compose，会让你同时面对数据库迁移、对象存储、
-任务队列和网络调试，学习成本很高，而且这些组件此刻还没有对应的业务代码。
-
-后续会按这个顺序扩展：
-
-1. 先完成 SQLAlchemy/Alembic，让数据结构可以安全迁移。
-2. 再加入 PostgreSQL + pgvector，并保留 SQLite 本地适配器。
-3. 然后加入 Redis 和 Worker，把 OCR、Embedding 与简历导出移出 Web 请求。
-4. 最后加入 MinIO/S3-compatible 对象存储和反向代理。
-
-## 重要边界
-
-- `docker compose down` 不等于删除业务数据；`data/` 仍在宿主机。
-- 删除或移动 `data/` 会丢失当前本地 SQLite、Chroma 和上传文件，操作前要备份。
-- `.env` 只挂载到容器，不会复制进镜像；不要把真实 API Key 写入 `compose.yaml`。
-- `JOB_AGENT_DOCKER_BASE_IMAGE` 只用于解决镜像下载网络问题，不要把带有账号密码的私有镜像地址写进仓库。
-- 这是本地开发环境，不代表已经具备企业生产部署所需的 HTTPS、备份、监控和高可用。
+- 当前 Compose 使用 `POSTGRES_HOST_AUTH_METHOD=trust`，只绑定 `127.0.0.1`，仅适合本机开发。
+- 生产环境必须改用强密码、Secret 管理、私有网络、最小权限账号和 TLS。
+- `.env` 仍只读挂载到容器，不会复制进镜像；不要把真实 API Key、数据库密码或 Session 写入 `compose.yaml`。
+- `JOB_AGENT_DOCKER_BASE_IMAGE` 和 `JOB_AGENT_POSTGRES_IMAGE` 仅解决镜像下载问题，不应作为生产固定依赖。
+- Redis、Worker、对象存储、备份、监控和高可用仍未实施，不能把当前 Compose 当作生产部署方案。

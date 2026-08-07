@@ -729,6 +729,111 @@ def read_collection_dimension(
     return len(vectors[0])
 
 
+def rag_embedding_model_name(embeddings: Embeddings) -> str:
+    """生成不含密钥的稳定 Embedding 身份，隔离不可直接比较的语义空间。"""
+
+    configured_model = getattr(embeddings, "model", None)
+    if isinstance(configured_model, str) and configured_model.strip():
+        model_label = configured_model.strip()
+    elif isinstance(embeddings, LocalHashEmbeddings):
+        model_label = f"local-hash-{embeddings.dimensions}"
+    else:
+        model_label = f"{type(embeddings).__module__}.{type(embeddings).__qualname__}"
+    # 相同模型名经由不同端点时不能默认表示相同模型；端点只参与哈希，不入库明文。
+    endpoint = getattr(embeddings, "embeddings_url", None) or getattr(embeddings, "endpoint", None) or ""
+    dimensions = getattr(embeddings, "dimensions", None)
+    identity_material = "|".join(
+        [
+            f"{type(embeddings).__module__}.{type(embeddings).__qualname__}",
+            model_label,
+            str(endpoint),
+            str(dimensions),
+        ]
+    )
+    identity_suffix = hashlib.sha256(identity_material.encode("utf-8")).hexdigest()[:16]
+    return f"{model_label[:220]}#{identity_suffix}"
+
+
+def build_rag_documents(
+    long_texts: list[LongTextRecord],
+    account_id: int | None = None,
+) -> list[Document]:
+    """把长文本事实源转换为与具体向量后端无关的 LangChain 文档。"""
+
+    documents: list[Document] = []
+    for record in long_texts:
+        if not record.text.strip():
+            continue
+        if account_id is not None and record.account_id is not None and record.account_id != account_id:
+            # 调用方可以传 account_id 做检索隔离，但不能借此重写已登记材料的真实归属。
+            raise ValueError("RAG 索引材料的账号归属与当前请求账号不一致。")
+        resolved_account_id = account_id if account_id is not None else record.account_id
+        metadata: dict[str, object] = {
+            "long_text_id": record.id,
+            "entity_type": record.entity_type,
+            "entity_id": record.entity_id,
+            "source_label": record.source_label,
+            "account_id": resolved_account_id if resolved_account_id is not None else -1,
+        }
+        if record.candidate_id is not None:
+            metadata["candidate_id"] = record.candidate_id
+        documents.append(Document(page_content=record.text, metadata=metadata))
+    return documents
+
+
+def split_rag_documents(documents: list[Document]) -> list[Document]:
+    """按统一规则切分文档，并为每一块生成跨后端稳定的 chunk ID。"""
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=80,
+        separators=["\n\n", "\n", "。", "；", "，", " ", ""],
+    )
+    chunks = splitter.split_documents(documents)
+    chunk_indexes_by_long_text: dict[int, int] = {}
+    for chunk in chunks:
+        long_text_id = int(chunk.metadata["long_text_id"])
+        chunk_index = chunk_indexes_by_long_text.get(long_text_id, 0)
+        chunk_indexes_by_long_text[long_text_id] = chunk_index + 1
+        chunk.metadata["chunk_index"] = chunk_index
+        chunk.metadata["chunk_id"] = f"long-text-{long_text_id}-chunk-{chunk_index}"
+    return chunks
+
+
+def rerank_rag_results(
+    query: str,
+    candidates: list[RAGSearchResult],
+    top_k: int,
+    reranker: Reranker | None,
+) -> list[RAGSearchResult]:
+    """把可选 Rerank 输出映射回向量召回结果，并保留来源与距离。"""
+
+    if not candidates or top_k <= 0 or reranker is None:
+        return candidates[:top_k]
+    rankings = reranker.rerank(
+        query,
+        [candidate.content for candidate in candidates],
+        top_n=min(top_k, len(candidates)),
+    )
+    selected_indices: set[int] = set()
+    reranked: list[RAGSearchResult] = []
+    for ranking in rankings:
+        if ranking.index in selected_indices or not 0 <= ranking.index < len(candidates):
+            continue
+        selected_indices.add(ranking.index)
+        reranked.append(candidates[ranking.index])
+        if len(reranked) >= top_k:
+            return reranked
+
+    # 上游偶发缺项时仍返回已经可靠召回的证据，避免无故丢失上下文。
+    for index, candidate in enumerate(candidates):
+        if index not in selected_indices:
+            reranked.append(candidate)
+        if len(reranked) >= top_k:
+            break
+    return reranked
+
+
 class RAGKnowledgeBase:
     """本地持久化 RAG 知识库门面。
 
@@ -921,30 +1026,7 @@ class RAGKnowledgeBase:
     ) -> list[RAGSearchResult]:
         """将向量召回候选映射回 Rerank 返回的原始索引，保留来源和向量距离。"""
 
-        if not candidates or top_k <= 0 or self.reranker is None:
-            return candidates[:top_k]
-        rankings = self.reranker.rerank(
-            query,
-            [candidate.content for candidate in candidates],
-            top_n=min(top_k, len(candidates)),
-        )
-        selected_indices: set[int] = set()
-        reranked: list[RAGSearchResult] = []
-        for ranking in rankings:
-            if ranking.index in selected_indices or not 0 <= ranking.index < len(candidates):
-                continue
-            selected_indices.add(ranking.index)
-            reranked.append(candidates[ranking.index])
-            if len(reranked) >= top_k:
-                return reranked
-
-        # 上游偶发缺项时仍返回已经可靠召回的证据，避免无故丢失上下文。
-        for index, candidate in enumerate(candidates):
-            if index not in selected_indices:
-                reranked.append(candidate)
-            if len(reranked) >= top_k:
-                break
-        return reranked
+        return rerank_rag_results(query, candidates, top_k, self.reranker)
 
     def _vector_store(self) -> Chroma:
         """创建 Chroma 向量库对象。"""
@@ -963,39 +1045,9 @@ class RAGKnowledgeBase:
     ) -> list[Document]:
         """把 SQLite 长文本记录转换为 LangChain Document。"""
 
-        documents = []
-        for record in long_texts:
-            if not record.text.strip():
-                continue
-            resolved_account_id = account_id if account_id is not None else record.account_id
-            documents.append(
-                Document(
-                    page_content=record.text,
-                    metadata={
-                        "long_text_id": record.id,
-                        "entity_type": record.entity_type,
-                        "entity_id": record.entity_id,
-                        "source_label": record.source_label,
-                        "account_id": resolved_account_id if resolved_account_id is not None else -1,
-                    },
-                )
-            )
-        return documents
+        return build_rag_documents(long_texts, account_id=account_id)
 
     def _split_documents(self, documents: list[Document]) -> list[Document]:
         """使用 LangChain 文本切分器切分文档，并补充 chunk metadata。"""
 
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=80,
-            separators=["\n\n", "\n", "。", "；", "，", " ", ""],
-        )
-        chunks = splitter.split_documents(documents)
-        chunk_indexes_by_long_text: dict[int, int] = {}
-        for chunk in chunks:
-            long_text_id = chunk.metadata["long_text_id"]
-            chunk_index = chunk_indexes_by_long_text.get(long_text_id, 0)
-            chunk_indexes_by_long_text[long_text_id] = chunk_index + 1
-            chunk.metadata["chunk_index"] = chunk_index
-            chunk.metadata["chunk_id"] = f"long-text-{long_text_id}-chunk-{chunk_index}"
-        return chunks
+        return split_rag_documents(documents)

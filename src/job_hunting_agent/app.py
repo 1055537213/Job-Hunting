@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from langchain_core.embeddings import Embeddings
+
 from .auth import AuthService
 from .config import DEFAULT_ENV_PATH, load_semantic_matching_enabled
 from .conversation_ingestion import decide_conversation_ingestion
@@ -32,7 +34,8 @@ from .models import (
 )
 from .model_gateway import ModelGateway
 from .project_analyzer import analyze_project
-from .rag import RAGKnowledgeBase
+from .pgvector_rag import PgVectorKnowledgeBase
+from .rag import RAGKnowledgeBase, Reranker
 from .resume_document import (
     ResumeFileStore,
     extract_resume_document,
@@ -243,11 +246,18 @@ class JobHuntingApp:
         rag_persist_directory: str | Path | None,
         account_id: int | None,
     ) -> dict[str, object]:
-        """清理 RAG chunk；SQLite 删除已经完成时，向调用方返回可读警告。"""
+        """清理 RAG chunk；结构化数据删除完成时，向调用方返回可读警告。"""
 
         long_text_ids = [int(item_id) for item_id in result.get("long_text_ids", [])]
         result["rag_deleted_chunks"] = 0
-        if not long_text_ids or rag_persist_directory is None:
+        if not long_text_ids:
+            return result
+        if self._uses_pgvector_rag():
+            # rag_chunks.long_text_id 使用 ON DELETE CASCADE；仓储删除事实源后，数据库会
+            # 在同一事务中删除派生向量。无需再创建 Embedding 客户端或做一次空删除查询。
+            result["rag_cleanup"] = "database_cascade"
+            return result
+        if rag_persist_directory is None:
             return result
         try:
             call_context = self.model_gateway.new_call_context(
@@ -618,13 +628,13 @@ class JobHuntingApp:
         return TailoredResumeResult(draft=draft_record, artifacts=saved_records)
 
     def rebuild_rag_index(self, persist_directory: str | Path = "data/chroma", account_id: int | None = None) -> RAGIndexStats:
-        """把 SQLite `long_texts` 全量同步到本地 Chroma RAG 索引。"""
+        """把长文本事实源全量同步到当前存储后端对应的 RAG 派生索引。"""
 
         call_context = self.model_gateway.new_call_context(
             "embedding_rebuild",
             account_id=account_id,
         )
-        knowledge_base = RAGKnowledgeBase(
+        knowledge_base = self._rag_knowledge_base(
             persist_directory,
             embeddings=self.model_gateway.embeddings(call_context),
         )
@@ -636,17 +646,17 @@ class JobHuntingApp:
         persist_directory: str | Path = "data/chroma",
         account_id: int | None = None,
     ) -> RAGIndexStats:
-        """把指定长文本增量追加到本地 Chroma RAG 索引。
+        """把指定长文本增量追加到当前 RAG 派生索引。
 
-        SQLite 仍然是长文本材料登记处；这个方法只把指定 ID 的材料同步到 Chroma，
-        适合对话式自动入库后的即时检索。
+        PostgreSQL 是长文本材料登记处；这个方法只同步指定 ID，适合对话式自动
+        入库后的即时检索。生产环境写入 pgvector，SQLite 测试环境继续写入 Chroma。
         """
 
         call_context = self.model_gateway.new_call_context(
             "embedding_index",
             account_id=account_id,
         )
-        knowledge_base = RAGKnowledgeBase(
+        knowledge_base = self._rag_knowledge_base(
             persist_directory,
             embeddings=self.model_gateway.embeddings(call_context),
         )
@@ -660,7 +670,7 @@ class JobHuntingApp:
         entity_types: list[str] | None = None,
         account_id: int | None = None,
     ) -> list[RAGSearchResult]:
-        """从本地 Chroma RAG 索引检索带来源的证据片段。"""
+        """从当前 RAG 后端检索带来源、账号隔离的证据片段。"""
 
         call_context = self.model_gateway.new_call_context(
             "embedding_query",
@@ -670,12 +680,30 @@ class JobHuntingApp:
             "rerank_query",
             account_id=account_id,
         )
-        knowledge_base = RAGKnowledgeBase(
+        knowledge_base = self._rag_knowledge_base(
             persist_directory,
             embeddings=self.model_gateway.embeddings(call_context),
             reranker=self.model_gateway.reranker(rerank_context),
         )
         return knowledge_base.search(query, top_k, entity_types, account_id=account_id)
+
+    def _uses_pgvector_rag(self) -> bool:
+        """仅在真实 PostgreSQL 存储上启用 pgvector，保留 SQLite 的 Chroma 测试回退。"""
+
+        return isinstance(self.store, SQLAlchemyStore) and self.store.engine.dialect.name == "postgresql"
+
+    def _rag_knowledge_base(
+        self,
+        persist_directory: str | Path,
+        *,
+        embeddings: Embeddings,
+        reranker: Reranker | None = None,
+    ) -> RAGKnowledgeBase | PgVectorKnowledgeBase:
+        """在一个应用内 seam 后选择 RAG 后端，调用方无需感知数据库差异。"""
+
+        if self._uses_pgvector_rag():
+            return PgVectorKnowledgeBase(self.store.engine, embeddings=embeddings, reranker=reranker)
+        return RAGKnowledgeBase(persist_directory, embeddings=embeddings, reranker=reranker)
 
 
 def format_rag_evidence(result: RAGSearchResult) -> str:
