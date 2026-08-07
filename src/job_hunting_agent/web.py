@@ -23,6 +23,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
 
 from .agent import JobHuntingAgent
 from .app import JobHuntingApp
@@ -37,6 +38,7 @@ from .auth import (
 )
 from .config import (
     load_agent_memory_settings,
+    load_database_settings,
     load_embedding_settings,
     load_rerank_settings,
     load_cookie_secure,
@@ -178,6 +180,7 @@ def create_web_app(
     chat_agent: JobHuntingAgent | None = None,
     resume_llm_client: LLMClient | None = None,
     require_auth: bool = True,
+    database_url: str | None = None,
 ) -> FastAPI:
     """创建本地 FastAPI 应用。
 
@@ -185,10 +188,16 @@ def create_web_app(
 
     - 生产使用时，Web 层通过 `JobHuntingAgent` 或 `JobHuntingApp` 访问业务能力；
     - 测试时，可以安全地注入临时 SQLite、临时 Chroma 和假模型；
-    - Web 层自己不直接碰 SQLite 连接、RAG 向量库细节或厂商 SDK。
+    - 生产入口传入 PostgreSQL URL 后，Web 层通过 SQLAlchemy 仓储访问数据；
+    - Web 层自己不直接碰数据库连接、RAG 向量库细节或厂商 SDK。
     """
 
-    backend = JobHuntingApp(db_path, env_file, resume_dir=resume_dir)
+    backend = JobHuntingApp(
+        db_path,
+        env_file,
+        resume_dir=resume_dir,
+        database_url=database_url,
+    )
     backend.initialize()
     env_path = Path(env_file)
     rag_path = Path(rag_dir)
@@ -260,7 +269,8 @@ def create_web_app(
             )
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
-        except sqlite3.IntegrityError as error:
+        # 测试 SQLite 与生产 SQLAlchemy/PostgreSQL 的唯一约束异常都映射为同一 409 响应。
+        except (sqlite3.IntegrityError, SQLAlchemyIntegrityError) as error:
             raise HTTPException(status_code=409, detail="该邮箱已经注册。") from error
         return {"account": asdict(account)}
 
@@ -803,7 +813,7 @@ def create_web_app(
                     )
                 )
             except RAGProviderRequestError as error:
-                # 文件与 SQLite 正文已经安全保存；索引失败单独告知，避免用户重复上传。
+                # 文件与 PostgreSQL 正文已经安全保存；索引失败单独告知，避免用户重复上传。
                 rag_warning = f"简历已保存，但 RAG 增量索引失败：{error}"
         return {
             "artifact": serialize_resume_artifact(artifact),
@@ -1229,7 +1239,7 @@ def format_web_chat_reply(
 def summarize_tool_outputs_for_display(tool_outputs: list[dict[str, object]]) -> str:
     """把 Agent 工具输出压缩成网页可读摘要。
 
-    这里只生成展示文本，不把工具输出当成新的前端事实源；事实仍以后端 SQLite 为准。
+    这里只生成展示文本，不把工具输出当成新的前端事实源；事实仍以后端 PostgreSQL 为准。
     """
 
     lines: list[str] = []
@@ -1296,12 +1306,17 @@ def create_reloadable_web_app() -> FastAPI:
     重建应用，同时避免把运行路径混入用户维护的模型配置文件。
     """
 
+    env_file = os.environ.get(WEB_RELOAD_ENV_FILE_ENV, ".env")
+    database_settings = load_database_settings(env_file)
+    if not database_settings.configured or database_settings.url is None:
+        raise RuntimeError("网页服务需要 JOB_AGENT_DATABASE_URL。")
     return create_web_app(
         db_path=os.environ.get(WEB_RELOAD_DB_ENV, "data/job_agent.db"),
-        env_file=os.environ.get(WEB_RELOAD_ENV_FILE_ENV, ".env"),
+        env_file=env_file,
         rag_dir=os.environ.get(WEB_RELOAD_RAG_DIR_ENV, "data/chroma"),
         resume_dir=os.environ.get(WEB_RELOAD_RESUME_DIR_ENV, "data/resumes"),
         require_auth=True,
+        database_url=database_settings.url,
     )
 
 
@@ -1334,6 +1349,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
+    database_settings = load_database_settings(args.env_file)
+    if not database_settings.configured or database_settings.url is None:
+        raise SystemExit(
+            "网页服务需要 JOB_AGENT_DATABASE_URL；请先启动 PostgreSQL 并执行 job-agent database-upgrade。"
+        )
+
     import uvicorn
 
     if args.reload:
@@ -1356,6 +1377,7 @@ def main(argv: list[str] | None = None) -> None:
             args.rag_dir,
             resume_dir=args.resume_dir,
             require_auth=True,
+            database_url=database_settings.url,
         ),
         host=args.host,
         port=args.port,

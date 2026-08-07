@@ -63,7 +63,7 @@ class CandidateProfileInput:
 
 @dataclass
 class CandidateProfile(CandidateProfileInput):
-    """已经写入 SQLite 后的候选人档案。
+    """已经写入结构化事实源后的候选人档案。
 
     与 `CandidateProfileInput` 相比，它多了数据库分配的 `id`。
     """
@@ -160,7 +160,7 @@ class ProjectExperienceCard:
 
 @dataclass
 class ProjectExperienceRecord:
-    """已经保存到 SQLite 的项目经历卡片记录。
+    """已经保存到结构化事实源的项目经历卡片记录。
 
     `card` 是系统分析出的待确认内容；`status` 和 `confirmed_summary`
     记录候选人是否确认过。确认项目卡片不会反向覆盖候选人档案里的结构化事实。
@@ -214,7 +214,7 @@ class ResumeDraftRecord:
 class ResumeArtifactRecord:
     """一份已上传或已生成的简历文件版本。
 
-    SQLite 只保存文件元数据、提取文本和归属关系；二进制文件位于受控文件目录。
+    结构化事实源只保存文件元数据、提取文本和归属关系；二进制文件位于受控文件目录。
     `parent_artifact_id` 把职位定制文件关联回原始上传文件，避免覆盖源文件。
     """
 
@@ -250,7 +250,7 @@ class TailoredResumeResult:
 
 @dataclass
 class LongTextRecord:
-    """SQLite `long_texts` 表中的一条长文本材料。
+    """结构化数据库 `long_texts` 表中的一条长文本材料。
 
     它是 RAG 索引的输入来源，但仍然不是向量库本身。RAG 层必须保留这些来源字段，
     方便候选人追溯“这段证据来自哪里”。
@@ -261,8 +261,10 @@ class LongTextRecord:
     entity_id: int
     source_label: str
     text: str
-    # 账号级 metadata 用于 Chroma 检索过滤；旧离线记录可以为空。
+    # 账号级 metadata 用于向量检索隔离；旧离线记录可以为空。
     account_id: int | None = None
+    # 候选人归属用于 pgvector 表的外键和后续候选人级检索；职位公共材料可以为空。
+    candidate_id: int | None = None
 
 
 @dataclass
@@ -287,7 +289,7 @@ class RAGIndexStats:
     """一次 RAG 索引写入的统计结果。
 
     `mode` 用来区分全量重建和增量追加；两种模式都只描述向量索引动作，
-    不改变 SQLite 事实源。
+    不改变结构化事实源。
     """
 
     document_count: int
@@ -302,7 +304,7 @@ class RAGSearchResult:
     """RAG 检索返回的证据片段。
 
     `distance` 来自向量库，数值越小通常表示越相关；它不是事实可信度。
-    事实可信度仍然要回到 SQLite 结构化事实和候选人确认状态判断。
+    事实可信度仍然要回到结构化事实和候选人确认状态判断。
     """
 
     content: str
@@ -319,7 +321,7 @@ class CandidateProfilePatch:
     """对候选人档案的局部更新。
 
     对话式自动入库不会要求用户一次性提交完整档案；LLM/规则只提取当前消息中
-    明确出现的字段，然后通过这个 patch 合并到 SQLite 结构化档案。
+    明确出现的字段，然后通过这个 patch 合并到结构化档案。
     """
 
     status: str | None = None
@@ -355,7 +357,7 @@ class LongTextInput:
 class ConversationIngestionDecision:
     """对一条对话资料的保存决策。
 
-    `profile_updates` 表示进入 SQLite 结构化档案的内容；`long_texts` 表示进入
+    `profile_updates` 表示进入结构化档案的内容；`long_texts` 表示进入
     长文本材料库、后续可同步到 RAG 的内容；`reply` 是 agent 对用户的回复。
     """
 

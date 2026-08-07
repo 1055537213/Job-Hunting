@@ -5,6 +5,7 @@ version = "0.1.0"
 description = "A local, read-only job hunting assistant MVP."
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.14.0",
     "chromadb>=1.5.9",
     "fastapi>=0.124.4",
     "langchain>=1.2.12",
@@ -19,8 +20,11 @@ dependencies = [
     "pypdfium2>=4.30.0",
     "python-docx>=1.1.2",
     "python-multipart>=0.0.9",
+    "pgvector>=0.3.6",
+    "psycopg[binary]>=3.2.0",
     "rapidocr>=3.0.0",
     "reportlab>=4.0.0",
+    "SQLAlchemy>=2.0.0",
     "uvicorn>=0.38.0",
 ]
 

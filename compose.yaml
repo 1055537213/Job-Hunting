@@ -1,8 +1,50 @@
-# 当前 Compose 只承载本地 SQLite + Chroma 版本。PostgreSQL、Redis 和 MinIO
-# 会在对应迁移阶段单独加入，避免把尚未使用的生产组件混入当前开发环境。
+# 本地 PostgreSQL + pgvector 开发环境。Web 不再直接创建表，而是等待 migrate
+# 服务完成 Alembic 升级后再启动。Redis、对象存储和 Worker 仍属于后续阶段。
 name: job-hunting-agent
 
 services:
+  postgres:
+    # 默认使用官方 pgvector 镜像；网络受限时可通过环境变量切换兼容镜像源。
+    image: "${JOB_AGENT_POSTGRES_IMAGE:-pgvector/pgvector:pg16}"
+    restart: unless-stopped
+    environment:
+      # 这是仅限本机开发的无密码连接，生产环境必须改为 Secret 管理的强密码。
+      POSTGRES_DB: "${JOB_AGENT_POSTGRES_DB:-job_agent}"
+      POSTGRES_USER: "${JOB_AGENT_POSTGRES_USER:-job_agent}"
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      # 只绑定回环地址，避免本机开发库意外暴露到局域网。
+      - "127.0.0.1:${JOB_AGENT_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # Docker named volume 独立保存 PostgreSQL 数据；docker compose down 不会删除它。
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  migrate:
+    # 与 Web 使用相同镜像，确保迁移脚本和应用代码来自同一版本。
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: "${JOB_AGENT_DOCKER_BASE_IMAGE:-python:3.12-slim}"
+    image: job-hunting-agent:web-dev
+    restart: "no"
+    environment:
+      # 容器内通过服务名访问 PostgreSQL，不依赖宿主机端口映射。
+      JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
+    volumes:
+      # 模型配置仍只读挂载；迁移命令不会输出或复制其中的 API Key。
+      - ./.env:/app/.env:ro
+    command: ["job-agent", "--env-file", "/app/.env", "database-upgrade"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   web:
     # 使用项目根目录构建可复现的 Python 运行镜像。
     build:
@@ -14,12 +56,18 @@ services:
     image: job-hunting-agent:web-dev
     # 容器异常退出时自动重启；手动 docker compose stop 不会造成循环启动。
     restart: unless-stopped
+    environment:
+      # Web 使用 PostgreSQL；不会再退回 data/ 下的 SQLite 文件。
+      JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
     ports:
       - "8000:8000"
-    # .env 只读挂载给应用解析，data 绑定到宿主机以保留数据库、向量索引和文件。
+    # .env 只读挂载给应用解析；生产 RAG 存在 PostgreSQL，data 只保存简历文件等受控二进制。
     volumes:
       - ./.env:/app/.env:ro
       - ./data:/app/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       # /api/health 不要求登录，可用于 Docker 判断 Web 进程是否已经监听并能响应。
       test:
@@ -28,3 +76,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+
+volumes:
+  # 本地开发数据库持久卷；显式 docker compose down -v 才会删除其中的测试数据。
+  postgres_data:

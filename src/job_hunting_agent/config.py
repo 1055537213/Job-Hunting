@@ -11,6 +11,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 
 DEFAULT_ENV_PATH = Path(".env")
@@ -49,6 +50,40 @@ class ModelGatewaySettings:
     chat_max_retries: int = 2
     embedding_max_retries: int = 2
     rerank_max_retries: int = 2
+
+
+@dataclass(frozen=True)
+class DatabaseSettings:
+    """生产数据库连接配置。
+
+    当前业务运行默认仍使用本地 SQLite 文件；只有显式配置
+    ``JOB_AGENT_DATABASE_URL`` 并执行 Alembic 迁移时才会连接生产数据库。
+    这样不会让开发环境意外切到一个空的 PostgreSQL 数据库。
+    """
+
+    url: str | None = None
+
+    @property
+    def configured(self) -> bool:
+        """返回是否显式提供了数据库 URL。"""
+
+        return bool(self.url)
+
+    @property
+    def dialect(self) -> str | None:
+        """返回配置使用的数据库方言标签。"""
+
+        if self.url is None:
+            return None
+        return self.url.split(":", 1)[0].split("+", 1)[0]
+
+    @property
+    def masked_url(self) -> str | None:
+        """返回可显示的 URL 摘要，绝不回显数据库密码。"""
+
+        if self.url is None:
+            return None
+        return mask_database_url(self.url)
 
 
 @dataclass(frozen=True)
@@ -261,6 +296,68 @@ def masked_model_gateway_settings(settings: ModelGatewaySettings) -> dict[str, o
         "chat_max_retries": settings.chat_max_retries,
         "embedding_max_retries": settings.embedding_max_retries,
         "rerank_max_retries": settings.rerank_max_retries,
+    }
+
+
+def load_database_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> DatabaseSettings:
+    """从 .env 或系统环境变量读取可选的生产数据库 URL。
+
+    PostgreSQL 统一归一化为 postgresql+psycopg，避免运行时因 SQLAlchemy
+    自动选择不同驱动而产生行为差异。未配置时返回空 Settings，而不是把当前
+    SQLite 文件路径伪装成生产连接。
+    """
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+    raw_url = environment.get("JOB_AGENT_DATABASE_URL") or file_values.get(
+        "JOB_AGENT_DATABASE_URL"
+    )
+    if not raw_url or not raw_url.strip():
+        return DatabaseSettings()
+    return DatabaseSettings(url=normalize_database_url(raw_url.strip()))
+
+
+def normalize_database_url(value: str) -> str:
+    """校验并归一化 SQLAlchemy 数据库 URL。"""
+
+    normalized = value.strip()
+    if normalized.startswith("postgres://"):
+        normalized = "postgresql+psycopg://" + normalized.removeprefix("postgres://")
+    elif normalized.startswith("postgresql://"):
+        normalized = "postgresql+psycopg://" + normalized.removeprefix("postgresql://")
+
+    allowed_prefixes = ("postgresql+psycopg://", "sqlite://", "sqlite+pysqlite://")
+    if not normalized.startswith(allowed_prefixes):
+        raise ValueError(
+            "JOB_AGENT_DATABASE_URL 只支持 postgresql+psycopg、postgresql 或 sqlite URL"
+        )
+    return normalized
+
+
+def mask_database_url(value: str) -> str:
+    """掩码数据库 URL 中的密码，供 CLI、日志和健康检查展示。"""
+
+    parts = urlsplit(value)
+    if "@" not in parts.netloc:
+        return value
+    credentials, host = parts.netloc.rsplit("@", 1)
+    username = credentials.split(":", 1)[0]
+    masked_credentials = username + ":***" if ":" in credentials else username
+    return urlunsplit(
+        (parts.scheme, masked_credentials + "@" + host, parts.path, parts.query, parts.fragment)
+    )
+
+
+def masked_database_settings(settings: DatabaseSettings) -> dict[str, object]:
+    """返回数据库配置的脱敏摘要。"""
+
+    return {
+        "configured": settings.configured,
+        "dialect": settings.dialect,
+        "url": settings.masked_url,
     }
 
 

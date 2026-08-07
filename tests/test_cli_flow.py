@@ -6,8 +6,12 @@ CLI 是当前教学 MVP 最直接的使用入口，所以这里用真实命令�
 
 import json
 
+import pytest
+
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.cli import create_admin_account, main
+from job_hunting_agent.database_migrations import upgrade_database
+from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
 
 
 def test_cli_can_create_profile_import_job_and_match_all(tmp_path, capsys):
@@ -60,6 +64,93 @@ def test_cli_can_create_profile_import_job_and_match_all(tmp_path, capsys):
     assert match_output["candidate_id"] == candidate_id
     assert match_output["matches"][0]["job"]["id"] == imported_job["id"]
     assert match_output["matches"][0]["match"]["tier"] in {"强推荐", "可投递"}
+
+
+def test_cli_requires_account_context_for_production_data_commands(tmp_path, capsys, monkeypatch):
+    """生产数据库模式下，业务 CLI 不应把无归属资料交给数据库约束处理。"""
+
+    database_path = tmp_path / "production-cli.db"
+    database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
+    env_file = tmp_path / ".env"
+    profile_file = tmp_path / "profile.json"
+    monkeypatch.delenv("JOB_AGENT_DATABASE_URL", raising=False)
+    env_file.write_text(f"JOB_AGENT_DATABASE_URL={database_url}\n", encoding="utf-8")
+    profile_file.write_text(
+        json.dumps(
+            {
+                "name": "生产 CLI 候选人",
+                "status": "在职",
+                "education": "本科",
+                "experience_years": 2.0,
+                "skills": {"Python": "项目使用"},
+                "preferred_cities": ["杭州"],
+                "salary_floor_k": 12,
+                "expected_salary_k": 16,
+                "target_directions": ["Python 后端开发"],
+                "unacceptable": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    upgrade_database(database_url)
+
+    with pytest.raises(SystemExit, match="--account-id"):
+        main(["--env-file", str(env_file), "create-profile", "--from-json", str(profile_file)])
+
+    assert capsys.readouterr().out == ""
+
+
+def test_cli_passes_explicit_account_context_through_production_workflow(tmp_path, capsys, monkeypatch):
+    """带账号参数的 CLI 可以在生产式仓储完成档案、职位和匹配流程。"""
+
+    database_path = tmp_path / "production-cli.db"
+    database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
+    env_file = tmp_path / ".env"
+    profile_file = tmp_path / "profile.json"
+    job_file = tmp_path / "job.txt"
+    monkeypatch.delenv("JOB_AGENT_DATABASE_URL", raising=False)
+    env_file.write_text(f"JOB_AGENT_DATABASE_URL={database_url}\n", encoding="utf-8")
+    profile_file.write_text(
+        json.dumps(
+            {
+                "name": "生产 CLI 候选人",
+                "status": "在职",
+                "education": "本科",
+                "experience_years": 2.0,
+                "skills": {"Python": "项目使用", "FastAPI": "项目使用"},
+                "preferred_cities": ["杭州"],
+                "salary_floor_k": 12,
+                "expected_salary_k": 16,
+                "target_directions": ["Python 后端开发"],
+                "unacceptable": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    job_file.write_text(
+        "Python 后端开发工程师\n15-20K\n杭州\n1-3年\n本科\n职位描述：负责 Python 和 FastAPI 后端开发。",
+        encoding="utf-8",
+    )
+    upgrade_database(database_url)
+    store = SQLAlchemyStore(database_url)
+    account = store.create_account("production-cli@example.com", "hashed-password")
+    command_prefix = ["--env-file", str(env_file), "--account-id", str(account.id)]
+    try:
+        main([*command_prefix, "create-profile", "--from-json", str(profile_file)])
+        candidate_id = json.loads(capsys.readouterr().out)["candidate_id"]
+        main([*command_prefix, "import-job", str(job_file)])
+        job_id = json.loads(capsys.readouterr().out)["id"]
+        main([*command_prefix, "match", str(candidate_id), str(job_id)])
+        match_output = json.loads(capsys.readouterr().out)
+
+        assert store.get_candidate_profile(candidate_id, account_id=account.id).name == "生产 CLI 候选人"
+        assert store.get_job(job_id, account_id=account.id).title == "Python 后端开发工程师"
+        assert match_output["candidate_id"] == candidate_id
+        assert match_output["job_id"] == job_id
+    finally:
+        store.close()
 
 
 def test_cli_create_admin_reads_password_with_visible_input(tmp_path, monkeypatch, capsys):

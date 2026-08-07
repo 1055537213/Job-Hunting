@@ -24,8 +24,8 @@ def test_docker_files_keep_runtime_data_and_secrets_out_of_image():
     assert "tests/" in dockerignore
 
 
-def test_compose_mounts_env_read_only_and_data_persistently():
-    """Compose 只读挂载配置，并把运行数据留在宿主机。"""
+def test_compose_mounts_env_read_only_and_starts_postgres_before_web():
+    """Compose 只读挂载配置，并在 Web 前完成 PostgreSQL 与 Alembic 迁移。"""
 
     compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
 
@@ -33,6 +33,11 @@ def test_compose_mounts_env_read_only_and_data_persistently():
     assert "./data:/app/data" in compose
     assert "8000:8000" in compose
     assert "JOB_AGENT_DOCKER_BASE_IMAGE" in compose
+    assert "pgvector/pgvector:pg16" in compose
+    assert "JOB_AGENT_DATABASE_URL" in compose
+    assert "database-upgrade" in compose
+    assert "service_completed_successfully" in compose
+    assert "postgres_data" in compose
     assert "/api/health" in compose
     # 不把整个 .env 作为 env_file 注入，避免 compose config 展开 API Key。
     assert "env_file:" not in compose

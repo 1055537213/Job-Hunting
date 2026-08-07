@@ -24,6 +24,10 @@ def test_reloadable_web_app_reads_runtime_paths_from_reloader_environment(monkey
     monkeypatch.setenv(web.WEB_RELOAD_ENV_FILE_ENV, str(tmp_path / ".env"))
     monkeypatch.setenv(web.WEB_RELOAD_RAG_DIR_ENV, str(tmp_path / "chroma"))
     monkeypatch.setenv(web.WEB_RELOAD_RESUME_DIR_ENV, str(tmp_path / "resumes"))
+    monkeypatch.setenv(
+        "JOB_AGENT_DATABASE_URL",
+        f"sqlite+pysqlite:///{(tmp_path / 'database.db').as_posix()}",
+    )
 
     assert web.create_reloadable_web_app() is sentinel
     assert received == {
@@ -32,6 +36,7 @@ def test_reloadable_web_app_reads_runtime_paths_from_reloader_environment(monkey
         "rag_dir": str(tmp_path / "chroma"),
         "resume_dir": str(tmp_path / "resumes"),
         "require_auth": True,
+        "database_url": f"sqlite+pysqlite:///{(tmp_path / 'database.db').as_posix()}",
     }
 
 
@@ -44,6 +49,10 @@ def test_web_cli_reload_uses_an_importable_factory_and_watches_requested_directo
         calls.append((app, kwargs))
 
     monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=fake_run))
+    monkeypatch.setenv(
+        "JOB_AGENT_DATABASE_URL",
+        f"sqlite+pysqlite:///{(tmp_path / 'database.db').as_posix()}",
+    )
     reload_env_keys = (
         web.WEB_RELOAD_DB_ENV,
         web.WEB_RELOAD_ENV_FILE_ENV,

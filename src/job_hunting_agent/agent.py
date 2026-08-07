@@ -7,11 +7,11 @@ Web / CLI
     -> LangChain create_agent
     -> Tools
     -> JobHuntingApp
-    -> SQLite / RAG / LLM
+    -> PostgreSQL / SQLite test adapter / RAG / LLM
 
 其中：
 
-- SQLite 仍然是结构化事实源。
+- PostgreSQL 是生产环境的结构化事实源；SQLite 仅用于离线兼容和测试。
 - long_texts 仍然是长文本材料登记处。
 - RAG 仍然只是派生语义索引，不单独充当事实源。
 - Agent 不直接改数据库，只能通过工具调用 `JobHuntingApp`。
@@ -69,7 +69,7 @@ AGENT_SYSTEM_PROMPT = """
 4. 对本地项目进行分析，并等待候选人确认项目摘要。
 
 你必须遵守这些边界：
-- 结构化事实只能通过工具写入 SQLite。
+- 结构化事实只能通过工具写入结构化事实源。
 - 长文本材料只能通过工具写入 long_texts，再由工具决定是否增量进入 RAG。
 - RAG 检索只是证据索引，不是事实源。
 - 不能登录 BOSS、不能爬取网站、不能自动投递、不能自动发送 HR 消息。

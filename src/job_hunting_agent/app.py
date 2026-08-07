@@ -41,14 +41,16 @@ from .resume_document import (
 )
 from .resume_exporter import export_tailored_resume_files
 from .resume_writer import build_resume_draft
+from .sqlalchemy_store import SQLAlchemyStore
 from .storage import SQLiteStore
 
 
 class JobHuntingApp:
     """求职助手 MVP 的门面类。
 
-    它把 SQLite 存储、职位解析、本地项目分析、匹配规则、LLM 草稿生成和
-    RAG 检索组合到一起。外部入口保持简单，内部能力可以逐步替换升级。
+    它把关系数据库存储、职位解析、本地项目分析、匹配规则、LLM 草稿生成和
+    RAG 检索组合到一起。测试可继续注入 SQLite 文件；生产入口显式传入数据库 URL
+    后会使用经 Alembic 管理的 SQLAlchemyStore。
     """
 
     def __init__(
@@ -57,10 +59,12 @@ class JobHuntingApp:
         env_path: str | Path = DEFAULT_ENV_PATH,
         resume_dir: str | Path | None = None,
         semantic_matching: bool | None = None,
+        database_url: str | None = None,
     ):
-        """绑定 SQLite、项目 `.env` 和受控简历文件目录。"""
+        """绑定数据库、项目 `.env` 和受控简历文件目录。"""
 
-        self.store = SQLiteStore(db_path)
+        # 未传 URL 时保留 SQLite 测试适配器；Web 生产入口会显式传入 PostgreSQL URL。
+        self.store = SQLAlchemyStore(database_url) if database_url else SQLiteStore(db_path)
         # Web/CLI 都通过同一认证服务创建账号和 Session，避免重复实现密码逻辑。
         self.auth = AuthService(self.store)
         self.env_path = Path(env_path)
@@ -90,7 +94,7 @@ class JobHuntingApp:
     def get_candidate_profile(self, candidate_id: int, account_id: int | None = None) -> CandidateProfile:
         """读取候选人档案。
 
-        CLI 和测试需要通过应用服务读取档案，避免越过门面类直接访问 SQLite。
+        CLI 和测试需要通过应用服务读取档案，避免越过门面类直接访问持久化实现。
         """
 
         return self.store.get_candidate_profile(candidate_id, account_id=account_id)
@@ -130,8 +134,8 @@ class JobHuntingApp:
         """自动判断并保存一条候选人对话资料。
 
         这是“对话即入库”的应用层入口：LLM 或规则只负责产出保存决策，
-        真正的 SQLite 结构化更新、长文本写入和 RAG 增量索引都在本地代码中完成。
-        这样可以保留清晰边界：SQLite 是事实源，RAG 是证据索引，LLM 是判断/表达工具。
+        真正的结构化更新、长文本写入和 RAG 增量索引都在本地代码中完成。
+        这样可以保留清晰边界：PostgreSQL 是事实源，RAG 是证据索引，LLM 是判断/表达工具。
         """
 
         candidate = self.store.get_candidate_profile(candidate_id, account_id=account_id)
@@ -143,7 +147,7 @@ class JobHuntingApp:
             decision.profile_updates,
             account_id=account_id,
         )
-        # 长文本先进入 SQLite long_texts；Chroma 只从这里同步，便于追溯来源。
+        # 长文本先进入 PostgreSQL long_texts；当前 RAG 后端只从这里构建可追溯的派生索引。
         saved_long_text_ids = [
             self.store.add_long_text(
                 item.entity_type,
@@ -462,7 +466,7 @@ class JobHuntingApp:
                 register_long_text=True,
             )
         except Exception:
-            # SQLite 保存失败时删除刚写入的文件，保持两个存储边界一致。
+            # 数据库保存失败时删除刚写入的文件，保持两个存储边界一致。
             self.resume_files.delete(stored.storage_key)
             raise
 

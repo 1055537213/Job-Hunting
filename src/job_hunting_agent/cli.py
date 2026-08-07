@@ -15,33 +15,63 @@ from .agent import JobHuntingAgent
 from .app import JobHuntingApp
 from .auth import hash_password
 from .config import (
+    load_database_settings,
     load_embedding_settings,
     load_llm_settings,
     load_rerank_settings,
+    masked_database_settings,
     masked_embedding_settings,
     masked_llm_settings,
     masked_rerank_settings,
 )
+from .database_migrations import current_database_revision, upgrade_database
 from .llm import LLMClient, StaticLLMClient
 from .models import CandidateProfileInput
+
+
+# PostgreSQL 是多账号事实源；以下命令会读取或写入账号归属数据，不能隐式使用全局范围。
+ACCOUNT_SCOPED_COMMANDS = frozenset(
+    {
+        "create-profile",
+        "ingest-message",
+        "agent-chat",
+        "demo",
+        "confirm-project",
+        "list-projects",
+        "import-job",
+        "import-jobs",
+        "list-jobs",
+        "rag-rebuild",
+        "rag-search",
+        "match",
+        "match-all",
+        "draft-resume",
+        "list-resume-drafts",
+    }
+)
 
 
 def main(argv: list[str] | None = None) -> None:
     """解析命令行参数并分发到对应功能。"""
 
     parser = argparse.ArgumentParser(prog="job-agent")
-    # 所有命令共用同一个本地 SQLite 数据库；默认放在 data/ 下，已被 .gitignore 忽略。
+    # 未配置 PostgreSQL 时才使用 SQLite 离线兼容路径；默认文件已被 .gitignore 忽略。
     parser.add_argument("--db", default="data/job_agent.db")
     # 模型配置单独放在 .env，方便后续换供应商/模型，不需要改代码。
     parser.add_argument("--env-file", default=".env")
-    # Chroma 向量库默认持久化到 data/ 下，已被 .gitignore 忽略。
+    # 仅 SQLite 离线兼容路径使用本地 Chroma；生产 PostgreSQL 会忽略这个参数。
     parser.add_argument("--rag-dir", default="data/chroma")
+    # 生产 CLI 没有网页 Cookie，因此需要显式指定当前操作所属的账号。
+    parser.add_argument("--account-id", type=int)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("init")
     subparsers.add_parser("llm-config")
     subparsers.add_parser("embedding-config")
     subparsers.add_parser("rerank-config")
+    subparsers.add_parser("database-config")
+    subparsers.add_parser("database-current")
+    subparsers.add_parser("database-upgrade")
     subparsers.add_parser("create-admin")
 
     web_parser = subparsers.add_parser("web")
@@ -138,35 +168,81 @@ def main(argv: list[str] | None = None) -> None:
     list_drafts_parser.add_argument("--job-id", type=int)
 
     args = parser.parse_args(argv)
-    app = JobHuntingApp(args.db, args.env_file)
+    # 数据库迁移命令不能先构造 JobHuntingApp，否则会意外创建旧 SQLite 测试库。
+    database_settings = load_database_settings(args.env_file)
+    if args.command == "database-config":
+        print_json(masked_database_settings(database_settings))
+        return
+    # 纯配置查询不应初始化应用，更不能因为查看配置而创建 SQLite 测试文件。
+    if args.command == "llm-config":
+        print_json(masked_llm_settings(load_llm_settings(args.env_file)))
+        return
+    if args.command == "embedding-config":
+        print_json(masked_embedding_settings(load_embedding_settings(args.env_file)))
+        return
+    if args.command == "rerank-config":
+        print_json(masked_rerank_settings(load_rerank_settings(args.env_file)))
+        return
+    if args.command in {"database-current", "database-upgrade"}:
+        if not database_settings.configured or database_settings.url is None:
+            raise SystemExit(
+                "缺少 JOB_AGENT_DATABASE_URL；请在 .env 中配置 PostgreSQL 连接后再执行数据库命令。"
+            )
+        if args.command == "database-upgrade":
+            revision = upgrade_database(database_settings.url)
+            print_json(
+                {
+                    "status": "ok",
+                    "database": database_settings.masked_url,
+                    "revision": revision,
+                }
+            )
+        else:
+            print_json(
+                {
+                    "configured": True,
+                    "database": database_settings.masked_url,
+                    "revision": current_database_revision(database_settings.url),
+                }
+            )
+        return
+
+    # 配置了数据库 URL 时，CLI 与 Web 使用同一 PostgreSQL 仓储；未配置时仅保留
+    # SQLite 测试/离线兼容路径，方便现有教学回归在临时文件中运行。
+    app = JobHuntingApp(
+        args.db,
+        args.env_file,
+        database_url=database_settings.url if database_settings.configured else None,
+    )
     # 每次运行命令前都初始化表结构，让新手不用单独记住建表步骤。
     app.initialize()
+    account_id = resolve_cli_account_id(app, args, production_database=database_settings.configured)
 
     if args.command == "init":
         print_json({"status": "ok", "db": str(Path(args.db).resolve())})
     elif args.command == "create-admin":
         create_admin_account(app)
-    elif args.command == "llm-config":
-        print_json(masked_llm_settings(load_llm_settings(args.env_file)))
-    elif args.command == "embedding-config":
-        print_json(masked_embedding_settings(load_embedding_settings(args.env_file)))
-    elif args.command == "rerank-config":
-        print_json(masked_rerank_settings(load_rerank_settings(args.env_file)))
     elif args.command == "web":
         run_web_server(args)
     elif args.command == "create-profile":
         profile = build_profile_from_cli(args)
-        candidate_id = app.save_candidate_profile(profile)
-        print_json({"candidate_id": candidate_id, "profile": asdict(app.get_candidate_profile(candidate_id))})
+        candidate_id = app.save_candidate_profile(profile, account_id=account_id)
+        print_json(
+            {
+                "candidate_id": candidate_id,
+                "profile": asdict(app.get_candidate_profile(candidate_id, account_id=account_id)),
+            }
+        )
     elif args.command == "ingest-message":
         print_json(
             asdict(
                 app.ingest_conversation_message(
                     args.candidate_id,
                     read_ingestion_message(args),
-                    llm_client=build_cli_llm(app, args, "tool_llm_ingestion"),
+                    llm_client=build_cli_llm(app, args, "tool_llm_ingestion", account_id=account_id),
                     rag_persist_directory=args.rag_dir,
                     auto_rebuild_rag=args.auto_rag,
+                    account_id=account_id,
                 )
             )
         )
@@ -182,6 +258,7 @@ def main(argv: list[str] | None = None) -> None:
                 llm_client=None,
                 rag_persist_directory=args.rag_dir,
                 auto_rebuild_rag=True,
+                account_id=account_id,
             )
             save_cli_chat_turn(
                 app,
@@ -190,6 +267,7 @@ def main(argv: list[str] | None = None) -> None:
                 message,
                 fallback.reply,
                 {"mode": "rule_based_ingestion", "fallback_reason": str(error)},
+                account_id=account_id,
             )
             print_json(
                 {
@@ -205,6 +283,7 @@ def main(argv: list[str] | None = None) -> None:
                 session_id=args.session_id,
                 use_tool_llm=True,
                 auto_rag=True,
+                account_id=account_id,
             )
             save_cli_chat_turn(
                 app,
@@ -213,45 +292,74 @@ def main(argv: list[str] | None = None) -> None:
                 message,
                 result.reply,
                 {"mode": result.mode, "used_tools": result.used_tools},
+                account_id=account_id,
             )
             print_json(
                 asdict(result)
             )
     elif args.command == "demo":
-        run_demo(app, args.project)
+        run_demo(app, args.project, account_id=account_id)
     elif args.command == "analyze-project":
         if args.candidate_id is None:
             print_json(asdict(app.analyze_project(args.project_path)))
         else:
-            print_json(asdict(app.analyze_project_for_candidate(args.candidate_id, args.project_path)))
+            print_json(
+                asdict(
+                    app.analyze_project_for_candidate(
+                        args.candidate_id,
+                        args.project_path,
+                        account_id=account_id,
+                    )
+                )
+            )
     elif args.command == "confirm-project":
-        print_json(asdict(app.confirm_project_card(args.record_id, read_confirmation_summary(args))))
+        print_json(
+            asdict(
+                app.confirm_project_card(
+                    args.record_id,
+                    read_confirmation_summary(args),
+                    account_id=account_id,
+                )
+            )
+        )
     elif args.command == "list-projects":
         print_json(
             {
                 "candidate_id": args.candidate_id,
-                "project_cards": [asdict(record) for record in app.list_project_cards(args.candidate_id)],
+                "project_cards": [
+                    asdict(record)
+                    for record in app.list_project_cards(args.candidate_id, account_id=account_id)
+                ],
             }
         )
     elif args.command == "import-job":
         raw_text = Path(args.text_file).read_text(encoding="utf-8")
-        print_json(asdict(app.import_job_text(raw_text, args.source_url)))
+        print_json(asdict(app.import_job_text(raw_text, args.source_url, account_id=account_id)))
     elif args.command == "import-jobs":
         raw_text = Path(args.text_file).read_text(encoding="utf-8")
-        jobs = [app.import_job_text(text, args.source_url) for text in split_job_texts(raw_text, args.separator)]
+        jobs = [
+            app.import_job_text(text, args.source_url, account_id=account_id)
+            for text in split_job_texts(raw_text, args.separator)
+        ]
         print_json({"count": len(jobs), "jobs": [asdict(job) for job in jobs]})
     elif args.command == "list-jobs":
-        print_json({"jobs": [asdict(job) for job in app.list_jobs()]})
+        print_json({"jobs": [asdict(job) for job in app.list_jobs(account_id=account_id)]})
     elif args.command == "rag-rebuild":
-        print_json(asdict(app.rebuild_rag_index(args.rag_dir)))
+        print_json(asdict(app.rebuild_rag_index(args.rag_dir, account_id=account_id)))
     elif args.command == "rag-search":
-        results = app.search_rag(args.query, args.rag_dir, args.top_k, split_items(args.entity_types))
+        results = app.search_rag(
+            args.query,
+            args.rag_dir,
+            args.top_k,
+            split_items(args.entity_types),
+            account_id=account_id,
+        )
         print_json({"query": args.query, "results": [asdict(result) for result in results]})
     elif args.command == "match":
-        print_json(asdict(app.match_job(args.candidate_id, args.job_id)))
+        print_json(asdict(app.match_job(args.candidate_id, args.job_id, account_id=account_id)))
     elif args.command == "match-all":
-        matches = app.match_all_jobs(args.candidate_id)
-        jobs_by_id = {job.id: job for job in app.list_jobs()}
+        matches = app.match_all_jobs(args.candidate_id, account_id=account_id)
+        jobs_by_id = {job.id: job for job in app.list_jobs(account_id=account_id)}
         print_json(
             {
                 "candidate_id": args.candidate_id,
@@ -267,9 +375,10 @@ def main(argv: list[str] | None = None) -> None:
                 app.create_resume_draft(
                     args.candidate_id,
                     args.job_id,
-                    build_cli_llm(app, args, "resume_rewrite"),
+                    build_cli_llm(app, args, "resume_rewrite", account_id=account_id),
                     rag_persist_directory=args.rag_dir if args.use_rag else None,
                     rag_query=args.rag_query,
+                    account_id=account_id,
                 )
             )
         )
@@ -279,7 +388,11 @@ def main(argv: list[str] | None = None) -> None:
                 "candidate_id": args.candidate_id,
                 "resume_drafts": [
                     asdict(record)
-                    for record in app.list_resume_drafts(args.candidate_id, args.job_id)
+                    for record in app.list_resume_drafts(
+                        args.candidate_id,
+                        args.job_id,
+                        account_id=account_id,
+                    )
                 ],
             }
         )
@@ -396,6 +509,7 @@ def save_cli_chat_turn(
     user_message: str,
     assistant_message: str,
     assistant_metadata: dict[str, object],
+    account_id: int | None = None,
 ) -> None:
     """保存一次 CLI Agent 聊天，让命令行和网页共用持久化对话记忆。"""
 
@@ -405,6 +519,7 @@ def save_cli_chat_turn(
         "user",
         user_message,
         {"source": "cli_agent_chat"},
+        account_id=account_id,
     )
     app.save_chat_message(
         candidate_id,
@@ -412,6 +527,7 @@ def save_cli_chat_turn(
         "assistant",
         assistant_message,
         assistant_metadata,
+        account_id=account_id,
     )
 
 
@@ -489,6 +605,7 @@ def build_cli_llm(
     app: JobHuntingApp,
     args: argparse.Namespace,
     operation: str,
+    account_id: int | None = None,
 ) -> LLMClient | None:
     """根据 CLI 参数构造 LLM 客户端。
 
@@ -506,12 +623,12 @@ def build_cli_llm(
         return StaticLLMClient(static_response)
     if use_env_llm:
         return app.model_gateway.llm_client(
-            app.model_gateway.new_call_context(operation)
+            app.model_gateway.new_call_context(operation, account_id=account_id)
         )
     return None
 
 
-def run_demo(app: JobHuntingApp, project_path: str) -> None:
+def run_demo(app: JobHuntingApp, project_path: str, account_id: int | None = None) -> None:
     """跑通第一条端到端演示链路。
 
     演示链路包含：创建候选人档案、分析项目目录、导入职位文本、输出匹配解释。
@@ -536,7 +653,8 @@ def run_demo(app: JobHuntingApp, project_path: str) -> None:
             expected_salary_k=15,
             target_directions=["AI Agent 应用开发", "Python 后端开发"],
             unacceptable=["外包", "长期出差"],
-        )
+        ),
+        account_id=account_id,
     )
     project_card = app.analyze_project(project_path)
     job = app.import_job_text(
@@ -553,9 +671,10 @@ def run_demo(app: JobHuntingApp, project_path: str) -> None:
         职位描述：
         负责基于 Python、FastAPI 和 LangChain 的 Agent 应用开发，
         需要熟悉 SQLite、RAG、向量检索和职位文本处理。
-        """
+        """,
+        account_id=account_id,
     )
-    match = app.match_job(candidate_id, job.id)
+    match = app.match_job(candidate_id, job.id, account_id=account_id)
     print_json(
         {
             "candidate_id": candidate_id,
@@ -576,8 +695,20 @@ def run_web_server(args: argparse.Namespace) -> None:
 
     import uvicorn
 
+    database_settings = load_database_settings(args.env_file)
+    if not database_settings.configured or database_settings.url is None:
+        raise SystemExit(
+            "网页服务需要 JOB_AGENT_DATABASE_URL；请先启动 PostgreSQL 并执行 job-agent database-upgrade。"
+        )
+
     uvicorn.run(
-        create_web_app(args.db, args.env_file, args.rag_dir, require_auth=True),
+        create_web_app(
+            args.db,
+            args.env_file,
+            args.rag_dir,
+            require_auth=True,
+            database_url=database_settings.url,
+        ),
         host=args.host,
         port=args.port,
     )
@@ -599,6 +730,30 @@ def create_admin_account(app: JobHuntingApp) -> None:
     except Exception as error:  # noqa: BLE001 - CLI 需要把唯一约束错误转成可读信息。
         raise SystemExit(f"管理员创建失败：{error}") from error
     print_json({"status": "ok", "account": asdict(account)})
+
+
+def resolve_cli_account_id(
+    app: JobHuntingApp,
+    args: argparse.Namespace,
+    *,
+    production_database: bool,
+) -> int | None:
+    """在生产数据库模式下为业务 CLI 强制绑定已存在的账号。"""
+
+    command_needs_account = args.command in ACCOUNT_SCOPED_COMMANDS or (
+        args.command == "analyze-project" and args.candidate_id is not None
+    )
+    if not production_database or not command_needs_account:
+        return args.account_id
+    if args.account_id is None:
+        raise SystemExit(
+            f"生产数据库中的 {args.command} 必须在命令前提供 --account-id <账号 ID>。"
+        )
+    try:
+        app.store.get_account(args.account_id)
+    except KeyError as error:
+        raise SystemExit(f"账号不存在：{args.account_id}") from error
+    return args.account_id
 
 
 def print_json(value: object) -> None:

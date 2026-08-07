@@ -396,7 +396,7 @@ class SQLiteStore:
                     display_name,
                     role,
                     status,
-                    int(must_change_password),
+                    bool(must_change_password),
                     now,
                     now,
                 ),
@@ -427,7 +427,7 @@ class SQLiteStore:
 
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT * FROM accounts WHERE email = ? COLLATE NOCASE",
+                "SELECT * FROM accounts WHERE LOWER(email) = LOWER(?)",
                 (email,),
             ).fetchone()
         if row is None:
@@ -493,7 +493,7 @@ class SQLiteStore:
                 SET password_hash = ?, must_change_password = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (password_hash, int(must_change_password), now_iso(), account_id),
+                (password_hash, bool(must_change_password), now_iso(), account_id),
             )
             if cursor.rowcount == 0:
                 raise KeyError(f"Account not found: {account_id}")
@@ -723,12 +723,13 @@ class SQLiteStore:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO usage_events (
+                INSERT INTO usage_events (
                     account_id, candidate_id, session_id, root_request_id, call_id,
                     provider, model, operation, input_tokens, output_tokens,
                     total_tokens, usage_source, status, attempt, provider_request_id,
                     raw_usage_json, created_at, billable, pricing_version
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (call_id) DO NOTHING
                 """,
                 (
                     event.account_id,
@@ -750,7 +751,7 @@ class SQLiteStore:
                     event.created_at,
                     # 只有供应商确认的成功用量才进入正式计费汇总；estimated/missing/local
                     # 仍会保留明细，但不会被误加到 billable_tokens。
-                    int(event.billable and event.usage_source == "provider" and event.status == "succeeded"),
+                    bool(event.billable and event.usage_source == "provider" and event.status == "succeeded"),
                     event.pricing_version,
                 ),
             )
@@ -802,7 +803,7 @@ class SQLiteStore:
                     COALESCE(SUM(input_tokens), 0) AS input_tokens,
                     COALESCE(SUM(output_tokens), 0) AS output_tokens,
                     COALESCE(SUM(total_tokens), 0) AS total_tokens,
-                    COALESCE(SUM(CASE WHEN billable = 1 THEN total_tokens ELSE 0 END), 0)
+                    COALESCE(SUM(CASE WHEN billable THEN total_tokens ELSE 0 END), 0)
                         AS billable_tokens,
                     COUNT(*) AS event_count
                 FROM usage_events{where}
@@ -822,7 +823,7 @@ class SQLiteStore:
                     COALESCE(SUM(input_tokens), 0) AS input_tokens,
                     COALESCE(SUM(output_tokens), 0) AS output_tokens,
                     COALESCE(SUM(total_tokens), 0) AS total_tokens,
-                    COALESCE(SUM(CASE WHEN billable = 1 THEN total_tokens ELSE 0 END), 0)
+                    COALESCE(SUM(CASE WHEN billable THEN total_tokens ELSE 0 END), 0)
                         AS billable_tokens,
                     COUNT(*) AS event_count
                 FROM usage_events
@@ -1023,7 +1024,8 @@ class SQLiteStore:
                     skills_json = ?, preferred_cities_json = ?,
                     acceptable_cities_json = ?, preference_weights_json = ?,
                     target_directions_json = ?, unacceptable_json = ?
-                WHERE id = ? AND (? IS NULL OR account_id = ?)
+                WHERE id = ?
+                  AND COALESCE(account_id, -1) = COALESCE(?, COALESCE(account_id, -1))
                 """,
                 (
                     status,
@@ -1038,7 +1040,6 @@ class SQLiteStore:
                     json.dumps(target_directions, ensure_ascii=False),
                     json.dumps(unacceptable, ensure_ascii=False),
                     candidate_id,
-                    account_id,
                     account_id,
                 ),
             )
@@ -1203,11 +1204,11 @@ class SQLiteStore:
             )
         with self.connect() as conn:
             conn.execute(
-                "UPDATE jobs SET skill_requirements_json = ? WHERE id = ? AND (? IS NULL OR account_id = ?)",
+                "UPDATE jobs SET skill_requirements_json = ? WHERE id = ? "
+                "AND COALESCE(account_id, -1) = COALESCE(?, COALESCE(account_id, -1))",
                 (
                     json.dumps([asdict(item) for item in merged], ensure_ascii=False),
                     job_id,
-                    account_id,
                     account_id,
                 ),
             )
@@ -1538,9 +1539,10 @@ class SQLiteStore:
                 """
                 UPDATE project_experience_cards
                 SET status = ?, confirmed_summary = ?, confirmed_at = ?
-                WHERE id = ? AND (? IS NULL OR account_id = ?)
+                WHERE id = ?
+                  AND COALESCE(account_id, -1) = COALESCE(?, COALESCE(account_id, -1))
                 """,
-                ("已确认", summary, confirmed_at, record_id, account_id, account_id),
+                ("已确认", summary, confirmed_at, record_id, account_id),
             )
             # 如果候选人没有写确认摘要，就把卡片草稿作为可检索材料保存，
             # 但界面仍然应该提示它来自候选人确认过的卡片而不是原始档案事实。
@@ -2309,7 +2311,7 @@ def candidate_profile_from_row(row: sqlite3.Row) -> CandidateProfile:
 
 
 def long_text_from_row(row: sqlite3.Row) -> LongTextRecord:
-    """把 SQLite 行转换为长文本记录。"""
+    """把数据库行转换为长文本记录。"""
 
     return LongTextRecord(
         id=int(row["id"]),
@@ -2318,6 +2320,7 @@ def long_text_from_row(row: sqlite3.Row) -> LongTextRecord:
         source_label=row["source_label"],
         text=row["text"],
         account_id=row["account_id"] if "account_id" in row.keys() else None,
+        candidate_id=row["candidate_id"] if "candidate_id" in row.keys() else None,
     )
 
 

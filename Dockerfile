@@ -19,8 +19,9 @@ RUN apt-get update \
 # 后续命令都在 /app 内执行，源码和运行数据边界清晰。
 WORKDIR /app
 
-# 复制项目声明和源码，随后按项目定义安装所有运行依赖。
-COPY pyproject.toml README.md ./
+# Alembic 脚本属于运行时迁移资产，必须随镜像保留，但不包含任何 .env 密钥。
+COPY pyproject.toml README.md alembic.ini ./
+COPY alembic ./alembic
 COPY src ./src
 
 # 以包的形式安装项目，确保 `job-agent-web` 命令和 Vue 静态资源都可用。
@@ -33,5 +34,5 @@ RUN useradd --create-home --uid 10001 appuser \
     && chown -R appuser:appuser /app
 USER appuser
 
-# 直接调用项目定义的 Web 入口；Compose 会传入 .env 和数据目录参数。
-CMD ["job-agent-web", "--db", "/app/data/job_agent.db", "--env-file", "/app/.env", "--rag-dir", "/app/data/chroma", "--resume-dir", "/app/data/resumes", "--host", "0.0.0.0", "--port", "8000"]
+# 直接调用项目定义的 Web 入口；Compose 会传入 .env 和受控简历目录参数。
+CMD ["job-agent-web", "--db", "/app/data/job_agent.db", "--env-file", "/app/.env", "--resume-dir", "/app/data/resumes", "--host", "0.0.0.0", "--port", "8000"]
