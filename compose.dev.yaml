@@ -1,0 +1,25 @@
+# 本文件只用于本机开发：通过 `-f compose.yaml -f compose.dev.yaml` 叠加使用。
+# 默认 compose.yaml 保持可复现的镜像运行方式，避免把开发期的源码挂载带到部署环境。
+services:
+  web:
+    # 覆盖默认启动命令，使 Uvicorn 在 Python 源码变化时重新导入应用工厂。
+    command:
+      - job-agent-web
+      - --db
+      - /app/data/job_agent.db
+      - --env-file
+      - /app/.env
+      - --rag-dir
+      - /app/data/chroma
+      - --resume-dir
+      - /app/data/resumes
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
+      - --reload-dir
+      - /app/src
+    volumes:
+      # 只读源码挂载让容器立即看到宿主机修改；依赖和镜像仍保持由 Dockerfile 管理。
+      - ./src:/app/src:ro

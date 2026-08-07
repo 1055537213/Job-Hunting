@@ -153,6 +153,7 @@ Job-hunting Agent/
 ├─ pyproject.toml                 # 依赖和命令入口
 ├─ Dockerfile                    # Python Web 运行镜像构建步骤
 ├─ compose.yaml                  # Docker Compose 本地开发服务
+├─ compose.dev.yaml              # 本机源码热更新开发覆盖配置
 ├─ .dockerignore                 # Docker 构建上下文排除规则
 ├─ .env.example                   # 模型配置模板
 └─ .gitignore                     # 密钥、数据库、缓存和运行数据忽略规则
@@ -334,6 +335,23 @@ docker compose down
 
 当前 Compose 只包含 `web` 服务，与本地 SQLite + Chroma 实现对应。PostgreSQL、pgvector、
 Redis、Worker、MinIO 和反向代理会在完成相应代码和迁移后再加入。
+
+### 5.1 本机开发时启用源码热更新
+
+日常修改 `src/` 下的 Python、前端 JS 或 CSS 时，使用开发覆盖配置启动：
+
+```powershell
+docker compose -f compose.yaml -f compose.dev.yaml up -d --build
+```
+
+首次构建完成后，后续保存 Python 文件会自动重启 Web 服务；修改前端静态文件后刷新浏览器即可，无需重新构建镜像。
+修改 `.env` 后仍需执行下面的重启命令：
+
+```powershell
+docker compose -f compose.yaml -f compose.dev.yaml restart web
+```
+
+`compose.dev.yaml` 只用于本机开发。需要模拟稳定部署或后续上线时，继续使用默认的 `compose.yaml`。
 
 ## 常用功能
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import uuid
 from dataclasses import asdict
@@ -55,6 +56,12 @@ from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
 STATIC_DIR = Path(__file__).with_name("web_static")
 SESSION_COOKIE_NAME = "job_agent_session"
 SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+# Uvicorn 的重载子进程只能通过导入路径重新创建应用，因此启动参数通过这些
+# 仅在进程内存在的环境变量传递，不写进用户的 .env 文件。
+WEB_RELOAD_DB_ENV = "JOB_AGENT_WEB_RELOAD_DB"
+WEB_RELOAD_ENV_FILE_ENV = "JOB_AGENT_WEB_RELOAD_ENV_FILE"
+WEB_RELOAD_RAG_DIR_ENV = "JOB_AGENT_WEB_RELOAD_RAG_DIR"
+WEB_RELOAD_RESUME_DIR_ENV = "JOB_AGENT_WEB_RELOAD_RESUME_DIR"
 
 
 class NoCacheStaticFiles(StaticFiles):
@@ -1281,6 +1288,32 @@ def clean_string_dict(values: dict[str, str]) -> dict[str, str]:
     }
 
 
+def create_reloadable_web_app() -> FastAPI:
+    """为 Uvicorn 重载子进程重新创建认证 Web 应用。
+
+    不能把已经创建好的 ``FastAPI`` 对象传给 ``uvicorn.run(..., reload=True)``，
+    否则子进程无法在源码变化后重新导入模块。这里通过启动父进程写入的运行路径
+    重建应用，同时避免把运行路径混入用户维护的模型配置文件。
+    """
+
+    return create_web_app(
+        db_path=os.environ.get(WEB_RELOAD_DB_ENV, "data/job_agent.db"),
+        env_file=os.environ.get(WEB_RELOAD_ENV_FILE_ENV, ".env"),
+        rag_dir=os.environ.get(WEB_RELOAD_RAG_DIR_ENV, "data/chroma"),
+        resume_dir=os.environ.get(WEB_RELOAD_RESUME_DIR_ENV, "data/resumes"),
+        require_auth=True,
+    )
+
+
+def configure_reload_runtime(args: argparse.Namespace) -> None:
+    """把 CLI 路径传给 Uvicorn 重载子进程，保持重启前后的数据位置一致。"""
+
+    os.environ[WEB_RELOAD_DB_ENV] = str(args.db)
+    os.environ[WEB_RELOAD_ENV_FILE_ENV] = str(args.env_file)
+    os.environ[WEB_RELOAD_RAG_DIR_ENV] = str(args.rag_dir)
+    os.environ[WEB_RELOAD_RESUME_DIR_ENV] = str(args.resume_dir)
+
+
 def main(argv: list[str] | None = None) -> None:
     """从命令行启动本地 Web 服务。"""
 
@@ -1291,9 +1324,30 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--resume-dir", default="data/resumes")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    # 只供本地开发覆盖配置使用；生产镜像应保持固定版本，不能自动加载宿主机源码。
+    parser.add_argument("--reload", action="store_true", help="监听源码变化并自动重启开发服务")
+    parser.add_argument(
+        "--reload-dir",
+        action="append",
+        default=[],
+        help="需要监听的源码目录；可重复传入多个目录",
+    )
     args = parser.parse_args(argv)
 
     import uvicorn
+
+    if args.reload:
+        configure_reload_runtime(args)
+        reload_dirs = args.reload_dir or [str(Path(__file__).resolve().parents[1])]
+        uvicorn.run(
+            "job_hunting_agent.web:create_reloadable_web_app",
+            factory=True,
+            host=args.host,
+            port=args.port,
+            reload=True,
+            reload_dirs=reload_dirs,
+        )
+        return
 
     uvicorn.run(
         create_web_app(

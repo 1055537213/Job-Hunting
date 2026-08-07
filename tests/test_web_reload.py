@@ -1,0 +1,88 @@
+"""Web 开发热更新启动方式的回归测试。"""
+
+from __future__ import annotations
+
+import os
+import sys
+from types import SimpleNamespace
+
+import job_hunting_agent.web as web
+
+
+def test_reloadable_web_app_reads_runtime_paths_from_reloader_environment(monkeypatch, tmp_path):
+    """Uvicorn 重载子进程应重建使用同一组运行路径的认证 Web 应用。"""
+
+    received: dict[str, object] = {}
+    sentinel = object()
+
+    def fake_create_web_app(**kwargs):
+        received.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(web, "create_web_app", fake_create_web_app)
+    monkeypatch.setenv(web.WEB_RELOAD_DB_ENV, str(tmp_path / "agent.db"))
+    monkeypatch.setenv(web.WEB_RELOAD_ENV_FILE_ENV, str(tmp_path / ".env"))
+    monkeypatch.setenv(web.WEB_RELOAD_RAG_DIR_ENV, str(tmp_path / "chroma"))
+    monkeypatch.setenv(web.WEB_RELOAD_RESUME_DIR_ENV, str(tmp_path / "resumes"))
+
+    assert web.create_reloadable_web_app() is sentinel
+    assert received == {
+        "db_path": str(tmp_path / "agent.db"),
+        "env_file": str(tmp_path / ".env"),
+        "rag_dir": str(tmp_path / "chroma"),
+        "resume_dir": str(tmp_path / "resumes"),
+        "require_auth": True,
+    }
+
+
+def test_web_cli_reload_uses_an_importable_factory_and_watches_requested_directory(monkeypatch, tmp_path):
+    """重载模式不能传递已创建的应用对象，否则 Uvicorn 无法重新导入新源码。"""
+
+    calls: list[tuple[object, dict[str, object]]] = []
+
+    def fake_run(app, **kwargs):
+        calls.append((app, kwargs))
+
+    monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=fake_run))
+    monkeypatch.delenv(web.WEB_RELOAD_DB_ENV, raising=False)
+    monkeypatch.delenv(web.WEB_RELOAD_ENV_FILE_ENV, raising=False)
+    monkeypatch.delenv(web.WEB_RELOAD_RAG_DIR_ENV, raising=False)
+    monkeypatch.delenv(web.WEB_RELOAD_RESUME_DIR_ENV, raising=False)
+
+    watch_dir = tmp_path / "source"
+    web.main(
+        [
+            "--db",
+            str(tmp_path / "agent.db"),
+            "--env-file",
+            str(tmp_path / ".env"),
+            "--rag-dir",
+            str(tmp_path / "chroma"),
+            "--resume-dir",
+            str(tmp_path / "resumes"),
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8123",
+            "--reload",
+            "--reload-dir",
+            str(watch_dir),
+        ]
+    )
+
+    assert calls == [
+        (
+            "job_hunting_agent.web:create_reloadable_web_app",
+            {
+                "factory": True,
+                "host": "0.0.0.0",
+                "port": 8123,
+                "reload": True,
+                "reload_dirs": [str(watch_dir)],
+            },
+        )
+    ]
+    assert os.environ[web.WEB_RELOAD_DB_ENV] == str(tmp_path / "agent.db")
+    assert os.environ[web.WEB_RELOAD_ENV_FILE_ENV] == str(tmp_path / ".env")
+    assert os.environ[web.WEB_RELOAD_RAG_DIR_ENV] == str(tmp_path / "chroma")
+    assert os.environ[web.WEB_RELOAD_RESUME_DIR_ENV] == str(tmp_path / "resumes")

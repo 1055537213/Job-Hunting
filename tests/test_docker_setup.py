@@ -38,10 +38,23 @@ def test_compose_mounts_env_read_only_and_data_persistently():
     assert "env_file:" not in compose
 
 
+def test_development_compose_mounts_source_and_enables_web_reload():
+    """开发覆盖配置应只为本地编辑增加源码挂载和自动重载。"""
+
+    compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    development_compose = (ROOT / "compose.dev.yaml").read_text(encoding="utf-8")
+
+    assert "./src:/app/src:ro" not in compose
+    assert "./src:/app/src:ro" in development_compose
+    assert "--reload" in development_compose
+    assert "--reload-dir" in development_compose
+    assert "/app/src" in development_compose
+
+
 def test_docker_learning_document_explains_stack_and_boundaries():
     """面向初学者的文档必须说明技术作用、选型理由和当前边界。"""
 
     document = (ROOT / "docs" / "learning" / "docker-environment.md").read_text(encoding="utf-8")
 
-    for phrase in ("Docker", "Docker Compose", "为什么现在选用", "SQLite", "PostgreSQL"):
+    for phrase in ("Docker", "Docker Compose", "为什么现在选用", "SQLite", "PostgreSQL", "热更新"):
         assert phrase in document

@@ -95,6 +95,33 @@ docker compose down
 Invoke-WebRequest http://127.0.0.1:8000/api/health | Select-Object -ExpandProperty Content
 ```
 
+## 开发模式：源码热更新
+
+默认的 `compose.yaml` 用于验证可复现镜像：源码在构建时复制到镜像，因此修改 Python 或前端文件后需要重新执行
+`docker compose up -d --build`。本项目额外提供 `compose.dev.yaml`，它只在本机开发时把 `src/` 以只读方式挂载到
+容器，并让 Uvicorn 监听 `/app/src`。
+
+第一次进入开发模式或修改依赖、`Dockerfile` 后，先构建一次：
+
+```powershell
+docker compose -f compose.yaml -f compose.dev.yaml up -d --build
+```
+
+之后修改 `src/` 中的内容时，不需要再次构建镜像：Python 文件变化会自动重启 Web 子进程；Vue 静态 JS/CSS 文件在浏览器刷新后
+即可读取新版本。查看开发服务日志：
+
+```powershell
+docker compose -f compose.yaml -f compose.dev.yaml logs -f web
+```
+
+`.env` 仍在应用启动时读取，修改后需要重启开发服务：
+
+```powershell
+docker compose -f compose.yaml -f compose.dev.yaml restart web
+```
+
+热更新仅限本机开发。部署环境应继续使用不叠加 `compose.dev.yaml` 的固定镜像，避免宿主机代码变化直接影响线上服务。
+
 ## 现在为什么只有一个 `web` 服务
 
 当前项目本地开发仍使用 SQLite、Chroma 和本地文件目录。把 PostgreSQL、pgvector、
