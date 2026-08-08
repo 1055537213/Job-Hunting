@@ -39,6 +39,7 @@
                 type="email"
                 autocomplete="email"
                 required
+                @input="clearAuthFeedback"
                 :aria-invalid="String(Boolean(authError))"
                 aria-describedby="authError"
               />
@@ -54,6 +55,7 @@
                   :autocomplete="authMode === 'login' ? 'current-password' : 'new-password'"
                   minlength="8"
                   required
+                  @input="clearAuthFeedback"
                   :aria-invalid="String(Boolean(authError))"
                   aria-describedby="authError"
                 />

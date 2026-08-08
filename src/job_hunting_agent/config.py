@@ -23,7 +23,7 @@ DEFAULT_ENV_PATH = Path(".env")
 class LLMSettings:
     """LLM 供应商配置。
 
-    `api_key` 是敏感字段，只在内存中用于请求头，CLI 和日志都不应该打印它。
+    `api_key` 是敏感字段，只在内存中用于请求头，管理 API 和日志都不应该打印它。
     `provider` 是用于日志和计量的标签，不参与供应商白名单判断；只要接口兼容
     OpenAI Chat Completions，就可以通过 `.env` 切换官方服务、本地服务或中转站。
     """
@@ -56,9 +56,8 @@ class ModelGatewaySettings:
 class DatabaseSettings:
     """生产数据库连接配置。
 
-    当前业务运行默认仍使用本地 SQLite 文件；只有显式配置
-    ``JOB_AGENT_DATABASE_URL`` 并执行 Alembic 迁移时才会连接生产数据库。
-    这样不会让开发环境意外切到一个空的 PostgreSQL 数据库。
+    Web 运行入口、迁移任务和测试均使用 PostgreSQL URL；没有配置时会直接报错，
+    避免用户数据悄悄写入本地文件数据库。
     """
 
     url: str | None = None
@@ -87,6 +86,19 @@ class DatabaseSettings:
 
 
 @dataclass(frozen=True)
+class BootstrapAdminSettings:
+    """首次启动时创建管理员账号的一次性配置。
+
+    该密码只在数据库尚无管理员账号时读取并写入 Argon2id 哈希，不会出现在
+    API 响应、健康检查或日志中。常规管理员登录后应从 `.env` 删除密码配置。
+    """
+
+    email: str
+    password: str
+    display_name: str | None = None
+
+
+@dataclass(frozen=True)
 class EmbeddingSettings:
     """Embedding 供应商配置。
 
@@ -110,7 +122,7 @@ class RerankSettings:
     """Rerank 供应商配置。
 
     Rerank 只在向量检索拿到候选证据后调用，用于按“查询 + 证据正文”重新排序；
-    它不参与 Chroma 建库，因此更换 rerank 模型无需重建向量索引。
+    它不参与 pgvector 建库，因此更换 rerank 模型无需重建向量索引。
     """
 
     provider: str
@@ -127,7 +139,7 @@ class RerankSettings:
 class AgentMemorySettings:
     """Agent 对话记忆配置。
 
-    `restore_history_limit` 控制启动恢复时最多读取多少条 SQLite 聊天记录。
+    `restore_history_limit` 控制启动恢复时最多读取多少条 PostgreSQL 聊天记录。
     `restore_trigger_tokens` 控制恢复历史过长时何时先压缩再交给 Agent。
     `summary_trigger_tokens` 控制 LangChain 运行中何时触发自动总结。
     `summary_keep_messages` 表示总结后保留最近多少条原文消息。
@@ -229,7 +241,7 @@ def load_llm_settings(
 
 
 def masked_llm_settings(settings: LLMSettings) -> dict[str, object]:
-    """返回适合 CLI 展示的配置摘要，不泄露 API Key。"""
+    """返回适合管理健康检查展示的配置摘要，不泄露 API Key。"""
 
     return {
         "provider": settings.provider,
@@ -303,11 +315,11 @@ def load_database_settings(
     env_path: str | Path = DEFAULT_ENV_PATH,
     environ: Mapping[str, str] | None = None,
 ) -> DatabaseSettings:
-    """从 .env 或系统环境变量读取可选的生产数据库 URL。
+    """从 .env 或系统环境变量读取数据库 URL。
 
     PostgreSQL 统一归一化为 postgresql+psycopg，避免运行时因 SQLAlchemy
-    自动选择不同驱动而产生行为差异。未配置时返回空 Settings，而不是把当前
-    SQLite 文件路径伪装成生产连接。
+    自动选择不同驱动而产生行为差异。未配置时返回空 Settings，由运行入口决定
+    是否应当拒绝启动。
     """
 
     file_values = load_dotenv_values(env_path)
@@ -320,8 +332,54 @@ def load_database_settings(
     return DatabaseSettings(url=normalize_database_url(raw_url.strip()))
 
 
+def load_bootstrap_admin_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> BootstrapAdminSettings | None:
+    """读取可选的首次管理员引导配置。
+
+    普通用户仍只能通过网页注册为 `user`。只有数据库尚无管理员时，Web 启动会
+    使用此配置创建一个 `admin`，因此不需要保留公开或日常使用的终端创建入口。
+    """
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(key: str) -> str | None:
+        return environment.get(key) or file_values.get(key)
+
+    email = get("JOB_AGENT_BOOTSTRAP_ADMIN_EMAIL")
+    password = get("JOB_AGENT_BOOTSTRAP_ADMIN_PASSWORD")
+    display_name = get("JOB_AGENT_BOOTSTRAP_ADMIN_DISPLAY_NAME")
+    if not email and not password:
+        return None
+    if not email or not password:
+        raise ValueError(
+            "首次管理员配置必须同时提供 JOB_AGENT_BOOTSTRAP_ADMIN_EMAIL 和 "
+            "JOB_AGENT_BOOTSTRAP_ADMIN_PASSWORD。"
+        )
+    return BootstrapAdminSettings(
+        email=email.strip(),
+        password=password,
+        display_name=display_name.strip() if display_name else None,
+    )
+
+
+def require_postgresql_database_url(settings: DatabaseSettings) -> str:
+    """返回可用的 PostgreSQL URL，拒绝缺失配置和非 PostgreSQL 方言。"""
+
+    if not settings.configured or settings.url is None:
+        raise ValueError("缺少 JOB_AGENT_DATABASE_URL；运行时必须连接 PostgreSQL。")
+    if settings.dialect != "postgresql":
+        raise ValueError("项目只支持 PostgreSQL 数据库 URL。")
+    return settings.url
+
+
 def normalize_database_url(value: str) -> str:
-    """校验并归一化 SQLAlchemy 数据库 URL。"""
+    """校验并归一化 SQLAlchemy 数据库 URL。
+
+    项目统一使用 psycopg 驱动的 PostgreSQL URL；其他方言会在配置阶段被拒绝。
+    """
 
     normalized = value.strip()
     if normalized.startswith("postgres://"):
@@ -329,16 +387,13 @@ def normalize_database_url(value: str) -> str:
     elif normalized.startswith("postgresql://"):
         normalized = "postgresql+psycopg://" + normalized.removeprefix("postgresql://")
 
-    allowed_prefixes = ("postgresql+psycopg://", "sqlite://", "sqlite+pysqlite://")
-    if not normalized.startswith(allowed_prefixes):
-        raise ValueError(
-            "JOB_AGENT_DATABASE_URL 只支持 postgresql+psycopg、postgresql 或 sqlite URL"
-        )
+    if not normalized.startswith("postgresql+psycopg://"):
+        raise ValueError("数据库 URL 只支持 postgresql+psycopg 或 postgresql 协议。")
     return normalized
 
 
 def mask_database_url(value: str) -> str:
-    """掩码数据库 URL 中的密码，供 CLI、日志和健康检查展示。"""
+    """掩码数据库 URL 中的密码，供日志和健康检查展示。"""
 
     parts = urlsplit(value)
     if "@" not in parts.netloc:
@@ -498,7 +553,7 @@ def load_embedding_settings(
 
 
 def masked_embedding_settings(settings: EmbeddingSettings | None) -> dict[str, object]:
-    """返回适合 CLI / Web 展示的 embedding 配置摘要。"""
+    """返回适合 Web 管理健康检查展示的 embedding 配置摘要。"""
 
     if settings is None:
         return {"provider": "local_hash", "mode": "fallback", "configured": False}
@@ -592,7 +647,7 @@ def load_rerank_settings(
 
 
 def masked_rerank_settings(settings: RerankSettings | None) -> dict[str, object]:
-    """返回不含 API Key 的 Rerank 配置摘要，供 CLI 和健康检查展示。"""
+    """返回不含 API Key 的 Rerank 配置摘要，供健康检查展示。"""
 
     if settings is None:
         return {"provider": "disabled", "configured": False}
@@ -700,7 +755,7 @@ def load_semantic_matching_enabled(
 
 
 def masked_agent_memory_settings(settings: AgentMemorySettings) -> dict[str, object]:
-    """返回适合 Web/CLI 展示的 Agent 记忆配置。"""
+    """返回适合 Web 管理健康检查展示的 Agent 记忆配置。"""
 
     return {
         "enabled": settings.enabled,

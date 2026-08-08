@@ -19,6 +19,8 @@ def test_docker_files_keep_runtime_data_and_secrets_out_of_image():
     assert "USER appuser" in dockerfile
     assert "--host" in dockerfile
     assert "0.0.0.0" in dockerfile
+    assert "--db" not in dockerfile
+    assert "--rag-dir" not in dockerfile
     assert ".env" in dockerignore
     assert "data/" in dockerignore
     assert "tests/" in dockerignore
@@ -35,7 +37,8 @@ def test_compose_mounts_env_read_only_and_starts_postgres_before_web():
     assert "JOB_AGENT_DOCKER_BASE_IMAGE" in compose
     assert "pgvector/pgvector:pg16" in compose
     assert "JOB_AGENT_DATABASE_URL" in compose
-    assert "database-upgrade" in compose
+    assert '["alembic", "upgrade", "head"]' in compose
+    assert "job-agent" not in compose
     assert "service_completed_successfully" in compose
     assert "postgres_data" in compose
     assert "/api/health" in compose
@@ -54,6 +57,8 @@ def test_development_compose_mounts_source_and_enables_web_reload():
     assert "--reload" in development_compose
     assert "--reload-dir" in development_compose
     assert "/app/src" in development_compose
+    assert "--db" not in development_compose
+    assert "--rag-dir" not in development_compose
 
 
 def test_docker_learning_document_explains_stack_and_boundaries():
@@ -61,5 +66,5 @@ def test_docker_learning_document_explains_stack_and_boundaries():
 
     document = (ROOT / "docs" / "learning" / "docker-environment.md").read_text(encoding="utf-8")
 
-    for phrase in ("Docker", "Docker Compose", "为什么现在选用", "SQLite", "PostgreSQL", "热更新"):
+    for phrase in ("Docker", "Docker Compose", "为什么现在选用", "PostgreSQL", "pgvector", "热更新"):
         assert phrase in document

@@ -1,21 +1,17 @@
-"""SQLite 存储层。
+﻿"""数据库无关的领域仓储方法。
 
-这个模块是当前 MVP 的事实源：
-
-- `candidate_profiles` 保存候选人的结构化事实和偏好。
-- `jobs` 保存职位原文及其标准化字段。
-- `long_texts` 先作为长文本检索的占位表，后续可以替换或同步到向量库。
-
-注意：这里不接触 BOSS 账号，也不自动抓取职位，只保存候选人主动提供的数据。
+本模块只保存候选人、职位、对话、简历和用量的领域读写逻辑，不创建数据库连接，
+也不负责 schema 初始化。具体连接和事务由 `SQLAlchemyStore` 提供，因此 Web、
+后台任务和测试都走同一条 PostgreSQL + pgvector 数据路径。
 """
 
 from __future__ import annotations
 
 import json
-import sqlite3
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime
-from pathlib import Path
+from typing import Any, Protocol
 
 from .auth import AuthSession, AuthUser, is_session_expired, session_expiry, session_token_hash, utc_now
 from .city_catalog import normalize_city_list
@@ -41,328 +37,41 @@ from .models import (
 )
 
 
-class ClosingSQLiteConnection(sqlite3.Connection):
-    """让 `with self.connect()` 在提交/回滚后同时释放 Windows 文件句柄。"""
+class RepositoryRow(Protocol):
+    """仓储方法读取的最小行接口；具体实现由 SQLAlchemy 适配层提供。"""
 
-    def __exit__(self, exc_type, exc_value, traceback):  # noqa: ANN001
-        try:
-            return super().__exit__(exc_type, exc_value, traceback)
-        finally:
-            self.close()
+    def __getitem__(self, key: str) -> Any:
+        ...
+
+    def keys(self) -> list[str]:
+        ...
 
 
-class SQLiteStore:
-    """封装所有 SQLite 读写。
+class RepositoryConnection(Protocol):
+    """仓储方法需要的最小事务连接接口。"""
 
-    业务层通过这个类保存和读取实体，不需要关心表结构和 JSON 序列化细节。
-    """
+    def __enter__(self) -> "RepositoryConnection":
+        ...
 
-    def __init__(self, db_path: str | Path):
-        """记录数据库路径；真正连接会在每次操作时创建。"""
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        ...
 
-        self.db_path = Path(db_path)
+    def execute(self, sql: str, parameters: object = None) -> Any:
+        ...
 
-    def connect(self) -> sqlite3.Connection:
-        """创建 SQLite 连接，并让查询结果可以像字典一样按列名读取。"""
 
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        # 启用外键约束并稍微延长等待时间，避免认证和聊天并发写入时过早报锁库。
-        conn = sqlite3.connect(self.db_path, timeout=30, factory=ClosingSQLiteConnection)
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.row_factory = sqlite3.Row
-        return conn
+class RepositoryStore:
+    """封装领域读写逻辑；连接、事务和 schema 由具体数据库适配层负责。"""
+
+    def connect(self) -> RepositoryConnection:
+        """返回一次短生命周期事务连接。"""
+
+        raise NotImplementedError
 
     def initialize(self) -> None:
-        """创建 MVP 所需的数据表。
+        """确认数据库已经由 Alembic 管理并完成迁移。"""
 
-        当前先把 list/dict 字段保存成 JSON 文本，这是教学版里最直观的做法；
-        以后如果查询需求变复杂，再拆成独立关系表。
-        """
-
-        with self.connect() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS accounts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    email TEXT NOT NULL COLLATE NOCASE UNIQUE,
-                    password_hash TEXT NOT NULL,
-                    display_name TEXT,
-                    role TEXT NOT NULL DEFAULT 'user',
-                    status TEXT NOT NULL DEFAULT 'active',
-                    must_change_password INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS auth_sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id INTEGER NOT NULL,
-                    token_hash TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL,
-                    last_seen_at TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    absolute_expires_at TEXT NOT NULL,
-                    revoked_at TEXT,
-                    user_agent TEXT,
-                    ip_address TEXT,
-                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_auth_sessions_account
-                    ON auth_sessions(account_id, revoked_at);
-                CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry
-                    ON auth_sessions(expires_at, absolute_expires_at);
-
-                CREATE TABLE IF NOT EXISTS chat_sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL UNIQUE,
-                    account_id INTEGER NOT NULL,
-                    candidate_id INTEGER NOT NULL,
-                    job_id INTEGER,
-                    title TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    archived_at TEXT,
-                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
-                    FOREIGN KEY(candidate_id) REFERENCES candidate_profiles(id) ON DELETE CASCADE
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_chat_sessions_account
-                    ON chat_sessions(account_id, updated_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_chat_sessions_candidate
-                    ON chat_sessions(candidate_id, updated_at DESC);
-
-                CREATE TABLE IF NOT EXISTS usage_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id INTEGER NOT NULL,
-                    candidate_id INTEGER,
-                    session_id TEXT,
-                    root_request_id TEXT,
-                    call_id TEXT NOT NULL UNIQUE,
-                    provider TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    input_tokens INTEGER NOT NULL DEFAULT 0,
-                    output_tokens INTEGER NOT NULL DEFAULT 0,
-                    total_tokens INTEGER NOT NULL DEFAULT 0,
-                    usage_source TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'succeeded',
-                    attempt INTEGER NOT NULL DEFAULT 1,
-                    provider_request_id TEXT,
-                    raw_usage_json TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL,
-                    billable INTEGER NOT NULL DEFAULT 0,
-                    pricing_version TEXT,
-                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_usage_events_account_time
-                    ON usage_events(account_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_usage_events_session
-                    ON usage_events(session_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_usage_events_request
-                    ON usage_events(root_request_id, created_at);
-
-                CREATE TABLE IF NOT EXISTS candidate_profiles (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    account_id INTEGER,
-                    name TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    education TEXT NOT NULL,
-                    experience_years REAL NOT NULL,
-                    salary_floor_k INTEGER,
-                    expected_salary_k INTEGER,
-                    skills_json TEXT NOT NULL,
-                    preferred_cities_json TEXT NOT NULL,
-                    acceptable_cities_json TEXT NOT NULL DEFAULT '[]',
-                    preference_weights_json TEXT NOT NULL DEFAULT '{}',
-                    target_directions_json TEXT NOT NULL,
-                    unacceptable_json TEXT NOT NULL,
-                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS jobs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    account_id INTEGER,
-                    raw_text TEXT NOT NULL,
-                    source_url TEXT,
-                    title TEXT NOT NULL,
-                    city TEXT,
-                    salary_min_k INTEGER,
-                    salary_max_k INTEGER,
-                    salary_months INTEGER,
-                    salary_unit TEXT NOT NULL,
-                    experience_min_years REAL,
-                    experience_max_years REAL,
-                    experience_label TEXT,
-                    education TEXT,
-                     company_name TEXT,
-                     industry TEXT,
-                     company_size TEXT,
-                     skills_json TEXT NOT NULL,
-                     skill_requirements_json TEXT NOT NULL DEFAULT '[]',
-                     description_text TEXT NOT NULL,
-                    field_confidence_json TEXT NOT NULL,
-                    uncertainty_notes_json TEXT NOT NULL,
-                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS long_texts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    account_id INTEGER,
-                    candidate_id INTEGER,
-                    entity_type TEXT NOT NULL,
-                    entity_id INTEGER NOT NULL,
-                    source_label TEXT NOT NULL,
-                    text TEXT NOT NULL,
-                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
-                    FOREIGN KEY(candidate_id) REFERENCES candidate_profiles(id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS chat_messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    account_id INTEGER,
-                    candidate_id INTEGER NOT NULL,
-                    session_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
-                    FOREIGN KEY(candidate_id) REFERENCES candidate_profiles(id)
-                );
-
-                CREATE TABLE IF NOT EXISTS project_experience_cards (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    account_id INTEGER,
-                    candidate_id INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    project_name TEXT NOT NULL,
-                    card_json TEXT NOT NULL,
-                    confirmed_summary TEXT,
-                    created_at TEXT NOT NULL,
-                    confirmed_at TEXT,
-                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
-                    FOREIGN KEY(candidate_id) REFERENCES candidate_profiles(id)
-                );
-
-                CREATE TABLE IF NOT EXISTS resume_drafts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    account_id INTEGER,
-                    candidate_id INTEGER NOT NULL,
-                    job_id INTEGER NOT NULL,
-                    version INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    draft_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
-                    FOREIGN KEY(candidate_id) REFERENCES candidate_profiles(id),
-                    FOREIGN KEY(job_id) REFERENCES jobs(id)
-                );
-
-                CREATE TABLE IF NOT EXISTS resume_artifacts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    account_id INTEGER,
-                    candidate_id INTEGER NOT NULL,
-                    job_id INTEGER,
-                    draft_id INTEGER,
-                    parent_artifact_id INTEGER,
-                    version INTEGER NOT NULL,
-                    artifact_type TEXT NOT NULL,
-                    original_filename TEXT NOT NULL,
-                    download_filename TEXT NOT NULL,
-                    storage_key TEXT NOT NULL UNIQUE,
-                    media_type TEXT NOT NULL,
-                    file_size INTEGER NOT NULL,
-                    sha256 TEXT NOT NULL,
-                    extraction_method TEXT NOT NULL,
-                    extracted_text TEXT NOT NULL,
-                    text_length INTEGER NOT NULL,
-                    page_count INTEGER,
-                    status TEXT NOT NULL,
-                    long_text_id INTEGER,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
-                    FOREIGN KEY(candidate_id) REFERENCES candidate_profiles(id) ON DELETE CASCADE,
-                    FOREIGN KEY(job_id) REFERENCES jobs(id),
-                    FOREIGN KEY(draft_id) REFERENCES resume_drafts(id),
-                    FOREIGN KEY(parent_artifact_id) REFERENCES resume_artifacts(id)
-                );
-
-                """
-            )
-            # 兼容用户已有的本地数据库：旧表缺字段时只补充可空归属列，
-            # 不自动删除任何数据；正式部署可用全新数据库初始化。
-            for table in (
-                "candidate_profiles",
-                "jobs",
-                "long_texts",
-                "chat_messages",
-                "project_experience_cards",
-                "resume_drafts",
-                "resume_artifacts",
-            ):
-                self._ensure_column(conn, table, "user_id", "INTEGER")
-
-            # 账号是共享访问和统一计费边界；旧测试数据库没有 account_id 时补充可空列。
-            self._ensure_column(conn, "candidate_profiles", "account_id", "INTEGER")
-            # 新增城市偏好分类时兼容已经存在的本地数据库。
-            self._ensure_column(
-                conn,
-                "candidate_profiles",
-                "acceptable_cities_json",
-                "TEXT NOT NULL DEFAULT '[]'",
-            )
-            self._ensure_column(
-                conn,
-                "candidate_profiles",
-                "preference_weights_json",
-                "TEXT NOT NULL DEFAULT '{}'",
-            )
-            self._ensure_column(
-                conn,
-                "jobs",
-                "skill_requirements_json",
-                "TEXT NOT NULL DEFAULT '[]'",
-            )
-            self._ensure_column(conn, "jobs", "account_id", "INTEGER")
-            self._ensure_column(conn, "long_texts", "account_id", "INTEGER")
-            self._ensure_column(conn, "long_texts", "candidate_id", "INTEGER")
-            self._ensure_column(conn, "chat_messages", "account_id", "INTEGER")
-            self._ensure_column(conn, "project_experience_cards", "account_id", "INTEGER")
-            self._ensure_column(conn, "resume_drafts", "account_id", "INTEGER")
-            self._ensure_column(conn, "resume_artifacts", "account_id", "INTEGER")
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_candidate_profiles_account "
-                "ON candidate_profiles(account_id, id)"
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_account ON jobs(account_id, id)")
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_long_texts_account "
-                "ON long_texts(account_id, id)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_chat_messages_account "
-                "ON chat_messages(account_id, candidate_id, session_id, id)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_resume_artifacts_owner "
-                "ON resume_artifacts(account_id, candidate_id, id)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_resume_artifacts_parent "
-                "ON resume_artifacts(parent_artifact_id, draft_id)"
-            )
-
-    # ------------------------------------------------------------------
+        raise NotImplementedError
     # 账号、Session、会话和用量流水
     # ------------------------------------------------------------------
 
@@ -629,17 +338,26 @@ class SQLiteStore:
             raise KeyError(f"Chat session not found: {record_id}")
         return chat_session_from_row(row)
 
-    def get_chat_session_by_key(self, session_id: str, account_id: int) -> ChatSessionRecord:
+    def get_chat_session_by_key(self, session_id: str, account_id: int | None) -> ChatSessionRecord:
         """按账号和公开 Session ID读取对话，防止跨账号猜 ID。"""
 
         with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM chat_sessions
-                WHERE session_id = ? AND account_id = ?
-                """,
-                (session_id, account_id),
-            ).fetchone()
+            if account_id is None:
+                row = conn.execute(
+                    """
+                    SELECT * FROM chat_sessions
+                    WHERE session_id = ? AND account_id IS NULL
+                    """,
+                    (session_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT * FROM chat_sessions
+                    WHERE session_id = ? AND account_id = ?
+                    """,
+                    (session_id, account_id),
+                ).fetchone()
         if row is None:
             raise KeyError(f"Chat session not found: {session_id}")
         return chat_session_from_row(row)
@@ -836,15 +554,6 @@ class SQLiteStore:
             for row in rows
         ]
 
-    @staticmethod
-    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-        """为旧版本地表补充兼容列。"""
-
-        columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-        if column not in columns:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-
     def save_candidate_profile(
         self,
         profile: CandidateProfileInput,
@@ -886,7 +595,7 @@ class SQLiteStore:
                 ),
             )
             candidate_id = int(cursor.lastrowid)
-            # 同一个事务里写 long_texts，避免 Windows 上 SQLite 多连接写入导致锁库。
+            # 同一个事务里写 long_texts，保证 PostgreSQL 外键和长文本登记原子完成。
             self._add_long_text(
                 conn,
                 "candidate_profile",
@@ -1705,7 +1414,7 @@ class SQLiteStore:
         """保存一份简历文件元数据，可选地同时登记 RAG 长文本来源。
 
         二进制文件应先由 `ResumeFileStore` 原子写入；调用方在本方法失败时负责
-        删除刚写入的文件，避免文件系统和 SQLite 之间留下孤立记录。
+        删除刚写入的文件，避免文件系统和 PostgreSQL 元数据之间留下孤立记录。
         """
 
         if artifact_type not in {"source", "tailored"}:
@@ -1987,7 +1696,7 @@ class SQLiteStore:
                 tuple(parameters),
             )
 
-    def _job_from_row(self, row: sqlite3.Row) -> ImportedJob:
+    def _job_from_row(self, row: RepositoryRow) -> ImportedJob:
         """把 jobs 表的一行转换成 `ImportedJob`。"""
 
         return ImportedJob(
@@ -2020,7 +1729,7 @@ class SQLiteStore:
             uncertainty_notes=json.loads(row["uncertainty_notes_json"]),
         )
 
-    def _project_card_from_row(self, row: sqlite3.Row) -> ProjectExperienceRecord:
+    def _project_card_from_row(self, row: RepositoryRow) -> ProjectExperienceRecord:
         """把项目卡片表的一行转换成领域模型。"""
 
         card = ProjectExperienceCard(**json.loads(row["card_json"]))
@@ -2034,7 +1743,7 @@ class SQLiteStore:
             confirmed_at=row["confirmed_at"],
         )
 
-    def _resume_draft_from_row(self, row: sqlite3.Row) -> ResumeDraftRecord:
+    def _resume_draft_from_row(self, row: RepositoryRow) -> ResumeDraftRecord:
         """把简历草稿表的一行转换成领域模型。"""
 
         draft = ResumeDraft(**json.loads(row["draft_json"]))
@@ -2048,7 +1757,7 @@ class SQLiteStore:
             created_at=row["created_at"],
         )
 
-    def _resume_artifact_from_row(self, row: sqlite3.Row) -> ResumeArtifactRecord:
+    def _resume_artifact_from_row(self, row: RepositoryRow) -> ResumeArtifactRecord:
         """把简历文件表的一行转换成不携带全文的领域记录。"""
 
         return ResumeArtifactRecord(
@@ -2078,7 +1787,7 @@ class SQLiteStore:
             created_at=str(row["created_at"]),
         )
 
-    def _chat_message_from_row(self, row: sqlite3.Row) -> ChatMessageRecord:
+    def _chat_message_from_row(self, row: RepositoryRow) -> ChatMessageRecord:
         """把聊天记录表的一行转换成领域模型。"""
 
         return ChatMessageRecord(
@@ -2125,7 +1834,7 @@ class SQLiteStore:
     ) -> list[LongTextRecord]:
         """列出可同步到 RAG 索引的长文本材料。
 
-        SQLite 仍然是长文本来源的登记处；RAG 层只从这里读取并建立语义索引。
+        PostgreSQL 的 long_texts 是长文本来源登记处；RAG 层只从这里读取并建立派生索引。
         """
 
         with self.connect() as conn:
@@ -2180,7 +1889,7 @@ class SQLiteStore:
 
     def _add_long_text(
         self,
-        conn: sqlite3.Connection,
+        conn: RepositoryConnection,
         entity_type: str,
         entity_id: int,
         source_label: str,
@@ -2206,7 +1915,7 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def account_from_row(row: sqlite3.Row) -> AccountRecord:
+def account_from_row(row: RepositoryRow) -> AccountRecord:
     """把账号行转换为不含密码的领域对象。"""
 
     return AccountRecord(
@@ -2221,7 +1930,7 @@ def account_from_row(row: sqlite3.Row) -> AccountRecord:
     )
 
 
-def auth_session_from_row(row: sqlite3.Row) -> AuthSessionRecord:
+def auth_session_from_row(row: RepositoryRow) -> AuthSessionRecord:
     """把认证 Session 行转换为领域对象。"""
 
     return AuthSessionRecord(
@@ -2238,13 +1947,15 @@ def auth_session_from_row(row: sqlite3.Row) -> AuthSessionRecord:
     )
 
 
-def chat_session_from_row(row: sqlite3.Row) -> ChatSessionRecord:
+def chat_session_from_row(row: RepositoryRow) -> ChatSessionRecord:
     """把独立对话行转换为领域对象。"""
 
     return ChatSessionRecord(
         id=int(row["id"]),
         session_id=str(row["session_id"]),
-        account_id=int(row["account_id"]),
+        # 未登录的历史领域/Web 测试记录可能没有账号归属；生产 Web
+        # 始终传入正整数，旧记录在领域对象中用 0 表示“未绑定账号”。
+        account_id=int(row["account_id"]) if row["account_id"] is not None else 0,
         candidate_id=int(row["candidate_id"]),
         job_id=int(row["job_id"]) if row["job_id"] is not None else None,
         title=str(row["title"]),
@@ -2255,7 +1966,7 @@ def chat_session_from_row(row: sqlite3.Row) -> ChatSessionRecord:
     )
 
 
-def usage_event_from_row(row: sqlite3.Row) -> UsageEventRecord:
+def usage_event_from_row(row: RepositoryRow) -> UsageEventRecord:
     """把用量流水行转换为领域对象。"""
 
     return UsageEventRecord(
@@ -2282,8 +1993,8 @@ def usage_event_from_row(row: sqlite3.Row) -> UsageEventRecord:
     )
 
 
-def candidate_profile_from_row(row: sqlite3.Row) -> CandidateProfile:
-    """把 SQLite 行转换为候选人档案对象。"""
+def candidate_profile_from_row(row: RepositoryRow) -> CandidateProfile:
+    """把 PostgreSQL 行转换为候选人档案对象。"""
 
     return CandidateProfile(
         id=int(row["id"]),
@@ -2310,7 +2021,7 @@ def candidate_profile_from_row(row: sqlite3.Row) -> CandidateProfile:
     )
 
 
-def long_text_from_row(row: sqlite3.Row) -> LongTextRecord:
+def long_text_from_row(row: RepositoryRow) -> LongTextRecord:
     """把数据库行转换为长文本记录。"""
 
     return LongTextRecord(

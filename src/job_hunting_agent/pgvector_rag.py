@@ -1,7 +1,7 @@
 """PostgreSQL + pgvector RAG 后端。
 
 ``long_texts`` 仍是长文本材料的事实源；本模块只把它们切分、嵌入并保存为
-``rag_chunks`` 派生索引。它与 ``RAGKnowledgeBase`` 保持相同的公共方法，应用层
+``rag_chunks`` 派生索引。它提供稳定的公共方法，应用层
 可在 PostgreSQL 环境切换后端，而不改变简历生成、对话入库或检索调用。
 """
 
@@ -37,7 +37,7 @@ PGVECTOR_PERSISTENCE_LABEL = "postgresql+pgvector"
 class PgVectorKnowledgeBase:
     """在 PostgreSQL 内维护账号隔离的 pgvector RAG 索引。
 
-    外部接口刻意与 Chroma 后端保持一致：调用方只需要提供长文本、查询和可选的
+    外部接口保持稳定：调用方只需要提供长文本、查询和可选的
     账号过滤条件。向量 SQL、稳定 ID、模型隔离和事务性 upsert 都留在此模块内部。
     """
 
@@ -184,8 +184,9 @@ class PgVectorKnowledgeBase:
         for document, vector in zip(documents, vectors, strict=True):
             normalized_vector = self._validate_vector(vector, "索引")
             metadata = document.metadata
-            account_id = int(metadata.get("account_id", -1))
-            if account_id <= 0:
+            raw_account_id = metadata.get("account_id")
+            account_id = int(raw_account_id) if raw_account_id is not None else None
+            if account_id is not None and account_id <= 0:
                 raise ValueError("pgvector RAG 索引必须关联有效的账号。")
             candidate_id = metadata.get("candidate_id")
             content = document.page_content
@@ -261,7 +262,7 @@ class PgVectorKnowledgeBase:
         return normalized
 
     def _stats(self, document_count: int, chunk_count: int, mode: str) -> RAGIndexStats:
-        """构造与 Chroma 后端一致的索引统计结果。"""
+        """构造 PostgreSQL + pgvector 的索引统计结果。"""
 
         return RAGIndexStats(
             document_count=document_count,

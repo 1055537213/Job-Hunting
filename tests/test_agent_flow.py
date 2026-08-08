@@ -4,7 +4,7 @@
 
 - Agent 会按标准 `create_agent -> tool loop` 执行。
 - 工具不会越过 `JobHuntingApp` 直接改库。
-- Agent 工具执行后，SQLite / RAG 的业务结果确实落地。
+- Agent 工具执行后，PostgreSQL / pgvector 的业务结果确实落地。
 """
 
 import warnings
@@ -62,10 +62,10 @@ class StreamingFakeChatModel(FakeListChatModel):
         return self
 
 
-def test_langchain_agent_can_call_ingest_tool_and_update_profile(tmp_path):
-    """Agent 可以通过工具把聊天资料保存进 SQLite，并增量更新 RAG。"""
+def test_langchain_agent_can_call_ingest_tool_and_update_profile(tmp_path, account_id):
+    """Agent 可以通过工具把聊天资料保存进 PostgreSQL，并增量更新 pgvector RAG。"""
 
-    app = JobHuntingApp(tmp_path / "agent.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -79,7 +79,8 @@ def test_langchain_agent_can_call_ingest_tool_and_update_profile(tmp_path):
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     model = ToolCallingFakeChatModel(
         responses=[
@@ -101,16 +102,17 @@ def test_langchain_agent_can_call_ingest_tool_and_update_profile(tmp_path):
         ]
     )
 
-    agent = JobHuntingAgent(app, rag_dir=tmp_path / "chroma", model=model)
+    agent = JobHuntingAgent(app, model=model)
     result = agent.chat(
         "我是本科，1年经验，会 Python 和 FastAPI。做过一个求职助手项目。",
         candidate_id=candidate_id,
         session_id="agent-test-ingest",
         use_tool_llm=False,
         auto_rag=True,
+        account_id=account_id,
     )
-    profile = app.get_candidate_profile(candidate_id)
-    rag_results = app.search_rag("FastAPI 求职助手", tmp_path / "chroma")
+    profile = app.get_candidate_profile(candidate_id, account_id=account_id)
+    rag_results = app.search_rag("FastAPI 求职助手", account_id=account_id)
 
     assert result.mode == "langchain_agent"
     assert result.used_tools == ["ingest_candidate_message"]
@@ -122,10 +124,10 @@ def test_langchain_agent_can_call_ingest_tool_and_update_profile(tmp_path):
     assert any("FastAPI" in item.content for item in rag_results)
 
 
-def test_langchain_agent_context_schema_does_not_emit_serializer_warning(tmp_path):
+def test_langchain_agent_context_schema_does_not_emit_serializer_warning(tmp_path, account_id):
     """工具收到运行时上下文时，不应把字典按 None 类型序列化。"""
 
-    app = JobHuntingApp(tmp_path / "agent.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -139,7 +141,8 @@ def test_langchain_agent_context_schema_does_not_emit_serializer_warning(tmp_pat
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     model = ToolCallingFakeChatModel(
         responses=[
@@ -157,7 +160,7 @@ def test_langchain_agent_context_schema_does_not_emit_serializer_warning(tmp_pat
             AIMessage(content="已保存。"),
         ]
     )
-    agent = JobHuntingAgent(app, rag_dir=tmp_path / "chroma", model=model)
+    agent = JobHuntingAgent(app, model=model)
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -166,16 +169,17 @@ def test_langchain_agent_context_schema_does_not_emit_serializer_warning(tmp_pat
             candidate_id=candidate_id,
             session_id="context-warning",
             use_tool_llm=False,
+            account_id=account_id,
         )
 
     assert result.reply == "已保存。"
     assert not any("Pydantic serializer warnings" in str(item.message) for item in caught)
 
 
-def test_langchain_agent_can_stream_reply_events(tmp_path):
+def test_langchain_agent_can_stream_reply_events(tmp_path, account_id):
     """Agent 可以通过 LangGraph stream 产出 token 和 final 事件。"""
 
-    app = JobHuntingApp(tmp_path / "agent.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -189,10 +193,11 @@ def test_langchain_agent_can_stream_reply_events(tmp_path):
             expected_salary_k=15,
             target_directions=["Python 后端开发"],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     model = ToolCallingFakeChatModel(responses=[AIMessage(content="可以，我会用流式方式回复。")])
-    agent = JobHuntingAgent(app, rag_dir=tmp_path / "chroma", model=model)
+    agent = JobHuntingAgent(app, model=model)
 
     events = list(
         agent.stream_chat(
@@ -200,6 +205,7 @@ def test_langchain_agent_can_stream_reply_events(tmp_path):
             candidate_id=candidate_id,
             session_id="agent-test-stream",
             use_tool_llm=False,
+            account_id=account_id,
         )
     )
 
@@ -208,10 +214,10 @@ def test_langchain_agent_can_stream_reply_events(tmp_path):
     assert events[-1]["result"].reply == "可以，我会用流式方式回复。"
 
 
-def test_langchain_agent_streams_multiple_token_events_with_streaming_model(tmp_path):
+def test_langchain_agent_streams_multiple_token_events_with_streaming_model(tmp_path, account_id):
     """当底层模型支持 token stream 时，Agent 不应退化成一次性完整回复。"""
 
-    app = JobHuntingApp(tmp_path / "agent.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -225,10 +231,11 @@ def test_langchain_agent_streams_multiple_token_events_with_streaming_model(tmp_
             expected_salary_k=15,
             target_directions=["Python 后端开发"],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     model = StreamingFakeChatModel(responses=["流式OK"])
-    agent = JobHuntingAgent(app, rag_dir=tmp_path / "chroma", model=model)
+    agent = JobHuntingAgent(app, model=model)
 
     events = list(
         agent.stream_chat(
@@ -236,6 +243,7 @@ def test_langchain_agent_streams_multiple_token_events_with_streaming_model(tmp_
             candidate_id=candidate_id,
             session_id="agent-test-stream-chunks",
             use_tool_llm=False,
+            account_id=account_id,
         )
     )
     token_events = [event for event in events if event["type"] == "token"]
@@ -245,10 +253,10 @@ def test_langchain_agent_streams_multiple_token_events_with_streaming_model(tmp_
     assert events[-1]["result"].reply == "流式OK"
 
 
-def test_langchain_agent_can_loop_across_multiple_tools(tmp_path):
+def test_langchain_agent_can_loop_across_multiple_tools(tmp_path, account_id):
     """Agent 可以先导入职位，再继续调用匹配工具，完成多步工具循环。"""
 
-    app = JobHuntingApp(tmp_path / "agent.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -262,7 +270,8 @@ def test_langchain_agent_can_loop_across_multiple_tools(tmp_path):
             expected_salary_k=15,
             target_directions=["Python 后端开发"],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     model = ToolCallingFakeChatModel(
         responses=[
@@ -302,24 +311,24 @@ def test_langchain_agent_can_loop_across_multiple_tools(tmp_path):
         ]
     )
 
-    agent = JobHuntingAgent(app, rag_dir=tmp_path / "chroma", model=model)
+    agent = JobHuntingAgent(app, model=model)
     result = agent.chat(
         "请帮我导入这个职位并判断我适不适合投。",
         candidate_id=candidate_id,
         session_id="agent-test-loop",
         use_tool_llm=False,
+        account_id=account_id,
     )
 
     assert result.used_tools == ["import_job_from_text", "match_all_jobs_for_candidate"]
-    assert len(app.list_jobs()) == 1
+    assert len(app.list_jobs(account_id=account_id)) == 1
     assert any(output["tool_name"] == "match_all_jobs_for_candidate" for output in result.tool_outputs)
 
 
-def test_langchain_agent_can_create_downloadable_resume_files_from_upload(tmp_path):
+def test_langchain_agent_can_create_downloadable_resume_files_from_upload(tmp_path, account_id, monkeypatch):
     """Agent 能先查看上传文件，再生成职位定制 DOCX/PDF 下载版本。"""
 
     app = JobHuntingApp(
-        tmp_path / "agent.db",
         resume_dir=tmp_path / "resume-files",
     )
     app.initialize()
@@ -335,7 +344,8 @@ def test_langchain_agent_can_create_downloadable_resume_files_from_upload(tmp_pa
             expected_salary_k=15,
             target_directions=["Python 后端开发"],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     job = app.import_job_text(
         """
@@ -345,13 +355,20 @@ def test_langchain_agent_can_create_downloadable_resume_files_from_upload(tmp_pa
         1-3年
         本科
         职位描述：负责 Python 与 FastAPI 后端接口开发。
-        """
+        """,
+        account_id=account_id,
     )
     source = app.upload_resume_document(
         candidate_id,
         "resume.docx",
         build_resume_docx_bytes("小林", "Python 与 FastAPI 项目经历"),
+        account_id=account_id,
     )
+
+    def fail_search(*_args, **_kwargs):  # noqa: ANN002,ANN003
+        raise AssertionError("禁用 RAG 时不应执行语义检索")
+
+    monkeypatch.setattr(app, "search_rag", fail_search)
     model = ToolCallingFakeChatModel(
         responses=[
             AIMessage(
@@ -384,13 +401,14 @@ def test_langchain_agent_can_create_downloadable_resume_files_from_upload(tmp_pa
         ]
     )
 
-    result = JobHuntingAgent(app, rag_dir=tmp_path / "chroma", model=model).chat(
+    result = JobHuntingAgent(app, model=model).chat(
         "用我上传的简历针对这个 Python 职位生成可下载文件。",
         candidate_id=candidate_id,
         session_id="agent-resume-file",
         use_tool_llm=False,
+        account_id=account_id,
     )
-    artifacts = app.list_resume_artifacts(candidate_id)
+    artifacts = app.list_resume_artifacts(candidate_id, account_id=account_id)
 
     assert result.used_tools == [
         "list_resume_artifacts_for_candidate",
@@ -403,10 +421,10 @@ def test_langchain_agent_can_create_downloadable_resume_files_from_upload(tmp_pa
     assert all("storage_key" not in item for item in generated_output["artifacts"])
 
 
-def test_langchain_agent_rejects_non_job_text_import(tmp_path):
+def test_langchain_agent_rejects_non_job_text_import(tmp_path, account_id):
     """Agent 工具导入非职位文本时，应返回错误且不写入职位池。"""
 
-    app = JobHuntingApp(tmp_path / "agent.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -420,7 +438,8 @@ def test_langchain_agent_rejects_non_job_text_import(tmp_path):
             expected_salary_k=15,
             target_directions=["Python 后端开发"],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     model = ToolCallingFakeChatModel(
         responses=[
@@ -439,23 +458,24 @@ def test_langchain_agent_rejects_non_job_text_import(tmp_path):
         ]
     )
 
-    agent = JobHuntingAgent(app, rag_dir=tmp_path / "chroma", model=model)
+    agent = JobHuntingAgent(app, model=model)
     result = agent.chat(
         "帮我导入这段文本。",
         candidate_id=candidate_id,
         session_id="agent-test-invalid-job",
         use_tool_llm=False,
+        account_id=account_id,
     )
 
-    assert app.list_jobs() == []
+    assert app.list_jobs(account_id=account_id) == []
     assert result.tool_outputs[0]["data"]["saved"] is False
     assert "不像一段完整的招聘职位信息" in result.tool_outputs[0]["data"]["error"]
 
 
-def test_langchain_agent_restores_persisted_chat_history_on_startup(tmp_path):
-    """新 Agent 进程启动后，会把 SQLite 聊天历史恢复到模型上下文。"""
+def test_langchain_agent_restores_persisted_chat_history_on_startup(tmp_path, account_id):
+    """新 Agent 进程启动后，会把 PostgreSQL 聊天历史恢复到模型上下文。"""
 
-    app = JobHuntingApp(tmp_path / "agent.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -469,15 +489,27 @@ def test_langchain_agent_restores_persisted_chat_history_on_startup(tmp_path):
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     session_id = "agent-test-restore"
-    app.save_chat_message(candidate_id, session_id, "user", "上一轮我说我会 Python 和 RAG。")
-    app.save_chat_message(candidate_id, session_id, "assistant", "已记录你的 Python 和 RAG 经历。")
+    app.save_chat_message(
+        candidate_id,
+        session_id,
+        "user",
+        "上一轮我说我会 Python 和 RAG。",
+        account_id=account_id,
+    )
+    app.save_chat_message(
+        candidate_id,
+        session_id,
+        "assistant",
+        "已记录你的 Python 和 RAG 经历。",
+        account_id=account_id,
+    )
     model = RecordingToolCallingFakeChatModel(responses=[AIMessage(content="我能看到之前的聊天历史。")])
     agent = JobHuntingAgent(
         app,
-        rag_dir=tmp_path / "chroma",
         model=model,
         memory_settings=AgentMemorySettings(summary_trigger_tokens=99999, restore_trigger_tokens=99999),
     )
@@ -487,6 +519,7 @@ def test_langchain_agent_restores_persisted_chat_history_on_startup(tmp_path):
         candidate_id=candidate_id,
         session_id=session_id,
         use_tool_llm=False,
+        account_id=account_id,
     )
     seen_text = "\n".join(message_text(message) for message in model.seen_messages[0])
 
@@ -496,10 +529,10 @@ def test_langchain_agent_restores_persisted_chat_history_on_startup(tmp_path):
     assert "我刚才说过哪些技能" in seen_text
 
 
-def test_langchain_agent_compacts_restored_history_before_model_call(tmp_path):
+def test_langchain_agent_compacts_restored_history_before_model_call(tmp_path, account_id):
     """启动恢复的历史过长时，较早消息会压缩成摘要，只保留最近消息原文。"""
 
-    app = JobHuntingApp(tmp_path / "agent.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -513,18 +546,42 @@ def test_langchain_agent_compacts_restored_history_before_model_call(tmp_path):
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     session_id = "agent-test-restore-compact"
     for index in range(6):
-        app.save_chat_message(candidate_id, session_id, "user", f"较早资料 {index}：我补充了一段很长的项目背景。")
-        app.save_chat_message(candidate_id, session_id, "assistant", f"较早回复 {index}：已整理。")
-    app.save_chat_message(candidate_id, session_id, "user", "最近资料：我正在看 AI Agent 实习。")
-    app.save_chat_message(candidate_id, session_id, "assistant", "最近回复：建议优先补项目证据。")
+        app.save_chat_message(
+            candidate_id,
+            session_id,
+            "user",
+            f"较早资料 {index}：我补充了一段很长的项目背景。",
+            account_id=account_id,
+        )
+        app.save_chat_message(
+            candidate_id,
+            session_id,
+            "assistant",
+            f"较早回复 {index}：已整理。",
+            account_id=account_id,
+        )
+    app.save_chat_message(
+        candidate_id,
+        session_id,
+        "user",
+        "最近资料：我正在看 AI Agent 实习。",
+        account_id=account_id,
+    )
+    app.save_chat_message(
+        candidate_id,
+        session_id,
+        "assistant",
+        "最近回复：建议优先补项目证据。",
+        account_id=account_id,
+    )
     model = RecordingToolCallingFakeChatModel(responses=[AIMessage(content="已基于压缩历史回复。")])
     agent = JobHuntingAgent(
         app,
-        rag_dir=tmp_path / "chroma",
         model=model,
         memory_settings=AgentMemorySettings(
             restore_trigger_tokens=1,
@@ -539,19 +596,20 @@ def test_langchain_agent_compacts_restored_history_before_model_call(tmp_path):
         candidate_id=candidate_id,
         session_id=session_id,
         use_tool_llm=False,
+        account_id=account_id,
     )
     seen_text = "\n".join(message_text(message) for message in model.seen_messages[0])
 
-    assert "以下是从 SQLite 持久化聊天历史恢复的压缩上下文" in seen_text
+    assert "以下是从持久化聊天历史恢复的压缩上下文" in seen_text
     assert "最近资料：我正在看 AI Agent 实习" in seen_text
     assert "最近回复：建议优先补项目证据" in seen_text
     assert "较早历史已截断" in seen_text
 
 
-def test_langchain_agent_summarizes_running_context_when_it_gets_too_long(tmp_path):
+def test_langchain_agent_summarizes_running_context_when_it_gets_too_long(tmp_path, account_id):
     """同一进程内对话变长后，LangChain 总结中间件会压缩旧消息再继续回答。"""
 
-    app = JobHuntingApp(tmp_path / "agent.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -565,7 +623,8 @@ def test_langchain_agent_summarizes_running_context_when_it_gets_too_long(tmp_pa
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     model = RecordingToolCallingFakeChatModel(
         responses=[
@@ -576,7 +635,6 @@ def test_langchain_agent_summarizes_running_context_when_it_gets_too_long(tmp_pa
     )
     agent = JobHuntingAgent(
         app,
-        rag_dir=tmp_path / "chroma",
         model=model,
         memory_settings=AgentMemorySettings(
             restore_trigger_tokens=99999,
@@ -586,8 +644,18 @@ def test_langchain_agent_summarizes_running_context_when_it_gets_too_long(tmp_pa
         ),
     )
 
-    agent.chat("第一轮：我在做一个求职助手 Agent。", candidate_id, session_id="agent-test-summary")
-    result = agent.chat("第二轮：继续。", candidate_id, session_id="agent-test-summary")
+    agent.chat(
+        "第一轮：我在做一个求职助手 Agent。",
+        candidate_id,
+        session_id="agent-test-summary",
+        account_id=account_id,
+    )
+    result = agent.chat(
+        "第二轮：继续。",
+        candidate_id,
+        session_id="agent-test-summary",
+        account_id=account_id,
+    )
     final_seen_text = "\n".join(message_text(message) for message in model.seen_messages[-1])
 
     assert result.reply == "第二轮回答。"

@@ -2,10 +2,10 @@
  * Job Hunting Agent Vue 3 前端。
  *
  * 这一层只负责页面状态、用户交互和 SSE 展示：
- * - 结构化事实仍由后端 SQLite 管理；
+ * - 结构化事实由后端 PostgreSQL 管理；
  * - 长文本仍由后端 long_texts/RAG 管理；
  * - 聊天通过 /api/chat/stream 接收 LangChain Agent 的增量输出；
- * - 页面不直接连接 SQLite，也不直接调用模型供应商 API。
+ * - 页面不直接连接数据库，也不直接调用模型供应商 API。
  */
 
 if (!window.Vue) {
@@ -17,6 +17,8 @@ if (!window.Vue) {
   const DEFAULT_AUTO_INCREMENTAL_RAG = true;
   // 模型或网络无响应时，前端最多等待三分钟；用户也可以提前停止生成。
   const CHAT_STREAM_TIMEOUT_MS = 180000;
+  // 认证错误不会永久占据登录表单；用户输入新内容时会更早清除。
+  const AUTH_ERROR_DISMISS_MS = 6000;
   const PINYIN_COLLATOR = new Intl.Collator("zh-CN-u-co-pinyin");
 
   /** 克隆并按拼音排列省份和城市，避免改变静态数据源。 */
@@ -61,6 +63,7 @@ if (!window.Vue) {
         authLoading: false,
         authSuccess: false,
         authError: "",
+        authErrorTimer: null,
         activeView: "workspace",
         sessions: [],
         activeSessionId: "",
@@ -203,7 +206,7 @@ if (!window.Vue) {
           {
             key: "refresh-jobs",
             title: "刷新职位列表",
-            description: "重新读取 SQLite 中已导入且通过审核的职位。",
+            description: "重新读取 PostgreSQL 中已导入且通过审核的职位。",
             shortcut: "Sync",
             action: "loadJobs",
             disabled: this.loadingJobs,
@@ -247,6 +250,7 @@ if (!window.Vue) {
     beforeUnmount() {
       document.removeEventListener("keydown", this.handleGlobalShortcut);
       document.body.classList.remove("cmdk-lock");
+      this.clearAuthFeedback();
     },
 
     methods: {
@@ -274,8 +278,7 @@ if (!window.Vue) {
       /** 切换登录与注册表单。 */
       toggleAuthMode() {
         this.authMode = this.authMode === "login" ? "register" : "login";
-        this.authError = "";
-        this.authSuccess = false;
+        this.clearAuthFeedback();
         this.authForm.password = "";
         this.authPasswordVisible = false;
       },
@@ -287,11 +290,29 @@ if (!window.Vue) {
         }
       },
 
+      /** 清理认证提示和旧定时器，避免错误信息覆盖用户下一次输入。 */
+      clearAuthFeedback() {
+        if (this.authErrorTimer !== null) {
+          window.clearTimeout(this.authErrorTimer);
+          this.authErrorTimer = null;
+        }
+        this.authError = "";
+        this.authSuccess = false;
+      },
+
+      /** 显示认证错误，并在用户没有继续操作时自动隐藏。 */
+      showAuthError(message) {
+        this.clearAuthFeedback();
+        this.authError = message || "认证请求失败。";
+        this.authErrorTimer = window.setTimeout(() => {
+          this.clearAuthFeedback();
+        }, AUTH_ERROR_DISMISS_MS);
+      },
+
       /** 提交登录或普通用户注册。 */
       async submitAuth() {
         this.authLoading = true;
-        this.authError = "";
-        this.authSuccess = false;
+        this.clearAuthFeedback();
         try {
           const endpoint = this.authMode === "login" ? "/api/auth/login" : "/api/auth/register";
           const data = await this.requestJson(endpoint, {
@@ -319,7 +340,7 @@ if (!window.Vue) {
           await nextTick();
           document.querySelector("#chatPanel")?.focus?.();
         } catch (error) {
-          this.authError = error.message || "认证请求失败。";
+          this.showAuthError(error.message || "认证请求失败。");
         } finally {
           this.authLoading = false;
         }
@@ -330,7 +351,7 @@ if (!window.Vue) {
         try {
           await this.requestJson("/api/auth/logout", { method: "POST" });
         } catch (error) {
-          this.authError = error.message || "退出失败。";
+          this.showAuthError(error.message || "退出失败。");
         }
         this.auth.authenticated = false;
         this.auth.account = null;
@@ -348,7 +369,7 @@ if (!window.Vue) {
         try {
           await this.requestJson("/api/auth/logout-all", { method: "POST" });
         } catch (error) {
-          this.authError = error.message || "退出所有设备失败。";
+          this.showAuthError(error.message || "退出所有设备失败。");
         }
         this.auth.authenticated = false;
         this.auth.account = null;

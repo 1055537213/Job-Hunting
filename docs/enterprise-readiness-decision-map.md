@@ -16,8 +16,8 @@
 
 | 领域 | 本地开发/测试 | 线上生产 | 迁移策略 |
 |---|---|---|---|
-| 关系数据库 | PostgreSQL + pgvector Compose 开发库；SQLite 仅用于自动化测试 | PostgreSQL | Alembic 管理版本，不在请求启动时临时改生产表 |
-| 向量检索 | PostgreSQL + pgvector；Chroma 仅用于 SQLite 离线测试回退 | PostgreSQL + pgvector | 测试数据可丢弃，真实旧数据才需要回填校验 |
+| 关系数据库 | PostgreSQL + pgvector Compose 开发库和隔离测试 schema | PostgreSQL | Alembic 管理版本，不在请求启动时临时改生产表 |
+| 向量检索 | PostgreSQL + pgvector | PostgreSQL + pgvector | 测试数据可丢弃，真实旧数据才需要回填校验 |
 | 模型接入 | `.env` 配置 OpenAI-compatible 接口 | 内部 Model Gateway 模块 | 先保留在模块化单体内，达到拆分条件后再独立服务 |
 | 文件存储 | 本地受控目录 | S3-compatible 对象存储 | 数据库只存对象键、哈希、版本和归属 |
 | 本地编排 | Docker Compose | Docker Compose 可用于单机早期环境 | 多副本和弹性需求出现后再引入 Kubernetes |
@@ -115,14 +115,14 @@ ModelGateway.embed(operation, texts, context)
 
 - 引入 SQLAlchemy 2.x 数据访问层和 Alembic。
 - 创建 PostgreSQL schema，保留 `account_id`、外键、唯一约束和必要索引。
-- 将 SQLite 作为测试适配器，不用 SQLite 特有语义污染领域接口。
+- 测试也使用 PostgreSQL 隔离 schema，不用另一种数据库语义污染领域接口。
 - 将稳定 chunk ID、chunk metadata 和向量写入 pgvector。
-- 若存在真实旧数据，编写一次性 SQLite 到 PostgreSQL 的导入和校验脚本。
+- 若存在真实旧数据，编写一次性旧版本数据到当前 PostgreSQL schema 的导入和校验脚本。
 
 当前状态：已完成 SQLAlchemy Engine/事务边界、冻结初始 Alembic revision、PostgreSQL +
 pgvector Compose 启动链、Web 对 PostgreSQL 的结构化读写，以及 pgvector 的全量重建、增量
 upsert、账号隔离检索、删除级联和真实 PostgreSQL 回归。当前测试数据允许丢弃，因此不实施
-SQLite 或 Chroma 数据导入。
+旧数据库或独立向量目录的数据导入。
 
 完成门槛：空库可由 Alembic 升级到最新；生产启动不执行 `CREATE TABLE IF NOT EXISTS`；
 RAG 在数据库内按账号隔离检索，重复增量索引不产生重复 chunk，删除事实源会级联删除向量。
@@ -196,7 +196,7 @@ Kubernetes 不是上线前置条件。只有出现以下需求时再进入该阶
 - 数据：所有读写都带账号归属；迁移、备份恢复和删除流程经过演练。
 - 文件：扩展名、签名、大小、页数、哈希和下载权限均被校验。
 - 模型：超时、重试、限流、usage 缺失和供应商故障均有明确状态。
-- RAG：向量结果带账号过滤和来源 ID，能回溯到 SQLite/PostgreSQL 登记材料。
+- RAG：向量结果带账号过滤和来源 ID，能回溯到 PostgreSQL `long_texts` 登记材料。
 - 安全：密码仍使用 Argon2id；Session 闲置 7 天、最长 30 天、支持退出所有设备。
 - 计费：只有供应商确认用量进入账单，幂等重试不会重复计费。
 - 运维：健康检查、日志、指标、告警、备份和回滚都有可执行手册。
@@ -210,5 +210,5 @@ Kubernetes 不是上线前置条件。只有出现以下需求时再进入该阶
   以及 `postgres -> migrate -> web` 启动链。Web 的结构化业务读写已切换到 PostgreSQL。
 - 尚未实施：对象存储、任务队列和生产可观测性。
 
-后续改造必须按上述阶段逐步提交。当前 pgvector RAG 已进入生产读写路径；Chroma 保留为
-SQLite 离线测试回退。在文件仍依赖单机目录时，不能先做多副本部署。
+后续改造必须按上述阶段逐步提交。当前 pgvector RAG 已进入生产读写路径；测试和 Web 共用
+PostgreSQL 后端。在文件仍依赖单机目录时，不能先做多副本部署。

@@ -1,12 +1,12 @@
 """对话式自动入库。
 
-用户把资料发给 agent 后，这个模块负责判断哪些内容应该进入 SQLite 结构化档案，
+用户把资料发给 agent 后，这个模块负责判断哪些内容应该进入结构化档案，
 哪些内容应该作为长文本材料进入后续 RAG 索引。第一版支持两种决策方式：
 
 - 有 LLM：要求 LLM 返回 JSON 保存决策。
 - 无 LLM：使用保守规则兜底，只提取明显事实。
 
-无论哪种方式，最终落库都由 `JobHuntingApp` 和 `SQLiteStore` 执行，LLM 不直接写库。
+无论哪种方式，最终落库都由 `JobHuntingApp` 和结构化仓储执行，LLM 不直接写库。
 """
 
 from __future__ import annotations

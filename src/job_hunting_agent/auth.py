@@ -1,7 +1,7 @@
 """账号认证与服务端 Session 工具。
 
 本模块只处理“谁登录了”以及“登录状态是否仍然有效”，不负责候选人档案、
-职位或 RAG 内容。业务资源的归属仍由 `SQLiteStore` 和 Web 层校验。
+职位或 RAG 内容。业务资源的归属仍由结构化仓储和 Web 层校验。
 
 设计要点：
 - 密码使用 Argon2id 单向哈希，数据库永远不保存明文密码。
@@ -132,7 +132,7 @@ def utc_now() -> datetime:
 
 
 def iso_utc(value: datetime | None = None) -> str:
-    """把 UTC 时间序列化为 SQLite 可读的 ISO 字符串。"""
+    """把 UTC 时间序列化为数据库可读的 ISO 字符串。"""
 
     return (value or utc_now()).isoformat(timespec="seconds")
 
@@ -193,7 +193,7 @@ class LoginResult:
 class AuthService:
     """账号注册、登录和服务端 Session 的应用服务。
 
-    该服务只依赖 `SQLiteStore` 的认证方法，业务资源权限由 Web 层拿到当前账号后
+    该服务只依赖结构化仓储的认证方法，业务资源权限由 Web 层拿到当前账号后
     再调用 `account_id` 过滤查询。Session 默认闲置 7 天、绝对 30 天，测试时可注入
     `clock` 以稳定验证过期行为。
     """
@@ -251,7 +251,7 @@ class AuthService:
         password: str,
         display_name: str | None = None,
     ):
-        """创建管理员账号；只应由初始化命令或现有管理员调用。"""
+        """创建管理员账号；只应由首次引导或受保护的管理员流程调用。"""
 
         normalized = self.normalize_email(email)
         password_hash = hash_password(password)

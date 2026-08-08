@@ -1,7 +1,7 @@
 """Alembic 数据库迁移的应用入口。
 
 业务代码不应直接调用 ``metadata.create_all()`` 初始化生产数据库。这里把 Alembic
-配置收束为一个小接口，CLI、容器迁移任务和测试可以共用它，同时保证数据库密码
+配置收束为一个小接口，容器迁移任务和测试可以共用它，同时保证数据库密码
 只从配置读取且不会被打印到输出中。
 """
 
@@ -37,7 +37,7 @@ ALEMBIC_SCRIPT_PATH = PROJECT_ROOT / "alembic"
 def build_alembic_config(database_url: str) -> Config:
     """构造一次迁移运行所需的 Alembic 配置。
 
-    这里显式写入绝对脚本路径，避免 Docker、pytest 或从任意当前目录执行 CLI 时
+    这里显式写入绝对脚本路径，避免 Docker、pytest 或从任意当前目录执行迁移时
     因相对路径不同而找不到迁移文件。
     """
 
@@ -48,7 +48,12 @@ def build_alembic_config(database_url: str) -> Config:
 
     config = Config(str(ALEMBIC_INI_PATH))
     config.set_main_option("script_location", str(ALEMBIC_SCRIPT_PATH))
-    config.set_main_option("sqlalchemy.url", normalize_database_url(database_url))
+    # alembic/env.py 只允许正常运行时从 JOB_AGENT_DATABASE_URL 读取 PostgreSQL。
+    # 迁移测试通过私有选项显式注入隔离的 PostgreSQL schema URL，不会污染运行时配置。
+    # ConfigParser 会把百分号视为插值语法；URL 中的编码参数或特殊字符必须先转义，
+    # Alembic 读取 option 时会自动还原为原始 PostgreSQL URL。
+    escaped_url = normalize_database_url(database_url).replace("%", "%%")
+    config.set_main_option("job_agent.runtime_database_url", escaped_url)
     return config
 
 
@@ -91,6 +96,12 @@ def current_database_revision(database_url: str) -> str | None:
     engine = sa.create_engine(normalize_database_url(database_url), pool_pre_ping=True)
     try:
         with engine.connect() as connection:
-            return MigrationContext.configure(connection).get_current_revision()
+            # 与 Alembic 在线迁移保持一致：测试 URL 的 search_path 包含
+            # public，必须把版本表固定在当前 schema，不能读到别的数据库的版本。
+            current_schema = connection.exec_driver_sql("SELECT current_schema()").scalar_one()
+            return MigrationContext.configure(
+                connection,
+                opts={"version_table_schema": current_schema},
+            ).get_current_revision()
     finally:
         engine.dispose()

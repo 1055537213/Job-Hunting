@@ -2,18 +2,13 @@
 
 from __future__ import annotations
 
-from job_hunting_agent.database_migrations import upgrade_database
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.models import CandidateProfileInput, UsageEventRecord
 from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
 
 
-def test_sqlalchemy_store_runs_existing_profile_chat_and_usage_workflow(tmp_path):
-    """现有业务方法可在 Alembic 管理的数据库上运行，而不是依赖 sqlite3 连接。"""
-
-    database_path = tmp_path / "production-adapter.db"
-    database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
-    upgrade_database(database_url)
+def test_sqlalchemy_store_runs_existing_profile_chat_and_usage_workflow(database_url):
+    """现有业务方法直接在 Alembic 管理的 PostgreSQL schema 上运行。"""
     store = SQLAlchemyStore(database_url)
     store.initialize()
 
@@ -83,14 +78,10 @@ def test_sqlalchemy_store_runs_existing_profile_chat_and_usage_workflow(tmp_path
     store.close()
 
 
-def test_app_uses_sqlalchemy_store_when_a_database_url_is_explicit(tmp_path):
-    """Web/CLI 传入数据库 URL 时必须绕开旧 SQLiteStore 初始化路径。"""
+def test_app_uses_sqlalchemy_store_when_a_database_url_is_explicit(database_url):
+    """Web 传入数据库 URL 时使用 PostgreSQL 仓储。"""
 
-    database_path = tmp_path / "app-production-adapter.db"
-    database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
-    upgrade_database(database_url)
-
-    app = JobHuntingApp(tmp_path / "ignored.db", database_url=database_url)
+    app = JobHuntingApp(database_url=database_url)
     app.initialize()
 
     assert app.store.__class__.__name__ == "SQLAlchemyStore"

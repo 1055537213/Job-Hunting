@@ -42,10 +42,10 @@ class InflatedKnownSkillFakeLLM:
         return "候选人精通 Python，可负责相关开发工作。"
 
 
-def test_llm_resume_draft_discards_unsupported_claims_and_saves_version(tmp_path):
+def test_llm_resume_draft_discards_unsupported_claims_and_saves_version(tmp_path, account_id, monkeypatch):
     """LLM 简历草稿不能引入未确认技能或成果，并会保存为职位定制版本。"""
 
-    app = JobHuntingApp(tmp_path / "mvp.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -59,7 +59,8 @@ def test_llm_resume_draft_discards_unsupported_claims_and_saves_version(tmp_path
             expected_salary_k=15,
             target_directions=["Python 后端开发"],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     job = app.import_job_text(
         """
@@ -69,7 +70,8 @@ def test_llm_resume_draft_discards_unsupported_claims_and_saves_version(tmp_path
         1-3年
         本科
         职位描述：负责 Python、FastAPI、Kubernetes 平台开发。
-        """
+        """,
+        account_id=account_id,
     )
     project = tmp_path / "job_agent"
     project.mkdir()
@@ -77,12 +79,26 @@ def test_llm_resume_draft_discards_unsupported_claims_and_saves_version(tmp_path
         "基于 Python 和 FastAPI 的求职助手项目。",
         encoding="utf-8",
     )
-    card = app.analyze_project_for_candidate(candidate_id, project)
-    app.confirm_project_card(card.id, "本人负责职位解析、匹配排序和 FastAPI 接口设计。")
+    card = app.analyze_project_for_candidate(candidate_id, project, account_id=account_id)
+    app.confirm_project_card(
+        card.id,
+        "本人负责职位解析、匹配排序和 FastAPI 接口设计。",
+        account_id=account_id,
+    )
 
     fake_llm = UnsafeFakeLLM()
-    draft_record = app.create_resume_draft(candidate_id, job.id, llm_client=fake_llm)
-    saved_records = app.list_resume_drafts(candidate_id, job.id)
+    def fail_search(*_args, **_kwargs):  # noqa: ANN002,ANN003
+        raise AssertionError("禁用 RAG 时不应执行语义检索")
+
+    monkeypatch.setattr(app, "search_rag", fail_search)
+    draft_record = app.create_resume_draft(
+        candidate_id,
+        job.id,
+        llm_client=fake_llm,
+        use_rag=False,
+        account_id=account_id,
+    )
+    saved_records = app.list_resume_drafts(candidate_id, job.id, account_id=account_id)
 
     assert fake_llm.prompts
     assert draft_record.status == "需候选人确认"
@@ -98,13 +114,16 @@ def test_llm_resume_draft_discards_unsupported_claims_and_saves_version(tmp_path
     assert any("LLM 输出已丢弃" in risk for risk in draft_record.draft.authenticity_risks)
     assert any("本人负责职位解析" in item for item in draft_record.draft.evidence_items)
     # 简历草稿是单独版本，不会反向覆盖候选人档案技能。
-    assert app.get_candidate_profile(candidate_id).skills == {"Python": "项目使用", "FastAPI": "项目使用"}
+    assert app.get_candidate_profile(candidate_id, account_id=account_id).skills == {
+        "Python": "项目使用",
+        "FastAPI": "项目使用",
+    }
 
 
-def test_job_rag_context_cannot_establish_candidate_skills_or_metrics(tmp_path):
+def test_job_rag_context_cannot_establish_candidate_skills_or_metrics(tmp_path, account_id):
     """职位或 RAG 上下文不能绕过候选人事实边界，也不能让规则回退崩溃。"""
 
-    app = JobHuntingApp(tmp_path / "mvp.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -118,7 +137,8 @@ def test_job_rag_context_cannot_establish_candidate_skills_or_metrics(tmp_path):
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     job = app.import_job_text(
         """
@@ -128,9 +148,10 @@ def test_job_rag_context_cannot_establish_candidate_skills_or_metrics(tmp_path):
         1-3年
         本科
         职位描述：要求使用 FastAPI 开发接口，并将性能提升 50%。
-        """
+        """,
+        account_id=account_id,
     )
-    candidate = app.get_candidate_profile(candidate_id)
+    candidate = app.get_candidate_profile(candidate_id, account_id=account_id)
     semantic_context = ["RAG 职位上下文：要求 FastAPI，并将性能提升 50%。"]
 
     fallback = build_resume_draft(candidate, job, [], semantic_evidence=semantic_context)
@@ -148,10 +169,10 @@ def test_job_rag_context_cannot_establish_candidate_skills_or_metrics(tmp_path):
     assert any("未确认技能：FastAPI" in risk for risk in rewritten.authenticity_risks)
 
 
-def test_proficiency_override_requires_explicit_flag_and_keeps_risk(tmp_path):
+def test_proficiency_override_requires_explicit_flag_and_keeps_risk(tmp_path, account_id):
     """默认阻止熟练度拔高；明确的一次性覆盖也必须保留真实性风险。"""
 
-    app = JobHuntingApp(tmp_path / "mvp.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -165,7 +186,8 @@ def test_proficiency_override_requires_explicit_flag_and_keeps_risk(tmp_path):
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     job = app.import_job_text(
         """
@@ -175,9 +197,10 @@ def test_proficiency_override_requires_explicit_flag_and_keeps_risk(tmp_path):
         经验不限
         本科
         职位描述：负责 Python 开发。
-        """
+        """,
+        account_id=account_id,
     )
-    candidate = app.get_candidate_profile(candidate_id)
+    candidate = app.get_candidate_profile(candidate_id, account_id=account_id)
 
     conservative = build_resume_draft(candidate, job, [], llm_client=InflatedKnownSkillFakeLLM())
     explicit_override = build_resume_draft(

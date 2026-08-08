@@ -39,7 +39,7 @@ Type: Discuss
 
 ### Answer
 
-学历、经验年限、技能、证书、偏好及职位筛选字段进入 SQLite 等结构化事实源；项目描述、成果材料、职位全文和对话上下文进入向量检索索引。向量库是派生索引，不是唯一事实源。
+学历、经验年限、技能、证书、偏好及职位筛选字段进入 PostgreSQL 结构化事实源；项目描述、成果材料、职位全文和对话上下文先登记到 `long_texts`，再进入 PostgreSQL + pgvector 派生索引。向量库是派生索引，不是唯一事实源。
 
 ## #4: BOSS 职位数据接入策略？
 
@@ -130,7 +130,7 @@ Agent 应按什么顺序询问城市、岗位方向、薪资、经验、学历�
 
 ### Answer
 
-第一版采用“先定搜索意图，再定平台入口，最后定排序偏好”的对话顺序。该流程已整合到正式 Agent 对话与职位匹配链路中，当前以 `src/job_hunting_agent/agent.py`、`src/job_hunting_agent/matcher.py` 和 Web/CLI 入口为准。
+第一版采用“先定搜索意图，再定平台入口，最后定排序偏好”的对话顺序。该流程已整合到正式 Agent 对话与职位匹配链路中，当前以 `src/job_hunting_agent/agent.py`、`src/job_hunting_agent/matcher.py` 和 Web 入口为准。
 
 推荐提问顺序：
 

@@ -2,16 +2,16 @@
 
 这个模块把用户可见的聊天入口统一收束为一条标准链路：
 
-Web / CLI
+Web/API
     -> JobHuntingAgent
     -> LangChain create_agent
     -> Tools
     -> JobHuntingApp
-    -> PostgreSQL / SQLite test adapter / RAG / LLM
+    -> PostgreSQL + pgvector / LLM
 
 其中：
 
-- PostgreSQL 是生产环境的结构化事实源；SQLite 仅用于离线兼容和测试。
+- PostgreSQL 是结构化事实源和长文本事实源；pgvector 是唯一的语义索引。
 - long_texts 仍然是长文本材料登记处。
 - RAG 仍然只是派生语义索引，不单独充当事实源。
 - Agent 不直接改数据库，只能通过工具调用 `JobHuntingApp`。
@@ -45,7 +45,6 @@ class JobHuntingAgentContext(TypedDict):
     """LangChain Agent 运行时上下文。
 
     `candidate_id` 让工具知道当前服务的是哪一个候选人。
-    `rag_dir` 告诉工具把增量索引写到哪里。
     `use_tool_llm` 控制工具内部是否继续调用真实大模型。
     `default_auto_rag` 让前端勾选项能传到工具层，而不是写死在 prompt 里。
     """
@@ -54,7 +53,6 @@ class JobHuntingAgentContext(TypedDict):
     account_id: int | None
     session_id: str
     root_request_id: str
-    rag_dir: str
     use_tool_llm: bool
     default_auto_rag: bool
 
@@ -110,7 +108,6 @@ class JobHuntingAgent:
         self,
         app: JobHuntingApp,
         env_path: str | Path = DEFAULT_ENV_PATH,
-        rag_dir: str | Path = "data/chroma",
         model: BaseChatModel | None = None,
         memory_settings: AgentMemorySettings | None = None,
     ):
@@ -123,7 +120,6 @@ class JobHuntingAgent:
         self.app = app
         self.model_gateway = app.model_gateway
         self.env_path = Path(env_path)
-        self.rag_dir = Path(rag_dir)
         if model is None:
             # Agent 不直接创建供应商 SDK；模型选择、重试策略和后续 usage 统一由
             # 内部 Model Gateway 收束。
@@ -171,7 +167,6 @@ class JobHuntingAgent:
                 "candidate_id": candidate_id,
                 "account_id": account_id,
                 "session_id": resolved_session_id,
-                "rag_dir": str(self.rag_dir),
                 "use_tool_llm": use_tool_llm and self.tool_llm_available,
                 "default_auto_rag": auto_rag,
                 "root_request_id": root_request_id,
@@ -230,7 +225,6 @@ class JobHuntingAgent:
                 "candidate_id": candidate_id,
                 "account_id": account_id,
                 "session_id": resolved_session_id,
-                "rag_dir": str(self.rag_dir),
                 "use_tool_llm": use_tool_llm and self.tool_llm_available,
                 "default_auto_rag": auto_rag,
                 "root_request_id": root_request_id,
@@ -307,10 +301,10 @@ class JobHuntingAgent:
         session_id: str,
         account_id: int | None = None,
     ) -> list[BaseMessage]:
-        """从 SQLite `chat_messages` 恢复一次历史上下文。
+        """从持久化 `chat_messages` 恢复一次历史上下文。
 
         `MemorySaver` 只在当前进程里有效；服务重启后它是空的。这里在每个
-        `(candidate_id, session_id)` 首次调用时读取 SQLite 历史，把页面上能恢复的
+        `(candidate_id, session_id)` 首次调用时读取数据库历史，把页面上能恢复的
         对话也恢复到模型上下文里。之后同一进程内交给 LangGraph checkpointer 累积。
         """
 
@@ -357,7 +351,7 @@ def build_job_hunting_tools(app: JobHuntingApp) -> list[object]:
         runtime: ToolRuntime[JobHuntingAgentContext, Any],
         auto_rag: bool | None = None,
     ) -> str:
-        """当用户补充候选人资料、技能、项目经历或 HR 对话时，自动保存到 SQLite 和 RAG。"""
+        """当用户补充候选人资料、技能、项目经历或 HR 对话时，自动保存到 PostgreSQL 和 RAG。"""
 
         context = require_runtime_context(runtime)
         candidate_id = require_candidate_id(context)
@@ -379,7 +373,6 @@ def build_job_hunting_tools(app: JobHuntingApp) -> list[object]:
             candidate_id,
             message,
             llm_client=llm_client,
-            rag_persist_directory=context["rag_dir"],
             auto_rebuild_rag=context["default_auto_rag"] if auto_rag is None else auto_rag,
             account_id=account_id,
         )
@@ -423,7 +416,6 @@ def build_job_hunting_tools(app: JobHuntingApp) -> list[object]:
         context = require_runtime_context(runtime)
         results = app.search_rag(
             query,
-            context["rag_dir"],
             top_k,
             entity_types,
             account_id=context.get("account_id"),
@@ -551,8 +543,8 @@ def build_job_hunting_tools(app: JobHuntingApp) -> list[object]:
             candidate_id,
             job_id,
             llm_client=llm_client,
-            rag_persist_directory=context["rag_dir"] if use_rag else None,
             rag_query=rag_query,
+            use_rag=use_rag,
             account_id=account_id,
         )
         return dumps_tool_output(asdict(draft))
@@ -612,8 +604,8 @@ def build_job_hunting_tools(app: JobHuntingApp) -> list[object]:
             source_artifact_id=source_artifact_id,
             job_id=job_id,
             llm_client=llm_client,
-            rag_persist_directory=context["rag_dir"] if use_rag else None,
             rag_query=rag_query,
+            use_rag=use_rag,
             allow_proficiency_upgrade=allow_proficiency_upgrade,
             account_id=account_id,
         )
@@ -687,7 +679,7 @@ def build_tool_usage_callback(
 
 
 def dumps_tool_output(value: dict[str, Any]) -> str:
-    """统一序列化工具输出，方便 Agent 阅读，也方便 Web/CLI 再解析。"""
+    """统一序列化工具输出，方便 Agent 阅读，也方便 Web API 再解析。"""
 
     return json.dumps(value, ensure_ascii=False, indent=2)
 

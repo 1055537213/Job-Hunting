@@ -1,12 +1,11 @@
-"""生产数据库 schema 和 Alembic 迁移的回归测试。"""
+"""PostgreSQL schema 和 Alembic 迁移回归测试。"""
 
 from __future__ import annotations
 
-import json
-import sqlite3
+import sqlalchemy as sa
+import pytest
 
-from job_hunting_agent.cli import main
-from job_hunting_agent.config import load_database_settings
+from job_hunting_agent.config import load_database_settings, require_postgresql_database_url
 from job_hunting_agent.database_migrations import (
     current_database_revision,
     downgrade_database,
@@ -30,24 +29,37 @@ def test_database_settings_normalize_postgresql_driver_and_mask_password(tmp_pat
     assert settings.masked_url == "postgresql+psycopg://job_agent:***@localhost:5432/job_agent"
 
 
-def test_upgrade_database_creates_versioned_schema_on_empty_sqlite_file(tmp_path):
-    """迁移链路可在空数据库上升级，供持续集成验证版本完整性。"""
+def test_runtime_database_requirement_rejects_missing_and_non_postgresql_urls(tmp_path):
+    """网页和迁移入口拒绝缺失或非 PostgreSQL 数据库配置。"""
 
-    database_path = tmp_path / "migrated.db"
-    database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
+    with pytest.raises(ValueError, match="缺少 JOB_AGENT_DATABASE_URL"):
+        require_postgresql_database_url(load_database_settings(tmp_path / "missing.env", environ={}))
 
-    upgrade_database(database_url)
+    invalid_env = tmp_path / "invalid.env"
+    invalid_env.write_text("JOB_AGENT_DATABASE_URL=mysql+pymysql://user@localhost/job_agent\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="数据库 URL 只支持"):
+        load_database_settings(invalid_env, environ={})
 
-    with sqlite3.connect(database_path) as connection:
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-        }
-        version = connection.execute(
-            "SELECT version_num FROM alembic_version"
-        ).fetchone()[0]
+
+def test_upgrade_database_creates_versioned_postgresql_schema(temporary_database_url):
+    """迁移链路可在独立 PostgreSQL schema 上创建完整生产表。"""
+
+    upgrade_database(temporary_database_url)
+    engine = sa.create_engine(temporary_database_url)
+    try:
+        with engine.connect() as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    sa.text(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = current_schema()"
+                    )
+                )
+            }
+            version = connection.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+    finally:
+        engine.dispose()
 
     assert {
         "accounts",
@@ -66,64 +78,27 @@ def test_upgrade_database_creates_versioned_schema_on_empty_sqlite_file(tmp_path
     assert version == "20260807_0001"
 
 
-def test_downgrade_database_returns_an_empty_revision_chain(tmp_path):
+def test_downgrade_database_returns_an_empty_revision_chain(temporary_database_url):
     """初始 revision 必须可回退，供部署演练和失败恢复使用。"""
 
-    database_path = tmp_path / "downgraded.db"
-    database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
-    upgrade_database(database_url)
-
-    revision = downgrade_database(database_url, "base")
+    upgrade_database(temporary_database_url)
+    revision = downgrade_database(temporary_database_url, "base")
 
     assert revision is None
-    assert current_database_revision(database_url) is None
-    with sqlite3.connect(database_path) as connection:
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-        }
+    assert current_database_revision(temporary_database_url) is None
+    engine = sa.create_engine(temporary_database_url)
+    try:
+        with engine.connect() as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    sa.text(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = current_schema()"
+                    )
+                )
+            }
+    finally:
+        engine.dispose()
     assert "accounts" not in tables
     assert "rag_chunks" not in tables
-
-
-def test_cli_database_config_masks_database_password(tmp_path, capsys):
-    """数据库配置命令只展示脱敏 URL，不能把密码输出到终端。"""
-
-    env_file = tmp_path / ".env"
-    env_file.write_text(
-        "JOB_AGENT_DATABASE_URL=postgresql://job_agent:secret@localhost:5432/job_agent\n",
-        encoding="utf-8",
-    )
-
-    main(["--env-file", str(env_file), "database-config"])
-
-    output_text = capsys.readouterr().out
-    output = json.loads(output_text)
-    assert output["configured"] is True
-    assert output["url"] == "postgresql+psycopg://job_agent:***@localhost:5432/job_agent"
-    assert "secret" not in output_text
-
-
-def test_cli_config_command_does_not_create_a_default_sqlite_file(tmp_path, monkeypatch, capsys):
-    """查询模型配置是只读操作，不能顺带初始化旧 SQLite 测试库。"""
-
-    env_file = tmp_path / ".env"
-    env_file.write_text(
-        "\n".join(
-            [
-                "JOB_AGENT_LLM_PROVIDER=test-provider",
-                "JOB_AGENT_LLM_MODEL=test-model",
-                "JOB_AGENT_LLM_API_KEY=test-key",
-                "JOB_AGENT_LLM_BASE_URL=https://example.test/v1",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.chdir(tmp_path)
-
-    main(["--env-file", str(env_file), "llm-config"])
-
-    assert json.loads(capsys.readouterr().out)["provider"] == "test-provider"
-    assert not (tmp_path / "data" / "job_agent.db").exists()

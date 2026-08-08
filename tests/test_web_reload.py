@@ -10,7 +10,7 @@ import job_hunting_agent.web as web
 
 
 def test_reloadable_web_app_reads_runtime_paths_from_reloader_environment(monkeypatch, tmp_path):
-    """Uvicorn 重载子进程应重建使用同一组运行路径的认证 Web 应用。"""
+    """Uvicorn 重载子进程应重建使用同一 PostgreSQL 配置的认证 Web 应用。"""
 
     received: dict[str, object] = {}
     sentinel = object()
@@ -20,27 +20,22 @@ def test_reloadable_web_app_reads_runtime_paths_from_reloader_environment(monkey
         return sentinel
 
     monkeypatch.setattr(web, "create_web_app", fake_create_web_app)
-    monkeypatch.setenv(web.WEB_RELOAD_DB_ENV, str(tmp_path / "agent.db"))
     monkeypatch.setenv(web.WEB_RELOAD_ENV_FILE_ENV, str(tmp_path / ".env"))
-    monkeypatch.setenv(web.WEB_RELOAD_RAG_DIR_ENV, str(tmp_path / "chroma"))
     monkeypatch.setenv(web.WEB_RELOAD_RESUME_DIR_ENV, str(tmp_path / "resumes"))
     monkeypatch.setenv(
         "JOB_AGENT_DATABASE_URL",
-        f"sqlite+pysqlite:///{(tmp_path / 'database.db').as_posix()}",
+        "postgresql+psycopg://job_agent@postgres:5432/job_agent",
     )
 
     assert web.create_reloadable_web_app() is sentinel
     assert received == {
-        "db_path": str(tmp_path / "agent.db"),
         "env_file": str(tmp_path / ".env"),
-        "rag_dir": str(tmp_path / "chroma"),
         "resume_dir": str(tmp_path / "resumes"),
-        "require_auth": True,
-        "database_url": f"sqlite+pysqlite:///{(tmp_path / 'database.db').as_posix()}",
+        "database_url": "postgresql+psycopg://job_agent@postgres:5432/job_agent",
     }
 
 
-def test_web_cli_reload_uses_an_importable_factory_and_watches_requested_directory(monkeypatch, tmp_path):
+def test_web_reload_uses_an_importable_factory_and_watches_requested_directory(monkeypatch, tmp_path):
     """重载模式不能传递已创建的应用对象，否则 Uvicorn 无法重新导入新源码。"""
 
     calls: list[tuple[object, dict[str, object]]] = []
@@ -51,12 +46,10 @@ def test_web_cli_reload_uses_an_importable_factory_and_watches_requested_directo
     monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=fake_run))
     monkeypatch.setenv(
         "JOB_AGENT_DATABASE_URL",
-        f"sqlite+pysqlite:///{(tmp_path / 'database.db').as_posix()}",
+        "postgresql+psycopg://job_agent@postgres:5432/job_agent",
     )
     reload_env_keys = (
-        web.WEB_RELOAD_DB_ENV,
         web.WEB_RELOAD_ENV_FILE_ENV,
-        web.WEB_RELOAD_RAG_DIR_ENV,
         web.WEB_RELOAD_RESUME_DIR_ENV,
     )
     original_environment = {key: os.environ.get(key) for key in reload_env_keys}
@@ -68,12 +61,8 @@ def test_web_cli_reload_uses_an_importable_factory_and_watches_requested_directo
         watch_dir = tmp_path / "source"
         web.main(
             [
-                "--db",
-                str(tmp_path / "agent.db"),
                 "--env-file",
                 str(tmp_path / ".env"),
-                "--rag-dir",
-                str(tmp_path / "chroma"),
                 "--resume-dir",
                 str(tmp_path / "resumes"),
                 "--host",
@@ -98,9 +87,7 @@ def test_web_cli_reload_uses_an_importable_factory_and_watches_requested_directo
                 },
             )
         ]
-        assert os.environ[web.WEB_RELOAD_DB_ENV] == str(tmp_path / "agent.db")
         assert os.environ[web.WEB_RELOAD_ENV_FILE_ENV] == str(tmp_path / ".env")
-        assert os.environ[web.WEB_RELOAD_RAG_DIR_ENV] == str(tmp_path / "chroma")
         assert os.environ[web.WEB_RELOAD_RESUME_DIR_ENV] == str(tmp_path / "resumes")
     finally:
         # 生产入口会为重载子进程保留变量；测试必须自行恢复，避免污染后续用例。

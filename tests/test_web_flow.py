@@ -1,7 +1,7 @@
 """Web 前端/API 行为测试。
 
-网页入口是给不熟悉 CLI 的使用者准备的本地界面。测试重点不放在像素级样式，
-而是验证页面资源可访问、Web API 会调用现有 `JobHuntingApp`，并保持 SQLite/RAG
+网页入口是面向日常使用者的本地界面。测试重点不放在像素级样式，
+而是验证页面资源可访问、Web API 会调用现有 `JobHuntingApp`，并保持 PostgreSQL/pgvector
 边界不变。
 """
 
@@ -35,10 +35,26 @@ class StreamingFakeChatModel(FakeListChatModel):
         return self
 
 
-def legacy_client(db_path, rag_dir):
-    """旧版 Web 行为测试显式关闭认证，生产默认仍要求登录。"""
+def login_test_account(client: TestClient, email: str = "web-tests@example.com") -> TestClient:
+    """为 Web 行为测试创建真实账号并建立 HttpOnly Session。"""
 
-    return TestClient(create_web_app(db_path=db_path, rag_dir=rag_dir, require_auth=False))
+    registered = client.post(
+        "/api/auth/register",
+        json={"email": email, "password": "password-123"},
+    )
+    assert registered.status_code in {200, 409}
+    logged_in = client.post(
+        "/api/auth/login",
+        json={"email": email, "password": "password-123"},
+    )
+    assert logged_in.status_code == 200
+    return client
+
+
+def legacy_client(*_unused):
+    """创建已登录客户端，保留原测试调用名称以避免无关改写。"""
+
+    return login_test_account(TestClient(create_web_app()))
 
 
 def test_web_chat_payload_defaults_to_langchain_agent() -> None:
@@ -58,10 +74,7 @@ def test_secure_cookie_setting_is_loaded_from_project_env(tmp_path, monkeypatch)
     env_path.write_text("JOB_AGENT_COOKIE_SECURE=true\n", encoding="utf-8")
     client = TestClient(
         create_web_app(
-            db_path=tmp_path / "web.db",
             env_file=env_path,
-            rag_dir=tmp_path / "chroma",
-            require_auth=True,
         )
     )
     registered = client.post(
@@ -78,10 +91,52 @@ def test_secure_cookie_setting_is_loaded_from_project_env(tmp_path, monkeypatch)
     assert "; secure" in response.headers["set-cookie"].lower()
 
 
+def test_web_bootstraps_initial_admin_once_from_env(tmp_path) -> None:
+    """首次管理员只能由私有环境配置引导，公开注册接口不能提升普通用户。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_BOOTSTRAP_ADMIN_EMAIL=admin@example.com",
+                "JOB_AGENT_BOOTSTRAP_ADMIN_PASSWORD=strong-password-123",
+                "JOB_AGENT_BOOTSTRAP_ADMIN_DISPLAY_NAME=初始管理员",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(
+        create_web_app(
+            env_file=env_path,
+        )
+    )
+
+    response = client.post(
+        "/api/auth/login",
+        json={"email": "admin@example.com", "password": "strong-password-123"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["account"]["role"] == "admin"
+
+    # 再次创建 Web 应用不会重复创建或重置该账号的密码。
+    restarted = TestClient(
+        create_web_app(
+            env_file=env_path,
+        )
+    )
+    repeated_login = restarted.post(
+        "/api/auth/login",
+        json={"email": "admin@example.com", "password": "strong-password-123"},
+    )
+
+    assert repeated_login.status_code == 200
+
+
 def test_web_home_page_and_assets_are_available(tmp_path):
     """本地 Web 应用可以打开首页，并加载前端静态资源。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
 
     home = client.get("/")
     script = client.get("/static/app.js")
@@ -124,7 +179,7 @@ def test_web_home_page_and_assets_are_available(tmp_path):
 def test_profile_delete_button_is_idle_without_a_selected_profile(tmp_path):
     """空档案状态不能把两个默认值 0 误判为正在删除。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
     home = client.get("/").text
     script = client.get("/static/app.js").text
     button = re.search(
@@ -142,7 +197,7 @@ def test_profile_delete_button_is_idle_without_a_selected_profile(tmp_path):
 def test_web_health_reports_enabled_memory_as_configured(tmp_path):
     """记忆配置成功且启用时，健康接口不能错误显示为未配置。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
 
     health = client.get("/api/health")
 
@@ -153,7 +208,7 @@ def test_web_health_reports_enabled_memory_as_configured(tmp_path):
 def test_web_auth_bootstrap_does_not_surface_probe_errors_in_login_form(tmp_path):
     """初始化 Session 探测失败时，不应把错误提前显示成登录失败。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
     script = client.get("/static/app.js").text
     check_auth_start = script.index("async checkAuth()")
     check_auth_end = script.index("/** 切换登录与注册表单。 */", check_auth_start)
@@ -165,7 +220,7 @@ def test_web_auth_bootstrap_does_not_surface_probe_errors_in_login_form(tmp_path
 def test_web_frontend_defaults_to_agent_and_incremental_rag_without_toggles(tmp_path):
     """网页聊天不再暴露模式开关，而是固定走 Agent + 自动增量 RAG。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
 
     home = client.get("/").text
     script = client.get("/static/app.js").text
@@ -182,7 +237,7 @@ def test_web_frontend_defaults_to_agent_and_incremental_rag_without_toggles(tmp_
 def test_web_profile_form_uses_recovered_selectors_and_auth_copy(tmp_path):
     """保留认证与学历约束，并支持按省份连续添加多个首选城市。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
 
     home = client.get("/").text
     script = client.get("/static/app.js").text
@@ -221,7 +276,7 @@ def test_web_profile_form_uses_recovered_selectors_and_auth_copy(tmp_path):
 def test_web_can_create_profile_and_ingest_chat_message_incrementally(tmp_path):
     """网页 API 可以创建候选人档案，并通过聊天消息自动入库和增量索引。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
     created = client.post(
         "/api/profiles",
         json={
@@ -261,7 +316,7 @@ def test_web_can_create_profile_and_ingest_chat_message_incrementally(tmp_path):
 def test_web_can_import_job_and_return_matches(tmp_path):
     """网页 API 可以导入候选人复制回来的 BOSS 职位文本，并返回匹配结果。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
     candidate_id = client.post(
         "/api/profiles",
         json={
@@ -302,10 +357,8 @@ def test_web_can_import_job_and_return_matches(tmp_path):
 def test_web_can_delete_profiles_sessions_and_jobs_with_account_scoping(tmp_path):
     """网页删除接口应清理从属数据，并拒绝其他账号跨边界删除。"""
 
-    db_path = tmp_path / "delete.db"
-    rag_dir = tmp_path / "chroma"
-    client_a = TestClient(create_web_app(db_path=db_path, rag_dir=rag_dir, require_auth=True))
-    client_b = TestClient(create_web_app(db_path=db_path, rag_dir=rag_dir, require_auth=True))
+    client_a = TestClient(create_web_app())
+    client_b = TestClient(create_web_app())
 
     for client, email in ((client_a, "delete-a@example.com"), (client_b, "delete-b@example.com")):
         assert client.post(
@@ -380,7 +433,7 @@ def test_web_can_delete_profiles_sessions_and_jobs_with_account_scoping(tmp_path
 def test_web_rejects_non_job_text_before_saving(tmp_path):
     """导入职位前应审核文本；非招聘职位内容不能进入职位池。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
 
     response = client.post(
         "/api/jobs",
@@ -396,7 +449,7 @@ def test_web_rejects_non_job_text_before_saving(tmp_path):
 def test_web_rejects_project_changelog_as_job_text(tmp_path):
     """项目更新日志包含技术词，也不能被误当成职位信息保存和打分。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
 
     response = client.post(
         "/api/jobs",
@@ -416,9 +469,9 @@ def test_web_rejects_project_changelog_as_job_text(tmp_path):
 def test_web_hides_legacy_invalid_job_rows_from_listing_and_matching(tmp_path):
     """历史误入库的非职位记录不应继续出现在前端列表或匹配结果里。"""
 
-    db_path = tmp_path / "web.db"
-    backend = JobHuntingApp(db_path)
+    backend = JobHuntingApp()
     backend.initialize()
+    account = backend.auth.register("legacy-job@example.com", "password-123")
     candidate_id = backend.save_candidate_profile(
         CandidateProfileInput(
             name="小林",
@@ -431,21 +484,23 @@ def test_web_hides_legacy_invalid_job_rows_from_listing_and_matching(tmp_path):
             expected_salary_k=15,
             target_directions=["Python 后端开发"],
             unacceptable=[],
-        )
+        ),
+        account_id=account.id,
     )
 
     with backend.store.connect() as conn:
         conn.execute(
             """
             INSERT INTO jobs (
-                raw_text, source_url, title, city, salary_min_k, salary_max_k,
+                account_id, raw_text, source_url, title, city, salary_min_k, salary_max_k,
                 salary_months, salary_unit, experience_min_years,
                 experience_max_years, experience_label, education,
                 company_name, industry, company_size, skills_json,
                 description_text, field_confidence_json, uncertainty_notes_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                account.id,
                 "今天心情不错，晚上想去吃火锅。",
                 None,
                 "今天心情不错，晚上想去吃火锅。",
@@ -468,7 +523,10 @@ def test_web_hides_legacy_invalid_job_rows_from_listing_and_matching(tmp_path):
             ),
         )
 
-    client = legacy_client(db_path, tmp_path / "chroma")
+    client = login_test_account(
+        TestClient(create_web_app()),
+        email="legacy-job@example.com",
+    )
 
     assert client.get("/api/jobs").json()["jobs"] == []
     assert client.get(f"/api/matches/{candidate_id}").json()["matches"] == []
@@ -477,7 +535,7 @@ def test_web_hides_legacy_invalid_job_rows_from_listing_and_matching(tmp_path):
 def test_web_frontend_loads_persisted_jobs_on_page_open(tmp_path):
     """页面脚本应在打开时主动拉取已导入职位，而不是只在匹配接口里临时使用。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
     client.post(
         "/api/jobs",
         json={
@@ -508,7 +566,7 @@ def test_web_frontend_loads_persisted_jobs_on_page_open(tmp_path):
 def test_web_can_save_manual_job_skill_categories(tmp_path):
     """网页可以调整已有职位技能分类，并通过接口返回更新后的职位。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
     job = client.post(
         "/api/jobs",
         json={
@@ -539,10 +597,9 @@ def test_web_can_save_manual_job_skill_categories(tmp_path):
 
 
 def test_web_chat_history_survives_page_reopen(tmp_path):
-    """网页聊天记录应保存到 SQLite，刷新或重新打开页面后可以恢复。"""
+    """网页聊天记录应保存到 PostgreSQL，刷新或重新打开页面后可以恢复。"""
 
-    db_path = tmp_path / "web.db"
-    client = legacy_client(db_path, tmp_path / "chroma")
+    client = legacy_client()
     candidate_id = client.post(
         "/api/profiles",
         json={
@@ -569,7 +626,7 @@ def test_web_chat_history_survives_page_reopen(tmp_path):
             "session_id": f"web-candidate-{candidate_id}",
         },
     )
-    reopened_client = legacy_client(db_path, tmp_path / "chroma")
+    reopened_client = legacy_client()
     history = reopened_client.get(
         "/api/chat/history",
         params={"candidate_id": candidate_id, "session_id": f"web-candidate-{candidate_id}"},
@@ -586,7 +643,7 @@ def test_web_chat_history_survives_page_reopen(tmp_path):
 def test_web_chat_can_use_langchain_agent_mode(tmp_path):
     """网页聊天在开启开关时，会走标准 LangChain Agent 主流程。"""
 
-    agent_backend = JobHuntingApp(tmp_path / "web.db")
+    agent_backend = JobHuntingApp()
     agent_backend.initialize()
     model = ToolCallingFakeChatModel(
         responses=[
@@ -608,16 +665,12 @@ def test_web_chat_can_use_langchain_agent_mode(tmp_path):
         ]
     )
     backend_app = create_web_app(
-        db_path=tmp_path / "web.db",
-        rag_dir=tmp_path / "chroma",
-        require_auth=False,
         chat_agent=JobHuntingAgent(
             app=agent_backend,
-            rag_dir=tmp_path / "chroma",
             model=model,
         ),
     )
-    client = TestClient(backend_app)
+    client = login_test_account(TestClient(backend_app))
     created = client.post(
         "/api/profiles",
         json={
@@ -653,20 +706,16 @@ def test_web_chat_can_use_langchain_agent_mode(tmp_path):
 def test_web_chat_stream_returns_sse_and_saves_history(tmp_path):
     """网页流式聊天接口会返回 SSE 事件，并在 final 后保存聊天历史。"""
 
-    agent_backend = JobHuntingApp(tmp_path / "web.db")
+    agent_backend = JobHuntingApp()
     agent_backend.initialize()
     model = ToolCallingFakeChatModel(responses=[AIMessage(content="这是流式回复。")])
     backend_app = create_web_app(
-        db_path=tmp_path / "web.db",
-        rag_dir=tmp_path / "chroma",
-        require_auth=False,
         chat_agent=JobHuntingAgent(
             app=agent_backend,
-            rag_dir=tmp_path / "chroma",
             model=model,
         ),
     )
-    client = TestClient(backend_app)
+    client = login_test_account(TestClient(backend_app))
     candidate_id = client.post(
         "/api/profiles",
         json={
@@ -710,20 +759,16 @@ def test_web_chat_stream_returns_sse_and_saves_history(tmp_path):
 def test_web_chat_stream_preserves_multiple_token_events(tmp_path):
     """底层模型支持 token stream 时，Web SSE 也必须向前端转发多个 token。"""
 
-    agent_backend = JobHuntingApp(tmp_path / "web.db")
+    agent_backend = JobHuntingApp()
     agent_backend.initialize()
     model = StreamingFakeChatModel(responses=["流式OK"])
     backend_app = create_web_app(
-        db_path=tmp_path / "web.db",
-        rag_dir=tmp_path / "chroma",
-        require_auth=False,
         chat_agent=JobHuntingAgent(
             app=agent_backend,
-            rag_dir=tmp_path / "chroma",
             model=model,
         ),
     )
-    client = TestClient(backend_app)
+    client = login_test_account(TestClient(backend_app))
     candidate_id = client.post(
         "/api/profiles",
         json={
@@ -762,7 +807,7 @@ def test_web_chat_stream_preserves_multiple_token_events(tmp_path):
 def test_web_chat_bubble_uses_markdown_renderer(tmp_path):
     """Vue 聊天气泡应渲染 Markdown，而不是把模型回复按纯文本展示。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
     script = client.get("/static/app.js").text
     home = client.get("/").text
 
@@ -783,7 +828,7 @@ def test_web_chat_bubble_uses_markdown_renderer(tmp_path):
 def test_web_chat_stream_has_timeout_and_cancel_path(tmp_path):
     """模型或网络长时间无响应时，前端必须能超时或主动停止生成。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
     script = client.get("/static/app.js").text
     home = client.get("/").text
 
@@ -799,7 +844,7 @@ def test_web_chat_stream_has_timeout_and_cancel_path(tmp_path):
 def test_web_stream_message_keeps_vue_reactive_proxy(tmp_path):
     """流式更新必须持有 Vue 数组里的 Proxy，不能继续修改 push 前的原始对象。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
 
     script = client.get("/static/app.js").text
 
@@ -812,7 +857,7 @@ def test_web_stream_message_keeps_vue_reactive_proxy(tmp_path):
 def test_web_markdown_renderer_supports_tables(tmp_path):
     """模型输出标准 Markdown 表格时，前端必须生成表格 DOM 和响应式滚动容器。"""
 
-    client = legacy_client(tmp_path / "web.db", tmp_path / "chroma")
+    client = legacy_client()
 
     script = client.get("/static/app.js").text
     styles = client.get("/static/styles.css").text

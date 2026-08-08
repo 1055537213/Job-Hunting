@@ -1,6 +1,6 @@
 """应用服务层。
 
-这个模块提供目前 MVP 的公共入口。CLI、测试或以后接入 Web/API 时，
+这个模块提供目前 MVP 的公共入口。Web/API、测试或以后接入后台任务时，
 都应该优先调用 `JobHuntingApp`，而不是直接操作存储、解析器和匹配器。
 这样可以让外部接口保持简单，内部实现以后逐步替换成 LLM/向量库也更稳。
 """
@@ -12,7 +12,12 @@ from pathlib import Path
 from langchain_core.embeddings import Embeddings
 
 from .auth import AuthService
-from .config import DEFAULT_ENV_PATH, load_semantic_matching_enabled
+from .config import (
+    DEFAULT_ENV_PATH,
+    load_database_settings,
+    load_semantic_matching_enabled,
+    require_postgresql_database_url,
+)
 from .conversation_ingestion import decide_conversation_ingestion
 from .llm import LLMClient
 from .matcher import match_job, semantic_direction_score
@@ -35,7 +40,7 @@ from .models import (
 from .model_gateway import ModelGateway
 from .project_analyzer import analyze_project
 from .pgvector_rag import PgVectorKnowledgeBase
-from .rag import RAGKnowledgeBase, Reranker
+from .rag import Reranker
 from .resume_document import (
     ResumeFileStore,
     extract_resume_document,
@@ -45,20 +50,17 @@ from .resume_document import (
 from .resume_exporter import export_tailored_resume_files
 from .resume_writer import build_resume_draft
 from .sqlalchemy_store import SQLAlchemyStore
-from .storage import SQLiteStore
 
 
 class JobHuntingApp:
     """求职助手 MVP 的门面类。
 
-    它把关系数据库存储、职位解析、本地项目分析、匹配规则、LLM 草稿生成和
-    RAG 检索组合到一起。测试可继续注入 SQLite 文件；生产入口显式传入数据库 URL
-    后会使用经 Alembic 管理的 SQLAlchemyStore。
+    它把 PostgreSQL 存储、职位解析、本地项目分析、匹配规则、LLM 草稿生成和
+    pgvector 检索组合到一起。所有入口都使用经 Alembic 管理的 SQLAlchemyStore。
     """
 
     def __init__(
         self,
-        db_path: str | Path,
         env_path: str | Path = DEFAULT_ENV_PATH,
         resume_dir: str | Path | None = None,
         semantic_matching: bool | None = None,
@@ -66,11 +68,14 @@ class JobHuntingApp:
     ):
         """绑定数据库、项目 `.env` 和受控简历文件目录。"""
 
-        # 未传 URL 时保留 SQLite 测试适配器；Web 生产入口会显式传入 PostgreSQL URL。
-        self.store = SQLAlchemyStore(database_url) if database_url else SQLiteStore(db_path)
-        # Web/CLI 都通过同一认证服务创建账号和 Session，避免重复实现密码逻辑。
-        self.auth = AuthService(self.store)
         self.env_path = Path(env_path)
+        resolved_database_url = database_url or require_postgresql_database_url(
+            load_database_settings(self.env_path)
+        )
+        self.store = SQLAlchemyStore(resolved_database_url)
+        default_resume_dir = Path("data/resumes")
+        # Web 与后台任务都通过同一认证服务创建账号和 Session，避免重复实现密码逻辑。
+        self.auth = AuthService(self.store)
         # 语义方向匹配涉及外部 Embedding/Rerank 请求，默认按 `.env` 显式开关；
         # 测试和离线模式可通过构造参数强制关闭或打开。
         self.semantic_matching_enabled = (
@@ -81,7 +86,6 @@ class JobHuntingApp:
         # 所有真实模型/Embedding 调用都通过内部 Gateway 构造和计量；它是惰性加载的，
         # 所以纯本地规则和离线测试不需要在创建 App 时提供 API Key。
         self.model_gateway = ModelGateway(self.env_path, usage_store=self.store)
-        default_resume_dir = Path(db_path).parent / "resumes"
         self.resume_files = ResumeFileStore(resume_dir or default_resume_dir)
 
     def initialize(self) -> None:
@@ -97,7 +101,7 @@ class JobHuntingApp:
     def get_candidate_profile(self, candidate_id: int, account_id: int | None = None) -> CandidateProfile:
         """读取候选人档案。
 
-        CLI 和测试需要通过应用服务读取档案，避免越过门面类直接访问持久化实现。
+        Web API 和测试通过应用服务读取档案，避免越过门面类直接访问持久化实现。
         """
 
         return self.store.get_candidate_profile(candidate_id, account_id=account_id)
@@ -110,7 +114,6 @@ class JobHuntingApp:
     def delete_candidate_profile(
         self,
         candidate_id: int,
-        rag_persist_directory: str | Path | None = None,
         account_id: int | None = None,
     ) -> dict[str, object]:
         """删除候选人档案及其从属数据，并尽量同步移除 RAG 证据。"""
@@ -118,7 +121,7 @@ class JobHuntingApp:
         result = self.store.delete_candidate_profile(candidate_id, account_id=account_id)
         for storage_key in result.get("storage_keys", []):
             self.resume_files.delete(str(storage_key))
-        return self._finish_deletion_cleanup(result, rag_persist_directory, account_id)
+        return self._finish_deletion_cleanup(result)
 
     def delete_chat_session(self, session_id: str, account_id: int) -> dict[str, object]:
         """永久删除一段网页对话及其消息。"""
@@ -130,7 +133,6 @@ class JobHuntingApp:
         candidate_id: int,
         message: str,
         llm_client: LLMClient | None = None,
-        rag_persist_directory: str | Path | None = None,
         auto_rebuild_rag: bool = False,
         account_id: int | None = None,
     ) -> ConversationIngestionResult:
@@ -170,7 +172,6 @@ class JobHuntingApp:
             # 参数名沿用早期版本；现在对话入库的自动 RAG 刷新采用增量追加，不做全量重建。
             rag_index_stats = self.index_rag_long_texts(
                 saved_long_text_ids,
-                rag_persist_directory or "data/chroma",
                 account_id=account_id,
             )
             rag_update_mode = rag_index_stats.mode
@@ -230,7 +231,6 @@ class JobHuntingApp:
     def delete_job(
         self,
         job_id: int,
-        rag_persist_directory: str | Path | None = None,
         account_id: int | None = None,
     ) -> dict[str, object]:
         """删除职位及其职位定制文件，并尽量同步移除 RAG 证据。"""
@@ -238,13 +238,11 @@ class JobHuntingApp:
         result = self.store.delete_job(job_id, account_id=account_id)
         for storage_key in result.get("storage_keys", []):
             self.resume_files.delete(str(storage_key))
-        return self._finish_deletion_cleanup(result, rag_persist_directory, account_id)
+        return self._finish_deletion_cleanup(result)
 
     def _finish_deletion_cleanup(
         self,
         result: dict[str, object],
-        rag_persist_directory: str | Path | None,
-        account_id: int | None,
     ) -> dict[str, object]:
         """清理 RAG chunk；结构化数据删除完成时，向调用方返回可读警告。"""
 
@@ -252,28 +250,9 @@ class JobHuntingApp:
         result["rag_deleted_chunks"] = 0
         if not long_text_ids:
             return result
-        if self._uses_pgvector_rag():
-            # rag_chunks.long_text_id 使用 ON DELETE CASCADE；仓储删除事实源后，数据库会
-            # 在同一事务中删除派生向量。无需再创建 Embedding 客户端或做一次空删除查询。
-            result["rag_cleanup"] = "database_cascade"
-            return result
-        if rag_persist_directory is None:
-            return result
-        try:
-            call_context = self.model_gateway.new_call_context(
-                "embedding_delete",
-                account_id=account_id,
-            )
-            knowledge_base = RAGKnowledgeBase(
-                rag_persist_directory,
-                embeddings=self.model_gateway.embeddings(call_context),
-            )
-            result["rag_deleted_chunks"] = knowledge_base.delete_long_texts(
-                long_text_ids,
-                account_id=account_id,
-            )
-        except Exception as error:  # noqa: BLE001 - 数据删除成功后返回可修复的索引警告。
-            result["rag_warning"] = str(error)
+        # rag_chunks.long_text_id 使用 ON DELETE CASCADE；事实源删除成功后，PostgreSQL
+        # 会在同一事务中删除派生向量，不需要再次调用 Embedding 或本地向量库。
+        result["rag_cleanup"] = "database_cascade"
         return result
 
     def save_chat_message(
@@ -289,6 +268,21 @@ class JobHuntingApp:
 
         # 先读取候选人，避免前端给不存在的档案写聊天记录。
         self.store.get_candidate_profile(candidate_id, account_id=account_id)
+        # PostgreSQL 以 chat_sessions.session_id 作为消息外键；直接调用应用层
+        # 入口时也要先登记默认会话，不能依赖 Web 路由的额外初始化步骤。
+        try:
+            session = self.store.get_chat_session_by_key(session_id, account_id)
+            if session.candidate_id != candidate_id:
+                raise ValueError("该会话不属于当前候选人档案。")
+            if session.status != "active":
+                raise ValueError("该会话已经归档，请新建对话。")
+        except KeyError:
+            self.store.create_chat_session(
+                session_id=session_id,
+                account_id=account_id,
+                candidate_id=candidate_id,
+                title=content[:32] or "新对话",
+            )
         return self.store.save_chat_message(candidate_id, session_id, role, content, metadata, account_id=account_id)
 
     def list_chat_messages(
@@ -393,14 +387,14 @@ class JobHuntingApp:
         candidate_id: int,
         job_id: int,
         llm_client: LLMClient | None = None,
-        rag_persist_directory: str | Path | None = None,
         rag_query: str | None = None,
+        use_rag: bool = True,
         account_id: int | None = None,
     ) -> ResumeDraftRecord:
         """为某个职位生成一版证据约束简历草稿。
 
         LLM 是可选表达工具；即使传入 LLM，最终草稿也会经过真实性检查。
-        RAG 是可选证据上下文；即使使用 RAG，也不会覆盖候选人档案。
+        RAG 是证据上下文；即使使用 RAG，也不会覆盖候选人档案。
         """
 
         candidate = self.store.get_candidate_profile(candidate_id, account_id=account_id)
@@ -410,15 +404,14 @@ class JobHuntingApp:
             for record in self.store.list_project_cards(candidate_id, account_id=account_id)
             if record.status == "已确认"
         ]
-        semantic_evidence = []
-        if rag_persist_directory is not None:
+        semantic_evidence: list[str] = []
+        if use_rag:
             query = rag_query or f"{job.title}\n{job.description_text}"
             # 简历草稿只允许检索已登记的候选人/职位/已确认项目材料；历史草稿不作为事实证据。
             semantic_evidence = [
                 format_rag_evidence(result)
                 for result in self.search_rag(
                     query,
-                    rag_persist_directory,
                     top_k=5,
                     entity_types=["candidate_profile", "job", "project_experience_card"],
                     account_id=account_id,
@@ -503,7 +496,6 @@ class JobHuntingApp:
     def delete_resume_artifact(
         self,
         artifact_id: int,
-        rag_persist_directory: str | Path | None = None,
         account_id: int | None = None,
     ) -> dict[str, object]:
         """删除单个原始或职位定制简历，并同步清理受控文件和 RAG 证据。"""
@@ -511,7 +503,7 @@ class JobHuntingApp:
         result = self.store.delete_resume_artifact(artifact_id, account_id=account_id)
         for storage_key in result.get("storage_keys", []):
             self.resume_files.delete(str(storage_key))
-        return self._finish_deletion_cleanup(result, rag_persist_directory, account_id)
+        return self._finish_deletion_cleanup(result)
 
     def resume_file_path(self, artifact: ResumeArtifactRecord) -> Path:
         """把受控存储键解析为文件路径，不接受数据库之外的任意路径。"""
@@ -525,8 +517,8 @@ class JobHuntingApp:
         source_artifact_id: int,
         job_id: int,
         llm_client: LLMClient | None = None,
-        rag_persist_directory: str | Path | None = None,
         rag_query: str | None = None,
+        use_rag: bool = True,
         allow_proficiency_upgrade: bool = False,
         account_id: int | None = None,
     ) -> TailoredResumeResult:
@@ -544,13 +536,12 @@ class JobHuntingApp:
             if record.status == "已确认"
         ]
         semantic_evidence: list[str] = []
-        if rag_persist_directory is not None:
+        if use_rag:
             query = rag_query or f"{job.title}\n{job.description_text}\n{source_text[:2_000]}"
             semantic_evidence = [
                 format_rag_evidence(result)
                 for result in self.search_rag(
                     query,
-                    rag_persist_directory,
                     top_k=6,
                     entity_types=[
                         "candidate_profile",
@@ -627,7 +618,10 @@ class JobHuntingApp:
             raise
         return TailoredResumeResult(draft=draft_record, artifacts=saved_records)
 
-    def rebuild_rag_index(self, persist_directory: str | Path = "data/chroma", account_id: int | None = None) -> RAGIndexStats:
+    def rebuild_rag_index(
+        self,
+        account_id: int | None = None,
+    ) -> RAGIndexStats:
         """把长文本事实源全量同步到当前存储后端对应的 RAG 派生索引。"""
 
         call_context = self.model_gateway.new_call_context(
@@ -635,7 +629,6 @@ class JobHuntingApp:
             account_id=account_id,
         )
         knowledge_base = self._rag_knowledge_base(
-            persist_directory,
             embeddings=self.model_gateway.embeddings(call_context),
         )
         return knowledge_base.rebuild(self.store.list_long_texts(account_id=account_id), account_id=account_id)
@@ -643,13 +636,12 @@ class JobHuntingApp:
     def index_rag_long_texts(
         self,
         long_text_ids: list[int],
-        persist_directory: str | Path = "data/chroma",
         account_id: int | None = None,
     ) -> RAGIndexStats:
         """把指定长文本增量追加到当前 RAG 派生索引。
 
         PostgreSQL 是长文本材料登记处；这个方法只同步指定 ID，适合对话式自动
-        入库后的即时检索。生产环境写入 pgvector，SQLite 测试环境继续写入 Chroma。
+        入库后的即时检索，直接写入 PostgreSQL 的 pgvector 派生索引。
         """
 
         call_context = self.model_gateway.new_call_context(
@@ -657,7 +649,6 @@ class JobHuntingApp:
             account_id=account_id,
         )
         knowledge_base = self._rag_knowledge_base(
-            persist_directory,
             embeddings=self.model_gateway.embeddings(call_context),
         )
         return knowledge_base.index_long_texts(self.store.get_long_texts_by_ids(long_text_ids, account_id=account_id), account_id=account_id)
@@ -665,7 +656,6 @@ class JobHuntingApp:
     def search_rag(
         self,
         query: str,
-        persist_directory: str | Path = "data/chroma",
         top_k: int = 5,
         entity_types: list[str] | None = None,
         account_id: int | None = None,
@@ -681,29 +671,25 @@ class JobHuntingApp:
             account_id=account_id,
         )
         knowledge_base = self._rag_knowledge_base(
-            persist_directory,
             embeddings=self.model_gateway.embeddings(call_context),
             reranker=self.model_gateway.reranker(rerank_context),
         )
         return knowledge_base.search(query, top_k, entity_types, account_id=account_id)
 
     def _uses_pgvector_rag(self) -> bool:
-        """仅在真实 PostgreSQL 存储上启用 pgvector，保留 SQLite 的 Chroma 测试回退。"""
+        """返回当前仓储是否使用 PostgreSQL 方言。"""
 
-        return isinstance(self.store, SQLAlchemyStore) and self.store.engine.dialect.name == "postgresql"
+        return self.store.engine.dialect.name == "postgresql"
 
     def _rag_knowledge_base(
         self,
-        persist_directory: str | Path,
         *,
         embeddings: Embeddings,
         reranker: Reranker | None = None,
-    ) -> RAGKnowledgeBase | PgVectorKnowledgeBase:
-        """在一个应用内 seam 后选择 RAG 后端，调用方无需感知数据库差异。"""
+    ) -> PgVectorKnowledgeBase:
+        """创建唯一的 PostgreSQL + pgvector 知识库实例。"""
 
-        if self._uses_pgvector_rag():
-            return PgVectorKnowledgeBase(self.store.engine, embeddings=embeddings, reranker=reranker)
-        return RAGKnowledgeBase(persist_directory, embeddings=embeddings, reranker=reranker)
+        return PgVectorKnowledgeBase(self.store.engine, embeddings=embeddings, reranker=reranker)
 
 
 def format_rag_evidence(result: RAGSearchResult) -> str:

@@ -47,7 +47,7 @@ from .rag import Reranker, build_rag_embeddings, build_reranker, extract_embeddi
 class UsageEventStore(Protocol):
     """Gateway 所需的最小用量持久化接口。
 
-    使用 Protocol 而不是直接依赖 SQLiteStore，方便第 2 阶段替换为 PostgreSQL
+    使用 Protocol 隔离用量写入边界，便于在 PostgreSQL 上测试和替换实现。
     Repository 时保持 Gateway 的业务接口不变。
     """
 
@@ -80,7 +80,7 @@ class ModelCallContext:
 class ModelGateway:
     """模块化单体中的模型调用门面。
 
-    Gateway 不保存业务状态；SQLite/PostgreSQL 仍然由调用方注入的用量存储负责。
+    Gateway 不保存业务状态；业务数据和用量仍然由调用方注入的 PostgreSQL 存储负责。
     这样后续把 Gateway 单独部署时，只需要替换这一层的持久化上报实现。
     """
 

@@ -1,7 +1,7 @@
 """对话式自动入库行为测试。
 
 用户希望“把资料发给 agent 后，agent 一边回复，一边自动判断哪些内容进入
-SQLite 结构化事实、哪些内容进入 RAG 长文本知识库”。这一组测试验证第一版
+PostgreSQL 结构化事实、哪些内容进入 RAG 长文本知识库”。这一组测试验证第一版
 自动入库链路。
 """
 
@@ -9,10 +9,10 @@ from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.models import CandidateProfileInput, sanitize_preference_weights
 
 
-def test_conversation_message_auto_saves_structured_facts_and_long_text(tmp_path):
+def test_conversation_message_auto_saves_structured_facts_and_long_text(tmp_path, account_id):
     """一条资料消息可以自动更新候选人档案，并保存原文长文本。"""
 
-    app = JobHuntingApp(tmp_path / "mvp.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -26,15 +26,17 @@ def test_conversation_message_auto_saves_structured_facts_and_long_text(tmp_path
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
 
     result = app.ingest_conversation_message(
         candidate_id,
         "我是本科，1年经验，会 Python 和 FastAPI。做过一个求职助手项目，负责职位解析和匹配排序。",
+        account_id=account_id,
     )
-    updated_profile = app.get_candidate_profile(candidate_id)
-    long_texts = app.store.list_long_texts(["conversation_message"])
+    updated_profile = app.get_candidate_profile(candidate_id, account_id=account_id)
+    long_texts = app.store.list_long_texts(["conversation_message"], account_id=account_id)
 
     assert "已保存" in result.reply
     assert updated_profile.education == "本科"
@@ -47,10 +49,10 @@ def test_conversation_message_auto_saves_structured_facts_and_long_text(tmp_path
     assert long_texts[0].text.startswith("我是本科")
 
 
-def test_conversation_message_can_auto_incrementally_index_rag(tmp_path):
+def test_conversation_message_can_auto_incrementally_index_rag(tmp_path, account_id):
     """自动入库后可以增量追加 RAG 索引，让新资料立刻可检索。"""
 
-    app = JobHuntingApp(tmp_path / "mvp.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -64,16 +66,17 @@ def test_conversation_message_can_auto_incrementally_index_rag(tmp_path):
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
 
     result = app.ingest_conversation_message(
         candidate_id,
         "项目经历：我做过一个 Agent 求职助手，负责 RAG 知识库、职位解析和简历草稿生成。",
-        rag_persist_directory=tmp_path / "chroma",
         auto_rebuild_rag=True,
+        account_id=account_id,
     )
-    search_results = app.search_rag("RAG 知识库 简历草稿", tmp_path / "chroma")
+    search_results = app.search_rag("RAG 知识库 简历草稿", account_id=account_id)
 
     assert not result.rag_rebuilt
     assert result.rag_update_mode == "incremental"
@@ -113,10 +116,10 @@ class DecisionFakeLLM:
         """
 
 
-def test_conversation_ingestion_can_use_llm_json_decision(tmp_path):
+def test_conversation_ingestion_can_use_llm_json_decision(tmp_path, account_id):
     """自动入库可以使用 LLM 的 JSON 决策，但仍通过本地存储边界落库。"""
 
-    app = JobHuntingApp(tmp_path / "mvp.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -131,12 +134,18 @@ def test_conversation_ingestion_can_use_llm_json_decision(tmp_path):
             target_directions=[],
             unacceptable=[],
             preference_weights={"salary": 2.0},
-        )
+        ),
+        account_id=account_id,
     )
 
     llm = DecisionFakeLLM()
-    result = app.ingest_conversation_message(candidate_id, "我最近做了 LangChain RAG 项目。", llm_client=llm)
-    updated_profile = app.get_candidate_profile(candidate_id)
+    result = app.ingest_conversation_message(
+        candidate_id,
+        "我最近做了 LangChain RAG 项目。",
+        llm_client=llm,
+        account_id=account_id,
+    )
+    updated_profile = app.get_candidate_profile(candidate_id, account_id=account_id)
 
     assert llm.prompts
     assert result.reply == "我已提取并保存你的学历、技能和项目材料。"
@@ -148,10 +157,10 @@ def test_conversation_ingestion_can_use_llm_json_decision(tmp_path):
     assert result.saved_long_text_ids
 
 
-def test_conversation_persists_only_explicit_preference_weight_updates(tmp_path):
+def test_conversation_persists_only_explicit_preference_weight_updates(tmp_path, account_id):
     """明确优先级只覆盖提到的维度，不能把默认权重误写成更新。"""
 
-    app = JobHuntingApp(tmp_path / "weights.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -165,11 +174,16 @@ def test_conversation_persists_only_explicit_preference_weight_updates(tmp_path)
             expected_salary_k=15,
             target_directions=["Python 后端"],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
 
-    result = app.ingest_conversation_message(candidate_id, "我最看重薪资，城市无所谓。")
-    profile = app.get_candidate_profile(candidate_id)
+    result = app.ingest_conversation_message(
+        candidate_id,
+        "我最看重薪资，城市无所谓。",
+        account_id=account_id,
+    )
+    profile = app.get_candidate_profile(candidate_id, account_id=account_id)
 
     assert profile.preference_weights["salary"] == 2.0
     assert profile.preference_weights["city"] == 1.0
@@ -188,10 +202,10 @@ def test_preference_weights_are_limited_to_discrete_levels():
     assert weights["city"] == 1.0
 
 
-def test_rule_based_ingestion_preserves_explicit_missing_skill(tmp_path):
+def test_rule_based_ingestion_preserves_explicit_missing_skill(tmp_path, account_id):
     """候选人明确说不会某技能时，结构化档案需要保留负向事实。"""
 
-    app = JobHuntingApp(tmp_path / "missing-skill.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -205,11 +219,16 @@ def test_rule_based_ingestion_preserves_explicit_missing_skill(tmp_path):
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
 
-    app.ingest_conversation_message(candidate_id, "我不会 Docker，但会 Python。")
+    app.ingest_conversation_message(
+        candidate_id,
+        "我不会 Docker，但会 Python。",
+        account_id=account_id,
+    )
 
-    profile = app.get_candidate_profile(candidate_id)
+    profile = app.get_candidate_profile(candidate_id, account_id=account_id)
     assert profile.skills["Docker"] == "不会"
     assert profile.skills["Python"] == "待确认"

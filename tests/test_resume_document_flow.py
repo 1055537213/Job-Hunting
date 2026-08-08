@@ -1,6 +1,6 @@
 """简历文件上传、解析、改写和导出工作流测试。
 
-这些测试把上传的二进制文件、SQLite 元数据和 RAG 长文本登记视为同一条业务链路，
+这些测试把上传的二进制文件、PostgreSQL 元数据和 RAG 长文本登记视为同一条业务链路，
 同时锁住账号隔离边界：知道别人的文件 ID 也不能列出或下载该文件。
 """
 
@@ -180,7 +180,7 @@ def test_sanitized_long_resume_filename_keeps_supported_extension() -> None:
 def test_app_saves_uploaded_resume_as_versioned_artifact_and_rag_source(tmp_path) -> None:
     """上传简历应同时保存原文件、受控元数据和一条候选人范围的长文本来源。"""
 
-    app = JobHuntingApp(tmp_path / "app.db", resume_dir=tmp_path / "resume-files")
+    app = JobHuntingApp( resume_dir=tmp_path / "resume-files")
     app.initialize()
     account_a = app.auth.register("a@example.com", "password-123")
     account_b = app.auth.register("b@example.com", "password-123")
@@ -228,10 +228,7 @@ def test_web_upload_list_and_download_are_scoped_to_logged_in_account(tmp_path) 
     """Web 下载接口必须再次校验账号，不能仅凭可枚举的 artifact_id 返回文件。"""
 
     web_app = create_web_app(
-        db_path=tmp_path / "web.db",
-        rag_dir=tmp_path / "chroma",
         resume_dir=tmp_path / "resume-files",
-        require_auth=True,
     )
     owner = TestClient(web_app)
     stranger = TestClient(web_app)
@@ -282,7 +279,7 @@ def test_web_upload_list_and_download_are_scoped_to_logged_in_account(tmp_path) 
 def test_tailored_resume_creates_docx_and_pdf_without_overwriting_profile_or_source(tmp_path) -> None:
     """职位改写应产出独立草稿和可下载文件，原简历与结构化档案保持不变。"""
 
-    app = JobHuntingApp(tmp_path / "app.db", resume_dir=tmp_path / "resume-files")
+    app = JobHuntingApp( resume_dir=tmp_path / "resume-files")
     app.initialize()
     account = app.auth.register("resume@example.com", "password-123")
     candidate_id = app.save_candidate_profile(profile_input(), account_id=account.id)
@@ -345,17 +342,19 @@ def test_tailored_resume_creates_docx_and_pdf_without_overwriting_profile_or_sou
     assert app.resume_file_path(generated.artifacts[0]).read_bytes() == generated_bytes[generated.artifacts[0].media_type]
 
 
-def test_web_can_tailor_uploaded_resume_and_return_download_urls(tmp_path) -> None:
+def test_web_can_tailor_uploaded_resume_and_return_download_urls(tmp_path, monkeypatch) -> None:
     """网页职位定制接口应返回独立草稿和两个可直接下载的文件版本。"""
 
+    def fail_search(*_args, **_kwargs):  # noqa: ANN002,ANN003
+        raise AssertionError("Web 禁用 RAG 时不应执行语义检索")
+
+    monkeypatch.setattr(JobHuntingApp, "search_rag", fail_search)
+
     web_app = create_web_app(
-        db_path=tmp_path / "web.db",
-        rag_dir=tmp_path / "chroma",
         resume_dir=tmp_path / "resume-files",
         resume_llm_client=StaticLLMClient(
             "# 小林\n\n## 求职目标\nPython 后端开发工程师\n\n## 项目经历\n- 使用 Python 与 FastAPI 开发求职助手。"
         ),
-        require_auth=True,
     )
     client = TestClient(web_app)
     register_and_login(client, "tailor@example.com")
@@ -414,10 +413,7 @@ def test_vue_frontend_exposes_resume_upload_tailor_and_download_workflow(tmp_pat
 
     client = TestClient(
         create_web_app(
-            db_path=tmp_path / "web.db",
-            rag_dir=tmp_path / "chroma",
             resume_dir=tmp_path / "resume-files",
-            require_auth=False,
         )
     )
 

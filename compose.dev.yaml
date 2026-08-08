@@ -5,12 +5,8 @@ services:
     # 覆盖默认启动命令，使 Uvicorn 在 Python 源码变化时重新导入应用工厂。
     command:
       - job-agent-web
-      - --db
-      - /app/data/job_agent.db
       - --env-file
       - /app/.env
-      - --rag-dir
-      - /app/data/chroma
       - --resume-dir
       - /app/data/resumes
       - --host

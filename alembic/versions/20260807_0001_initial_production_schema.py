@@ -24,7 +24,7 @@ branch_labels = None
 depends_on = None
 
 
-# SQLite test runs use JSON, while PostgreSQL receives JSONB and its vector extension type.
+# PostgreSQL 使用 JSONB 和 pgvector 类型；这条历史 migration 只面向生产 PostgreSQL。
 JSON_TYPE = sa.JSON().with_variant(postgresql.JSONB(), "postgresql")
 VECTOR_TYPE = sa.JSON().with_variant(Vector(), "postgresql")
 TIMESTAMP_TYPE = sa.DateTime(timezone=True)

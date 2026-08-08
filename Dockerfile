@@ -24,7 +24,7 @@ COPY pyproject.toml README.md alembic.ini ./
 COPY alembic ./alembic
 COPY src ./src
 
-# 以包的形式安装项目，确保 `job-agent-web` 命令和 Vue 静态资源都可用。
+# 以包的形式安装项目，确保 Web 服务入口、Alembic 和 Vue 静态资源都可用。
 RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -m pip install --no-cache-dir .
 
@@ -34,5 +34,5 @@ RUN useradd --create-home --uid 10001 appuser \
     && chown -R appuser:appuser /app
 USER appuser
 
-# 直接调用项目定义的 Web 入口；Compose 会传入 .env 和受控简历目录参数。
-CMD ["job-agent-web", "--db", "/app/data/job_agent.db", "--env-file", "/app/.env", "--resume-dir", "/app/data/resumes", "--host", "0.0.0.0", "--port", "8000"]
+# 直接调用项目定义的 Web 入口；Compose 注入 PostgreSQL URL，受控简历目录单独挂载。
+CMD ["job-agent-web", "--env-file", "/app/.env", "--resume-dir", "/app/data/resumes", "--host", "0.0.0.0", "--port", "8000"]

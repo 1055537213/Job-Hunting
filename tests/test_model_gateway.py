@@ -11,7 +11,7 @@ from job_hunting_agent.config import (
 )
 from job_hunting_agent.model_gateway import ModelGateway, extract_provider_request_id
 from job_hunting_agent.rag import EmbeddingRequestError, OpenAICompatibleEmbeddings
-from job_hunting_agent.storage import SQLiteStore
+from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
 
 
 def test_gateway_settings_distinguish_runtime_environment_and_retry_policy(tmp_path):
@@ -38,10 +38,10 @@ def test_gateway_settings_distinguish_runtime_environment_and_retry_policy(tmp_p
     assert settings.rerank_max_retries == 4
 
 
-def test_gateway_records_idempotent_provider_usage_without_prompt_content(tmp_path):
+def test_gateway_records_idempotent_provider_usage_without_prompt_content(tmp_path, database_url):
     """同一 call_id 重复上报时只保留一条可计费流水。"""
 
-    store = SQLiteStore(tmp_path / "gateway.db")
+    store = SQLAlchemyStore(database_url)
     store.initialize()
     account = store.create_account("gateway@example.com", "not-used-by-this-test")
     gateway = ModelGateway(
@@ -96,10 +96,10 @@ def test_gateway_extracts_provider_request_id_from_response_headers():
     assert request_id == "upstream-42"
 
 
-def test_gateway_records_rerank_usage_under_the_rerank_model_identity(tmp_path):
+def test_gateway_records_rerank_usage_under_the_rerank_model_identity(tmp_path, database_url):
     """Rerank 的供应商 Token 用量必须进入现有账号级流水，供后续按量计费。"""
 
-    store = SQLiteStore(tmp_path / "gateway-rerank.db")
+    store = SQLAlchemyStore(database_url)
     store.initialize()
     account = store.create_account("rerank@example.com", "not-used-by-this-test")
     gateway = ModelGateway(

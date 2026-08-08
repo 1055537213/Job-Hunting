@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sqlite3
 import uuid
 from dataclasses import asdict
 from pathlib import Path
@@ -28,6 +27,7 @@ from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
 from .agent import JobHuntingAgent
 from .app import JobHuntingApp
 from .auth import (
+    AccountAlreadyExistsError,
     hash_password,
     is_session_expired,
     new_session_token,
@@ -38,6 +38,7 @@ from .auth import (
 )
 from .config import (
     load_agent_memory_settings,
+    load_bootstrap_admin_settings,
     load_database_settings,
     load_embedding_settings,
     load_rerank_settings,
@@ -47,6 +48,7 @@ from .config import (
     masked_embedding_settings,
     masked_llm_settings,
     masked_rerank_settings,
+    require_postgresql_database_url,
 )
 from .models import AccountRecord, CandidateProfileInput, ResumeArtifactRecord, SkillRequirement
 from .job_parser import InvalidJobTextError
@@ -60,10 +62,29 @@ SESSION_COOKIE_NAME = "job_agent_session"
 SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 # Uvicorn 的重载子进程只能通过导入路径重新创建应用，因此启动参数通过这些
 # 仅在进程内存在的环境变量传递，不写进用户的 .env 文件。
-WEB_RELOAD_DB_ENV = "JOB_AGENT_WEB_RELOAD_DB"
 WEB_RELOAD_ENV_FILE_ENV = "JOB_AGENT_WEB_RELOAD_ENV_FILE"
-WEB_RELOAD_RAG_DIR_ENV = "JOB_AGENT_WEB_RELOAD_RAG_DIR"
 WEB_RELOAD_RESUME_DIR_ENV = "JOB_AGENT_WEB_RELOAD_RESUME_DIR"
+
+
+def bootstrap_initial_admin(backend: JobHuntingApp, env_path: Path) -> None:
+    """在空管理员集合上安全地应用一次 `.env` 引导配置。
+
+    这不是公开注册接口：只有数据库中从未创建过管理员时才会执行。密码仅被
+    AuthService 哈希后写入数据库，函数不返回也不记录原始密码。
+    """
+
+    settings = load_bootstrap_admin_settings(env_path)
+    if settings is None:
+        return
+    if any(account.role == "admin" for account in backend.store.list_accounts()):
+        return
+    try:
+        backend.auth.create_admin(settings.email, settings.password, settings.display_name)
+    except AccountAlreadyExistsError as error:
+        # 同邮箱的普通账号不能被静默提升为管理员，避免配置笔误造成权限变化。
+        existing = backend.store.get_account_by_email(settings.email)
+        if existing is None or existing[0].role != "admin":
+            raise RuntimeError("首次管理员邮箱已被普通账号占用，请更换邮箱。") from error
 
 
 class NoCacheStaticFiles(StaticFiles):
@@ -173,40 +194,36 @@ class TailorResumePayload(BaseModel):
 
 
 def create_web_app(
-    db_path: str | Path = "data/job_agent.db",
     env_file: str | Path = ".env",
-    rag_dir: str | Path = "data/chroma",
     resume_dir: str | Path | None = None,
     chat_agent: JobHuntingAgent | None = None,
     resume_llm_client: LLMClient | None = None,
-    require_auth: bool = True,
     database_url: str | None = None,
 ) -> FastAPI:
     """创建本地 FastAPI 应用。
 
-    这里显式保留数据库路径、`.env` 路径、RAG 目录和可注入 Agent，目的是：
+    这里保留测试可注入的 Agent 和模型，目的是：
 
     - 生产使用时，Web 层通过 `JobHuntingAgent` 或 `JobHuntingApp` 访问业务能力；
-    - 测试时，可以安全地注入临时 SQLite、临时 Chroma 和假模型；
+    - 测试时，可以显式注入假模型；
     - 生产入口传入 PostgreSQL URL 后，Web 层通过 SQLAlchemy 仓储访问数据；
     - Web 层自己不直接碰数据库连接、RAG 向量库细节或厂商 SDK。
     """
 
     backend = JobHuntingApp(
-        db_path,
-        env_file,
+        env_path=env_file,
         resume_dir=resume_dir,
         database_url=database_url,
     )
     backend.initialize()
     env_path = Path(env_file)
-    rag_path = Path(rag_dir)
+    bootstrap_initial_admin(backend, env_path)
     cookie_secure = load_cookie_secure(env_path)
 
     agent_error: str | None = None
     if chat_agent is None:
         try:
-            chat_agent = JobHuntingAgent(backend, env_path=env_path, rag_dir=rag_path)
+            chat_agent = JobHuntingAgent(backend, env_path=env_path)
         except ValueError as error:
             # `.env` 没配好时，网页仍然可以以本地规则模式工作。
             agent_error = str(error)
@@ -219,7 +236,7 @@ def create_web_app(
 
         token = request.cookies.get(SESSION_COOKIE_NAME)
         if not token:
-            if required and require_auth:
+            if required:
                 raise HTTPException(status_code=401, detail="请先登录。")
             return None
         session = backend.store.get_auth_session_by_token_hash(session_token_hash(token))
@@ -228,7 +245,7 @@ def create_web_app(
             or session.revoked_at is not None
             or is_session_expired(session.expires_at, session.absolute_expires_at)
         ):
-            if required and require_auth:
+            if required:
                 raise HTTPException(status_code=401, detail="登录状态已过期，请重新登录。")
             return None
         try:
@@ -269,8 +286,8 @@ def create_web_app(
             )
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
-        # 测试 SQLite 与生产 SQLAlchemy/PostgreSQL 的唯一约束异常都映射为同一 409 响应。
-        except (sqlite3.IntegrityError, SQLAlchemyIntegrityError) as error:
+        # PostgreSQL 唯一约束异常统一映射为同一 409 响应。
+        except SQLAlchemyIntegrityError as error:
             raise HTTPException(status_code=409, detail="该邮箱已经注册。") from error
         return {"account": asdict(account)}
 
@@ -381,8 +398,8 @@ def create_web_app(
             }
         return {
             "status": "ok",
-            "db_path": str(Path(db_path)),
-            "rag_dir": str(rag_path),
+            "storage_backend": "postgresql" if backend._uses_pgvector_rag() else "test_adapter",
+            "rag_backend": "pgvector",
             "llm": llm_config,
             "embedding": embedding_config,
             "rerank": rerank_config,
@@ -440,7 +457,6 @@ def create_web_app(
         try:
             result = backend.delete_candidate_profile(
                 candidate_id,
-                rag_persist_directory=rag_path,
                 account_id=account.id if account else None,
             )
         except KeyError as error:
@@ -452,7 +468,8 @@ def create_web_app(
         """创建一个绑定当前账号和候选人档案的独立会话。"""
 
         account = current_account(request)
-        account_id = account.id if account else None
+        assert account is not None
+        account_id = account.id
         get_profile_or_404(backend, payload.candidate_id, account_id)
         if payload.job_id is not None:
             backend.store.get_job(payload.job_id, account_id=account_id)
@@ -467,7 +484,7 @@ def create_web_app(
         return {"session": asdict(record)}
 
     def validate_chat_session(
-        account_id: int | None,
+        account_id: int,
         candidate_id: int,
         session_id: str,
     ) -> None:
@@ -477,8 +494,6 @@ def create_web_app(
         已存在的会话若绑定了另一份档案则立即拒绝，避免记忆和历史串线。
         """
 
-        if account_id is None:
-            return
         try:
             session = backend.store.get_chat_session_by_key(session_id, account_id)
         except KeyError:
@@ -536,7 +551,8 @@ def create_web_app(
         """
 
         account = current_account(request)
-        account_id = account.id if account else None
+        assert account is not None
+        account_id = account.id
         get_profile_or_404(backend, payload.candidate_id, account_id)
         user_message = payload.message.strip()
         session_id = payload.session_id or default_web_session_id(payload.candidate_id, account_id)
@@ -595,7 +611,6 @@ def create_web_app(
                 payload.candidate_id,
                 user_message,
                 llm_client=None,
-                rag_persist_directory=rag_path,
                 auto_rebuild_rag=payload.auto_rag,
                 account_id=account_id,
             )
@@ -661,7 +676,6 @@ def create_web_app(
                 payload=payload,
                 user_message=user_message,
                 session_id=session_id,
-                rag_path=rag_path,
                 account_id=account_id,
             ),
             media_type="text/event-stream",
@@ -682,7 +696,8 @@ def create_web_app(
         """返回网页聊天历史，供页面刷新或重新打开时恢复对话。"""
 
         account = current_account(request)
-        account_id = account.id if account else None
+        assert account is not None
+        account_id = account.id
         get_profile_or_404(backend, candidate_id, account_id)
         actual_session_id = session_id or default_web_session_id(candidate_id, account_id)
         validate_chat_session(account_id, candidate_id, actual_session_id)
@@ -753,7 +768,6 @@ def create_web_app(
         try:
             result = backend.delete_job(
                 job_id,
-                rag_persist_directory=rag_path,
                 account_id=account.id if account else None,
             )
         except KeyError as error:
@@ -808,7 +822,6 @@ def create_web_app(
                 rag_update = asdict(
                     backend.index_rag_long_texts(
                         [artifact.long_text_id],
-                        rag_path,
                         account_id=account_id,
                     )
                 )
@@ -847,7 +860,6 @@ def create_web_app(
         try:
             result = backend.delete_resume_artifact(
                 artifact_id,
-                rag_persist_directory=rag_path,
                 account_id=account_id,
             )
         except KeyError as error:
@@ -905,7 +917,6 @@ def create_web_app(
                 "account_id": account_id,
                 "session_id": f"resume-web-{source.candidate_id}",
                 "root_request_id": request_id,
-                "rag_dir": str(rag_path),
                 "use_tool_llm": True,
                 "default_auto_rag": True,
             }
@@ -928,7 +939,7 @@ def create_web_app(
                 source_artifact_id=source.id,
                 job_id=payload.job_id,
                 llm_client=active_llm,
-                rag_persist_directory=rag_path if payload.use_rag else None,
+                use_rag=payload.use_rag,
                 # 网页按钮始终采用档案熟练度；一次性放宽只允许 Agent 完成风险确认后调用。
                 allow_proficiency_upgrade=False,
                 account_id=account_id,
@@ -950,7 +961,7 @@ def create_web_app(
 
         account = current_account(request)
         try:
-            results = backend.search_rag(query, rag_path, top_k, account_id=account.id if account else None)
+            results = backend.search_rag(query, top_k, account_id=account.id if account else None)
         except RAGProviderRequestError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         return {"query": query, "results": [asdict(result) for result in results]}
@@ -1020,8 +1031,7 @@ def stream_web_chat_events(
     payload: ChatPayload,
     user_message: str,
     session_id: str,
-    rag_path: Path,
-    account_id: int | None = None,
+    account_id: int,
 ):
     """生成网页聊天 SSE 事件。
 
@@ -1089,7 +1099,6 @@ def stream_web_chat_events(
             payload.candidate_id,
             user_message,
             llm_client=None,
-            rag_persist_directory=rag_path,
             auto_rebuild_rag=payload.auto_rag,
             account_id=account_id,
         )
@@ -1147,14 +1156,14 @@ def serialize_resume_artifact(artifact: ResumeArtifactRecord) -> dict[str, objec
     return payload
 
 
-def default_web_session_id(candidate_id: int, account_id: int | None = None) -> str:
+def default_web_session_id(candidate_id: int, account_id: int) -> str:
     """生成网页默认会话 ID。
 
     目前一个候选人对应一个默认网页聊天窗口；后续如果支持多个求职主题会话，
     可以在前端传入更细的 `session_id`。
     """
 
-    return f"account-{account_id or 'legacy'}-candidate-{candidate_id}"
+    return f"account-{account_id}-candidate-{candidate_id}"
 
 
 def save_successful_web_chat_turn(
@@ -1164,28 +1173,27 @@ def save_successful_web_chat_turn(
     user_message: str,
     assistant_message: str,
     assistant_metadata: dict[str, object],
-    account_id: int | None = None,
+    account_id: int,
 ) -> None:
     """保存一次成功网页聊天的用户消息和助手消息。
 
     失败的模型/API 调用不会写入历史，避免用户刷新后看到半截无效回合。
     """
 
-    if account_id is not None:
-        # 首次使用默认会话时自动登记会话索引；显式创建的会话则复用已有记录。
-        try:
-            session = backend.store.get_chat_session_by_key(session_id, account_id)
-            if session.candidate_id != candidate_id:
-                raise HTTPException(status_code=403, detail="该会话不属于当前候选人档案。")
-            if session.status != "active":
-                raise HTTPException(status_code=409, detail="该会话已经归档，请新建对话。")
-        except KeyError:
-            backend.store.create_chat_session(
-                session_id=session_id,
-                account_id=account_id,
-                candidate_id=candidate_id,
-                title=user_message[:32] or "新对话",
-            )
+    # 首次使用默认会话时自动登记会话索引；显式创建的会话则复用已有记录。
+    try:
+        session = backend.store.get_chat_session_by_key(session_id, account_id)
+        if session.candidate_id != candidate_id:
+            raise HTTPException(status_code=403, detail="该会话不属于当前候选人档案。")
+        if session.status != "active":
+            raise HTTPException(status_code=409, detail="该会话已经归档，请新建对话。")
+    except KeyError:
+        backend.store.create_chat_session(
+            session_id=session_id,
+            account_id=account_id,
+            candidate_id=candidate_id,
+            title=user_message[:32] or "新对话",
+        )
 
     backend.save_chat_message(
         candidate_id,
@@ -1308,24 +1316,21 @@ def create_reloadable_web_app() -> FastAPI:
 
     env_file = os.environ.get(WEB_RELOAD_ENV_FILE_ENV, ".env")
     database_settings = load_database_settings(env_file)
-    if not database_settings.configured or database_settings.url is None:
-        raise RuntimeError("网页服务需要 JOB_AGENT_DATABASE_URL。")
+    try:
+        database_url = require_postgresql_database_url(database_settings)
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
     return create_web_app(
-        db_path=os.environ.get(WEB_RELOAD_DB_ENV, "data/job_agent.db"),
         env_file=env_file,
-        rag_dir=os.environ.get(WEB_RELOAD_RAG_DIR_ENV, "data/chroma"),
         resume_dir=os.environ.get(WEB_RELOAD_RESUME_DIR_ENV, "data/resumes"),
-        require_auth=True,
-        database_url=database_settings.url,
+        database_url=database_url,
     )
 
 
 def configure_reload_runtime(args: argparse.Namespace) -> None:
-    """把 CLI 路径传给 Uvicorn 重载子进程，保持重启前后的数据位置一致。"""
+    """把启动参数路径传给 Uvicorn 重载子进程，保持重启前后的数据位置一致。"""
 
-    os.environ[WEB_RELOAD_DB_ENV] = str(args.db)
     os.environ[WEB_RELOAD_ENV_FILE_ENV] = str(args.env_file)
-    os.environ[WEB_RELOAD_RAG_DIR_ENV] = str(args.rag_dir)
     os.environ[WEB_RELOAD_RESUME_DIR_ENV] = str(args.resume_dir)
 
 
@@ -1333,9 +1338,7 @@ def main(argv: list[str] | None = None) -> None:
     """从命令行启动本地 Web 服务。"""
 
     parser = argparse.ArgumentParser(prog="job-agent-web")
-    parser.add_argument("--db", default="data/job_agent.db")
     parser.add_argument("--env-file", default=".env")
-    parser.add_argument("--rag-dir", default="data/chroma")
     parser.add_argument("--resume-dir", default="data/resumes")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -1349,11 +1352,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    database_settings = load_database_settings(args.env_file)
-    if not database_settings.configured or database_settings.url is None:
-        raise SystemExit(
-            "网页服务需要 JOB_AGENT_DATABASE_URL；请先启动 PostgreSQL 并执行 job-agent database-upgrade。"
-        )
+    try:
+        database_url = require_postgresql_database_url(load_database_settings(args.env_file))
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
 
     import uvicorn
 
@@ -1372,12 +1374,9 @@ def main(argv: list[str] | None = None) -> None:
 
     uvicorn.run(
         create_web_app(
-            args.db,
-            args.env_file,
-            args.rag_dir,
+            env_file=args.env_file,
             resume_dir=args.resume_dir,
-            require_auth=True,
-            database_url=database_settings.url,
+            database_url=database_url,
         ),
         host=args.host,
         port=args.port,

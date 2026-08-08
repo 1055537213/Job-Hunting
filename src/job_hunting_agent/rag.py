@@ -1,10 +1,9 @@
-"""LangChain + Chroma RAG 知识库。
+﻿"""LangChain RAG 支持组件。
 
-RAG 层负责把 SQLite `long_texts` 中的长文本材料同步到本地持久化 Chroma，
-并提供带来源的语义检索结果。它不是事实源：学历、技能、年限等精确事实仍以
-SQLite 结构化表为准；向量库只帮助找到“可能相关的证据片段”。
+本模块只提供 Embedding、Rerank、文本切分和来源元数据工具；唯一的持久化向量后端
+是 PostgreSQL + pgvector，长文本事实源也由 PostgreSQL 保存。它不是结构化事实源：
+学历、技能、年限等精确事实仍以关系表为准。
 """
-
 from __future__ import annotations
 
 import hashlib
@@ -18,9 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-import chromadb
-from chromadb.errors import NotFoundError
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -33,9 +29,6 @@ from .config import (
     load_rerank_settings,
 )
 from .models import LongTextRecord, RAGIndexStats, RAGSearchResult
-
-
-DEFAULT_RAG_COLLECTION = "job_hunting_agent"
 
 
 class RAGProviderRequestError(RuntimeError):
@@ -677,58 +670,6 @@ def build_reranker(
     )
 
 
-def resolve_collection_name_for_embeddings(
-    persist_directory: str | Path,
-    collection_name: str,
-    embeddings: Embeddings,
-) -> str:
-    """在已有向量维度不兼容时，为当前 Embedding 选择独立集合。
-
-    Chroma 的同一个 collection 只能保存一种向量维度。真实模型索引与本地 hash
-    fallback 共用持久化目录时，如果仍使用同名 collection，就会在查询或增量写入时
-    抛出维度不一致错误。这里仅在能提前得知当前维度且发现冲突时切换集合，既保留原
-    索引，也让离线 fallback 可以继续工作。
-    """
-
-    expected_dimension = getattr(embeddings, "dimensions", None)
-    if not isinstance(expected_dimension, int) or expected_dimension <= 0:
-        return collection_name
-
-    existing_dimension = read_collection_dimension(persist_directory, collection_name)
-    if existing_dimension is None or existing_dimension == expected_dimension:
-        return collection_name
-
-    model = str(getattr(embeddings, "model", "local-hash"))
-    identity = f"{type(embeddings).__module__}.{type(embeddings).__qualname__}:{model}:{expected_dimension}"
-    identity_suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
-    return f"{collection_name}_dim{expected_dimension}_{identity_suffix}"
-
-
-def read_collection_dimension(
-    persist_directory: str | Path,
-    collection_name: str,
-) -> int | None:
-    """读取现有 Chroma 集合首条向量的维度；集合不存在或为空时返回 ``None``。"""
-
-    directory = Path(persist_directory)
-    if not directory.exists():
-        return None
-
-    client = chromadb.PersistentClient(path=str(directory))
-    try:
-        collection = client.get_collection(collection_name)
-    except NotFoundError:
-        return None
-    if collection.count() == 0:
-        return None
-
-    payload = collection.get(limit=1, include=["embeddings"])
-    vectors = payload.get("embeddings")
-    if vectors is None or len(vectors) == 0:
-        return None
-    return len(vectors[0])
-
-
 def rag_embedding_model_name(embeddings: Embeddings) -> str:
     """生成不含密钥的稳定 Embedding 身份，隔离不可直接比较的语义空间。"""
 
@@ -773,7 +714,8 @@ def build_rag_documents(
             "entity_type": record.entity_type,
             "entity_id": record.entity_id,
             "source_label": record.source_label,
-            "account_id": resolved_account_id if resolved_account_id is not None else -1,
+            # 未登录的历史领域测试允许没有账号归属；Web/生产调用会显式传入账号 ID。
+            "account_id": resolved_account_id,
         }
         if record.candidate_id is not None:
             metadata["candidate_id"] = record.candidate_id
@@ -832,222 +774,3 @@ def rerank_rag_results(
         if len(reranked) >= top_k:
             break
     return reranked
-
-
-class RAGKnowledgeBase:
-    """本地持久化 RAG 知识库门面。
-
-    外部只需要关心“重建索引”“追加索引”和“检索证据”。Chroma、文本切分、
-    metadata 规范都封装在这里，避免这些细节散落到 App/CLI。
-    """
-
-    def __init__(
-        self,
-        persist_directory: str | Path = "data/chroma",
-        collection_name: str = DEFAULT_RAG_COLLECTION,
-        embeddings: Embeddings | None = None,
-        env_path: str | Path = DEFAULT_ENV_PATH,
-        usage_callback: Callable[[dict[str, object]], None] | None = None,
-        usage_operation: str = "embedding",
-        *,
-        embedding_settings: EmbeddingSettings | None = None,
-        embedding_max_retries: int = 2,
-        reranker: Reranker | None = None,
-    ):
-        """绑定 Chroma 持久化目录、集合名、Embedding 和可选的 Rerank 实现。"""
-
-        self.persist_directory = Path(persist_directory)
-        self.embeddings = embeddings or build_rag_embeddings(
-            env_path,
-            settings=embedding_settings,
-            usage_callback=usage_callback,
-            usage_operation=usage_operation,
-            max_retries=embedding_max_retries,
-        )
-        self.collection_name = resolve_collection_name_for_embeddings(
-            self.persist_directory,
-            collection_name,
-            self.embeddings,
-        )
-        self.reranker = reranker
-
-    def rebuild(
-        self,
-        long_texts: list[LongTextRecord],
-        account_id: int | None = None,
-    ) -> RAGIndexStats:
-        """用 SQLite 长文本重建 Chroma 索引。
-
-        全量重建适合修复索引、切换 embedding 或怀疑 Chroma 与 SQLite 不一致时使用；
-        日常对话新增资料优先走 `index_long_texts` 增量追加。
-        """
-
-        vector_store = self._vector_store()
-        # 账号级重建只能替换当前账号的 chunk；共享 Chroma 集合中其它账号的资料
-        # 必须保留。只有 CLI/维护命令明确不传 account_id 时才重置整个集合。
-        if account_id is None:
-            vector_store.reset_collection()
-        else:
-            try:
-                vector_store.delete(where={"account_id": account_id})
-            except (TypeError, ValueError):
-                # 兼容旧版 Chroma 不接受 where 的情况：删除当前账号的稳定 chunk ID。
-                existing_ids = vector_store.get(where={"account_id": account_id}).get("ids", [])
-                if existing_ids:
-                    vector_store.delete(ids=existing_ids)
-        documents = self._split_documents(self._to_documents(long_texts, account_id=account_id))
-        if documents:
-            vector_store.add_documents(documents, ids=[document.metadata["chunk_id"] for document in documents])
-        return RAGIndexStats(
-            document_count=len(long_texts),
-            chunk_count=len(documents),
-            persist_directory=str(self.persist_directory),
-            collection_name=self.collection_name,
-            mode="rebuild",
-        )
-
-    def index_long_texts(
-        self,
-        long_texts: list[LongTextRecord],
-        account_id: int | None = None,
-    ) -> RAGIndexStats:
-        """把新增长文本增量追加到现有 Chroma 索引。
-
-        这个方法不会清空集合，只处理传入的长文本。chunk ID 由 `long_text_id` 和
-        `chunk_index` 稳定生成；如果同一条长文本被重复索引，会先删除同 ID chunk
-        再写入，避免重复记录。
-        """
-
-        documents = self._split_documents(self._to_documents(long_texts, account_id=account_id))
-        if documents:
-            vector_store = self._vector_store()
-            ids = [document.metadata["chunk_id"] for document in documents]
-            # LangChain Chroma 的 add_documents 最终使用 upsert；稳定 ID 会原位替换旧 chunk。
-            # 不先删除可以避免 Embedding 或写入失败时把上一版可用向量提前移除。
-            vector_store.add_documents(documents, ids=ids)
-        return RAGIndexStats(
-            document_count=len(long_texts),
-            chunk_count=len(documents),
-            persist_directory=str(self.persist_directory),
-            collection_name=self.collection_name,
-            mode="incremental",
-        )
-
-    def delete_long_texts(
-        self,
-        long_text_ids: list[int],
-        account_id: int | None = None,
-    ) -> int:
-        """删除指定长文本对应的 Chroma chunk，不调用 Embedding API。"""
-
-        normalized_ids = sorted({int(item_id) for item_id in long_text_ids if int(item_id) > 0})
-        if not normalized_ids:
-            return 0
-        vector_store = self._vector_store()
-        where: dict[str, object] = {"long_text_id": {"$in": normalized_ids}}
-        if account_id is not None:
-            where = {
-                "$and": [
-                    {"long_text_id": {"$in": normalized_ids}},
-                    {"account_id": account_id},
-                ]
-            }
-        try:
-            payload = vector_store.get(where=where)
-        except (TypeError, ValueError):
-            # 兼容旧版 Chroma 的过滤语法，退回到本地 metadata 过滤。
-            payload = vector_store.get()
-            ids = payload.get("ids", [])
-            metadatas = payload.get("metadatas", [])
-            matched_ids = [
-                chunk_id
-                for chunk_id, metadata in zip(ids, metadatas)
-                if isinstance(metadata, dict)
-                and int(metadata.get("long_text_id", -1)) in normalized_ids
-                and (account_id is None or int(metadata.get("account_id", -1)) == account_id)
-            ]
-            if matched_ids:
-                vector_store.delete(ids=matched_ids)
-            return len(matched_ids)
-        matched_ids = [str(chunk_id) for chunk_id in payload.get("ids", [])]
-        if matched_ids:
-            vector_store.delete(ids=matched_ids)
-        return len(matched_ids)
-
-    def search(
-        self,
-        query: str,
-        top_k: int = 5,
-        entity_types: list[str] | None = None,
-        account_id: int | None = None,
-    ) -> list[RAGSearchResult]:
-        """检索相关证据片段，并保留来源 metadata。"""
-
-        if not query.strip():
-            return []
-        vector_store = self._vector_store()
-        # 先多取一些，再在 Python 侧做 entity_type 过滤，避免依赖不同向量库的过滤语法。
-        # 启用 Rerank 时按配置扩展候选池，再将重排后的前 top_k 条返回给调用方。
-        candidate_multiplier = self.reranker.candidate_multiplier if self.reranker is not None else 3
-        candidate_limit = max(top_k * max(1, candidate_multiplier), top_k)
-        search_kwargs: dict[str, object] = {"k": candidate_limit}
-        if account_id is not None:
-            # 账号 metadata 过滤必须在 Chroma 查询层执行，不能先取全局 top-k 再在 Python 侧过滤。
-            search_kwargs["filter"] = {"account_id": account_id}
-        docs_with_scores = vector_store.similarity_search_with_score(query, **search_kwargs)
-        results: list[RAGSearchResult] = []
-        allowed = set(entity_types or [])
-        for document, distance in docs_with_scores:
-            metadata = document.metadata
-            if allowed and metadata.get("entity_type") not in allowed:
-                continue
-            results.append(
-                RAGSearchResult(
-                    content=document.page_content,
-                    entity_type=str(metadata.get("entity_type", "")),
-                    entity_id=int(metadata.get("entity_id", 0)),
-                    source_label=str(metadata.get("source_label", "")),
-                    long_text_id=int(metadata.get("long_text_id", 0)),
-                    chunk_index=int(metadata.get("chunk_index", 0)),
-                    distance=float(distance),
-                )
-            )
-            if len(results) >= candidate_limit:
-                break
-        if self.reranker is None:
-            return results[:top_k]
-        return self._rerank_results(query, results, top_k)
-
-    def _rerank_results(
-        self,
-        query: str,
-        candidates: list[RAGSearchResult],
-        top_k: int,
-    ) -> list[RAGSearchResult]:
-        """将向量召回候选映射回 Rerank 返回的原始索引，保留来源和向量距离。"""
-
-        return rerank_rag_results(query, candidates, top_k, self.reranker)
-
-    def _vector_store(self) -> Chroma:
-        """创建 Chroma 向量库对象。"""
-
-        self.persist_directory.mkdir(parents=True, exist_ok=True)
-        return Chroma(
-            collection_name=self.collection_name,
-            embedding_function=self.embeddings,
-            persist_directory=str(self.persist_directory),
-        )
-
-    def _to_documents(
-        self,
-        long_texts: list[LongTextRecord],
-        account_id: int | None = None,
-    ) -> list[Document]:
-        """把 SQLite 长文本记录转换为 LangChain Document。"""
-
-        return build_rag_documents(long_texts, account_id=account_id)
-
-    def _split_documents(self, documents: list[Document]) -> list[Document]:
-        """使用 LangChain 文本切分器切分文档，并补充 chunk metadata。"""
-
-        return split_rag_documents(documents)

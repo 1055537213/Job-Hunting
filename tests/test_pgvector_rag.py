@@ -6,35 +6,22 @@ PostgreSQL，默认的单元测试环境不会因本机未启动 Docker 而失�
 
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
 import sqlalchemy as sa
 
 from job_hunting_agent.app import JobHuntingApp
-from job_hunting_agent.database_migrations import upgrade_database
 from job_hunting_agent.database_schema import accounts
 from job_hunting_agent.models import CandidateProfileInput
 from job_hunting_agent.pgvector_rag import PgVectorKnowledgeBase
 from job_hunting_agent.rag import LocalHashEmbeddings
 
 
-POSTGRES_TEST_URL_ENV = "JOB_AGENT_PGVECTOR_TEST_DATABASE_URL"
-POSTGRES_TEST_URL = os.environ.get(POSTGRES_TEST_URL_ENV)
-
-pytestmark = pytest.mark.skipif(
-    not POSTGRES_TEST_URL,
-    reason=f"需要显式设置 {POSTGRES_TEST_URL_ENV} 才运行 pgvector 集成测试。",
-)
-
-
-def test_pgvector_rebuilds_and_searches_only_the_requested_account(tmp_path):
+def test_pgvector_rebuilds_and_searches_only_the_requested_account(database_url):
     """pgvector 重建后只能召回当前账号已经登记的长文本证据。"""
 
-    assert POSTGRES_TEST_URL is not None
-    upgrade_database(POSTGRES_TEST_URL)
-    app = JobHuntingApp(tmp_path / "ignored.db", database_url=POSTGRES_TEST_URL)
+    app = JobHuntingApp(database_url=database_url)
     app.initialize()
 
     account_ids: list[int] = []
@@ -101,12 +88,10 @@ def test_pgvector_rebuilds_and_searches_only_the_requested_account(tmp_path):
         app.store.close()
 
 
-def test_pgvector_rejects_long_text_from_a_different_account(tmp_path):
+def test_pgvector_rejects_long_text_from_a_different_account(database_url):
     """传入账号不能改写已经归属另一账号的长文本证据。"""
 
-    assert POSTGRES_TEST_URL is not None
-    upgrade_database(POSTGRES_TEST_URL)
-    app = JobHuntingApp(tmp_path / "ignored.db", database_url=POSTGRES_TEST_URL)
+    app = JobHuntingApp(database_url=database_url)
     app.initialize()
     account_ids: list[int] = []
     try:
@@ -148,17 +133,14 @@ def test_pgvector_rejects_long_text_from_a_different_account(tmp_path):
         app.store.close()
 
 
-def test_app_uses_pgvector_backend_when_its_store_is_postgresql(tmp_path):
-    """应用门面在 PostgreSQL 模式下不应创建 Chroma 目录。"""
+def test_app_uses_pgvector_backend_when_its_store_is_postgresql(database_url, tmp_path):
+    """应用门面通过 PostgreSQL + pgvector 完成索引和检索。"""
 
-    assert POSTGRES_TEST_URL is not None
-    upgrade_database(POSTGRES_TEST_URL)
-    app = JobHuntingApp(tmp_path / "ignored.db", database_url=POSTGRES_TEST_URL)
+    app = JobHuntingApp(database_url=database_url)
     app.initialize()
     app.model_gateway.embeddings = lambda _context: LocalHashEmbeddings(dimensions=16)
     app.model_gateway.reranker = lambda _context: None
     account_ids: list[int] = []
-    ignored_chroma_dir = tmp_path / "should-not-be-created"
     try:
         account = app.store.create_account(
             f"pgvector-app-{uuid.uuid4().hex}@example.com",
@@ -178,28 +160,21 @@ def test_app_uses_pgvector_backend_when_its_store_is_postgresql(tmp_path):
             candidate_id=candidate_id,
         )
 
-        stats = app.rebuild_rag_index(ignored_chroma_dir, account_id=account.id)
-        results = app.search_rag(
-            "PostgreSQL 职位解析",
-            ignored_chroma_dir,
-            account_id=account.id,
-        )
+        stats = app.rebuild_rag_index(account_id=account.id)
+        results = app.search_rag("PostgreSQL 职位解析", account_id=account.id)
 
         assert stats.persist_directory == "postgresql+pgvector"
         assert long_text_id in [result.long_text_id for result in results]
-        assert not ignored_chroma_dir.exists()
     finally:
         with app.store.engine.begin() as connection:
             connection.execute(sa.delete(accounts).where(accounts.c.id.in_(account_ids)))
         app.store.close()
 
 
-def test_pgvector_incremental_indexing_is_idempotent_and_supports_deletion(tmp_path):
+def test_pgvector_incremental_indexing_is_idempotent_and_supports_deletion(database_url):
     """重复索引同一长文本不会重复召回，删除时会移除它的派生 chunk。"""
 
-    assert POSTGRES_TEST_URL is not None
-    upgrade_database(POSTGRES_TEST_URL)
-    app = JobHuntingApp(tmp_path / "ignored.db", database_url=POSTGRES_TEST_URL)
+    app = JobHuntingApp(database_url=database_url)
     app.initialize()
     account_ids: list[int] = []
     try:
@@ -253,12 +228,10 @@ def test_pgvector_incremental_indexing_is_idempotent_and_supports_deletion(tmp_p
         app.store.close()
 
 
-def test_pgvector_does_not_compare_vectors_from_a_different_embedding_identity(tmp_path):
+def test_pgvector_does_not_compare_vectors_from_a_different_embedding_identity(database_url):
     """切换 Embedding 后旧向量被隔离，检索不会因维度不同而报错或混用结果。"""
 
-    assert POSTGRES_TEST_URL is not None
-    upgrade_database(POSTGRES_TEST_URL)
-    app = JobHuntingApp(tmp_path / "ignored.db", database_url=POSTGRES_TEST_URL)
+    app = JobHuntingApp(database_url=database_url)
     app.initialize()
     account_ids: list[int] = []
     try:
@@ -302,12 +275,10 @@ def test_pgvector_does_not_compare_vectors_from_a_different_embedding_identity(t
         app.store.close()
 
 
-def test_app_deletion_relies_on_postgresql_cascade_for_pgvector_chunks(tmp_path):
+def test_app_deletion_relies_on_postgresql_cascade_for_pgvector_chunks(database_url):
     """删除候选人档案时，PostgreSQL 外键应同步删除其 RAG 证据。"""
 
-    assert POSTGRES_TEST_URL is not None
-    upgrade_database(POSTGRES_TEST_URL)
-    app = JobHuntingApp(tmp_path / "ignored.db", database_url=POSTGRES_TEST_URL)
+    app = JobHuntingApp(database_url=database_url)
     app.initialize()
     app.model_gateway.embeddings = lambda _context: LocalHashEmbeddings(dimensions=16)
     account_ids: list[int] = []
@@ -329,11 +300,10 @@ def test_app_deletion_relies_on_postgresql_cascade_for_pgvector_chunks(tmp_path)
             account_id=account.id,
             candidate_id=candidate_id,
         )
-        app.index_rag_long_texts([long_text_id], tmp_path / "ignored-chroma", account_id=account.id)
+        app.index_rag_long_texts([long_text_id], account_id=account.id)
 
         deletion = app.delete_candidate_profile(
             candidate_id,
-            rag_persist_directory=tmp_path / "ignored-chroma",
             account_id=account.id,
         )
         knowledge_base = PgVectorKnowledgeBase(

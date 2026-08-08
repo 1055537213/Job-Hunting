@@ -1,9 +1,8 @@
 """SQLAlchemy 驱动的生产仓储适配层。
 
-现有业务服务已经通过 ``SQLiteStore`` 集中处理候选人、会话、简历和用量逻辑。
-为了在一次可回滚的改造中切换到 PostgreSQL，本模块复用这组成熟业务方法，提供
-SQLAlchemy 连接、事务、参数绑定和结果兼容层。后续阶段可以把方法内部逐步改为
-SQLAlchemy Core，而不改变上层 Agent、FastAPI 或认证服务的接口。
+领域读写方法位于 ``storage.py`` 的 ``RepositoryStore``，本模块只负责提供
+SQLAlchemy 连接、事务、参数绑定和结果转换。Web、后台任务和测试因此使用同一套
+PostgreSQL 行为，不再存在其他数据库运行或测试分支。
 """
 
 from __future__ import annotations
@@ -19,14 +18,14 @@ from sqlalchemy.engine import Connection, CursorResult, Engine
 
 from .config import normalize_database_url
 from .database_migrations import current_database_revision, latest_database_revision
-from .storage import SQLiteStore
+from .storage import RepositoryConnection, RepositoryStore
 
 
 INSERT_PATTERN = re.compile(r"^\s*INSERT\s+INTO\s+", re.IGNORECASE)
 
 
 class SQLAlchemyRow:
-    """把 SQLAlchemy 映射行适配成现有仓储代码使用的 sqlite3.Row 形状。"""
+    """把 SQLAlchemy 映射行适配成领域仓储需要的列名读取形状。"""
 
     def __init__(self, values: Mapping[str, Any]):
         self._values = dict(values)
@@ -48,7 +47,7 @@ class SQLAlchemyRow:
 
 
 class SQLAlchemyCursor:
-    """封装 SQLAlchemy 结果对象，并提供 sqlite3 风格的最小游标接口。"""
+    """封装 SQLAlchemy 结果对象，并提供领域仓储需要的最小游标接口。"""
 
     def __init__(self, result: CursorResult[Any], inserted_row_id: int | None = None):
         self._result = result
@@ -68,7 +67,7 @@ class SQLAlchemyCursor:
 
 
 class SQLAlchemyConnection:
-    """让既有 qmark SQL 在 SQLAlchemy 事务中运行的连接适配器。"""
+    """让领域仓储的参数化 SQL 在 SQLAlchemy 事务中运行。"""
 
     def __init__(self, engine: Engine):
         self._engine = engine
@@ -120,18 +119,18 @@ class SQLAlchemyConnection:
         return SQLAlchemyCursor(result, inserted_row_id)
 
 
-class SQLAlchemyStore(SQLiteStore):
+class SQLAlchemyStore(RepositoryStore):
     """使用 SQLAlchemy Engine 访问经 Alembic 管理的数据库。
 
-    继承只复用领域读写方法和行转换逻辑，不调用 SQLite 的连接或建表逻辑。生产启动
-    只检查 Alembic revision，数据库结构变更必须由独立迁移命令完成。
+    继承只复用领域读写方法和行转换逻辑。生产启动只检查 Alembic revision，数据库
+    结构变更必须由独立迁移命令完成。
     """
 
     def __init__(self, database_url: str):
         self.database_url = normalize_database_url(database_url)
         self.engine = sa.create_engine(self.database_url, pool_pre_ping=True)
 
-    def connect(self) -> SQLAlchemyConnection:
+    def connect(self) -> RepositoryConnection:
         """返回一次短生命周期的 SQLAlchemy 事务连接。"""
 
         return SQLAlchemyConnection(self.engine)
@@ -143,7 +142,7 @@ class SQLAlchemyStore(SQLiteStore):
         expected_revision = latest_database_revision()
         if current_revision != expected_revision:
             raise RuntimeError(
-                "数据库尚未迁移到最新版本；请先执行 job-agent database-upgrade。"
+                "数据库尚未迁移到最新版本；请先等待 Docker migrate 服务完成或执行 alembic upgrade head。"
             )
 
     def close(self) -> None:
@@ -156,10 +155,10 @@ def prepare_statement(
     sql: str,
     parameters: Sequence[object] | Mapping[str, object] | None,
 ) -> tuple[str, dict[str, object]]:
-    """把既有 sqlite qmark 参数转换成 SQLAlchemy 命名参数。
+    """把仓储层保留的 qmark 参数转换成 SQLAlchemy 命名参数。
 
-    当前仓储 SQL 不在字符串字面量中使用问号，因此逐个替换可保持查询可读，同时支持
-    ``IN (?, ?, ?)`` 这类动态占位符。新代码应优先直接使用 SQLAlchemy Core。
+    这是仓储 SQL 的兼容适配，不代表运行时支持多种数据库；所有连接仍由
+    PostgreSQL SQLAlchemy Engine 提供。
     """
 
     if parameters is None:

@@ -40,7 +40,8 @@ services:
     volumes:
       # 模型配置仍只读挂载；迁移命令不会输出或复制其中的 API Key。
       - ./.env:/app/.env:ro
-    command: ["job-agent", "--env-file", "/app/.env", "database-upgrade"]
+    # Alembic 从 JOB_AGENT_DATABASE_URL 读取容器内 PostgreSQL 地址；不依赖交互式终端程序。
+    command: ["alembic", "upgrade", "head"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -57,7 +58,7 @@ services:
     # 容器异常退出时自动重启；手动 docker compose stop 不会造成循环启动。
     restart: unless-stopped
     environment:
-      # Web 使用 PostgreSQL；不会再退回 data/ 下的 SQLite 文件。
+      # Web 使用 PostgreSQL；不会退回 data/ 下的本地文件数据库。
       JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
     ports:
       - "8000:8000"

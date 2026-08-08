@@ -2,7 +2,7 @@
 
 ## 这一步完成了什么
 
-项目现在把网页实际使用的结构化数据放入 PostgreSQL，而不是以前的 SQLite 测试文件。
+项目现在把网页和自动化测试使用的结构化数据统一放入 PostgreSQL 隔离 schema。
 旧数据全部是测试数据，因此本次没有实现导入脚本；数据库直接由 Alembic 从空库创建。
 
 初始 revision 为 `20260807_0001`，其中包含：
@@ -16,9 +16,9 @@
 
 | 技术 | 作用 | 为什么在此时引入 |
 | --- | --- | --- |
-| SQLAlchemy 2.x | 用一个 Engine 管理连接、事务和数据库方言差异 | 业务代码不再直接绑定 `sqlite3` 或 psycopg 驱动 |
+| SQLAlchemy 2.x | 用一个 Engine 管理连接、事务和数据库方言差异 | 业务代码只依赖仓储边界，不直接绑定 psycopg 驱动 |
 | Alembic | 将 schema 变化保存为版本化 migration | 生产启动不会临时建表，每次改表都可审计和回退 |
-| PostgreSQL 16 | 作为真实结构化事实源 | 外键、事务、JSONB、检查约束和索引比 SQLite 更适合多账号 Web 服务 |
+| PostgreSQL 16 | 作为结构化事实源和 pgvector 宿主 | 外键、事务、JSONB、检查约束和向量检索都能在同一数据库治理 |
 | pgvector | 为 PostgreSQL 提供 `vector` 列和余弦检索 | 生产 RAG 与结构化数据共享同一事务边界、账号隔离和备份策略 |
 | Psycopg 3 | SQLAlchemy 对 PostgreSQL 的驱动 | 支持 PostgreSQL 类型，且 SQLAlchemy 2.x 集成稳定 |
 | Docker Compose | 先健康检查数据库，再运行迁移，再启动 Web | 不让应用在表还不存在时对外提供服务 |
@@ -48,30 +48,32 @@ compose.yaml
 
 ## 启动与检查
 
-Docker Compose 会在启动时自动执行迁移。宿主机需要手动运行时使用：
+Docker Compose 会在启动时自动执行迁移。日常使用网页时不需要执行任何迁移命令；
+只有本机调试 Docker 以外的 Web 启动方式时，才需要在已配置 PostgreSQL URL 的 `.env` 下运行：
 
 ```powershell
-python -m job_hunting_agent.cli --env-file .env database-config
-python -m job_hunting_agent.cli --env-file .env database-upgrade
-python -m job_hunting_agent.cli --env-file .env database-current
+alembic upgrade head
+alembic current
 ```
 
-其中 `database-config` 只输出脱敏 URL、方言和是否配置；不会输出数据库密码。
-`database-upgrade` 默认升级到最新 revision。Web 进程只检查当前版本，缺失时会提示先运行迁移。
+`alembic upgrade head` 默认升级到最新 revision，`alembic current` 只读取当前 revision。
+网页、Docker Web 和 Alembic 运行入口只接受 PostgreSQL URL；缺失配置或写入其他数据库 URL 时会拒绝启动，
+避免用户资料退回本地测试文件。
 
-## 本地 SQLite 为什么仍存在
+## 测试数据库隔离
 
-SQLite 现在不再是 Web 的实际数据库，但仍用于两类自动化测试：
+自动化测试也连接 PostgreSQL，但每个 pytest 会话使用随机 schema：
 
 1. Alembic 空库升级测试，快速检查迁移链是否完整。
-2. 既有业务规则测试，使用临时文件隔离测试数据。
+2. 业务规则测试在同一数据库引擎内隔离数据，避免测试分支和生产分支行为不一致。
 
-这是测试适配器，而不是生产回退路径。真实 Web 由 `JOB_AGENT_DATABASE_URL` 指向 PostgreSQL。
+测试 schema 会在会话结束时自动删除。真实 Web 由 `JOB_AGENT_DATABASE_URL` 指向 PostgreSQL，
+不会创建本地数据库文件或独立向量目录。
 
 ## pgvector 当前状态
 
 迁移会执行 `CREATE EXTENSION IF NOT EXISTS vector`，并创建
-`rag_chunks.embedding vector`。生产 Web 和配置了 PostgreSQL 的 CLI 会自动选择
+`rag_chunks.embedding vector`。生产 Web 会自动选择
 `PgVectorKnowledgeBase`：`long_texts` 仍是长文本事实源，`rag_chunks` 只保存可重建的分块、
 Embedding、模型身份和维度。
 
@@ -80,7 +82,7 @@ Embedding、模型身份和维度。
 1. 全量重建按账号原子替换，增量写入按稳定 chunk ID upsert，不会重复产生证据。
 2. 查询先按账号、Embedding 模型身份和向量维度过滤，再使用 pgvector 余弦距离召回。
 3. 删除长文本或候选人时，外键级联会删除对应派生 chunk。
-4. SQLite 离线兼容和自动化测试仍使用 Chroma；生产路径不读写 `data/chroma`。
+4. 自动化测试与 Web 使用同一 PostgreSQL + pgvector 后端，避免隐藏的回退实现。
 
 因为项目暂时允许更换 Embedding 模型和维度，当前没有建立 HNSW 或 IVFFlat 索引。数据量增长后，
 应先固定生产 Embedding 模型与维度，再通过新的 Alembic revision 为对应向量空间建立合适索引。

@@ -1,7 +1,7 @@
 """Agent 对话记忆恢复与启动压缩。
 
 这个模块只处理“聊天历史如何重新进入 LangChain 上下文”。它不改变候选人档案、
-RAG 索引或职位匹配事实源；长期事实仍然分别由 SQLite 结构化表和 `long_texts` 管理。
+RAG 索引或职位匹配事实源；长期事实仍然分别由 PostgreSQL 结构化表和 `long_texts` 管理。
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ def build_restored_context_messages(
     records: list[ChatMessageRecord],
     settings: AgentMemorySettings,
 ) -> list[BaseMessage]:
-    """把 SQLite 聊天历史恢复成可传给 LangChain Agent 的消息列表。
+    """把持久化聊天历史恢复成可传给 LangChain Agent 的消息列表。
 
     如果历史过长，会先把较早消息压缩成一条摘要，再保留最近若干条原文消息。
     这样服务重启后既能恢复上下文，又不会一启动就把模型上下文塞满。
@@ -80,7 +80,7 @@ def build_restored_summary_message(messages: list[BaseMessage], max_chars: int) 
     summary = build_extractive_summary(messages, max_chars)
     return HumanMessage(
         content=(
-            "以下是从 SQLite 持久化聊天历史恢复的压缩上下文，不是用户的新请求。\n"
+            "以下是从持久化聊天历史恢复的压缩上下文，不是用户的新请求。\n"
             "后续回答时请把它当作历史背景参考，但不要把摘要里的内容当成未经确认的新事实。\n\n"
             f"{summary}"
         ),

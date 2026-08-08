@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-from langchain_core.documents import Document
-
 from job_hunting_agent.config import (
     load_embedding_settings,
     load_rerank_settings,
@@ -14,9 +12,7 @@ from job_hunting_agent.config import (
 )
 from job_hunting_agent.rag import (
     HttpReranker,
-    LocalHashEmbeddings,
     NativeMultimodalEmbeddings,
-    RAGKnowledgeBase,
     RerankResult,
     OpenAICompatibleEmbeddings,
     build_rag_embeddings,
@@ -139,7 +135,6 @@ def test_native_multimodal_embeddings_use_native_payload_and_restore_input_order
         },
     }
 
-
 def test_native_reranker_uses_query_documents_payload_and_preserves_indexes():
     """native 重排器仅返回候选索引，调用方可复用本地 chunk。"""
 
@@ -208,57 +203,3 @@ def test_standard_reranker_uses_common_rerank_payload():
         "top_n": 2,
         "return_documents": False,
     }
-
-
-def test_rag_uses_rerank_order_after_expanded_vector_recall(tmp_path):
-    """RAG 应先扩大向量候选池，再按 rerank 返回的索引顺序选择最终证据。"""
-
-    class FakeVectorStore:
-        def __init__(self) -> None:
-            self.search_kwargs: dict[str, object] = {}
-
-        def similarity_search_with_score(self, query, **kwargs):  # noqa: ANN001
-            self.search_kwargs = kwargs
-            return [
-                (build_document("first", 1), 0.1),
-                (build_document("second", 2), 0.2),
-                (build_document("third", 3), 0.3),
-            ]
-
-    class FakeReranker:
-        candidate_multiplier = 4
-
-        def rerank(self, query, documents, top_n):  # noqa: ANN001
-            assert query == "目标岗位"
-            assert documents == ["first", "second", "third"]
-            assert top_n == 2
-            return [RerankResult(index=2, relevance_score=0.98), RerankResult(index=0, relevance_score=0.71)]
-
-    vector_store = FakeVectorStore()
-    knowledge_base = RAGKnowledgeBase(
-        tmp_path / "chroma",
-        embeddings=LocalHashEmbeddings(),
-        reranker=FakeReranker(),
-    )
-    knowledge_base._vector_store = lambda: vector_store  # type: ignore[method-assign]
-
-    results = knowledge_base.search("目标岗位", top_k=2)
-
-    assert vector_store.search_kwargs == {"k": 8}
-    assert [result.content for result in results] == ["third", "first"]
-
-
-def build_document(content: str, identifier: int) -> Document:
-    """构造带完整 RAG metadata 的测试候选 chunk。"""
-
-    return Document(
-        page_content=content,
-        metadata={
-            "entity_type": "project_experience",
-            "entity_id": identifier,
-            "source_label": f"source-{identifier}",
-            "long_text_id": identifier,
-            "chunk_index": 0,
-            "account_id": 1,
-        },
-    )

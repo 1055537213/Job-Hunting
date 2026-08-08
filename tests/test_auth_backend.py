@@ -12,13 +12,13 @@ from job_hunting_agent.auth import (
     session_token_hash,
 )
 from job_hunting_agent.models import CandidateProfileInput, UsageEventRecord
-from job_hunting_agent.storage import SQLiteStore
+from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
 
 
-def test_register_login_and_logout_all_use_server_side_session(tmp_path):
+def test_register_login_and_logout_all_use_server_side_session(database_url):
     """登录只返回原始令牌，数据库保存令牌摘要，退出所有设备会立即失效。"""
 
-    store = SQLiteStore(tmp_path / "auth.db")
+    store = SQLAlchemyStore(database_url)
     store.initialize()
     auth = AuthService(store)
 
@@ -44,10 +44,10 @@ def test_register_login_and_logout_all_use_server_side_session(tmp_path):
         auth.current_account(login.session_token)
 
 
-def test_session_has_idle_and_absolute_expiry(tmp_path):
+def test_session_has_idle_and_absolute_expiry(database_url):
     """闲置 Session 会滑动，但绝对过期时间不会被延长。"""
 
-    store = SQLiteStore(tmp_path / "session.db")
+    store = SQLAlchemyStore(database_url)
     store.initialize()
     current = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
     auth = AuthService(store, idle_days=7, max_days=30, clock=lambda: current[0])
@@ -68,10 +68,10 @@ def test_session_has_idle_and_absolute_expiry(tmp_path):
     assert account.id == login.account.id
 
 
-def test_account_filters_profiles_jobs_and_usage_events(tmp_path):
+def test_account_filters_profiles_jobs_and_usage_events(database_url):
     """同一数据库内不同账号只能按 account_id 读取自己的资源和用量。"""
 
-    store = SQLiteStore(tmp_path / "ownership.db")
+    store = SQLAlchemyStore(database_url)
     store.initialize()
     auth = AuthService(store)
     account_a = auth.register("a@example.com", "password-123")

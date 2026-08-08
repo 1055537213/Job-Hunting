@@ -1,7 +1,7 @@
 """面向 PostgreSQL 的 SQLAlchemy 数据库 schema。
 
-生产 Web 与配置了 ``JOB_AGENT_DATABASE_URL`` 的 CLI 通过 ``SQLAlchemyStore`` 使用这组
-表；Alembic 负责创建和升级它们。SQLite 仅保留为离线兼容和自动化测试适配器。
+生产 Web 与配置了 ``JOB_AGENT_DATABASE_URL`` 的迁移任务通过 ``SQLAlchemyStore`` 使用这组
+表；Alembic 负责创建和升级它们。当前运行时和自动化测试统一使用 PostgreSQL。
 
 本模块描述当前目标结构，供迁移校验和后续 revision 参考；已发布的历史 DDL 必须保留在
 ``alembic/versions`` 中，不能通过修改此处倒改历史数据库。
@@ -25,9 +25,9 @@ NAMING_CONVENTION = {
 
 metadata = sa.MetaData(naming_convention=NAMING_CONVENTION)
 
-# 本地 SQLite 测试使用通用 JSON；生产 PostgreSQL 自动升级为 JSONB，便于后续索引。
+# PostgreSQL 使用 JSONB，便于保存结构化字段并支持后续索引。
 json_type = sa.JSON().with_variant(postgresql.JSONB(), "postgresql")
-# pgvector 只在 PostgreSQL 上生效；SQLite 迁移回归仍可把嵌入向量存为 JSON。
+# pgvector 向量类型只在 PostgreSQL 目标 schema 中启用。
 vector_type = sa.JSON().with_variant(Vector(), "postgresql")
 timestamp_type = sa.DateTime(timezone=True)
 

@@ -146,7 +146,7 @@ def match_job(
 
     eliminated = bool(elimination_reasons)
     if eliminated:
-        # 已淘汰职位不进入正常排序，所以分数归零，方便 UI 或 CLI 区分展示。
+        # 已淘汰职位不进入正常排序，所以分数归零，方便 UI 或 API 区分展示。
         score = 0
         tier = "已淘汰"
     else:

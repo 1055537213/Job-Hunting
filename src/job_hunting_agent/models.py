@@ -383,7 +383,7 @@ class ConversationIngestionResult:
 class AgentChatResult:
     """LangChain Agent 一轮对话的执行摘要。
 
-    这个对象面向 Web/CLI 等用户入口：除了最终回复，还会记录本轮实际使用了哪些
+    这个对象面向 Web/API 等用户入口：除了最终回复，还会记录本轮实际使用了哪些
     工具，以及工具输出的结构化摘要，方便界面展示和后续调试。
     """
 

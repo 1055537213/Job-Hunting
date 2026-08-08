@@ -9,10 +9,10 @@ from job_hunting_agent.matcher import match_job, semantic_direction_score
 from job_hunting_agent.models import CandidateProfileInput, SkillRequirement
 
 
-def test_candidate_can_import_job_and_get_explainable_match(tmp_path):
+def test_candidate_can_import_job_and_get_explainable_match(tmp_path, account_id):
     """候选人可以导入职位文本，并得到可解释匹配结果。"""
 
-    app = JobHuntingApp(tmp_path / "mvp.db")
+    app = JobHuntingApp()
     app.initialize()
 
     candidate_id = app.save_candidate_profile(
@@ -33,7 +33,8 @@ def test_candidate_can_import_job_and_get_explainable_match(tmp_path):
             expected_salary_k=15,
             target_directions=["AI Agent 应用开发", "Python 后端开发"],
             unacceptable=["外包", "长期出差"],
-        )
+        ),
+        account_id=account_id,
     )
 
     job = app.import_job_text(
@@ -52,9 +53,10 @@ def test_candidate_can_import_job_and_get_explainable_match(tmp_path):
         需要熟悉 SQLite、RAG、向量检索和职位文本处理。
         """,
         source_url="https://www.zhipin.com/job_detail/example.html",
+        account_id=account_id,
     )
 
-    match = app.match_job(candidate_id, job.id)
+    match = app.match_job(candidate_id, job.id, account_id=account_id)
 
     assert match.tier in {"强推荐", "可投递"}
     assert match.score >= 65
@@ -63,10 +65,10 @@ def test_candidate_can_import_job_and_get_explainable_match(tmp_path):
     assert match.resume_suggestions
 
 
-def test_matcher_applies_experience_and_education_hard_eliminations(tmp_path):
+def test_matcher_applies_experience_and_education_hard_eliminations(tmp_path, account_id):
     """匹配器会执行 #7 定下的经验和学历硬性淘汰规则。"""
 
-    app = JobHuntingApp(tmp_path / "mvp.db")
+    app = JobHuntingApp()
     app.initialize()
 
     candidate_id = app.save_candidate_profile(
@@ -81,7 +83,8 @@ def test_matcher_applies_experience_and_education_hard_eliminations(tmp_path):
             expected_salary_k=12,
             target_directions=["Python 后端"],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
 
     senior_job = app.import_job_text(
@@ -92,7 +95,8 @@ def test_matcher_applies_experience_and_education_hard_eliminations(tmp_path):
         5-10年
         本科
         职位描述：负责 Python 后端系统开发。
-        """
+        """,
+        account_id=account_id,
     )
     education_job = app.import_job_text(
         """
@@ -102,11 +106,12 @@ def test_matcher_applies_experience_and_education_hard_eliminations(tmp_path):
         1-3年
         硕士
         职位描述：负责 Python 和 RAG 应用。
-        """
+        """,
+        account_id=account_id,
     )
 
-    senior_match = app.match_job(candidate_id, senior_job.id)
-    education_match = app.match_job(candidate_id, education_job.id)
+    senior_match = app.match_job(candidate_id, senior_job.id, account_id=account_id)
+    education_match = app.match_job(candidate_id, education_job.id, account_id=account_id)
 
     assert senior_match.eliminated
     assert any("经验" in reason for reason in senior_match.elimination_reasons)
@@ -114,10 +119,10 @@ def test_matcher_applies_experience_and_education_hard_eliminations(tmp_path):
     assert any("学历" in reason for reason in education_match.elimination_reasons)
 
 
-def test_target_city_preference_changes_ranking_without_eliminating_job(tmp_path):
+def test_target_city_preference_changes_ranking_without_eliminating_job(tmp_path, account_id):
     """目标城市属于普通偏好，异地职位只能扣分，不能被当成明确拒绝条件。"""
 
-    app = JobHuntingApp(tmp_path / "mvp.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -131,7 +136,8 @@ def test_target_city_preference_changes_ranking_without_eliminating_job(tmp_path
             expected_salary_k=None,
             target_directions=["Python 开发"],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     job = app.import_job_text(
         """
@@ -141,7 +147,8 @@ def test_target_city_preference_changes_ranking_without_eliminating_job(tmp_path
         1-3年
         本科
         职位描述：负责 Python 后端开发。
-        """
+        """,
+        account_id=account_id,
     )
 
     result = app.match_job(candidate_id, job.id)
@@ -151,10 +158,10 @@ def test_target_city_preference_changes_ranking_without_eliminating_job(tmp_path
     assert any("需要确认是否接受" in item for item in result.risks)
 
 
-def test_salary_below_floor_lowers_score_without_hard_elimination(tmp_path):
+def test_salary_below_floor_lowers_score_without_hard_elimination(tmp_path, account_id):
     """职位月薪低于底线时只降薪资维度分，不触发硬性淘汰。"""
 
-    app = JobHuntingApp(tmp_path / "salary.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -168,7 +175,8 @@ def test_salary_below_floor_lowers_score_without_hard_elimination(tmp_path):
             expected_salary_k=20,
             target_directions=["Python 后端"],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     job = app.import_job_text(
         """
@@ -180,19 +188,20 @@ def test_salary_below_floor_lowers_score_without_hard_elimination(tmp_path):
         职位描述：负责 Python 后端服务开发。
         """,
         classify_with_llm=False,
+        account_id=account_id,
     )
 
-    result = app.match_job(candidate_id, job.id)
+    result = app.match_job(candidate_id, job.id, account_id=account_id)
 
     assert not result.eliminated
     assert result.dimension_scores["salary"] < 60
     assert any("低于最低接受线" in item for item in result.deductions)
 
 
-def test_bonus_skill_missing_does_not_reduce_skill_score(tmp_path):
+def test_bonus_skill_missing_does_not_reduce_skill_score(tmp_path, account_id):
     """职位的加分技能没有掌握时，不应把核心技能得分再压低。"""
 
-    app = JobHuntingApp(tmp_path / "skills.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -206,7 +215,8 @@ def test_bonus_skill_missing_does_not_reduce_skill_score(tmp_path):
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     job = app.import_job_text(
         """
@@ -218,6 +228,7 @@ def test_bonus_skill_missing_does_not_reduce_skill_score(tmp_path):
         职位描述：必须掌握 Python；有 Docker 经验者优先。
         """,
         classify_with_llm=False,
+        account_id=account_id,
     )
     # 这里直接注入已确认的技能分类，隔离测试“缺少加分技能不扣分”本身，
     # 不让规则分类窗口影响评分断言。
@@ -225,17 +236,17 @@ def test_bonus_skill_missing_does_not_reduce_skill_score(tmp_path):
         SkillRequirement(name="Python", category="core", confidence=1.0),
         SkillRequirement(name="Docker", category="bonus", confidence=1.0),
     ]
-    result = match_job(app.get_candidate_profile(candidate_id), job)
+    result = match_job(app.get_candidate_profile(candidate_id, account_id=account_id), job)
 
     assert any(item.name == "Docker" and item.category == "bonus" for item in job.skill_requirements)
     assert result.dimension_scores["skills"] >= 65
     assert not any("Docker" in item for item in result.deductions)
 
 
-def test_direction_score_uses_30_percent_title_and_70_percent_description(tmp_path):
+def test_direction_score_uses_30_percent_title_and_70_percent_description(tmp_path, account_id):
     """岗位方向匹配中，职位描述正文应比标题承担更高权重。"""
 
-    app = JobHuntingApp(tmp_path / "direction.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -249,7 +260,8 @@ def test_direction_score_uses_30_percent_title_and_70_percent_description(tmp_pa
             expected_salary_k=None,
             target_directions=["Python 后端开发"],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     title_only = app.import_job_text(
         """
@@ -261,6 +273,7 @@ def test_direction_score_uses_30_percent_title_and_70_percent_description(tmp_pa
         职位描述：负责数据分析和报表制作。
         """,
         classify_with_llm=False,
+        account_id=account_id,
     )
     body_only = app.import_job_text(
         """
@@ -272,16 +285,17 @@ def test_direction_score_uses_30_percent_title_and_70_percent_description(tmp_pa
         职位描述：负责 Python 后端开发和服务接口维护。
         """,
         classify_with_llm=False,
+        account_id=account_id,
     )
 
-    title_result = app.match_job(candidate_id, title_only.id)
-    body_result = app.match_job(candidate_id, body_only.id)
+    title_result = app.match_job(candidate_id, title_only.id, account_id=account_id)
+    body_result = app.match_job(candidate_id, body_only.id, account_id=account_id)
 
     assert title_result.dimension_scores["direction"] == 30
     assert body_result.dimension_scores["direction"] == 70
 
 
-def test_semantic_direction_score_combines_embedding_and_rerank_protocols(tmp_path):
+def test_semantic_direction_score_combines_embedding_and_rerank_protocols(tmp_path, account_id):
     """语义方向评分只依赖通用协议，并按正文 70% 计算。"""
 
     class FakeEmbeddings:
@@ -301,7 +315,7 @@ def test_semantic_direction_score_combines_embedding_and_rerank_protocols(tmp_pa
 
             return [RerankResult(index=0, relevance_score=0.2), RerankResult(index=1, relevance_score=0.9)]
 
-    app = JobHuntingApp(tmp_path / "semantic.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -315,7 +329,8 @@ def test_semantic_direction_score_combines_embedding_and_rerank_protocols(tmp_pa
             expected_salary_k=None,
             target_directions=["目标方向"],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     job = app.import_job_text(
         """
@@ -327,8 +342,9 @@ def test_semantic_direction_score_combines_embedding_and_rerank_protocols(tmp_pa
         职位描述：负责目标方向相关工作。
         """,
         classify_with_llm=False,
+        account_id=account_id,
     )
-    candidate = app.get_candidate_profile(candidate_id)
+    candidate = app.get_candidate_profile(candidate_id, account_id=account_id)
 
     embedding_only = semantic_direction_score(candidate, job, FakeEmbeddings())
     combined = semantic_direction_score(candidate, job, FakeEmbeddings(), FakeReranker())
@@ -337,10 +353,10 @@ def test_semantic_direction_score_combines_embedding_and_rerank_protocols(tmp_pa
     assert combined == 77.0
 
 
-def test_job_skill_categories_can_be_corrected_without_adding_new_skills(tmp_path):
+def test_job_skill_categories_can_be_corrected_without_adding_new_skills(tmp_path, account_id):
     """人工分类只能调整已解析技能，不能向职位要求中凭空增加技能。"""
 
-    app = JobHuntingApp(tmp_path / "skill-edit.db")
+    app = JobHuntingApp()
     app.initialize()
     job = app.import_job_text(
         """
@@ -352,11 +368,13 @@ def test_job_skill_categories_can_be_corrected_without_adding_new_skills(tmp_pat
         职位描述：负责 Python 和 Docker 后端服务开发。
         """,
         classify_with_llm=False,
+        account_id=account_id,
     )
 
     updated = app.update_job_skill_requirements(
         job.id,
         [SkillRequirement(name="Python", category="core", confidence=1.0)],
+        account_id=account_id,
     )
 
     assert updated.skill_requirements[0].category == "core"
@@ -366,6 +384,7 @@ def test_job_skill_categories_can_be_corrected_without_adding_new_skills(tmp_pat
         app.update_job_skill_requirements(
             job.id,
             [SkillRequirement(name="不存在的技能", category="core", confidence=1.0)],
+            account_id=account_id,
         )
     except ValueError as error:
         assert "不在职位原始技能列表" in str(error)
@@ -373,10 +392,10 @@ def test_job_skill_categories_can_be_corrected_without_adding_new_skills(tmp_pat
         raise AssertionError("不应允许人工增加职位原始技能之外的名称")
 
 
-def test_confirmed_missing_core_skill_can_trigger_hard_elimination(tmp_path):
+def test_confirmed_missing_core_skill_can_trigger_hard_elimination(tmp_path, account_id):
     """只有候选人明确确认不具备核心技能时，技能门槛才淘汰职位。"""
 
-    app = JobHuntingApp(tmp_path / "missing-core.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -390,7 +409,8 @@ def test_confirmed_missing_core_skill_can_trigger_hard_elimination(tmp_path):
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     job = app.import_job_text(
         """
@@ -402,18 +422,19 @@ def test_confirmed_missing_core_skill_can_trigger_hard_elimination(tmp_path):
         职位描述：必须掌握 Python，负责后端服务开发。
         """,
         classify_with_llm=False,
+        account_id=account_id,
     )
 
-    result = app.match_job(candidate_id, job.id)
+    result = app.match_job(candidate_id, job.id, account_id=account_id)
 
     assert result.eliminated
     assert any("确认不具备" in item for item in result.elimination_reasons)
 
 
-def test_uncertain_skill_gap_is_not_scored_as_zero(tmp_path):
+def test_uncertain_skill_gap_is_not_scored_as_zero(tmp_path, account_id):
     """不确定技能缺失只保留风险，不把技能维度直接压成 0。"""
 
-    app = JobHuntingApp(tmp_path / "uncertain-skill.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -427,7 +448,8 @@ def test_uncertain_skill_gap_is_not_scored_as_zero(tmp_path):
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     job = app.import_job_text(
         """
@@ -439,21 +461,22 @@ def test_uncertain_skill_gap_is_not_scored_as_zero(tmp_path):
         职位描述：负责 Python 和 Docker 后端服务开发。
         """,
         classify_with_llm=False,
+        account_id=account_id,
     )
     job.skill_requirements = [
         SkillRequirement(name="Python", category="core", confidence=1.0),
         SkillRequirement(name="Docker", category="uncertain", confidence=0.2),
     ]
-    result = match_job(app.get_candidate_profile(candidate_id), job)
+    result = match_job(app.get_candidate_profile(candidate_id, account_id=account_id), job)
 
     assert result.dimension_scores["skills"] >= 65
     assert any("不确定技能要求" in item for item in result.risks)
 
 
-def test_low_confidence_education_does_not_trigger_hard_elimination(tmp_path):
+def test_low_confidence_education_does_not_trigger_hard_elimination(tmp_path, account_id):
     """学历字段置信度不足时只提示，不执行硬性学历淘汰。"""
 
-    app = JobHuntingApp(tmp_path / "education-confidence.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -467,7 +490,8 @@ def test_low_confidence_education_does_not_trigger_hard_elimination(tmp_path):
             expected_salary_k=None,
             target_directions=[],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
     job = app.import_job_text(
         """
@@ -479,9 +503,10 @@ def test_low_confidence_education_does_not_trigger_hard_elimination(tmp_path):
         职位描述：负责后端服务开发。
         """,
         classify_with_llm=False,
+        account_id=account_id,
     )
     job.field_confidence["education"] = 0.2
-    result = match_job(app.get_candidate_profile(candidate_id), job)
+    result = match_job(app.get_candidate_profile(candidate_id, account_id=account_id), job)
 
     assert not result.eliminated
     assert any("学历字段置信度较低" in item for item in result.risks)
@@ -497,7 +522,7 @@ def test_project_analysis_outputs_confirmable_card_and_skips_sensitive_files(tmp
         encoding="utf-8",
     )
     (project / "requirements.txt").write_text(
-        "langchain\nfastapi\nchromadb\npytest\n",
+        "langchain\nfastapi\npgvector\npytest\n",
         encoding="utf-8",
     )
     (project / "app.py").write_text(
@@ -506,7 +531,7 @@ def test_project_analysis_outputs_confirmable_card_and_skips_sensitive_files(tmp
     )
     (project / ".env").write_text("OPENAI_API_KEY=should-not-read", encoding="utf-8")
 
-    app = JobHuntingApp(tmp_path / "mvp.db")
+    app = JobHuntingApp()
     app.initialize()
     card = app.analyze_project(project)
 
@@ -517,7 +542,7 @@ def test_project_analysis_outputs_confirmable_card_and_skips_sensitive_files(tmp
     assert card.questions_for_candidate
 
 
-def test_project_card_can_be_saved_and_confirmed_without_overwriting_profile(tmp_path):
+def test_project_card_can_be_saved_and_confirmed_without_overwriting_profile(tmp_path, account_id):
     """项目分析结果要先作为待确认卡片保存，不能自动覆盖候选人档案事实。"""
 
     project = tmp_path / "portfolio_agent"
@@ -531,7 +556,7 @@ def test_project_card_can_be_saved_and_confirmed_without_overwriting_profile(tmp
         encoding="utf-8",
     )
 
-    app = JobHuntingApp(tmp_path / "mvp.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -545,11 +570,12 @@ def test_project_card_can_be_saved_and_confirmed_without_overwriting_profile(tmp
             expected_salary_k=15,
             target_directions=["AI Agent 应用开发"],
             unacceptable=[],
-        )
+        ),
+        account_id=account_id,
     )
 
-    pending_record = app.analyze_project_for_candidate(candidate_id, project)
-    profile_after_analysis = app.get_candidate_profile(candidate_id)
+    pending_record = app.analyze_project_for_candidate(candidate_id, project, account_id=account_id)
+    profile_after_analysis = app.get_candidate_profile(candidate_id, account_id=account_id)
 
     assert pending_record.status == "待确认"
     assert pending_record.candidate_id == candidate_id
@@ -560,8 +586,9 @@ def test_project_card_can_be_saved_and_confirmed_without_overwriting_profile(tmp
     confirmed_record = app.confirm_project_card(
         pending_record.id,
         confirmed_summary="本人负责职位解析、匹配排序和 FastAPI 接口设计。",
+        account_id=account_id,
     )
-    listed_records = app.list_project_cards(candidate_id)
+    listed_records = app.list_project_cards(candidate_id, account_id=account_id)
 
     assert confirmed_record.status == "已确认"
     assert confirmed_record.confirmed_summary == "本人负责职位解析、匹配排序和 FastAPI 接口设计。"
@@ -569,10 +596,10 @@ def test_project_card_can_be_saved_and_confirmed_without_overwriting_profile(tmp
     assert listed_records[0].status == "已确认"
 
 
-def test_candidate_can_match_all_imported_jobs_in_recommendation_order(tmp_path):
+def test_candidate_can_match_all_imported_jobs_in_recommendation_order(tmp_path, account_id):
     """候选人可以对所有已导入职位批量匹配，未淘汰职位按分数优先展示。"""
 
-    app = JobHuntingApp(tmp_path / "mvp.db")
+    app = JobHuntingApp()
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(
@@ -586,7 +613,8 @@ def test_candidate_can_match_all_imported_jobs_in_recommendation_order(tmp_path)
             expected_salary_k=15,
             target_directions=["AI Agent 应用开发"],
             unacceptable=["外包"],
-        )
+        ),
+        account_id=account_id,
     )
     strong_job = app.import_job_text(
         """
@@ -596,7 +624,8 @@ def test_candidate_can_match_all_imported_jobs_in_recommendation_order(tmp_path)
         1-3年
         本科
         职位描述：负责 Python、FastAPI、LangChain Agent 应用开发。
-        """
+        """,
+        account_id=account_id,
     )
     weak_job = app.import_job_text(
         """
@@ -606,7 +635,8 @@ def test_candidate_can_match_all_imported_jobs_in_recommendation_order(tmp_path)
         1-3年
         本科
         职位描述：负责 Java、MySQL 和 Redis 后端开发。
-        """
+        """,
+        account_id=account_id,
     )
     eliminated_job = app.import_job_text(
         """
@@ -616,10 +646,11 @@ def test_candidate_can_match_all_imported_jobs_in_recommendation_order(tmp_path)
         5-10年
         本科
         职位描述：负责 Python 后端架构设计。
-        """
+        """,
+        account_id=account_id,
     )
 
-    matches = app.match_all_jobs(candidate_id)
+    matches = app.match_all_jobs(candidate_id, account_id=account_id)
 
     assert [match.job_id for match in matches] == [strong_job.id, weak_job.id, eliminated_job.id]
     assert not matches[0].eliminated

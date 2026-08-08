@@ -2,7 +2,7 @@
 
 ## 这次改进解决什么问题
 
-以前网页服务把结构化数据写入 `data/job_agent.db` 的 SQLite 文件。现在这些数据只包含
+以前网页服务把结构化数据写入本地文件。现在这些数据只包含
 测试内容，所以没有设计旧数据导入，而是直接把实际 Web 服务切换到 PostgreSQL。这样账号、
 候选人档案、会话、职位、简历元数据和 Token 用量能使用外键、约束、事务和版本化迁移。
 
@@ -30,7 +30,7 @@ Web 启动时只验证 Alembic revision，不会自行执行 `CREATE TABLE`。�
 | Docker Compose | 声明 `postgres`、`migrate`、`web` 的网络、卷和依赖顺序 | 比手工启动三个进程更可复现，适合当前单机开发 |
 | PostgreSQL 16 | 保存账号、档案、会话、职位、文件元数据和用量账本 | 支持事务、外键、JSONB、严格约束和生产级运维能力 |
 | pgvector | 提供 PostgreSQL 的 `vector` 列类型和余弦距离查询 | RAG 分块、账号过滤和结构化事实可在同一个事务型数据库中管理 |
-| SQLAlchemy 2.x | 创建 Engine、连接池和跨数据库的执行边界 | 业务层不直接绑定 psycopg 或 SQLite 驱动 |
+| SQLAlchemy 2.x | 创建 Engine、连接池和 PostgreSQL 执行边界 | 业务层不直接绑定 psycopg 驱动 |
 | Alembic | 管理 `20260807_0001` 等数据库版本 | 新增字段、索引或表时能升级、审计和回退 |
 | Psycopg 3 | SQLAlchemy 连接 PostgreSQL 的驱动 | SQLAlchemy 2.x 官方支持良好，支持 PostgreSQL 类型 |
 | Docker named volume | 保存 PostgreSQL 数据目录 | 容器重建后数据库不会消失 |
@@ -40,10 +40,10 @@ Web 启动时只验证 Alembic revision，不会自行执行 `CREATE TABLE`。�
 ## 当前数据边界
 
 - PostgreSQL 是结构化事实源，也是 Web 服务实际使用的数据库。
-- `data/` 只保存上传简历、导出文件和可选的 SQLite/Chroma 测试回退，不再作为生产 SQLite 数据库位置。
-- SQLite 仍保留在单元测试和 Alembic 迁移测试中，用于快速、隔离地验证 SQL 兼容性。
+- `data/` 只保存上传简历和导出文件，不再作为数据库或向量索引位置。
+- 自动化测试也使用隔离的 PostgreSQL schema；网页和 Docker 运行入口不会创建本地数据库文件。
 - PostgreSQL 的 `rag_chunks.embedding` 已由 pgvector 实际读写；检索先在数据库内按账号过滤，
-  再按余弦距离排序。Chroma 只保留给 SQLite 离线测试回退。
+  再按余弦距离排序。pgvector 是唯一的向量运行后端，网页不会创建独立向量目录。
 
 ## 第一次启动
 
@@ -91,14 +91,14 @@ http://127.0.0.1:8000
 docker compose up -d postgres
 ```
 
-在 `.env` 增加本机连接地址，再执行迁移：
+在 `.env` 配置本机连接地址，再执行迁移。该变量是网页运行时必填项，缺失时服务会拒绝启动：
 
 ```dotenv
 JOB_AGENT_DATABASE_URL=postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent
 ```
 
 ```powershell
-python -m job_hunting_agent.cli --env-file .env database-upgrade
+alembic upgrade head
 python -m job_hunting_agent.web --env-file .env
 ```
 
@@ -121,9 +121,8 @@ docker compose down
 # 查看 Web 健康检查
 Invoke-WebRequest http://127.0.0.1:8000/api/health | Select-Object -ExpandProperty Content
 
-# 仅查看脱敏后的数据库配置和当前 revision
-python -m job_hunting_agent.cli --env-file .env database-config
-python -m job_hunting_agent.cli --env-file .env database-current
+# 仅查看当前 Alembic revision
+alembic current
 ```
 
 当前数据库数据是测试数据时，可重新创建 PostgreSQL：
@@ -134,7 +133,7 @@ docker compose up -d
 ```
 
 `down -v` 会删除 `postgres_data`，其中也包含生产 RAG 向量；不会删除宿主机 `data/` 中的
-简历文件或可选的 Chroma 测试回退。存在需要保留的数据库数据或简历文件时，不应执行此命令。
+简历文件。存在需要保留的数据库数据或简历文件时，不应执行此命令。
 
 ## 开发模式：源码热更新
 
