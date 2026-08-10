@@ -246,7 +246,8 @@ def test_bonus_skill_missing_does_not_reduce_skill_score(tmp_path, account_id):
 def test_direction_score_uses_30_percent_title_and_70_percent_description(tmp_path, account_id):
     """岗位方向匹配中，职位描述正文应比标题承担更高权重。"""
 
-    app = JobHuntingApp()
+    # 该用例验证本地规则的 30%/70% 权重，显式关闭可选语义增强以避免读取开发机 `.env`。
+    app = JobHuntingApp(semantic_matching=False)
     app.initialize()
     candidate_id = app.save_candidate_profile(
         CandidateProfileInput(

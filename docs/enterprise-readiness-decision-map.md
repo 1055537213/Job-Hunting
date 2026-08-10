@@ -134,10 +134,25 @@ RAG 在数据库内按账号隔离检索，重复增量索引不产生重复 chu
 - 用 S3-compatible 接口保存原始简历、项目压缩包和生成文件。
 - Redis 作为任务队列基础设施；Worker 执行 OCR、索引、项目分析和批量导出。
 - 任务记录包含 queued/running/succeeded/failed/cancelled 状态、进度、重试次数和错误摘要。
-- 上传采用大小限制、文件签名检查、哈希去重和恶意文件扫描。
+- 上传采用大小限制和文件签名检查；哈希去重与恶意文件扫描仍需补齐。
 - 下载使用短期签名 URL 或经过鉴权的流式代理，不公开对象存储永久地址。
 
-完成门槛：Web 进程重启不丢任务；重复提交不会生成重复账单或重复文件版本；失败可重试。
+实施状态：第 3.1 步已完成。Docker Compose 已提供 MinIO，业务层通过 S3-compatible
+对象存储接口写入原始简历和职位定制文件；PostgreSQL 继续保存归属、对象键、哈希和版本。
+下载仍由鉴权后的 Web 流式代理返回，不公开对象存储地址。第 3.2 步已完成基础设施切片：
+Compose 提供带密码的 Redis、Celery Worker 和 `background_tasks` 状态表；管理员探针已验证
+Web -> PostgreSQL -> Redis -> Worker -> PostgreSQL 的完整链路。第 3.3 步已完成简历上传后的
+RAG 增量 Embedding 迁移：Web 先保存文件和 `long_texts`，再登记 `rag_index` 任务。第 3.4 步
+已完成扫描/混合 PDF OCR 迁移：Web 仅检查文本层并保存待处理原件，`resume_ocr` Worker 写入
+正文和 `long_texts` 后自动创建 `rag_index`；Vue 按任务链轮询。第 3.5 步已完成公开 GitHub
+项目分析迁移：Web/Agent 只接受规范化仓库首页 URL，Worker 通过官方 API/codeload 流式读取
+受限归档，跳过敏感文件和不安全路径，生成待确认项目经历卡片；Vue 支持状态恢复和候选人确认，
+确认后会创建独立 RAG 增量索引任务。GitHub ZIP 当前只在 Worker 内临时处理，尚未持久化到
+对象存储。队列关闭时保留同步回退。项目分析的本地目录入口保留给未来桌面客户端；私有仓库
+凭证、简历导出任务迁移、文件哈希去重和恶意文件扫描仍按垂直切片逐个实施。
+
+当前已满足任务状态持久化、重复消息原子认领和失败投递恢复；完整阶段门槛仍包括文档导出
+异步化、文件哈希去重、恶意文件扫描和 GitHub 归档持久化。
 
 ### 阶段 4：安全、隐私与可观测性
 
@@ -207,8 +222,12 @@ Kubernetes 不是上线前置条件。只有出现以下需求时再进入该阶
 - 已有：账号/Session、候选人多档案、多会话、Token 用量流水、LangChain Agent、RAG、职位匹配、内部 Model Gateway，以及可选 provider-native Embedding/Rerank。
 - 本轮恢复：DOCX/PDF 上传、文字层解析、扫描 PDF OCR、简历文件版本、职位定制 DOCX/PDF 和鉴权下载。
 - 本轮新增：SQLAlchemy、Alembic、PostgreSQL + pgvector Compose 服务、冻结的生产 schema，
-  以及 `postgres -> migrate -> web` 启动链。Web 的结构化业务读写已切换到 PostgreSQL。
-- 尚未实施：对象存储、任务队列和生产可观测性。
+  `postgres -> migrate -> web/worker` 启动链，以及 MinIO/S3 对象存储边界。Web 的结构化业务
+  读写已切换到 PostgreSQL，简历文件已切换到 MinIO named volume。
+- 本轮新增后台基础设施：Redis broker、Celery Worker、`background_tasks` 状态表、任务幂等键、
+  进度/重试/错误摘要和管理员探针接口；并把扫描 PDF OCR、简历上传后的 RAG 增量 Embedding
+  迁移到了 Worker，Vue 会轮询任务状态并在刷新页面后恢复未完成任务；公开 GitHub 项目分析
+  也已接入同一 Worker 边界。尚未实施的是文档导出迁移和生产可观测性。
 
 后续改造必须按上述阶段逐步提交。当前 pgvector RAG 已进入生产读写路径；测试和 Web 共用
-PostgreSQL 后端。在文件仍依赖单机目录时，不能先做多副本部署。
+PostgreSQL 后端。文件正文已不再依赖宿主机目录，但在引入 Worker 前仍不能先做多副本部署。

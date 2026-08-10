@@ -15,12 +15,14 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from reportlab.pdfgen import canvas
 
+from job_hunting_agent import app as app_module
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.llm import StaticLLMClient
 from job_hunting_agent.models import CandidateProfileInput
 from job_hunting_agent import resume_document
 from job_hunting_agent.resume_document import (
     ResumeDocumentError,
+    ResumeExtraction,
     extract_resume_document,
     sanitize_download_filename,
 )
@@ -135,6 +137,22 @@ def test_resume_parser_handles_docx_text_pdf_and_scanned_pdf() -> None:
     assert scanned_pdf_result.page_count == 1
 
 
+def test_pdf_text_layer_inspection_does_not_start_ocr(monkeypatch) -> None:
+    """扫描 PDF 的上传前检查只能判断是否需要 OCR，不能在 Web 进程运行 OCR。"""
+
+    def fail_if_ocr_runs(_image):
+        """OCR 若在检查阶段运行，测试必须失败。"""
+
+        raise AssertionError("PDF 文本层检查不应调用 RapidOCR")
+
+    monkeypatch.setattr(resume_document, "run_rapidocr", fail_if_ocr_runs)
+
+    inspection = resume_document.inspect_pdf_for_ocr(build_scanned_pdf_bytes())
+
+    assert inspection.page_count == 1
+    assert inspection.pages_needing_ocr == [0]
+
+
 @pytest.mark.parametrize(
     ("filename", "content"),
     [
@@ -224,6 +242,63 @@ def test_app_saves_uploaded_resume_as_versioned_artifact_and_rag_source(tmp_path
         app.get_resume_artifact(first.id, account_id=account_b.id)
 
 
+def test_app_defers_scanned_pdf_ocr_then_registers_one_rag_source(tmp_path, monkeypatch) -> None:
+    """待处理扫描 PDF 先保存原件，Worker 成功后才登记一次长文本来源。"""
+
+    app = JobHuntingApp(resume_dir=tmp_path / "resume-files")
+    app.initialize()
+    account = app.auth.register("deferred-ocr@example.com", "password-123")
+    candidate_id = app.save_candidate_profile(profile_input(), account_id=account.id)
+    pending = app.upload_resume_document(
+        candidate_id,
+        "scan.pdf",
+        build_scanned_pdf_bytes(),
+        account_id=account.id,
+        defer_ocr=True,
+    )
+
+    assert pending.status == "processing"
+    assert pending.extraction_method == "pending_ocr"
+    assert pending.long_text_id is None
+    assert app.store.list_long_texts(
+        entity_types=["resume_artifact"],
+        account_id=account.id,
+        candidate_id=candidate_id,
+    ) == []
+
+    monkeypatch.setattr(
+        app_module,
+        "extract_resume_document",
+        lambda _filename, _content: ResumeExtraction(
+            text="扫描简历 OCR 得到 Python、FastAPI 与 PostgreSQL 项目经验。",
+            method="pdf_ocr",
+            page_count=1,
+        ),
+    )
+    completed = app.process_resume_ocr_artifact(
+        artifact_id=pending.id,
+        account_id=account.id,
+        candidate_id=candidate_id,
+    )
+    repeated = app.process_resume_ocr_artifact(
+        artifact_id=pending.id,
+        account_id=account.id,
+        candidate_id=candidate_id,
+    )
+
+    assert completed.status == "ready"
+    assert completed.extraction_method == "pdf_ocr"
+    assert completed.long_text_id is not None
+    assert repeated.long_text_id == completed.long_text_id
+    long_texts = app.store.list_long_texts(
+        entity_types=["resume_artifact"],
+        account_id=account.id,
+        candidate_id=candidate_id,
+    )
+    assert len(long_texts) == 1
+    assert "PostgreSQL" in long_texts[0].text
+
+
 def test_web_upload_list_and_download_are_scoped_to_logged_in_account(tmp_path) -> None:
     """Web 下载接口必须再次校验账号，不能仅凭可枚举的 artifact_id 返回文件。"""
 
@@ -274,6 +349,92 @@ def test_web_upload_list_and_download_are_scoped_to_logged_in_account(tmp_path) 
     assert deleted.json()["deleted"] is True
     assert listed_after_delete.json()["artifacts"] == []
     assert missing_download.status_code == 404
+
+
+def test_web_upload_enqueues_rag_index_when_worker_is_enabled(tmp_path, monkeypatch) -> None:
+    """队列开启时上传接口立即返回任务，不在 Web 请求内调用 Embedding。"""
+
+    class FakeQueue:
+        """不连接 Redis 的最小队列替身，保留投递记录供断言。"""
+
+        def __init__(self) -> None:
+            self.enqueued: list[str] = []
+
+        def health_check(self) -> None:
+            """测试替身始终可用。"""
+
+        def enqueue(self, task_key: str) -> None:
+            """记录 Web 交给 Worker 的任务键。"""
+
+            self.enqueued.append(task_key)
+
+    def fail_if_called(*_args, **_kwargs):
+        """如果 Web 同步索引，测试应立即失败。"""
+
+        raise AssertionError("队列模式不应在 Web 请求内执行 RAG 索引")
+
+    monkeypatch.setattr(JobHuntingApp, "index_rag_long_texts", fail_if_called)
+    queue = FakeQueue()
+    web_app = create_web_app(resume_dir=tmp_path / "resume-files", task_queue=queue)
+    client = TestClient(web_app)
+    register_and_login(client, "async-upload@example.com")
+    candidate_id = create_profile_over_web(client)
+
+    response = client.post(
+        "/api/resumes/upload",
+        data={"candidate_id": str(candidate_id)},
+        files={"file": ("resume.docx", build_docx_bytes("Python 后端开发经历", "使用 FastAPI 完成求职助手接口项目"), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["indexing_async"] is True
+    assert payload["rag_update"] is None
+    assert payload["task"]["status"] == "queued"
+    assert queue.enqueued == [payload["task"]["task_key"]]
+    task_response = client.get(f"/api/tasks/{payload['task']['task_key']}")
+    assert task_response.status_code == 200
+    assert task_response.json()["task"]["task_type"] == "rag_index"
+
+
+def test_web_upload_enqueues_ocr_for_scanned_pdf_when_worker_is_enabled(tmp_path) -> None:
+    """队列模式下扫描 PDF 上传只创建 OCR 任务，不同步加载 OCR 模型。"""
+
+    class FakeQueue:
+        """记录投递任务键的最小 Worker 队列替身。"""
+
+        def __init__(self) -> None:
+            self.enqueued: list[str] = []
+
+        def health_check(self) -> None:
+            """测试替身始终可用。"""
+
+        def enqueue(self, task_key: str) -> None:
+            """记录一次投递。"""
+
+            self.enqueued.append(task_key)
+
+    queue = FakeQueue()
+    web_app = create_web_app(resume_dir=tmp_path / "resume-files", task_queue=queue)
+    client = TestClient(web_app)
+    register_and_login(client, "async-ocr-upload@example.com")
+    candidate_id = create_profile_over_web(client)
+
+    response = client.post(
+        "/api/resumes/upload",
+        data={"candidate_id": str(candidate_id)},
+        files={"file": ("scan.pdf", build_scanned_pdf_bytes(), "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["workflow"] == "ocr"
+    assert payload["processing_async"] is True
+    assert payload["indexing_async"] is False
+    assert payload["artifact"]["status"] == "processing"
+    assert payload["artifact"]["long_text_id"] is None
+    assert payload["task"]["task_type"] == "resume_ocr"
+    assert queue.enqueued == [payload["task"]["task_key"]]
 
 
 def test_tailored_resume_creates_docx_and_pdf_without_overwriting_profile_or_source(tmp_path) -> None:
@@ -429,9 +590,12 @@ def test_vue_frontend_exposes_resume_upload_tailor_and_download_workflow(tmp_pat
     assert ':href="artifact.download_url"' in home
     assert "async uploadResume(event)" in script
     assert '"/api/resumes/upload"' in script
+    assert 'task.task_type === "resume_ocr"' in script
+    assert "rag_task_key" in script
     assert "async loadResumeArtifacts(signal = null)" in script
     assert "async tailorResume(artifact)" in script
     assert "async deleteResumeArtifact(artifact)" in script
     assert "/api/resumes/${encodeURIComponent(artifact.id)}" in script
     assert "resume-delete" in home
+    assert "artifact.status !== 'ready'" in home
     assert "resume-artifact-list" in styles

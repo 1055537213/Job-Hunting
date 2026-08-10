@@ -28,11 +28,10 @@ COPY src ./src
 RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -m pip install --no-cache-dir .
 
-# 应用不以 root 身份运行；运行时的 data 目录由 Compose 挂载到宿主机。
+# 应用不以 root 身份运行；运行时文件正文由对象存储服务保存。
 RUN useradd --create-home --uid 10001 appuser \
-    && mkdir -p /app/data \
     && chown -R appuser:appuser /app
 USER appuser
 
-# 直接调用项目定义的 Web 入口；Compose 注入 PostgreSQL URL，受控简历目录单独挂载。
-CMD ["job-agent-web", "--env-file", "/app/.env", "--resume-dir", "/app/data/resumes", "--host", "0.0.0.0", "--port", "8000"]
+# 直接调用项目定义的 Web 入口；Compose 注入 PostgreSQL 和对象存储配置。
+CMD ["job-agent-web", "--env-file", "/app/.env", "--host", "0.0.0.0", "--port", "8000"]

@@ -1024,7 +1024,8 @@ textarea:focus-visible,
 
 .job-list,
 .match-list,
-.resume-artifact-list {
+.resume-artifact-list,
+.project-card-list {
   display: grid;
   gap: var(--space-sm);
 }
@@ -1045,6 +1046,88 @@ textarea:focus-visible,
   background: var(--color-paper);
 }
 
+.project-card-list {
+  gap: var(--rule-thin);
+  overflow: hidden;
+  background: var(--color-rule);
+  border: var(--rule-thin) solid var(--color-rule);
+  border-radius: var(--radius-md);
+}
+
+.project-card-row {
+  min-width: 0;
+  display: grid;
+  gap: var(--space-xs);
+  padding: var(--space-sm);
+  background: var(--color-paper);
+}
+
+.project-card-head {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-xs);
+}
+
+.project-card-head strong {
+  min-width: 0;
+  color: var(--color-ink);
+  font-size: var(--text-sm);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.project-source-link,
+.project-card-meta {
+  min-width: 0;
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+.project-source-link {
+  color: var(--color-accent-ink);
+  text-decoration: underline;
+  text-decoration-thickness: var(--rule-thin);
+  text-underline-offset: var(--space-2xs);
+}
+
+.project-tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2xs);
+}
+
+.project-tag {
+  padding: var(--space-2xs) var(--space-xs);
+  color: var(--color-accent-ink);
+  background: var(--color-accent-soft);
+  border-radius: var(--radius-xs);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 700;
+}
+
+.project-card-details {
+  color: var(--color-muted);
+  font-size: var(--text-xs);
+}
+
+.project-card-details summary {
+  cursor: pointer;
+  color: var(--color-ink-2);
+  font-weight: 700;
+}
+
+.project-card-details ul {
+  display: grid;
+  gap: var(--space-2xs);
+  margin: var(--space-xs) 0 0;
+  padding-inline-start: var(--space-lg);
+}
+
 .resume-artifact-head {
   min-width: 0;
   display: flex;
@@ -1062,10 +1145,16 @@ textarea:focus-visible,
 }
 
 .file-kind,
-.resume-artifact-meta {
+.resume-artifact-meta,
+.resume-rag-status {
   color: var(--color-muted);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
+}
+
+.resume-rag-status {
+  color: var(--color-accent);
+  font-weight: 700;
 }
 
 .file-kind {

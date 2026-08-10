@@ -1,5 +1,5 @@
 # 本地 PostgreSQL + pgvector 开发环境。Web 不再直接创建表，而是等待 migrate
-# 服务完成 Alembic 升级后再启动。Redis、对象存储和 Worker 仍属于后续阶段。
+# 服务完成 Alembic 升级后再启动。文件正文由 MinIO 保存，耗时任务由 Redis/Celery Worker 执行。
 name: job-hunting-agent
 
 services:
@@ -24,6 +24,49 @@ services:
       timeout: 5s
       retries: 20
       start_period: 10s
+
+  minio:
+    # MinIO 实现 S3-compatible API；本地开发可直接验证未来云对象存储的调用边界。
+    image: "${JOB_AGENT_MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}"
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      # 仅限本机回环地址开发的默认凭据；生产环境必须通过 Secret 注入强凭据。
+      MINIO_ROOT_USER: "${JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY:-job_agent_minio}"
+      MINIO_ROOT_PASSWORD: "${JOB_AGENT_OBJECT_STORAGE_SECRET_KEY:-job_agent_minio_local_secret}"
+    ports:
+      # API 和管理控制台均只绑定回环地址，不暴露到局域网。
+      - "127.0.0.1:${JOB_AGENT_MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${JOB_AGENT_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    # Redis 只作为 Celery broker；任务的权威状态保存在 PostgreSQL。
+    image: "${JOB_AGENT_REDIS_IMAGE:-redis:7.4-alpine}"
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${JOB_AGENT_REDIS_PASSWORD:-job_agent_redis_local_secret}"]
+    environment:
+      # REDISCLI_AUTH 只供健康检查使用，不把密码写进命令行参数。
+      REDISCLI_AUTH: "${JOB_AGENT_REDIS_PASSWORD:-job_agent_redis_local_secret}"
+    ports:
+      # 只绑定本机回环地址，供开发者调试；线上应放在内部网络。
+      - "127.0.0.1:${JOB_AGENT_REDIS_PORT:-6379}:6379"
+    volumes:
+      # AOF 让容器重启后尽量恢复尚未确认的队列消息；业务状态仍以 PostgreSQL 为准。
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
 
   migrate:
     # 与 Web 使用相同镜像，确保迁移脚本和应用代码来自同一版本。
@@ -58,17 +101,35 @@ services:
     # 容器异常退出时自动重启；手动 docker compose stop 不会造成循环启动。
     restart: unless-stopped
     environment:
-      # Web 使用 PostgreSQL；不会退回 data/ 下的本地文件数据库。
+      # Web 使用 PostgreSQL；简历原件和导出文件通过容器内服务名写入 MinIO。
       JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
+      JOB_AGENT_OBJECT_STORAGE_BACKEND: "s3"
+      JOB_AGENT_OBJECT_STORAGE_ENDPOINT: "http://minio:9000"
+      JOB_AGENT_OBJECT_STORAGE_BUCKET: "${JOB_AGENT_OBJECT_STORAGE_BUCKET:-job-agent-files}"
+      JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY: "${JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY:-job_agent_minio}"
+      JOB_AGENT_OBJECT_STORAGE_SECRET_KEY: "${JOB_AGENT_OBJECT_STORAGE_SECRET_KEY:-job_agent_minio_local_secret}"
+      JOB_AGENT_OBJECT_STORAGE_REGION: "${JOB_AGENT_OBJECT_STORAGE_REGION:-us-east-1}"
+      JOB_AGENT_OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
+      # 本地开发首次启动允许应用自动创建 bucket；生产环境应改为 false 并由基础设施预创建。
+      JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET: "${JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET:-true}"
+      # Web 与 Worker 使用容器内 Redis 服务名；宿主机 .env 中的 127.0.0.1 只用于本地脚本。
+      JOB_AGENT_TASK_QUEUE_ENABLED: "true"
+      JOB_AGENT_REDIS_URL: "redis://:${JOB_AGENT_REDIS_PASSWORD:-job_agent_redis_local_secret}@redis:6379/0"
+      JOB_AGENT_TASK_QUEUE_NAME: "${JOB_AGENT_TASK_QUEUE_NAME:-job_agent}"
+      JOB_AGENT_TASK_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_TIME_LIMIT_SECONDS:-900}"
+      JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS:-840}"
     ports:
       - "8000:8000"
-    # .env 只读挂载给应用解析；生产 RAG 存在 PostgreSQL，data 只保存简历文件等受控二进制。
+    # .env 只读挂载给应用解析；文件正文不再使用宿主机 data 目录。
     volumes:
       - ./.env:/app/.env:ro
-      - ./data:/app/data
     depends_on:
       migrate:
         condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       # /api/health 不要求登录，可用于 Docker 判断 Web 进程是否已经监听并能响应。
       test:
@@ -78,6 +139,46 @@ services:
       retries: 5
       start_period: 20s
 
+  worker:
+    # 独立 Celery Worker 已执行 OCR、RAG 索引和 GitHub 项目分析；文档导出后续迁移。
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: "${JOB_AGENT_DOCKER_BASE_IMAGE:-python:3.12-slim}"
+    image: job-hunting-agent:web-dev
+    restart: unless-stopped
+    environment:
+      # Worker 与 Web 使用同一 PostgreSQL 和对象存储配置，按 task_key 读取受控数据。
+      JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
+      JOB_AGENT_OBJECT_STORAGE_BACKEND: "s3"
+      JOB_AGENT_OBJECT_STORAGE_ENDPOINT: "http://minio:9000"
+      JOB_AGENT_OBJECT_STORAGE_BUCKET: "${JOB_AGENT_OBJECT_STORAGE_BUCKET:-job-agent-files}"
+      JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY: "${JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY:-job_agent_minio}"
+      JOB_AGENT_OBJECT_STORAGE_SECRET_KEY: "${JOB_AGENT_OBJECT_STORAGE_SECRET_KEY:-job_agent_minio_local_secret}"
+      JOB_AGENT_OBJECT_STORAGE_REGION: "${JOB_AGENT_OBJECT_STORAGE_REGION:-us-east-1}"
+      JOB_AGENT_OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
+      JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET: "${JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET:-true}"
+      JOB_AGENT_TASK_QUEUE_ENABLED: "true"
+      JOB_AGENT_REDIS_URL: "redis://:${JOB_AGENT_REDIS_PASSWORD:-job_agent_redis_local_secret}@redis:6379/0"
+      JOB_AGENT_TASK_QUEUE_NAME: "${JOB_AGENT_TASK_QUEUE_NAME:-job_agent}"
+      JOB_AGENT_TASK_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_TIME_LIMIT_SECONDS:-900}"
+      JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS:-840}"
+    volumes:
+      - ./.env:/app/.env:ro
+    command: ["job-agent-worker", "--env-file", "/app/.env", "--log-level", "INFO", "--concurrency", "1"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
 volumes:
   # 本地开发数据库持久卷；显式 docker compose down -v 才会删除其中的测试数据。
   postgres_data:
+  # MinIO 对象正文持久卷；其中保存上传原件和生成后的简历文件。
+  minio_data:
+  # Redis AOF 数据卷；删除测试任务需显式 docker compose down -v。
+  redis_data:

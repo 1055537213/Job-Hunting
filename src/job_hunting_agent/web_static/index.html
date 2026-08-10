@@ -334,11 +334,14 @@
                 <span class="resume-artifact-meta">
                   v{{ artifact.version }} · {{ resumeExtractionLabel(artifact.extraction_method) }} · {{ formatFileSize(artifact.file_size) }}
                 </span>
+                <span v-if="ragTaskStatus(artifact)" class="resume-rag-status">
+                  {{ ragTaskStatus(artifact) }}
+                </span>
                 <div v-if="artifact.artifact_type === 'source'" class="resume-tailor-controls">
                   <select
                     v-model.number="resumeJobSelections[artifact.id]"
                     class="field"
-                    :disabled="!jobs.length"
+                    :disabled="!jobs.length || artifact.status !== 'ready'"
                     :aria-label="`选择 ${artifact.download_filename} 的目标职位`"
                   >
                     <option :value="0">{{ jobs.length ? "选择目标职位" : "请先导入职位" }}</option>
@@ -349,7 +352,7 @@
                   <button
                     class="ghost-button compact"
                     type="button"
-                    :disabled="!jobs.length || !resumeJobSelections[artifact.id] || tailoringArtifactId === artifact.id"
+                    :disabled="artifact.status !== 'ready' || !jobs.length || !resumeJobSelections[artifact.id] || tailoringArtifactId === artifact.id"
                     :data-state="tailoringArtifactId === artifact.id ? 'loading' : 'idle'"
                     @click="tailorResume(artifact)"
                   >
@@ -374,6 +377,92 @@
                     {{ deletingResumeArtifactId === artifact.id ? "删除中" : "删除" }}
                   </button>
                 </div>
+              </article>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="githubProjectPanelTitle">
+            <div class="panel-title-row">
+              <div>
+                <p class="eyebrow">Project Evidence</p>
+                <h2 id="githubProjectPanelTitle" class="panel-title">GitHub 项目</h2>
+              </div>
+              <span class="count-chip">{{ projectCards.length }} 个</span>
+            </div>
+            <form class="form-stack" @submit.prevent="submitGitHubProject">
+              <label class="field-group" for="githubProjectUrl">
+                <span>公开仓库链接</span>
+                <input
+                  id="githubProjectUrl"
+                  ref="githubProjectUrl"
+                  v-model.trim="githubProjectUrl"
+                  class="field"
+                  type="url"
+                  autocomplete="url"
+                  placeholder="https://github.com/owner/repository"
+                  :disabled="submittingGitHubProject"
+                  :aria-invalid="String(Boolean(githubProjectError))"
+                  aria-describedby="githubProjectError"
+                />
+              </label>
+              <button
+                class="primary-button"
+                type="submit"
+                :disabled="!currentProfileId || !githubProjectUrl || submittingGitHubProject"
+                :data-state="submittingGitHubProject ? 'loading' : 'idle'"
+              >
+                {{ submittingGitHubProject ? "提交中" : "分析仓库" }}
+              </button>
+            </form>
+            <div
+              v-if="githubProjectError"
+              id="githubProjectError"
+              class="inline-error"
+              role="alert"
+            >
+              {{ githubProjectError }}
+            </div>
+            <div class="project-card-list">
+              <div v-if="!projectCards.length" class="empty-state compact-empty">
+                <strong>暂无项目卡片</strong>
+              </div>
+              <article v-for="record in projectCards" :key="record.id" class="project-card-row">
+                <div class="project-card-head">
+                  <strong>{{ record.card.project_name }}</strong>
+                  <span class="file-kind">{{ record.status }}</span>
+                </div>
+                <a
+                  v-if="record.card.source_url"
+                  class="project-source-link"
+                  :href="record.card.source_url"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {{ record.card.source_url }}<span v-if="record.card.source_ref"> · {{ record.card.source_ref }}</span>
+                </a>
+                <div v-if="record.card.detected_tech_stack?.length" class="project-tag-list" aria-label="识别到的技术栈">
+                  <span v-for="tech in record.card.detected_tech_stack" :key="tech" class="project-tag">{{ tech }}</span>
+                </div>
+                <div v-if="record.card.detected_core_features?.length" class="project-card-meta">
+                  {{ record.card.detected_core_features.join(" · ") }}
+                </div>
+                <details class="project-card-details">
+                  <summary>查看待确认内容</summary>
+                  <ul>
+                    <li v-for="item in record.card.responsibility_draft" :key="item">{{ item }}</li>
+                    <li v-for="item in record.card.questions_for_candidate" :key="item">{{ item }}</li>
+                  </ul>
+                </details>
+                <button
+                  v-if="record.status === '待确认'"
+                  class="ghost-button compact"
+                  type="button"
+                  :disabled="confirmingProjectCardId === record.id"
+                  :data-state="confirmingProjectCardId === record.id ? 'loading' : 'idle'"
+                  @click="confirmProjectCard(record)"
+                >
+                  {{ confirmingProjectCardId === record.id ? "确认中" : "确认项目经历" }}
+                </button>
               </article>
             </div>
           </section>

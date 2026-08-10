@@ -1,6 +1,6 @@
-"""本地项目分析器。
+"""项目源码证据分析器。
 
-候选人可以把本地项目目录交给系统分析，但分析结果只能生成
+候选人可以把本地项目目录或经过受控下载的仓库源码交给系统分析，但分析结果只能生成
 “待确认项目经历卡片”，不能自动写入候选人档案。这个模块只做最小必要读取：
 跳过密钥、数据库、日志、依赖目录、构建产物和大文件。
 """
@@ -35,13 +35,34 @@ SKIP_DIRS = {
 }
 # 这些后缀要么是敏感/二进制/生成文件，要么不适合在 MVP 里直接读取。
 SKIP_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".log", ".pyc", ".pem", ".key", ".zip", ".png", ".jpg", ".pdf"}
-SOURCE_SUFFIXES = {".py", ".ipynb", ".js", ".ts", ".md", ".txt", ".toml", ".yaml", ".yml", ".json"}
-IMPORTANT_NAMES = {"readme.md", "requirements.txt", "pyproject.toml", "package.json", "dockerfile", "docker-compose.yml"}
+SOURCE_SUFFIXES = {
+    ".py", ".ipynb", ".js", ".jsx", ".ts", ".tsx", ".vue", ".html", ".css",
+    ".java", ".kt", ".kts", ".go", ".rs", ".rb", ".php", ".cs", ".c", ".h",
+    ".cpp", ".hpp", ".swift", ".scala", ".sql", ".sh", ".bash", ".md", ".txt",
+    ".toml", ".yaml", ".yml", ".json", ".xml",
+}
+IMPORTANT_NAMES = {
+    "readme", "readme.md", "requirements.txt", "pyproject.toml", "package.json",
+    "dockerfile", "docker-compose.yml", "docker-compose.yaml", "makefile", "go.mod",
+    "pom.xml", "build.gradle", "cargo.toml",
+}
 SENSITIVE_PATTERNS = [re.compile(pattern, re.I) for pattern in (r"^\.env", r"secret", r"credential", r"password", r"token", r"private[_-]?key")]
 
 # 技术栈识别先用规则词表，后续可以让 LLM 基于 read_files 和证据片段生成更稳的卡片。
 TECH_PATTERNS = {
     "Python": [r"\.py$", r"python"],
+    "JavaScript": [r"\.(?:js|jsx)$", r"javascript|node(?:\.js)?"],
+    "TypeScript": [r"\.(?:ts|tsx)$", r"typescript"],
+    "Java": [r"\.java$", r"spring boot|springframework"],
+    "Go": [r"\.go$", r"\bgo\.mod\b"],
+    "Rust": [r"\.rs$", r"\bcargo\.toml\b"],
+    "C#/.NET": [r"\.cs$", r"\.net|asp\.net"],
+    "C/C++": [r"\.(?:c|h|cpp|hpp)$"],
+    "Swift": [r"\.swift$", r"swiftui"],
+    "Kotlin": [r"\.(?:kt|kts)$", r"kotlin"],
+    "SQL": [r"\.sql$", r"\bsql\b|postgresql|mysql"],
+    "React": [r"react"],
+    "Vue": [r"vue"],
     "LangChain": [r"langchain"],
     "LangGraph": [r"langgraph"],
     "FastAPI": [r"fastapi"],
@@ -100,12 +121,39 @@ def analyze_project(project_path: str | Path) -> ProjectExperienceCard:
             skipped["max_files_reached"] += 1
             break
 
+    selected_for_card = [
+        (Path(path.relative_to(root)), text)
+        for path, text in selected
+    ]
+    return build_project_experience_card(
+        project_name=root.name,
+        selected_files=selected_for_card,
+        skipped_summary=skipped,
+        source_type="local_directory",
+    )
+
+
+def build_project_experience_card(
+    *,
+    project_name: str,
+    selected_files: list[tuple[Path, str]],
+    skipped_summary: Counter[str] | dict[str, int],
+    source_type: str,
+    source_url: str | None = None,
+    source_ref: str | None = None,
+) -> ProjectExperienceCard:
+    """把已受控读取的源码文本整理为一张待确认项目经历卡片。
+
+    本函数不读取文件系统，也不发起网络请求。不同来源（本地目录、GitHub 归档、
+    后续客户端同步目录）都必须先完成各自的安全筛选，再把相对路径和文本交给这里，
+    从而让技术栈识别和真实性措辞保持一致。
+    """
+
     tech_evidence: dict[str, set[str]] = defaultdict(set)
     feature_evidence: dict[str, set[str]] = defaultdict(set)
-    symbol_names: Counter[str] = Counter()
 
-    for path, text in selected:
-        relative = str(path.relative_to(root))
+    for path, text in selected_files:
+        relative = path.as_posix()
         # detection_haystack 会收窄源码文件里的识别范围，避免把工具自身的关键词表
         # 误判成项目实际使用的技术。
         haystack = detection_haystack(path, text).lower()
@@ -115,8 +163,6 @@ def analyze_project(project_path: str | Path) -> ProjectExperienceCard:
         for feature, patterns in FEATURE_PATTERNS.items():
             if any(re.search(pattern, haystack, re.I) for pattern in patterns):
                 feature_evidence[feature].add(relative)
-        for match in re.finditer(r"^\s*(?:def|class)\s+([a-zA-Z_]\w*)", text, re.MULTILINE):
-            symbol_names[match.group(1)] += 1
 
     techs = sorted(tech_evidence)
     features = sorted(feature_evidence)
@@ -124,9 +170,9 @@ def analyze_project(project_path: str | Path) -> ProjectExperienceCard:
 
     return ProjectExperienceCard(
         card_type="待确认项目经历卡片",
-        project_name=root.name,
-        read_files=[str(path.relative_to(root)) for path, _ in selected],
-        skipped_summary=dict(skipped),
+        project_name=project_name,
+        read_files=[path.as_posix() for path, _ in selected_files],
+        skipped_summary=dict(skipped_summary),
         detected_tech_stack=techs,
         detected_core_features=features,
         responsibility_draft=responsibilities,
@@ -142,6 +188,9 @@ def analyze_project(project_path: str | Path) -> ProjectExperienceCard:
             "项目是否有可运行 Demo、部署地址、测试数据或评估结果？",
             "是否有可以确认的成果数字，例如处理数据量、响应时间、准确率或节省时间？",
         ],
+        source_type=source_type,
+        source_url=source_url,
+        source_ref=source_ref,
     )
 
 
@@ -154,7 +203,12 @@ def is_sensitive(path: Path) -> bool:
 def read_text(path: Path) -> str:
     """读取文本文件，并兼容 UTF-8、UTF-16、GBK 等常见编码。"""
 
-    raw = path.read_bytes()
+    return decode_text_bytes(path.read_bytes())
+
+
+def decode_text_bytes(raw: bytes) -> str:
+    """解码已受限大小的文本字节，供本地目录与远程归档共用。"""
+
     encodings = ("utf-16", "utf-16-le", "utf-16-be", "utf-8", "utf-8-sig", "gbk") if raw[:200].count(b"\x00") > 10 else ("utf-8", "utf-8-sig", "utf-16", "gbk")
     for encoding in encodings:
         try:
@@ -172,14 +226,18 @@ def detection_haystack(path: Path, text: str) -> str:
     """
 
     suffix = path.suffix.lower()
-    if path.name.lower() in IMPORTANT_NAMES or suffix in {".md", ".toml", ".yaml", ".yml", ".json"}:
+    if path.name.lower() in IMPORTANT_NAMES or suffix in {".md", ".toml", ".yaml", ".yml", ".json", ".xml"}:
         return f"{path}\n{text}"
     lines = []
     for line in text.splitlines():
         stripped = line.strip()
-        if suffix == ".py" and stripped.startswith(("import ", "from ", "class ", "def ", "@")):
-            lines.append(stripped)
-        elif suffix in {".js", ".ts"} and (stripped.startswith(("import ", "export ", "function ", "class ")) or "require(" in stripped):
+        if stripped.startswith(
+            (
+                "import ", "from ", "package ", "using ", "namespace ", "include ",
+                "class ", "interface ", "struct ", "def ", "func ", "fn ",
+                "function ", "export ", "@", "public ", "private ",
+            )
+        ) or "require(" in stripped:
             lines.append(stripped)
     return f"{path}\n" + "\n".join(lines[:200])
 

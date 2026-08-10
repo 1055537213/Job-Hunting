@@ -38,7 +38,7 @@ from .config import AgentMemorySettings, DEFAULT_ENV_PATH, load_agent_memory_set
 from .conversation_memory import build_restored_context_messages
 from .job_parser import InvalidJobTextError
 from .llm import extract_message_text
-from .models import AgentChatResult
+from .models import AgentChatResult, BackgroundTaskRecord
 
 
 class JobHuntingAgentContext(TypedDict):
@@ -64,17 +64,20 @@ AGENT_SYSTEM_PROMPT = """
 1. 在当前会话已经绑定候选人档案时，帮用户整理并保存候选人资料。
 2. 基于本地已导入职位做匹配分析。
 3. 为职位生成职位定制简历草稿，或基于用户已上传的简历生成 DOCX/PDF 文件。
-4. 对本地项目进行分析，并等待候选人确认项目摘要。
+4. 对候选人主动提供的公开 GitHub 项目进行分析，并等待候选人确认项目摘要。
 
 你必须遵守这些边界：
 - 结构化事实只能通过工具写入结构化事实源。
 - 长文本材料只能通过工具写入 long_texts，再由工具决定是否增量进入 RAG。
 - RAG 检索只是证据索引，不是事实源。
 - 不能登录 BOSS、不能爬取网站、不能自动投递、不能自动发送 HR 消息。
+- 不能要求或读取用户电脑上的本地路径；项目分析只接受公开 GitHub 仓库首页链接。
 - 不要假装已经执行某个保存/导入/匹配动作；只有在工具返回结果后才能确认。
 - 如果当前会话还没有绑定候选人，就先用 list_candidate_profiles 帮用户确认当前有哪些档案，
   并明确提醒用户先创建或选择候选人，再继续保存资料。
 - 当用户补充资料时，优先调用 ingest_candidate_message。
+- 当用户提供公开 GitHub 仓库首页链接并要求分析项目时，调用 analyze_github_project_for_candidate；
+  任务排队后要明确告诉用户等待 Worker 完成，不要声称已经读完仓库。
 - 当用户问“适合哪些岗位”时，优先调用 match_all_jobs_for_candidate。
 - 当用户让你改简历时，先调用 list_resume_artifacts_for_candidate 查看是否有原始上传文件。
 - 如果存在原始上传文件，优先调用 create_tailored_resume_from_upload，并把返回的下载链接告诉用户。
@@ -476,15 +479,40 @@ def build_job_hunting_tools(app: JobHuntingApp) -> list[object]:
         return dumps_tool_output({"project_cards": [asdict(card) for card in cards]})
 
     @tool
-    def analyze_local_project_for_candidate(
-        project_path: str,
+    def analyze_github_project_for_candidate(
+        repository_url: str,
         runtime: ToolRuntime[JobHuntingAgentContext, Any],
     ) -> str:
-        """分析本地项目目录并保存成待确认项目经历卡片。"""
+        """分析公开 GitHub 仓库并保存成待确认项目经历卡片。
+
+        只接受 ``https://github.com/owner/repository`` 形式的公开仓库首页链接。
+        网页运行环境会把任务交给 Worker；工具返回排队状态，不会假装已经完成分析。
+        """
 
         context = require_runtime_context(runtime)
         candidate_id = require_candidate_id(context)
-        record = app.analyze_project_for_candidate(candidate_id, project_path, account_id=context.get("account_id"))
+        account_id = context.get("account_id")
+        if app.task_queue_enabled:
+            if account_id is None:
+                raise ValueError("GitHub 项目分析任务缺少账号归属。")
+            task = app.enqueue_github_project_analysis_task(
+                repository_url=repository_url,
+                account_id=account_id,
+                candidate_id=candidate_id,
+                session_id=context.get("session_id"),
+                root_request_id=context.get("root_request_id"),
+            )
+            return dumps_tool_output(
+                {
+                    "task": background_task_tool_payload(task),
+                    "message": "GitHub 项目分析任务已排队，完成后会生成待确认项目经历卡片。",
+                }
+            )
+        record = app.analyze_github_project_for_candidate(
+            candidate_id,
+            repository_url,
+            account_id=account_id,
+        )
         return dumps_tool_output(asdict(record))
 
     @tool
@@ -507,12 +535,22 @@ def build_job_hunting_tools(app: JobHuntingApp) -> list[object]:
         }
         if record_id not in allowed_record_ids:
             raise ValueError(f"项目卡片 {record_id} 不属于当前候选人 {candidate_id}。")
-        record = app.confirm_project_card(
+        account_id = context.get("account_id")
+        if account_id is None:
+            raise ValueError("确认项目经历缺少账号归属。")
+        record, rag_task = app.confirm_project_card_and_enqueue_rag(
             record_id,
             confirmed_summary,
-            account_id=context.get("account_id"),
+            account_id=account_id,
+            session_id=context.get("session_id"),
+            root_request_id=context.get("root_request_id"),
         )
-        return dumps_tool_output(asdict(record))
+        return dumps_tool_output(
+            {
+                "project_card": asdict(record),
+                "task": background_task_tool_payload(rag_task) if rag_task is not None else None,
+            }
+        )
 
     @tool
     def create_resume_draft_for_job(
@@ -628,7 +666,7 @@ def build_job_hunting_tools(app: JobHuntingApp) -> list[object]:
         list_imported_jobs,
         match_all_jobs_for_candidate,
         list_project_cards_for_candidate,
-        analyze_local_project_for_candidate,
+        analyze_github_project_for_candidate,
         confirm_project_card,
         create_resume_draft_for_job,
         list_resume_artifacts_for_candidate,
@@ -692,6 +730,21 @@ def resume_artifact_tool_payload(artifact) -> dict[str, Any]:  # noqa: ANN001
     payload.pop("account_id", None)
     payload["download_url"] = f"/api/resumes/{artifact.id}/download"
     return payload
+
+
+def background_task_tool_payload(task: BackgroundTaskRecord) -> dict[str, Any]:
+    """把后台任务压缩成 Agent 可读摘要，不暴露账号和任务 payload。"""
+
+    return {
+        "task_key": task.task_key,
+        "task_type": task.task_type,
+        "status": task.status,
+        "progress": task.progress,
+        "attempt": task.attempt,
+        "max_attempts": task.max_attempts,
+        "result": task.result,
+        "error_summary": task.error_summary,
+    }
 
 
 def extract_usage_metadata(message: object) -> dict[str, int]:

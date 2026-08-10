@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 from langchain_core.embeddings import Embeddings
@@ -15,16 +16,20 @@ from .auth import AuthService
 from .config import (
     DEFAULT_ENV_PATH,
     load_database_settings,
+    load_object_storage_settings,
     load_semantic_matching_enabled,
+    load_task_queue_settings,
     require_postgresql_database_url,
 )
 from .conversation_ingestion import decide_conversation_ingestion
+from .github_project import analyze_public_github_repository, normalize_public_github_repository_url
 from .llm import LLMClient
 from .matcher import match_job, semantic_direction_score
 from .models import (
     CandidateProfile,
     CandidateProfileInput,
     ChatMessageRecord,
+    BackgroundTaskRecord,
     ConversationIngestionResult,
     ImportedJob,
     MatchResult,
@@ -38,24 +43,36 @@ from .models import (
     TailoredResumeResult,
 )
 from .model_gateway import ModelGateway
+from .object_storage import ObjectNotFoundError, ObjectStorage, S3ObjectStorage
 from .project_analyzer import analyze_project
 from .pgvector_rag import PgVectorKnowledgeBase
 from .rag import Reranker
 from .resume_document import (
+    PDF_EXTENSION,
     ResumeFileStore,
     extract_resume_document,
+    inspect_pdf_for_ocr,
     media_type_for_filename,
     sanitize_download_filename,
+    supported_resume_extension,
 )
 from .resume_exporter import export_tailored_resume_files
 from .resume_writer import build_resume_draft
 from .sqlalchemy_store import SQLAlchemyStore
+from .task_queue import (
+    GITHUB_PROJECT_ANALYSIS_TASK_TYPE,
+    RAG_INDEX_TASK_TYPE,
+    RESUME_OCR_TASK_TYPE,
+    BackgroundTaskQueue,
+    CeleryTaskQueue,
+    TaskQueueError,
+)
 
 
 class JobHuntingApp:
     """求职助手 MVP 的门面类。
 
-    它把 PostgreSQL 存储、职位解析、本地项目分析、匹配规则、LLM 草稿生成和
+    它把 PostgreSQL 存储、职位解析、项目证据分析、匹配规则、LLM 草稿生成和
     pgvector 检索组合到一起。所有入口都使用经 Alembic 管理的 SQLAlchemyStore。
     """
 
@@ -65,15 +82,21 @@ class JobHuntingApp:
         resume_dir: str | Path | None = None,
         semantic_matching: bool | None = None,
         database_url: str | None = None,
+        object_storage: ObjectStorage | None = None,
+        task_queue: BackgroundTaskQueue | None = None,
     ):
-        """绑定数据库、项目 `.env` 和受控简历文件目录。"""
+        """绑定数据库、项目 `.env`、对象存储和可选后台任务队列。"""
 
         self.env_path = Path(env_path)
         resolved_database_url = database_url or require_postgresql_database_url(
             load_database_settings(self.env_path)
         )
         self.store = SQLAlchemyStore(resolved_database_url)
-        default_resume_dir = Path("data/resumes")
+        # 直接运行 Web 或单元测试默认关闭队列；Compose 会显式开启并注入 Redis URL。
+        self.task_queue_settings = load_task_queue_settings(self.env_path)
+        self.task_queue = task_queue
+        if self.task_queue is None and self.task_queue_settings.enabled:
+            self.task_queue = CeleryTaskQueue(self.task_queue_settings)
         # Web 与后台任务都通过同一认证服务创建账号和 Session，避免重复实现密码逻辑。
         self.auth = AuthService(self.store)
         # 语义方向匹配涉及外部 Embedding/Rerank 请求，默认按 `.env` 显式开关；
@@ -86,12 +109,238 @@ class JobHuntingApp:
         # 所有真实模型/Embedding 调用都通过内部 Gateway 构造和计量；它是惰性加载的，
         # 所以纯本地规则和离线测试不需要在创建 App 时提供 API Key。
         self.model_gateway = ModelGateway(self.env_path, usage_store=self.store)
-        self.resume_files = ResumeFileStore(resume_dir or default_resume_dir)
+        if object_storage is not None:
+            # 测试或宿主机集成可以注入一个实现，业务层不关心具体厂商。
+            self.resume_files = object_storage
+        elif resume_dir is not None:
+            # 保留显式临时目录入口，便于解析器单元测试，不作为 Docker Web 默认路径。
+            self.resume_files = ResumeFileStore(resume_dir)
+        else:
+            storage_settings = load_object_storage_settings(self.env_path)
+            if storage_settings.backend == "s3":
+                assert storage_settings.endpoint_url is not None
+                assert storage_settings.bucket is not None
+                assert storage_settings.access_key is not None
+                assert storage_settings.secret_key is not None
+                self.resume_files = S3ObjectStorage(
+                    endpoint_url=storage_settings.endpoint_url,
+                    bucket=storage_settings.bucket,
+                    access_key=storage_settings.access_key,
+                    secret_key=storage_settings.secret_key,
+                    region=storage_settings.region,
+                    force_path_style=storage_settings.force_path_style,
+                    auto_create_bucket=storage_settings.auto_create_bucket,
+                )
+            else:
+                # local 只能通过配置显式启用，通常由测试 fixture 或临时本地集成使用。
+                self.resume_files = ResumeFileStore(Path("data/resumes"))
+        self.file_storage_backend = (
+            "s3" if isinstance(self.resume_files, S3ObjectStorage) else "local"
+        )
 
     def initialize(self) -> None:
-        """创建 MVP 需要的数据表。"""
+        """确认数据库 schema 和配置的对象存储都可供 Web 请求使用。"""
 
         self.store.initialize()
+        if isinstance(self.resume_files, S3ObjectStorage):
+            # Web 进程在接收上传前验证 bucket，避免用户选择文件后才暴露基础设施错误。
+            self.resume_files.health_check()
+        if self.task_queue is not None:
+            # 队列启用时启动检查直接失败，避免用户上传后才发现任务无人消费。
+            self.task_queue.health_check()
+
+    @property
+    def task_queue_enabled(self) -> bool:
+        """返回当前实例是否具备可投递后台任务的队列适配器。"""
+
+        return self.task_queue is not None
+
+    def enqueue_background_task(
+        self,
+        *,
+        account_id: int,
+        task_type: str,
+        payload: dict[str, object] | None = None,
+        candidate_id: int | None = None,
+        session_id: str | None = None,
+        idempotency_key: str | None = None,
+        max_attempts: int = 3,
+    ) -> BackgroundTaskRecord:
+        """先写 PostgreSQL 任务记录，再投递 task_key；失败时留下可审计状态。"""
+
+        if self.task_queue is None:
+            raise TaskQueueError("当前运行环境未启用后台任务队列。")
+        if idempotency_key:
+            existing = self.store.get_background_task_by_idempotency(
+                account_id,
+                idempotency_key,
+            )
+            if existing is not None:
+                if existing.status != "failed":
+                    # queued/running 已经投递，成功或取消任务也属于已完成的幂等请求。
+                    return existing
+                # 上一次可能只是在 Redis 投递阶段失败。恢复原任务键后重新发送，前端原有
+                # 轮询地址和审计链路都保持不变。
+                record = self.store.retry_failed_background_task(existing.task_key)
+            else:
+                record = self.store.create_background_task(
+                    account_id=account_id,
+                    task_type=task_type,
+                    payload=payload,
+                    candidate_id=candidate_id,
+                    session_id=session_id,
+                    idempotency_key=idempotency_key,
+                    max_attempts=max_attempts,
+                )
+        else:
+            record = self.store.create_background_task(
+                account_id=account_id,
+                task_type=task_type,
+                payload=payload,
+                candidate_id=candidate_id,
+                session_id=session_id,
+                idempotency_key=idempotency_key,
+                max_attempts=max_attempts,
+            )
+        # 幂等复用的已完成任务无需再次投递；queued 任务才需要向 Redis 发送消息。
+        if record.status != "queued":
+            return record
+        try:
+            self.task_queue.enqueue(record.task_key)
+        except TaskQueueError as error:
+            self.store.fail_queued_background_task(record.task_key, str(error))
+            raise
+        return self.store.get_background_task(record.task_key, account_id=account_id)
+
+    def get_background_task(
+        self,
+        task_key: str,
+        account_id: int | None = None,
+    ) -> BackgroundTaskRecord:
+        """读取后台任务状态，供 Web 轮询和管理员运维页面使用。"""
+
+        return self.store.get_background_task(task_key, account_id=account_id)
+
+    def enqueue_system_probe(self, account_id: int) -> BackgroundTaskRecord:
+        """登记一个不读取用户数据的 Worker 连通性探针，供管理员受控验证。"""
+
+        return self.enqueue_background_task(
+            account_id=account_id,
+            task_type="system_probe",
+            payload={"purpose": "admin_runtime_probe"},
+            max_attempts=1,
+        )
+
+    def enqueue_rag_index_task(
+        self,
+        *,
+        long_text_ids: list[int],
+        account_id: int,
+        candidate_id: int | None = None,
+        session_id: str | None = None,
+        root_request_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> BackgroundTaskRecord:
+        """登记并投递一次长文本增量索引任务。
+
+        队列消息只携带 ``task_key``；长文本 ID 和链路 ID 保存在 PostgreSQL
+        任务 payload 中，Worker 会再次按账号过滤读取，避免把简历正文放进 Redis。
+        """
+
+        normalized_id_set: set[int] = set()
+        for raw_id in long_text_ids:
+            if isinstance(raw_id, bool):
+                raise ValueError("RAG 增量索引任务包含无效长文本 ID。")
+            if isinstance(raw_id, int):
+                normalized_id = raw_id
+            elif isinstance(raw_id, str) and raw_id.strip().isdigit():
+                normalized_id = int(raw_id.strip())
+            else:
+                raise ValueError("RAG 增量索引任务包含无效长文本 ID。")
+            if normalized_id <= 0:
+                raise ValueError("RAG 增量索引任务包含无效长文本 ID。")
+            normalized_id_set.add(normalized_id)
+        normalized_ids = sorted(normalized_id_set)
+        if not normalized_ids:
+            raise ValueError("RAG 增量索引任务至少需要一个长文本 ID。")
+        payload: dict[str, object] = {"long_text_ids": normalized_ids}
+        if root_request_id:
+            payload["root_request_id"] = str(root_request_id)
+        return self.enqueue_background_task(
+            account_id=account_id,
+            task_type=RAG_INDEX_TASK_TYPE,
+            payload=payload,
+            candidate_id=candidate_id,
+            session_id=session_id,
+            idempotency_key=idempotency_key,
+        )
+
+    def enqueue_resume_ocr_task(
+        self,
+        *,
+        artifact_id: int,
+        account_id: int,
+        candidate_id: int,
+        session_id: str | None = None,
+        root_request_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> BackgroundTaskRecord:
+        """登记扫描 PDF 的 OCR 任务，确保任务只能读取当前账号的待处理原件。"""
+
+        artifact = self.store.get_resume_artifact(artifact_id, account_id=account_id)
+        if artifact.candidate_id != candidate_id:
+            raise ValueError("OCR 任务中的简历不属于当前候选人。")
+        if artifact.artifact_type != "source" or artifact.status != "processing":
+            raise ValueError("只有待处理的原始简历可以创建 OCR 任务。")
+        if artifact.media_type != "application/pdf":
+            raise ValueError("OCR 任务只支持 PDF 简历。")
+        payload: dict[str, object] = {"artifact_id": artifact.id}
+        if root_request_id:
+            payload["root_request_id"] = str(root_request_id)
+        return self.enqueue_background_task(
+            account_id=account_id,
+            task_type=RESUME_OCR_TASK_TYPE,
+            payload=payload,
+            candidate_id=candidate_id,
+            session_id=session_id,
+            idempotency_key=idempotency_key,
+        )
+
+    def enqueue_github_project_analysis_task(
+        self,
+        *,
+        repository_url: str,
+        account_id: int,
+        candidate_id: int,
+        session_id: str | None = None,
+        root_request_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> BackgroundTaskRecord:
+        """登记公开 GitHub 仓库分析任务，不把仓库正文写入 Redis。
+
+        URL 会在 Web/Agent 投递前再次规范化；Worker 只从 PostgreSQL 读取这个
+        已验证的仓库首页地址，再通过固定 GitHub 官方端点下载受限归档。
+        """
+
+        self.store.get_candidate_profile(candidate_id, account_id=account_id)
+        reference = normalize_public_github_repository_url(repository_url)
+        payload: dict[str, object] = {"repository_url": reference.canonical_url}
+        if root_request_id:
+            payload["root_request_id"] = str(root_request_id)
+        if idempotency_key is None:
+            # GitHub 的 owner/repository 大小写不敏感；候选人 ID 纳入键后，同一账号下
+            # 不同档案仍可分别分析同一个仓库。
+            idempotency_key = (
+                f"github-project:{candidate_id}:{reference.owner.lower()}/{reference.repository.lower()}"
+            )
+        return self.enqueue_background_task(
+            account_id=account_id,
+            task_type=GITHUB_PROJECT_ANALYSIS_TASK_TYPE,
+            payload=payload,
+            candidate_id=candidate_id,
+            session_id=session_id,
+            idempotency_key=idempotency_key,
+        )
 
     def save_candidate_profile(self, profile: CandidateProfileInput, account_id: int | None = None) -> int:
         """保存候选人档案，返回候选人 ID。"""
@@ -298,9 +547,14 @@ class JobHuntingApp:
         return self.store.list_chat_messages(candidate_id, session_id, limit, account_id=account_id)
 
     def analyze_project(self, project_path: str | Path) -> ProjectExperienceCard:
-        """分析候选人提供的本地项目目录，返回待确认项目经历卡片。"""
+        """分析候选人提供的本地项目目录，供未来客户端使用。"""
 
         return analyze_project(project_path)
+
+    def analyze_github_project(self, repository_url: str) -> ProjectExperienceCard:
+        """分析用户主动提供的公开 GitHub 仓库，返回待确认项目经历卡片。"""
+
+        return analyze_public_github_repository(repository_url)
 
     def analyze_project_for_candidate(
         self,
@@ -318,6 +572,18 @@ class JobHuntingApp:
         card = analyze_project(project_path)
         return self.store.save_project_card(candidate_id, card, account_id=account_id)
 
+    def analyze_github_project_for_candidate(
+        self,
+        candidate_id: int,
+        repository_url: str,
+        account_id: int | None = None,
+    ) -> ProjectExperienceRecord:
+        """分析公开 GitHub 仓库并保存为待确认项目经历卡片。"""
+
+        self.store.get_candidate_profile(candidate_id, account_id=account_id)
+        card = analyze_public_github_repository(repository_url)
+        return self.store.save_project_card(candidate_id, card, account_id=account_id)
+
     def confirm_project_card(
         self,
         record_id: int,
@@ -327,6 +593,46 @@ class JobHuntingApp:
         """确认一张项目经历卡片，并保存候选人确认摘要。"""
 
         return self.store.confirm_project_card(record_id, confirmed_summary, account_id=account_id)
+
+    def confirm_project_card_and_enqueue_rag(
+        self,
+        record_id: int,
+        confirmed_summary: str | None = None,
+        *,
+        account_id: int,
+        session_id: str | None = None,
+        root_request_id: str | None = None,
+    ) -> tuple[ProjectExperienceRecord, BackgroundTaskRecord | None]:
+        """确认项目证据，并在启用 Worker 时登记对应的增量 RAG 任务。
+
+        项目卡片仍由候选人明确确认后才进入 ``long_texts``。RAG 只是该事实源的派生
+        索引；确定性幂等键保证重复点击确认不会重复调用 Embedding。
+        """
+
+        record = self.store.confirm_project_card(
+            record_id,
+            confirmed_summary,
+            account_id=account_id,
+        )
+        long_text = self.store.get_long_text_for_entity(
+            "project_experience_card",
+            record.id,
+            source_label="confirmed",
+            account_id=account_id,
+        )
+        if long_text is None:
+            raise RuntimeError("项目经历确认后没有登记可索引的长文本。")
+        if self.task_queue is None:
+            return record, None
+        task = self.enqueue_rag_index_task(
+            long_text_ids=[long_text.id],
+            account_id=account_id,
+            candidate_id=record.candidate_id,
+            session_id=session_id,
+            root_request_id=root_request_id,
+            idempotency_key=f"project-rag:{record.id}",
+        )
+        return record, task
 
     def list_project_cards(self, candidate_id: int, account_id: int | None = None) -> list[ProjectExperienceRecord]:
         """列出某个候选人的项目经历卡片。"""
@@ -436,21 +742,42 @@ class JobHuntingApp:
         filename: str,
         content: bytes,
         account_id: int | None = None,
+        defer_ocr: bool = False,
     ) -> ResumeArtifactRecord:
         """解析并保存候选人上传的原始 DOCX/PDF 简历。
 
         原文件不会被后续改写覆盖；提取正文登记为 `resume_artifact` 长文本，供调用方
-        继续执行 RAG 增量索引。结构化档案不会从上传简历中自动覆盖。
+        继续执行 RAG 增量索引。若 ``defer_ocr`` 为真，扫描 PDF 只完成文本层检查和
+        原件保存，随后由 Worker 写入 OCR 正文；结构化档案始终不会被上传简历自动覆盖。
         """
 
         self.store.get_candidate_profile(candidate_id, account_id=account_id)
         clean_filename = sanitize_download_filename(filename, fallback="resume")
-        extraction = extract_resume_document(clean_filename, content)
+        extension = supported_resume_extension(clean_filename)
+        pending_ocr = False
+        if defer_ocr and extension == PDF_EXTENSION:
+            inspection = inspect_pdf_for_ocr(content)
+            pending_ocr = bool(inspection.pages_needing_ocr)
+            if pending_ocr:
+                extraction_method = "pending_ocr"
+                extracted_text = ""
+                page_count = inspection.page_count
+            else:
+                extraction = extract_resume_document(clean_filename, content)
+                extraction_method = extraction.method
+                extracted_text = extraction.text
+                page_count = extraction.page_count
+        else:
+            extraction = extract_resume_document(clean_filename, content)
+            extraction_method = extraction.method
+            extracted_text = extraction.text
+            page_count = extraction.page_count
         stored = self.resume_files.save(
             account_id=account_id,
             candidate_id=candidate_id,
             filename=clean_filename,
             content=content,
+            media_type=media_type_for_filename(clean_filename),
         )
         try:
             return self.store.save_resume_artifact(
@@ -463,15 +790,60 @@ class JobHuntingApp:
                 media_type=media_type_for_filename(clean_filename),
                 file_size=stored.file_size,
                 sha256=stored.sha256,
-                extraction_method=extraction.method,
-                extracted_text=extraction.text,
-                page_count=extraction.page_count,
-                register_long_text=True,
+                extraction_method=extraction_method,
+                extracted_text=extracted_text,
+                page_count=page_count,
+                status="processing" if pending_ocr else "ready",
+                register_long_text=not pending_ocr,
             )
         except Exception:
             # 数据库保存失败时删除刚写入的文件，保持两个存储边界一致。
             self.resume_files.delete(stored.storage_key)
             raise
+
+    def process_resume_ocr_artifact(
+        self,
+        *,
+        artifact_id: int,
+        account_id: int,
+        candidate_id: int,
+    ) -> ResumeArtifactRecord:
+        """由 Worker 读取待处理 PDF、执行 OCR，并原子登记正文和 RAG 来源。"""
+
+        artifact = self.store.get_resume_artifact(artifact_id, account_id=account_id)
+        if artifact.candidate_id != candidate_id:
+            raise ValueError("OCR 任务中的简历不属于当前候选人。")
+        if artifact.artifact_type != "source" or artifact.media_type != "application/pdf":
+            raise ValueError("OCR 任务只能处理原始 PDF 简历。")
+        # OCR 任务重投时不重复读取或重建长文本，直接复用已经完成的事实记录。
+        if artifact.status == "ready" and artifact.long_text_id is not None:
+            return artifact
+        if artifact.status != "processing":
+            raise ValueError("这份简历当前不处于 OCR 待处理状态。")
+        extraction = extract_resume_document(
+            artifact.original_filename,
+            self.read_resume_file(artifact),
+        )
+        return self.store.complete_resume_artifact_extraction(
+            artifact.id,
+            extraction_method=extraction.method,
+            extracted_text=extraction.text,
+            page_count=extraction.page_count,
+            account_id=account_id,
+        )
+
+    def fail_resume_ocr_artifact(
+        self,
+        *,
+        artifact_id: int,
+        account_id: int,
+    ) -> ResumeArtifactRecord:
+        """在 OCR 重试耗尽后标记原件失败，保留用户可下载和删除的文件。"""
+
+        return self.store.fail_resume_artifact_extraction(
+            artifact_id,
+            account_id=account_id,
+        )
 
     def get_resume_artifact(
         self,
@@ -508,7 +880,30 @@ class JobHuntingApp:
     def resume_file_path(self, artifact: ResumeArtifactRecord) -> Path:
         """把受控存储键解析为文件路径，不接受数据库之外的任意路径。"""
 
-        return self.resume_files.path_for(artifact.storage_key)
+        path_for = getattr(self.resume_files, "path_for", None)
+        if not callable(path_for):
+            raise RuntimeError("当前对象存储不提供本地文件路径，请使用 read_resume_file。")
+        return path_for(artifact.storage_key)
+
+    def read_resume_file(self, artifact: ResumeArtifactRecord) -> bytes:
+        """按数据库中的对象键读取简历正文，统一兼容本地和 S3 存储。"""
+
+        try:
+            return self.resume_files.read(artifact.storage_key)
+        except ObjectNotFoundError as error:
+            raise KeyError(artifact.id) from error
+
+    def stream_resume_file(
+        self,
+        artifact: ResumeArtifactRecord,
+        chunk_size: int = 64 * 1024,
+    ) -> Iterator[bytes]:
+        """按对象存储分块读取简历，供 Web 鉴权代理避免一次性加载大文件。"""
+
+        try:
+            return self.resume_files.stream(artifact.storage_key, chunk_size)
+        except ObjectNotFoundError as error:
+            raise KeyError(artifact.id) from error
 
     def create_tailored_resume_from_artifact(
         self,
@@ -529,6 +924,8 @@ class JobHuntingApp:
         source = self.store.get_resume_artifact(source_artifact_id, account_id=account_id)
         if source.candidate_id != candidate_id or source.artifact_type != "source":
             raise ValueError("只能使用当前候选人的原始上传简历生成职位定制版本。")
+        if source.status != "ready":
+            raise ValueError("原始简历仍在 OCR 解析或解析失败，暂时不能生成定制版本。")
         source_text = self.store.get_resume_artifact_text(source.id, account_id=account_id)
         confirmed_project_cards = [
             record
@@ -584,6 +981,7 @@ class JobHuntingApp:
                     candidate_id=candidate_id,
                     filename=generated.filename,
                     content=generated.content,
+                    media_type=generated.media_type,
                 )
                 saved_files.append(stored)
                 saved_records.append(
@@ -637,6 +1035,9 @@ class JobHuntingApp:
         self,
         long_text_ids: list[int],
         account_id: int | None = None,
+        candidate_id: int | None = None,
+        session_id: str | None = None,
+        root_request_id: str | None = None,
     ) -> RAGIndexStats:
         """把指定长文本增量追加到当前 RAG 派生索引。
 
@@ -647,6 +1048,9 @@ class JobHuntingApp:
         call_context = self.model_gateway.new_call_context(
             "embedding_index",
             account_id=account_id,
+            candidate_id=candidate_id,
+            session_id=session_id,
+            root_request_id=root_request_id,
         )
         knowledge_base = self._rag_knowledge_base(
             embeddings=self.model_gateway.embeddings(call_context),

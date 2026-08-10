@@ -17,6 +17,7 @@ import os
 import uuid
 from dataclasses import asdict
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -41,20 +42,32 @@ from .config import (
     load_bootstrap_admin_settings,
     load_database_settings,
     load_embedding_settings,
+    load_object_storage_settings,
     load_rerank_settings,
+    load_task_queue_settings,
     load_cookie_secure,
     load_llm_settings,
     masked_agent_memory_settings,
     masked_embedding_settings,
     masked_llm_settings,
+    masked_object_storage_settings,
     masked_rerank_settings,
+    masked_task_queue_settings,
     require_postgresql_database_url,
 )
-from .models import AccountRecord, CandidateProfileInput, ResumeArtifactRecord, SkillRequirement
+from .github_project import GitHubRepositoryError
+from .models import (
+    AccountRecord,
+    BackgroundTaskRecord,
+    CandidateProfileInput,
+    ResumeArtifactRecord,
+    SkillRequirement,
+)
 from .job_parser import InvalidJobTextError
 from .llm import LLMClient, LLMRequestError
 from .rag import RAGProviderRequestError
 from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
+from .task_queue import BackgroundTaskQueue, TaskQueueError
 
 
 STATIC_DIR = Path(__file__).with_name("web_static")
@@ -193,12 +206,26 @@ class TailorResumePayload(BaseModel):
     use_rag: bool = True
 
 
+class GitHubProjectPayload(BaseModel):
+    """网页提交公开 GitHub 项目分析时需要的归属和仓库链接。"""
+
+    candidate_id: int
+    repository_url: str
+
+
+class ProjectCardConfirmationPayload(BaseModel):
+    """候选人确认项目卡片时可选提供的本人职责摘要。"""
+
+    confirmed_summary: str | None = None
+
+
 def create_web_app(
     env_file: str | Path = ".env",
     resume_dir: str | Path | None = None,
     chat_agent: JobHuntingAgent | None = None,
     resume_llm_client: LLMClient | None = None,
     database_url: str | None = None,
+    task_queue: BackgroundTaskQueue | None = None,
 ) -> FastAPI:
     """创建本地 FastAPI 应用。
 
@@ -214,6 +241,7 @@ def create_web_app(
         env_path=env_file,
         resume_dir=resume_dir,
         database_url=database_url,
+        task_queue=task_queue,
     )
     backend.initialize()
     env_path = Path(env_file)
@@ -387,6 +415,20 @@ def create_web_app(
             memory_config = masked_agent_memory_settings(load_agent_memory_settings(env_path))
         except ValueError as error:
             memory_config = {"configured": False, "error": str(error)}
+        try:
+            file_storage_config = masked_object_storage_settings(
+                load_object_storage_settings(env_path)
+            )
+            file_storage_config["configured"] = True
+        except ValueError as error:
+            file_storage_config = {"configured": False, "error": str(error)}
+        try:
+            task_queue_config = masked_task_queue_settings(
+                load_task_queue_settings(env_path)
+            )
+            task_queue_config["configured"] = bool(task_queue_config.get("enabled"))
+        except ValueError as error:
+            task_queue_config = {"configured": False, "error": str(error)}
         if account is None or account.role != "admin":
             return {
                 "status": "ok",
@@ -395,15 +437,19 @@ def create_web_app(
                 "embedding": {"configured": bool(embedding_config.get("configured"))},
                 "rerank": {"configured": bool(rerank_config.get("configured"))},
                 "memory": {"configured": bool(memory_config.get("enabled"))},
+                "task_queue": {"configured": bool(task_queue_config.get("configured"))},
             }
         return {
             "status": "ok",
             "storage_backend": "postgresql" if backend._uses_pgvector_rag() else "test_adapter",
+            "file_storage_backend": backend.file_storage_backend,
+            "file_storage": file_storage_config,
             "rag_backend": "pgvector",
             "llm": llm_config,
             "embedding": embedding_config,
             "rerank": rerank_config,
             "memory": memory_config,
+            "task_queue": task_queue_config,
             "agent": {
                 "configured": chat_agent is not None,
                 "error": agent_error,
@@ -791,16 +837,102 @@ def create_web_app(
             ],
         }
 
+    @web_app.get("/api/projects")
+    def list_project_cards(
+        request: Request,
+        candidate_id: int = Query(...),
+    ) -> dict[str, object]:
+        """列出当前候选人的项目经历卡片，供网页复核与确认。"""
+
+        account = current_account(request)
+        assert account is not None
+        get_profile_or_404(backend, candidate_id, account.id)
+        return {
+            "project_cards": [
+                asdict(record)
+                for record in backend.list_project_cards(candidate_id, account_id=account.id)
+            ]
+        }
+
+    @web_app.post("/api/projects/github")
+    def analyze_github_project(
+        payload: GitHubProjectPayload,
+        request: Request,
+    ) -> dict[str, object]:
+        """登记公开 GitHub 仓库分析，并优先交由后台 Worker 处理。"""
+
+        account = current_account(request)
+        assert account is not None
+        account_id = account.id
+        get_profile_or_404(backend, payload.candidate_id, account_id)
+        try:
+            if backend.task_queue_enabled:
+                task = backend.enqueue_github_project_analysis_task(
+                    repository_url=payload.repository_url,
+                    account_id=account_id,
+                    candidate_id=payload.candidate_id,
+                    session_id=f"github-project-candidate-{payload.candidate_id}",
+                    root_request_id=uuid.uuid4().hex,
+                )
+                return {
+                    "task": serialize_background_task(task),
+                    "project_card": None,
+                    "processing_async": True,
+                }
+            # 纯本地测试或显式关闭队列时保留同步兼容，正式 Docker Web 默认不会走这里。
+            project_card = backend.analyze_github_project_for_candidate(
+                payload.candidate_id,
+                payload.repository_url,
+                account_id=account_id,
+            )
+        except GitHubRepositoryError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except TaskQueueError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        return {
+            "task": None,
+            "project_card": asdict(project_card),
+            "processing_async": False,
+        }
+
+    @web_app.post("/api/projects/{record_id}/confirm")
+    def confirm_project_card(
+        record_id: int,
+        payload: ProjectCardConfirmationPayload,
+        request: Request,
+    ) -> dict[str, object]:
+        """确认当前账号的一张项目经历卡片，不回写候选人档案事实。"""
+
+        account = current_account(request)
+        assert account is not None
+        try:
+            record, rag_task = backend.confirm_project_card_and_enqueue_rag(
+                record_id,
+                payload.confirmed_summary.strip() if payload.confirmed_summary else None,
+                account_id=account.id,
+                session_id=f"project-confirmation-{record_id}",
+                root_request_id=uuid.uuid4().hex,
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="项目经历卡片不存在。") from error
+        except TaskQueueError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        return {
+            "project_card": asdict(record),
+            "task": serialize_background_task(rag_task) if rag_task is not None else None,
+        }
+
     @web_app.post("/api/resumes/upload")
     async def upload_resume(
         request: Request,
         candidate_id: int = Form(...),
         file: UploadFile = File(...),
     ) -> dict[str, object]:
-        """上传并解析 DOCX/PDF 简历，然后自动增量登记到当前账号的 RAG。"""
+        """上传简历，并按文件类型安排同步解析、OCR 或 RAG 增量索引。"""
 
         account = current_account(request)
-        account_id = account.id if account else None
+        assert account is not None
+        account_id = account.id
         get_profile_or_404(backend, candidate_id, account_id)
         filename = file.filename or "resume"
         # 多读一个字节即可判断超限，避免把任意大文件一次性长期保留在内存中。
@@ -811,27 +943,82 @@ def create_web_app(
                 filename,
                 content,
                 account_id=account_id,
+                # 队列模式仅把扫描 PDF 的 OCR 放到 Worker；DOCX/文字 PDF 仍立即校验并保存。
+                defer_ocr=backend.task_queue_enabled,
             )
         except ResumeDocumentError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
         rag_update = None
         rag_warning = None
-        if artifact.long_text_id is not None:
+        background_task = None
+        workflow = "ready"
+        if artifact.status == "processing":
+            workflow = "ocr"
+            idempotency_key = f"resume-ocr:{artifact.id}"
             try:
-                rag_update = asdict(
-                    backend.index_rag_long_texts(
-                        [artifact.long_text_id],
-                        account_id=account_id,
-                    )
+                background_task = backend.enqueue_resume_ocr_task(
+                    artifact_id=artifact.id,
+                    account_id=account_id,
+                    candidate_id=candidate_id,
+                    session_id=f"resume-upload-candidate-{candidate_id}",
+                    root_request_id=uuid.uuid4().hex,
+                    idempotency_key=idempotency_key,
                 )
-            except RAGProviderRequestError as error:
-                # 文件与 PostgreSQL 正文已经安全保存；索引失败单独告知，避免用户重复上传。
-                rag_warning = f"简历已保存，但 RAG 增量索引失败：{error}"
+            except TaskQueueError as error:
+                # 原件已保存但没有可用 Worker 时，不能继续显示“处理中”。
+                artifact = backend.fail_resume_ocr_artifact(
+                    artifact_id=artifact.id,
+                    account_id=account_id,
+                )
+                rag_warning = f"简历已保存，但 OCR 后台任务投递失败：{error}"
+                background_task = backend.store.get_background_task_by_idempotency(
+                    account_id,
+                    idempotency_key,
+                )
+        elif artifact.long_text_id is not None:
+            if backend.task_queue_enabled:
+                workflow = "rag"
+                # 任务只保存长文本资源引用；正文留在 PostgreSQL/对象存储，不进入 Redis。
+                idempotency_key = f"resume-rag:{artifact.id}"
+                try:
+                    background_task = backend.enqueue_rag_index_task(
+                        long_text_ids=[artifact.long_text_id],
+                        account_id=account_id,
+                        candidate_id=candidate_id,
+                        session_id=f"resume-upload-candidate-{candidate_id}",
+                        root_request_id=uuid.uuid4().hex,
+                        idempotency_key=idempotency_key,
+                    )
+                except TaskQueueError as error:
+                    # 原文件已经保存；把投递失败作为可见警告返回，避免用户误以为文件丢失。
+                    rag_warning = f"简历已保存，但 RAG 后台任务投递失败：{error}"
+                    background_task = backend.store.get_background_task_by_idempotency(
+                        account_id,
+                        idempotency_key,
+                    )
+            else:
+                try:
+                    rag_update = asdict(
+                        backend.index_rag_long_texts(
+                            [artifact.long_text_id],
+                            account_id=account_id,
+                            candidate_id=candidate_id,
+                            session_id=f"resume-upload-candidate-{candidate_id}",
+                            root_request_id=uuid.uuid4().hex,
+                        )
+                    )
+                except RAGProviderRequestError as error:
+                    # 文件与 PostgreSQL 正文已经安全保存；索引失败单独告知，避免用户重复上传。
+                    rag_warning = f"简历已保存，但 RAG 增量索引失败：{error}"
         return {
             "artifact": serialize_resume_artifact(artifact),
             "rag_update": rag_update,
             "warning": rag_warning,
+            "task": serialize_background_task(background_task) if background_task is not None else None,
+            "workflow": workflow,
+            "processing_async": bool(background_task is not None),
+            "indexing_async": workflow == "rag" and background_task is not None,
         }
 
     @web_app.get("/api/resumes")
@@ -872,8 +1059,19 @@ def create_web_app(
             "rag_warning": result.get("rag_warning"),
         }
 
+    @web_app.get("/api/tasks/{task_key}")
+    def get_task(task_key: str, request: Request) -> dict[str, object]:
+        """返回当前账号可见的后台任务状态，不回显任务输入正文。"""
+
+        account = current_account(request)
+        try:
+            task = backend.get_background_task(task_key, account_id=account.id if account else None)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="后台任务不存在。") from error
+        return {"task": serialize_background_task(task)}
+
     @web_app.get("/api/resumes/{artifact_id}/download")
-    def download_resume(artifact_id: int, request: Request) -> FileResponse:
+    def download_resume(artifact_id: int, request: Request) -> StreamingResponse:
         """鉴权后下载原始或职位定制简历文件。"""
 
         account = current_account(request)
@@ -885,13 +1083,23 @@ def create_web_app(
         except KeyError as error:
             # 不区分“ID 不存在”和“属于其他账号”，避免泄露资源是否存在。
             raise HTTPException(status_code=404, detail="简历文件不存在。") from error
-        path = backend.resume_file_path(artifact)
-        if not path.is_file():
-            raise HTTPException(status_code=404, detail="简历文件已丢失，请重新上传或生成。")
-        return FileResponse(
-            path,
+        try:
+            content = backend.stream_resume_file(artifact)
+        except KeyError as error:
+            raise HTTPException(
+                status_code=404,
+                detail="简历文件已丢失，请重新上传或生成。",
+            ) from error
+        # 所有文件都经当前账号鉴权后由 Web 代理返回，避免公开对象存储永久链接。
+        filename = quote(artifact.download_filename, safe="")
+        return StreamingResponse(
+            content,
             media_type=artifact.media_type,
-            filename=artifact.download_filename,
+            headers={
+                "Content-Disposition": (
+                    f"attachment; filename=resume; filename*=UTF-8''{filename}"
+                )
+            },
         )
 
     @web_app.post("/api/resumes/{artifact_id}/tailor")
@@ -1007,6 +1215,17 @@ def create_web_app(
             "summary": backend.store.summarize_usage(),
             "by_account": backend.store.summarize_usage_by_account(),
         }
+
+    @web_app.post("/api/admin/tasks/probe")
+    def admin_task_queue_probe(request: Request) -> dict[str, object]:
+        """管理员登记一个无业务数据的 Worker 探针，用于运维验证。"""
+
+        actor = require_admin(request)
+        try:
+            task = backend.enqueue_system_probe(actor.id)
+        except TaskQueueError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        return {"task": serialize_background_task(task)}
 
     @web_app.get("/api/admin/usage/events")
     def admin_usage_events(
@@ -1156,6 +1375,25 @@ def serialize_resume_artifact(artifact: ResumeArtifactRecord) -> dict[str, objec
     return payload
 
 
+def serialize_background_task(task: BackgroundTaskRecord) -> dict[str, object]:
+    """返回任务进度和摘要，不把 payload 或账号归属泄露给前端。"""
+
+    return {
+        "task_key": task.task_key,
+        "task_type": task.task_type,
+        "status": task.status,
+        "progress": task.progress,
+        "attempt": task.attempt,
+        "max_attempts": task.max_attempts,
+        "result": task.result,
+        "error_summary": task.error_summary,
+        "created_at": task.created_at,
+        "started_at": task.started_at,
+        "finished_at": task.finished_at,
+        "updated_at": task.updated_at,
+    }
+
+
 def default_web_session_id(candidate_id: int, account_id: int) -> str:
     """生成网页默认会话 ID。
 
@@ -1278,6 +1516,9 @@ def summarize_tool_outputs_for_display(tool_outputs: list[dict[str, object]]) ->
         matches = data.get("matches")
         if isinstance(matches, list) and matches:
             lines.append(f"匹配结果：共 {len(matches)} 个职位，已按推荐顺序返回。")
+        task = data.get("task")
+        if isinstance(task, dict) and task.get("task_type") == "github_project_analysis":
+            lines.append("GitHub 项目分析：任务已排队，完成后会生成待确认项目卡片。")
     return "\n".join(lines)
 
 
@@ -1322,7 +1563,7 @@ def create_reloadable_web_app() -> FastAPI:
         raise RuntimeError(str(error)) from error
     return create_web_app(
         env_file=env_file,
-        resume_dir=os.environ.get(WEB_RELOAD_RESUME_DIR_ENV, "data/resumes"),
+        resume_dir=os.environ.get(WEB_RELOAD_RESUME_DIR_ENV) or None,
         database_url=database_url,
     )
 
@@ -1331,7 +1572,10 @@ def configure_reload_runtime(args: argparse.Namespace) -> None:
     """把启动参数路径传给 Uvicorn 重载子进程，保持重启前后的数据位置一致。"""
 
     os.environ[WEB_RELOAD_ENV_FILE_ENV] = str(args.env_file)
-    os.environ[WEB_RELOAD_RESUME_DIR_ENV] = str(args.resume_dir)
+    if args.resume_dir:
+        os.environ[WEB_RELOAD_RESUME_DIR_ENV] = str(args.resume_dir)
+    else:
+        os.environ.pop(WEB_RELOAD_RESUME_DIR_ENV, None)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1339,7 +1583,11 @@ def main(argv: list[str] | None = None) -> None:
 
     parser = argparse.ArgumentParser(prog="job-agent-web")
     parser.add_argument("--env-file", default=".env")
-    parser.add_argument("--resume-dir", default="data/resumes")
+    parser.add_argument(
+        "--resume-dir",
+        default=None,
+        help="仅用于本地兼容测试的文件目录；Docker 默认使用对象存储。",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     # 只供本地开发覆盖配置使用；生产镜像应保持固定版本，不能自动加载宿主机源码。

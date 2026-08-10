@@ -1,444 +1,163 @@
 # 求职助手 Agent
 
-## 项目概述
+## 1. 项目概述
 
-求职助手 Agent 是一个面向 BOSS 直聘求职场景的本地求职辅助系统。它把候选人的结构化档案、项目证据、职位信息和求职对话组织到同一个工作区中，帮助候选人完成以下工作：
+求职助手 Agent 是一个面向 BOSS 直聘求职场景的网页应用。一个账号可以创建多个候选人档案，每个档案可以建立多个独立对话。系统通过 LangChain Agent 组合候选人资料、职位信息、项目证据、简历文件和对话记忆，为不同求职者提供通用的职位匹配与材料生成能力。
 
-- 保存学历、经验年限、技能、证书、首选城市、其他可接受城市、薪资要求和不可接受条件。
-- 读取候选人主动提供的本地项目目录，分析技术栈、功能线索和项目经历草稿。
-- 保存候选人主动复制的 BOSS 职位文本，解析职位名称、城市、薪资、学历、经验和技能要求。
-- 按硬性条件和普通偏好计算职位匹配结果，并解释淘汰原因、短板和风险。
-- 上传 DOCX、文字 PDF 或扫描 PDF 简历，扫描件通过本地 OCR 提取文字。
-- 根据目标职位生成证据约束的简历草稿和独立 DOCX/PDF 文件，不覆盖候选人档案或原文件。
-- 根据候选人主动带回的 HR 问题生成可编辑回复草稿。
-- 在对话中自动判断内容应保存到 PostgreSQL 结构化存储还是长文本 RAG 知识库。
+当前核心功能：
 
-系统的外部操作边界如下：
+- 保存学历、经验年限、技能、证书、目标城市、薪资和不可接受条件等结构化档案。
+- 审核并导入用户复制的 BOSS 职位文本，拒绝与招聘无关的内容。
+- 按学历、经验、技能和明确不可接受条件淘汰职位，再用普通偏好进行排序。
+- 分析用户主动提供的公开 GitHub 仓库，生成待确认项目经历卡片；确认后写入长文本事实源并自动创建 RAG 增量索引任务。
+- 上传 DOCX、文字版 PDF 或扫描版 PDF 简历，提取正文并保存文件版本；扫描件由后台 Worker 执行 OCR。
+- 根据目标职位生成职位定制简历草稿和 DOCX/PDF 文件，不覆盖候选人档案或原始简历。
+- 根据 HR 问题生成可编辑回复草稿，并保持候选人事实与模型推断的边界。
+- 持久化聊天记录，启动时恢复上下文；超出上下文预算时压缩旧消息。
+- 记录聊天、Embedding 和 Rerank 的 Token 用量，为后台统计和后续按量计费提供数据。
 
-- 不自动登录 BOSS 直聘。
-- 不自动爬取职位页面。
-- 不自动投递简历。
-- 不自动发送 HR 消息。
-- 不把未确认的项目职责、技能熟练度或成果数字当成已确认事实。
+系统当前采用用户主动提供数据的方式接入 BOSS 直聘，不自动登录、抓取隐藏接口、投递简历或发送消息。
 
-候选人需要自己在 BOSS 直聘中查看职位，然后复制可见职位文本或提供本地文件。Agent 只负责本地解析、检索、匹配和生成草稿。
+## 2. 技术栈
 
-## 技术栈
+| 分类 | 技术 | 作用 |
+| --- | --- | --- |
+| 前端 | Vue、HTML、CSS、JavaScript | 构建登录页、候选人工作台、流式聊天、职位与简历管理界面 |
+| 前端 | Server-Sent Events、Markdown 渲染 | 接收流式 Agent 回复并展示表格、列表和代码块 |
+| 后端 | Python、FastAPI、Uvicorn | 提供网页服务、认证、业务 API、文件上传下载和流式响应 |
+| 后端 | LangChain、LangGraph | 创建 Agent、注册工具、编排模型调用和管理会话状态 |
+| 后端 | Celery、Redis | 异步执行 OCR、RAG 索引和 GitHub 项目分析任务 |
+| 后端 | RapidOCR、PDFium、pdfplumber、python-docx、ReportLab | 识别、解析和生成 DOCX/PDF 简历文件 |
+| 数据库 | PostgreSQL、SQLAlchemy | 保存账号、候选人档案、职位、会话、任务、文件元数据和 Token 用量 |
+| 数据库 | pgvector | 保存 RAG 文本向量并执行账号隔离的语义检索 |
+| 数据库 | Alembic | 以版本化迁移管理数据库表、约束和索引 |
+| 存储 | MinIO、S3-compatible API | 保存上传的原始简历和生成的职位定制文件 |
+| 开发工具 | Docker、Docker Compose | 统一启动数据库、对象存储、消息队列、迁移、Web 和 Worker |
+| 开发工具 | pytest | 验证业务规则、API、数据库迁移、RAG、后台任务和前端回归行为 |
 
-- 开发语言：Python 3.12 及以上。
-- Web 服务：FastAPI、Uvicorn。
-- Agent 编排：LangChain 1.x、LangGraph。
-- 模型接入：内部 Model Gateway 统一调用 OpenAI-compatible Chat API，通过 `.env` 配置供应商标签、模型、密钥和地址。
-- Embedding：支持 OpenAI-compatible、provider-native 多模态协议；未配置时回退到本地 hash embedding。
-- Rerank：支持常见 `/rerank` 协议或 provider-native 协议，对向量召回候选再次排序；未配置时保持纯向量检索。
-- 结构化存储：PostgreSQL、SQLAlchemy、Alembic；本地测试也使用隔离的 PostgreSQL schema。
-- 语义检索：所有环境统一使用 PostgreSQL + pgvector 的 `rag_chunks`，文本切分使用 LangChain。
-- 简历文档：python-docx、pdfplumber、PDFium、RapidOCR、ONNX Runtime、ReportLab。
-- 前端：Vue 3 本地静态构建、SSE 流式聊天、Markdown 渲染。
-- 认证：Argon2id 密码哈希、HttpOnly Session Cookie。
-- 容器化：Docker、Docker Compose；默认启动 PostgreSQL + pgvector、Alembic 迁移和 Web 服务。
-- 测试：pytest。
+## 3. 项目架构
 
-## 项目架构
-
-系统采用“结构化事实源 + 语义检索索引 + Agent 工具调用”的架构。
+### 整体架构与模块关系
 
 ```text
-Vue 3 Web 前端
-          |
-          v
+浏览器中的 Vue 页面
+        |
+        | HTTP / SSE
+        v
 FastAPI Web API
-          |
-          v
-JobHuntingAgent
-  LangChain create_agent
-  LangGraph 会话状态
-          |
-          v
-内部 Model Gateway
-  模型配置、重试策略、call_id、Token 用量
-          |
-          v
-工具层
-  档案工具
-  项目分析工具
-  职位导入与匹配工具
-  简历上传、改写与导出工具
-  HR 回复草稿工具
-          |
-          +----------------------+
-          |                      |
-          v                      v
-PostgreSQL 事实源          pgvector RAG 索引        受控文件目录
-学历、经验、技能、证书     项目描述、成果材料、       原始 DOCX/PDF、
-偏好、职位字段、文件元数据  职位全文、简历片段         职位定制 DOCX/PDF
-          |
-          +--> long_texts 事实源 -> rag_chunks 派生向量索引
+        |
+        v
+JobHuntingApp 业务门面
+        |
+        +---------------- LangChain Agent ----------------+
+        |                    |                             |
+        |                    v                             v
+        |             Model Gateway                 Agent 工具集
+        |          聊天 / Embedding / Rerank     档案 / 职位 / 项目 / 简历
+        |                                                  |
+        +--------------------+-----------------------------+
+                             |
+             +---------------+----------------+
+             |               |                |
+             v               v                v
+        PostgreSQL       MinIO 对象存储    Redis 消息队列
+        结构化事实源      简历二进制文件        |
+        long_texts                              v
+        rag_chunks                         Celery Worker
+        background_tasks                  OCR / RAG / GitHub 分析
 ```
 
-### 数据流
+`PostgreSQL` 是系统的权威事实源。`long_texts` 保存可追溯的长文本原文，`rag_chunks` 是通过 pgvector 建立的可重建派生索引。Redis 只传递 `task_key`，后台任务的状态、参数和结果摘要仍保存在 PostgreSQL；简历正文和仓库源码不会写入 Redis。
 
-1. 用户登录后选择候选人档案和求职会话。
-2. 用户输入资料、职位文本、项目目录、简历文件或 HR 问题。
-3. LangChain Agent 判断需要调用的工具。
-4. 工具把可精确比较的字段写入 PostgreSQL，把长文本登记到 `long_texts` 并切分、嵌入到 `rag_chunks`。
-5. 查询先在 PostgreSQL 中按账号过滤并用 pgvector 召回证据候选；启用 Rerank 后，再按“查询 + 候选正文”重排并选出最终证据。
-6. 匹配、简历改写和回复草稿同时读取 PostgreSQL 事实、上传简历正文与 RAG 证据。
-7. 模型输出经过事实边界检查；不安全时回退到规则版草稿。
-8. Agent、Embedding 和 Rerank 的供应商 Token usage 按账号写入 `usage_events`，供后台统计和后续计费。
+### 主要数据流
 
-### 存储边界
+1. 用户登录后选择候选人档案和对话会话。
+2. FastAPI 接收聊天、职位文本、GitHub 链接或简历文件，并校验账号与候选人归属。
+3. LangChain Agent 根据用户意图调用档案、职位、项目、RAG、简历或 HR 回复工具。
+4. 可精确比较的字段写入 PostgreSQL；项目描述、职位全文和简历正文登记到 `long_texts`。
+5. 耗时操作先创建 `background_tasks` 记录，再由 Redis/Celery Worker 认领；重复消息只有一个 Worker 可以执行。
+6. RAG Worker 切分长文本、调用 Embedding，并将向量写入 `rag_chunks`；检索时先按账号和候选人过滤。
+7. Agent 结合结构化事实、职位要求和 RAG 证据生成匹配解释、简历草稿或 HR 回复。
+8. 前端通过 SSE 接收聊天输出，通过任务 API 轮询 OCR、GitHub 分析和 RAG 索引状态。
 
-PostgreSQL 是结构化事实源，适合精确过滤和比较：
-
-- 学历。
-- 工作和项目经验年限。
-- 技能与熟练度。
-- 证书和资格。
-- 城市、薪资、工作形式和不可接受条件。
-- 职位标准化字段。
-- 账号、Session、候选人档案、对话和 Token 用量。
-- 简历文件版本、文件哈希、解析方式、源文件与定制文件关系。
-
-`rag_chunks` 是 PostgreSQL 中由 pgvector 支撑的派生语义检索索引，适合长文本召回：
-
-- 项目描述和成果材料。
-- 本地项目分析摘要。
-- 职位职责和任职要求全文。
-- 简历片段和自我介绍。
-- 上传简历中提取的正文。
-- HR 对话上下文。
-
-向量索引不是唯一事实源。结构化字段和候选人确认状态始终以 PostgreSQL 为准；`rag_chunks` 是可重建的派生索引。
-
-## 目录结构
+## 4. 目录结构
 
 ```text
 Job-hunting Agent/
-├─ src/
-│  └─ job_hunting_agent/
-│     ├─ agent.py                 # 标准 LangChain Agent 与工具注册
-│     ├─ app.py                   # 业务应用门面
-│     ├─ auth.py                  # 注册、登录和 Session
-│     ├─ city_catalog.py          # 全国城市规范化和可替换的邻近城市目录
-│     ├─ config.py                # .env 和运行配置
-│     ├─ database_migrations.py   # Alembic 升级、回退和版本检查入口
-│     ├─ database_schema.py       # PostgreSQL/pgvector 目标 schema
-│     ├─ conversation_ingestion.py# 对话内容分类与自动入库
-│     ├─ conversation_memory.py   # 持久化记忆和上下文压缩
-│     ├─ job_parser.py            # BOSS 职位文本解析与校验
-│     ├─ llm.py                   # LangChain ChatModel 适配
-│     ├─ matcher.py               # 职位匹配、淘汰和排序规则
-│     ├─ model_gateway.py         # 统一模型调用、用量和调用 ID
-│     ├─ models.py                # 数据模型和领域对象
-│     ├─ project_analyzer.py      # 本地项目最小必要读取与分析
-│     ├─ rag.py                   # Embedding、文本切分、Rerank 与索引元数据工具
-│     ├─ pgvector_rag.py           # PostgreSQL pgvector RAG 索引与检索
-│     ├─ resume_document.py       # DOCX/PDF 解析、扫描 PDF OCR 和受控文件存储
-│     ├─ resume_exporter.py       # 职位定制 DOCX/PDF 导出
-│     ├─ resume_writer.py         # 证据约束的简历草稿
-│     ├─ storage.py               # PostgreSQL 领域持久化逻辑
-│     ├─ sqlalchemy_store.py      # SQLAlchemy/PostgreSQL 生产仓储适配层
-│     ├─ web.py                   # FastAPI API 和 SSE
-│     └─ web_static/
-│        ├─ index.html            # Vue 3 页面结构
-│        ├─ app.js                # 前端状态、请求和流式聊天
-│        ├─ china_cities.js       # 中国省份和城市二级选择数据
-│        ├─ styles.css            # 页面样式
-│        ├─ tokens.css            # 前端设计 Token
-│        └─ vendor/vue.global.prod.js
-├─ tests/                         # 单元测试和 Web/API 回归测试
-├─ alembic/                       # 冻结的数据库版本迁移脚本
-├─ alembic.ini                    # Alembic 运行配置
+├─ src/job_hunting_agent/
+│  ├─ web.py                     # FastAPI、认证、业务 API 与 SSE 入口
+│  ├─ agent.py                   # LangChain Agent、提示词与工具注册
+│  ├─ app.py                     # 应用服务门面和模块编排
+│  ├─ storage.py                 # PostgreSQL 领域读写逻辑
+│  ├─ sqlalchemy_store.py        # SQLAlchemy 连接与事务适配
+│  ├─ database_schema.py         # PostgreSQL/pgvector 表结构定义
+│  ├─ models.py                  # 领域模型和 API 数据对象
+│  ├─ model_gateway.py           # 模型调用、重试、调用 ID 和 Token 用量
+│  ├─ pgvector_rag.py            # pgvector 索引与语义检索
+│  ├─ background_tasks.py        # Celery 任务状态机和执行器
+│  ├─ worker.py                  # Celery Worker 入口
+│  ├─ github_project.py          # GitHub URL 校验、归档读取与安全筛选
+│  ├─ resume_document.py         # DOCX/PDF 解析与 OCR
+│  ├─ resume_writer.py           # 职位定制简历内容生成
+│  ├─ resume_exporter.py         # DOCX/PDF 简历导出
+│  └─ web_static/                # Vue 页面、样式、城市数据和前端脚本
+├─ alembic/
+│  └─ versions/                  # 数据库版本迁移脚本
+├─ tests/                        # Python 测试与前端回归脚本
 ├─ docs/
-│  ├─ adr/                        # 架构决策记录
-│  ├─ learning/                   # 面向初学者的技术栈与操作说明
-│  ├─ research/                   # BOSS 接入和职位标准化研究
-│  └─ enterprise-readiness-decision-map.md # 企业级演进顺序与验收门槛
-├─ CONTEXT.md                     # 领域术语和边界
-├─ DECISION_MAP.md                # 项目决策地图
-├─ pyproject.toml                 # 依赖和命令入口
-├─ Dockerfile                    # Python Web 运行镜像构建步骤
-├─ compose.yaml                  # Docker Compose 本地开发服务
-├─ compose.dev.yaml              # 本机源码热更新开发覆盖配置
-├─ .dockerignore                 # Docker 构建上下文排除规则
-├─ .env.example                   # 模型配置模板
-└─ .gitignore                     # 密钥、数据库、缓存和运行数据忽略规则
+│  ├─ adr/                       # 架构决策记录
+│  ├─ learning/                  # 技术栈学习与操作说明
+│  └─ research/                  # BOSS 接入与职位标准化研究
+├─ compose.yaml                  # 完整本地容器拓扑
+├─ compose.dev.yaml              # 源码挂载和热更新覆盖配置
+├─ Dockerfile                    # Web/Worker 镜像构建
+├─ alembic.ini                   # Alembic 配置
+├─ pyproject.toml                # Python 依赖、包配置和命令入口
+├─ .env.example                  # 环境变量模板，不包含真实密钥
+├─ CONTEXT.md                    # 产品边界与领域上下文
+└─ DECISION_MAP.md               # 已确认决策和后续问题队列
 ```
 
-`data/` 不提交到代码仓库。生产 Web 数据和向量索引在 Docker named volume `postgres_data` 中；
-`data/` 只保留上传简历和导出文件；结构化数据和向量索引都保存在 PostgreSQL Docker volume 中。
+运行数据不提交到 Git。PostgreSQL、MinIO 和 Redis 数据分别保存在 Docker named volume 中；`.env`、缓存、构建产物和本地运行文件由忽略规则排除。
 
-## 核心文件说明
+## 5. 核心文件说明
 
 ### 项目入口和配置
 
-- `pyproject.toml`：声明 Python 版本、LangChain/FastAPI/SQLAlchemy/Alembic/pgvector 依赖，以及 Web 服务入口。
-- `compose.yaml`：按 `postgres -> migrate -> web` 顺序启动 PostgreSQL、Alembic 和 Web；源码通过构建写入镜像。
-- `compose.dev.yaml`：仅在本机开发时叠加源码挂载和 Uvicorn 重载，不应直接用于部署环境。
-- `.env.example`：展示模型、Embedding、记忆和 Cookie 配置项；真实 `.env` 不提交。
-- `src/job_hunting_agent/config.py`：读取并校验环境变量，避免 API Key 写死在代码中。
-- `src/job_hunting_agent/database_schema.py`、`database_migrations.py`：定义生产目标表和可追踪的 Alembic 迁移入口。
-- `src/job_hunting_agent/sqlalchemy_store.py`：将既有业务仓储接口接到 SQLAlchemy/PostgreSQL，并阻止 Web 在启动时自行建表。
-- `src/job_hunting_agent/web.py`：提供认证、候选人档案、会话、职位、匹配、简历上传/下载、管理员和 SSE 聊天 API。
-
-### 业务核心
-
-- `agent.py`：创建标准 LangChain Agent，注册档案、项目、职位、简历文件和 HR 回复工具。
-- `app.py`：组合存储、匹配、RAG、简历和对话服务，作为业务层门面。
-- `models.py`：定义候选人档案、职位、匹配结果、简历草稿、对话和 Token 用量模型。
-- `matcher.py`：执行学历硬门槛、经验差距淘汰、不可接受条件淘汰、技能匹配和普通偏好排序。
-- `job_parser.py`：审核职位文本是否确实包含职位信息，并提取标准化字段。
-- `project_analyzer.py`：只读取候选人指定项目中的必要文件，跳过密钥、缓存、依赖目录、构建产物和大型数据。
-- `resume_document.py`：校验并解析 DOCX、文字 PDF 和扫描 PDF；文件只能写入受控目录。
-- `resume_exporter.py`：把通过真实性检查的职位定制草稿导出为 DOCX 和 PDF。
-- `resume_writer.py`：根据目标职位和上传简历生成证据约束草稿，保持候选人档案不被覆盖。
-
-### 数据、记忆和模型
-
-- `storage.py`：保存 PostgreSQL 领域读写逻辑；`sqlalchemy_store.py` 提供 SQLAlchemy 连接和事务边界。
-- `rag.py`：负责文本切分、Embedding 身份、可选 Rerank 和来源元数据；`pgvector_rag.py` 负责 PostgreSQL 索引。
-- `pgvector_rag.py`：在 PostgreSQL 中执行账号过滤、稳定 chunk upsert、余弦检索和模型/维度隔离。
-- `conversation_ingestion.py`：判断当前对话内容应保存为结构化事实、长文本材料、项目确认项或普通聊天。
-- `conversation_memory.py`：从持久化会话恢复上下文，超过阈值时压缩旧消息并保留最近上下文。
-- `model_gateway.py`：为聊天、Embedding 和 Rerank 调用统一创建配置、有限重试、`call_id` 和不含正文的 Token 用量流水。
-- `llm.py`：封装 LangChain ChatModel 与 OpenAI-compatible 接口细节。
-- `auth.py`：实现 Argon2id 密码哈希、Session 滑动过期、最长有效期和退出所有设备。
-
-### 前端和测试
-
-- `web_static/index.html`：登录页、候选人工作台、职位面板和管理员后台的 Vue 模板。
-- `web_static/app.js`：前端状态管理、SSE 消费、Markdown 渲染、档案、职位和简历文件操作。
-- `web_static/styles.css`、`web_static/tokens.css`：布局、响应式规则和设计 Token。
-- `tests/`：验证 Agent 工具链、认证、RAG、Embedding、简历解析/OCR/导出、项目分析和 Web 行为。
-
-## 快速开始
-
-### 1. 安装依赖
-
-在项目根目录执行：
-
-```powershell
-python -m pip install -e .
-```
-
-### 2. 配置模型
-
-复制 `.env.example` 为 `.env`，填写真实模型配置：
-
-```dotenv
-JOB_AGENT_LLM_PROVIDER=your-chat-provider
-JOB_AGENT_LLM_MODEL=your-chat-model
-JOB_AGENT_LLM_API_KEY=your-api-key
-JOB_AGENT_LLM_BASE_URL=https://api.example.com/v1
-JOB_AGENT_ENVIRONMENT=development
-JOB_AGENT_MODEL_GATEWAY_CHAT_MAX_RETRIES=2
-JOB_AGENT_MODEL_GATEWAY_EMBEDDING_MAX_RETRIES=2
-JOB_AGENT_MODEL_GATEWAY_RERANK_MAX_RETRIES=2
-JOB_AGENT_MATCHING_SEMANTIC=false
-
-JOB_AGENT_EMBEDDING_PROVIDER=local_hash
-JOB_AGENT_EMBEDDING_MODEL=local-hash
-
-JOB_AGENT_MEMORY_ENABLED=true
-JOB_AGENT_COOKIE_SECURE=false
-
-# 运行 Web 或最小迁移命令时必填；Docker Compose 会自动使用容器内地址覆盖它。
-JOB_AGENT_DATABASE_URL=postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent
-```
-
-聊天模型、Embedding 模型和 Rerank 模型可以来自不同供应商。需要真实语义 Embedding 时，按
-`.env.example` 中的通用协议配置替换本地模式；部署到 HTTPS 后，把 `JOB_AGENT_COOKIE_SECURE` 改为 `true`。
-
-Embedding 支持以下协议样式：
-
-| `JOB_AGENT_EMBEDDING_API_STYLE` | 请求/响应约定 |
-| --- | --- |
-| `openai_compatible` | `POST {base_url}/embeddings`，读取 `data[].embedding` |
-| `native_multimodal` | 发送 `input.contents`，读取 `output.embeddings` |
-| `local_hash` | 本地离线 fallback，不访问网络 |
-
-Rerank 支持以下协议样式：
-
-| `JOB_AGENT_RERANK_API_STYLE` | 请求/响应约定 |
-| --- | --- |
-| `standard` | `POST {base_url}/rerank`，发送 `query/documents`，读取 `results[]` |
-| `native` | 发送 `input.query/documents` 与 `parameters`，读取 `output.results` |
-
-Rerank 没有跨供应商统一标准。若目标服务使用不同字段或响应结构，应在 `rag.py` 中新增独立协议适配器，
-而不是把供应商名称写进业务层。
-
-网页会在管理员健康检查中显示脱敏后的模型、Embedding、Rerank 和存储状态；日常使用不需要
-运行任何交互式终端命令。运行时只接受 PostgreSQL URL，不会创建本地文件数据库或独立向量目录。
-
-更换 Embedding 模型、端点或维度时，pgvector 会以不含密钥的模型身份和维度隔离旧向量，避免
-混用不同语义空间。已有材料需要重新索引才会被新模型召回；这类高成本操作将随后台异步任务
-一起提供，不能在有正式数据的环境中临时切换模型。Rerank 不参与建库，因此只更换 Rerank
-模型时不需要重建 RAG 索引。
-
-职位匹配的方向维度可以选择启用 Embedding/Rerank 语义评分：将
-`JOB_AGENT_MATCHING_SEMANTIC` 设为 `true` 后，职位标题占 30%，职位描述正文占 70%，
-多个目标方向取最高分。未启用、模型配置不完整或上游调用失败时，系统回退到同一比例的
-关键词评分，并在匹配风险中标记回退原因；不会因为语义服务故障阻断职位匹配。
-
-### 3. 使用 Docker Compose 启动网页
-
-日常使用只需要 Docker Compose 和浏览器。第一次使用时，确保项目根目录存在真实 `.env`；
-`.env` 只会以只读文件挂载到容器，不会打进镜像。
-
-若需要创建第一个管理员，在第一次启动前在真实 `.env` 中同时配置这两项：
-
-```dotenv
-JOB_AGENT_BOOTSTRAP_ADMIN_EMAIL=admin@example.com
-JOB_AGENT_BOOTSTRAP_ADMIN_PASSWORD=请设置一个高强度密码
-```
-
-Web 仅在数据库尚无管理员账号时读取该配置并写入 Argon2id 密码哈希；首次登录成功后，
-应从 `.env` 删除 `JOB_AGENT_BOOTSTRAP_ADMIN_PASSWORD`。普通用户始终只能通过网页注册为普通账号。
-
-```powershell
-docker compose up -d
-docker compose ps
-```
-
-浏览器仍然访问 `http://127.0.0.1:8000`。查看日志、停止和删除容器：
-
-```powershell
-docker compose logs -f migrate
-docker compose logs -f web
-docker compose stop
-docker compose down
-```
-
-Compose 会依次启动 `postgres`、执行一次 `migrate`、再启动 `web`。`migrate` 显示
-`Exited (0)` 表示迁移已完成，不是故障。`postgres_data` 是 Docker named volume，`down` 不会删除
-数据库；`data/` 是宿主机绑定目录，保存上传简历和导出文件；生产 RAG 向量保存在 PostgreSQL。完整的 Docker 技术栈解释、首次启动步骤和后续扩展顺序见
-[Docker 本地开发环境学习说明](./docs/learning/docker-environment.md)。
-
-本地开发使用 `POSTGRES_HOST_AUTH_METHOD=trust`，并且端口只绑定 `127.0.0.1`；它只适合这台
-开发机。生产部署必须改为密码/Secret 管理、受限网络和 TLS。当前 Web 已将 RAG 读写切换到
-PostgreSQL + pgvector；网页和自动化测试统一走同一套数据库后端。
-
-### 4. 本机开发时启用源码热更新
-
-日常修改 `src/` 下的 Python、前端 JS 或 CSS 时，使用开发覆盖配置启动：
-
-```powershell
-docker compose -f compose.yaml -f compose.dev.yaml up -d --build
-```
-
-首次构建完成后，后续保存 Python 文件会自动重启 Web 服务；修改前端静态文件后刷新浏览器即可，无需重新构建镜像。
-修改 `.env` 后仍需执行下面的重启命令：
-
-```powershell
-docker compose -f compose.yaml -f compose.dev.yaml restart web
-```
-
-`compose.dev.yaml` 只用于本机开发。需要模拟稳定部署或后续上线时，继续使用默认的 `compose.yaml`。
-
-## 常用功能
-
-### 候选人档案
-
-一个账号可以创建多个候选人档案，每个档案可以创建多个独立求职会话。账号是共享访问和统一 Token 计费主体，档案用于区分不同人的求职事实和上下文。
-
-### 项目分析
-
-可以把本地项目目录提供给 Agent。系统会优先读取 README、文档、依赖配置、源码入口、测试和部署配置，跳过以下内容：
-
-- `.env`、密钥、账号配置和证书。
-- 数据库文件、大型数据集和二进制产物。
-- `node_modules`、虚拟环境、缓存和构建目录。
-- 日志、临时文件和版本控制目录。
-
-项目分析只生成待确认项目经历卡片。候选人确认前，技术栈、职责和成果不能作为已确认简历事实。
-
-### 职位导入和匹配
-
-把 BOSS 职位详情页中可见的文本复制到职位导入框。系统会先审核文本是否为职位信息，再进行保存和匹配。
-
-匹配规则包括：
-
-- 学历按硬性条件处理，候选人学历不能低于职位要求。
-- 实际经验与职位要求相差超过 3 年时直接淘汰。
-- 候选人明确不可接受的条件直接淘汰。
-- 普通偏好只影响分数和排序。
-- 新建档案可以连续添加多个首选城市；对话中明确表示“也可以”的城市单独保存为其他可接受城市。
-- “邻近城市也可以”只使用本地已确认的常见城市关系；无法可靠解析时不会把整省城市当作邻近城市。
-- 技能熟练度只按候选人真实等级生成简历措辞，不自动夸大。
-
-### 简历和 HR 回复
-
-选择候选人档案后，在左侧“简历文件”区域上传 `.docx` 或 `.pdf`：
-
-- DOCX 和文字 PDF 直接提取正文。
-- 没有文本层的扫描 PDF 使用本地 RapidOCR 识别。
-- 原文件、解析元数据和正文来源按账号与候选人保存；正文会增量登记到 RAG。
-- 为原始简历选择已导入职位并点击“生成定制版”，系统会保存独立草稿，并生成可下载的 DOCX/PDF。
-- 每次生成都是新版本，原始简历和候选人结构化档案不会被覆盖。
-- 模型加入无证据技能、成果数字或擅自拔高熟练度时，改写会被丢弃并使用保守回退内容。
-
-HR 回复只生成可编辑草稿，发送动作由候选人自行完成。
-
-企业级 PostgreSQL、pgvector、Alembic、对象存储和容器化的实施顺序见
-[企业级演进决策地图](./docs/enterprise-readiness-decision-map.md)。
-
-## 准确性要求
-
-1. 修改代码前必须阅读相关源码、现有测试和配置，不能只根据文件名猜测行为。
-2. 修改 README 前必须检查当前目录结构、入口命令和实际 API，避免记录已经删除或不存在的内容。
-3. 关键行为必须通过测试、静态检查或实际 HTTP 请求验证，不能只依赖“代码看起来正确”。
-4. 代码、命令、文件名和环境变量发生变化时，必须同步检查 README、架构文档和测试中的旧引用。
-5. 候选人技能、职责、成果数字和证书必须有来源；系统不能为了让简历更漂亮而补造事实。
-6. 职位字段缺失或解析不确定时必须标记不确定，不能把猜测写成硬性条件。
-
-## 内容要求
-
-1. 使用普通 Markdown，不使用影响复制和检索的装饰性符号。
-2. 内容准确、简洁，优先说明结论、边界和可执行命令。
-3. 面向不同熟悉程度的读者，首次出现的技术术语要结合项目语境解释。
-4. 命令必须使用代码块，路径和环境变量使用行内代码。
-5. 说明“做什么、为什么这样做、在哪里修改”，避免只罗列文件名。
-6. 不把测试数据、临时日志、截图和本机路径当成正式运行依赖。
-7. 不在文档中写入 API Key、密码、Session、个人简历或职位隐私内容。
-8. 对 BOSS 直聘的接入边界、候选人确认和人工发送动作必须明确说明。
-9. 对 PostgreSQL 事实源、RAG 派生索引和职位定制简历版本之间的关系必须保持一致。
-
-## 结构要求
-
-1. 文档按“项目概述 → 技术栈 → 项目架构 → 目录结构 → 核心文件 → 使用方法 → 准确性与内容约束”的顺序组织。
-2. 每个主要模块只在一个位置解释，避免同一规则在多个段落出现不同版本。
-3. 目录结构只展示源码、测试、文档和配置；运行时生成的 `data/` 内容不作为固定目录清单。
-4. 所有相对链接都必须指向当前仍存在的文件。
-5. 文档示例应能在全新工作区中按顺序执行，生成的数据和索引放入已忽略的 `data/` 目录。
-6. 每次新增功能后，先更新对应核心文件说明，再更新快速开始或常用功能。
-
-## 测试和检查
-
-运行完整测试：
-
-```powershell
-python -m pytest -q
-```
-
-检查 Python 语法：
-
-```powershell
-python -m compileall src tests
-```
-
-运行前端快捷键和 SSE 流式超时回归检查（需要 Node.js）：
-
-```powershell
-node tests/frontend_shortcut_regression.mjs
-node tests/frontend_stream_timeout_regression.mjs
-```
-
-检查 Git 差异中的空白错误：
-
-```powershell
-git diff --check
-```
-
-当前测试不依赖仓库中的数据库或向量索引。测试会使用临时目录，因此可以在清空
-`data/` 后重新运行。
+- `src/job_hunting_agent/web.py`：网页主入口，提供注册登录、候选人档案、会话、职位、匹配、项目、简历、RAG、后台任务和管理员 API。
+- `src/job_hunting_agent/worker.py`：独立 Worker 入口，注册 Celery 任务并消费 Redis 队列。
+- `src/job_hunting_agent/config.py`：读取 `.env`，校验数据库、对象存储、队列、模型、Embedding、Rerank、记忆和 Session 配置。
+- `compose.yaml`：启动 PostgreSQL、MinIO、Redis、Alembic 迁移、Web 和 Worker。首次运行前需要将 `.env.example` 复制为 `.env`，替换占位凭据和模型配置，然后执行 `docker compose up -d --build`。
+- `compose.dev.yaml`：本地开发覆盖配置，挂载源码并开启 Web 热更新。
+- `pyproject.toml`：声明依赖、包数据以及 `job-agent-web`、`job-agent-worker` 命令入口。
+
+### 核心业务实现
+
+- `src/job_hunting_agent/app.py`：连接存储、Agent、RAG、项目分析、职位匹配、简历处理和后台任务，是 Web 与工具层共用的业务门面。
+- `src/job_hunting_agent/agent.py`：使用 LangChain 创建 Agent，定义系统提示词并注册候选人资料、职位、GitHub 项目、简历和 HR 回复工具。
+- `src/job_hunting_agent/matcher.py`：实现学历硬门槛、经验差距淘汰、不可接受条件淘汰、技能评分和普通偏好排序。
+- `src/job_hunting_agent/job_parser.py`：判断输入是否为有效招聘信息，并解析职位名称、城市、薪资、学历、经验和技能要求。
+- `src/job_hunting_agent/conversation_ingestion.py`：判断对话内容应写入结构化档案、长文本知识来源或仅保留为聊天消息。
+- `src/job_hunting_agent/conversation_memory.py`：恢复持久化对话，计算上下文预算并压缩较早消息。
+- `src/job_hunting_agent/project_analyzer.py`、`github_project.py`：从受控项目文本提取技术栈和功能线索；GitHub 模块只访问公开仓库官方端点，不执行仓库代码。
+- `src/job_hunting_agent/resume_writer.py`、`resume_exporter.py`：生成证据约束的职位定制草稿，并导出独立 DOCX/PDF 文件。
+
+### 数据模型和 API
+
+- `src/job_hunting_agent/models.py`：定义账号、候选人、职位、项目卡片、简历、聊天、RAG、任务和 Token 用量等领域对象。
+- `src/job_hunting_agent/database_schema.py`：定义目标 PostgreSQL 表、外键、唯一约束、状态检查和 pgvector 字段。
+- `src/job_hunting_agent/storage.py`：实现账号隔离的领域查询、写入和后台任务原子认领。
+- `src/job_hunting_agent/sqlalchemy_store.py`：将仓储接口连接到 SQLAlchemy Engine，并统一 PostgreSQL 参数与事务行为。
+- `alembic/versions/`：保存可审计的数据库升级脚本；Web 启动时只校验版本，不自行建表。
+- `src/job_hunting_agent/web.py`：将核心业务暴露为 JSON API、文件下载响应和 SSE 流式聊天接口。
+
+### 关键组件和服务模块
+
+- `src/job_hunting_agent/model_gateway.py`、`llm.py`：统一聊天、Embedding、Rerank 的供应商配置、有限重试、调用 ID 和 Token usage 记录。
+- `src/job_hunting_agent/rag.py`、`pgvector_rag.py`：负责文本切分、Embedding 协议、可选 Rerank、向量写入和来源可追溯检索。
+- `src/job_hunting_agent/object_storage.py`：通过 S3-compatible 接口读写 MinIO，数据库只保存对象键、哈希、版本和归属。
+- `src/job_hunting_agent/task_queue.py`：封装 Celery 投递，队列消息只包含安全的 `task_key`。
+- `src/job_hunting_agent/background_tasks.py`：原子认领任务并处理进度、重试、失败恢复、OCR、RAG 和 GitHub 分析。
+- `src/job_hunting_agent/resume_document.py`：校验文件类型和大小，解析 DOCX、文字 PDF，并为扫描 PDF 提供 OCR 流程。
+- `src/job_hunting_agent/web_static/index.html`、`app.js`、`styles.css`：实现登录、工作台、Markdown、SSE、任务轮询和响应式界面。
+- `tests/`：覆盖数据库迁移、认证隔离、职位匹配、Agent、RAG、对象存储、后台任务、简历和网页回归行为。

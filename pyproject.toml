@@ -6,6 +6,8 @@ description = "A local, read-only job hunting assistant MVP."
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.14.0",
+    "boto3>=1.35.0",
+    "celery[redis]>=5.4.0",
     "fastapi>=0.124.4",
     "langchain>=1.2.12",
     "langchain-core>=1.2.18",
@@ -29,6 +31,8 @@ dependencies = [
 [project.scripts]
 # 安装成包以后，容器和本地开发都通过这个入口启动网页服务。
 job-agent-web = "job_hunting_agent.web:main"
+# Worker 使用独立进程消费 Redis/Celery 任务，不阻塞 FastAPI 请求。
+job-agent-worker = "job_hunting_agent.worker:main"
 
 [tool.setuptools.package-data]
 # Web 前端静态资源需要随 Python 包一起安装。

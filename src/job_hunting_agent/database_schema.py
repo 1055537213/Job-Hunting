@@ -401,6 +401,56 @@ sa.Index("idx_usage_events_session", usage_events.c.session_id, usage_events.c.c
 sa.Index("idx_usage_events_request", usage_events.c.root_request_id, usage_events.c.created_at)
 
 
+# 后台任务的状态以 PostgreSQL 为准；Redis/Celery 只传递 task_key，不保存业务事实。
+background_tasks = sa.Table(
+    "background_tasks",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column("task_key", sa.String(64), nullable=False),
+    sa.Column(
+        "account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "candidate_id",
+        sa.Integer,
+        sa.ForeignKey("candidate_profiles.id", ondelete="CASCADE"),
+    ),
+    sa.Column("session_id", sa.String(128)),
+    sa.Column("task_type", sa.String(128), nullable=False),
+    sa.Column("status", sa.String(32), nullable=False, server_default=sa.text("'queued'")),
+    sa.Column("progress", sa.Integer, nullable=False, server_default=sa.text("0")),
+    sa.Column("attempt", sa.Integer, nullable=False, server_default=sa.text("0")),
+    sa.Column("max_attempts", sa.Integer, nullable=False, server_default=sa.text("3")),
+    sa.Column("idempotency_key", sa.String(128)),
+    sa.Column("payload_json", json_type, nullable=False, server_default=sa.text("'{}'")),
+    sa.Column("result_json", json_type, nullable=False, server_default=sa.text("'{}'")),
+    sa.Column("error_summary", sa.Text),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.Column("started_at", timestamp_type),
+    sa.Column("finished_at", timestamp_type),
+    sa.Column("updated_at", timestamp_type, nullable=False),
+    sa.UniqueConstraint("task_key", name="uq_background_tasks_task_key"),
+    sa.UniqueConstraint("account_id", "idempotency_key", name="uq_background_tasks_idempotency"),
+    sa.CheckConstraint(
+        "status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')",
+        name="background_tasks_status",
+    ),
+    sa.CheckConstraint("progress >= 0 AND progress <= 100", name="background_tasks_progress_range"),
+    sa.CheckConstraint("attempt >= 0", name="background_tasks_attempt_non_negative"),
+    sa.CheckConstraint("max_attempts > 0", name="background_tasks_max_attempts_positive"),
+)
+sa.Index(
+    "idx_background_tasks_account_status",
+    background_tasks.c.account_id,
+    background_tasks.c.status,
+    background_tasks.c.updated_at.desc(),
+)
+sa.Index("idx_background_tasks_candidate", background_tasks.c.candidate_id, background_tasks.c.updated_at.desc())
+
+
 # RAG 分块是 long_texts 的派生索引。维度尚未锁定，因此本阶段不创建 HNSW/IVFFlat 索引。
 rag_chunks = sa.Table(
     "rag_chunks",

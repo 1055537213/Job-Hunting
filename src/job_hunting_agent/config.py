@@ -86,6 +86,39 @@ class DatabaseSettings:
 
 
 @dataclass(frozen=True)
+class ObjectStorageSettings:
+    """受控二进制文件的对象存储配置。
+
+    `local` 仅用于显式传入临时目录的单元测试或离线兼容场景；Docker Web
+    服务使用 `s3`，并通过 MinIO 提供本地 S3-compatible API。
+    """
+
+    backend: str = "local"
+    endpoint_url: str | None = None
+    bucket: str | None = None
+    access_key: str | None = None
+    secret_key: str | None = None
+    region: str = "us-east-1"
+    force_path_style: bool = True
+    auto_create_bucket: bool = False
+
+
+@dataclass(frozen=True)
+class TaskQueueSettings:
+    """后台任务队列配置。
+
+    Redis 只承担 Celery broker 的短期消息传递；任务状态、归属、进度和错误摘要
+    始终写入 PostgreSQL。这样 Redis 重启或过期后，网页仍能从数据库恢复任务状态。
+    """
+
+    enabled: bool = False
+    redis_url: str | None = None
+    queue_name: str = "job_agent"
+    task_time_limit_seconds: int = 900
+    task_soft_time_limit_seconds: int = 840
+
+
+@dataclass(frozen=True)
 class BootstrapAdminSettings:
     """首次启动时创建管理员账号的一次性配置。
 
@@ -413,6 +446,160 @@ def masked_database_settings(settings: DatabaseSettings) -> dict[str, object]:
         "configured": settings.configured,
         "dialect": settings.dialect,
         "url": settings.masked_url,
+    }
+
+
+def load_object_storage_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> ObjectStorageSettings:
+    """从环境变量或 `.env` 读取对象存储配置。
+
+    环境变量优先于文件；启用 S3 时缺少 endpoint 或凭证会立即报错，避免
+    上传请求运行到一半才发现文件没有可写的持久化位置。
+    """
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(key: str, default: str | None = None) -> str | None:
+        """按环境变量优先级读取一个对象存储配置项。"""
+
+        value = environment.get(key) or file_values.get(key)
+        return value if value not in {None, ""} else default
+
+    raw_backend = get("JOB_AGENT_OBJECT_STORAGE_BACKEND")
+    if raw_backend is None:
+        raise ValueError(
+            "必须显式配置 JOB_AGENT_OBJECT_STORAGE_BACKEND；生产使用 s3，测试可使用 local。"
+        )
+    backend_aliases = {
+        "file": "local",
+        "filesystem": "local",
+        "local": "local",
+        "minio": "s3",
+        "s3": "s3",
+    }
+    backend = backend_aliases.get(raw_backend.strip().lower())
+    if backend is None:
+        raise ValueError(
+            "JOB_AGENT_OBJECT_STORAGE_BACKEND 只能是 local、s3 或 minio。"
+        )
+    if backend == "local":
+        return ObjectStorageSettings(backend="local")
+
+    endpoint_url = get("JOB_AGENT_OBJECT_STORAGE_ENDPOINT")
+    bucket = get("JOB_AGENT_OBJECT_STORAGE_BUCKET", "job-agent-files")
+    access_key = get("JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY")
+    secret_key = get("JOB_AGENT_OBJECT_STORAGE_SECRET_KEY")
+    if not endpoint_url:
+        raise ValueError(
+            "启用 S3 对象存储时必须配置 JOB_AGENT_OBJECT_STORAGE_ENDPOINT。"
+        )
+    if not access_key or not secret_key:
+        raise ValueError(
+            "启用 S3 对象存储时必须配置 JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY 和 "
+            "JOB_AGENT_OBJECT_STORAGE_SECRET_KEY。"
+        )
+    return ObjectStorageSettings(
+        backend="s3",
+        endpoint_url=endpoint_url.rstrip("/"),
+        bucket=bucket,
+        access_key=access_key,
+        secret_key=secret_key,
+        region=get("JOB_AGENT_OBJECT_STORAGE_REGION", "us-east-1") or "us-east-1",
+        force_path_style=parse_bool(
+            get("JOB_AGENT_OBJECT_STORAGE_FORCE_PATH_STYLE", "true")
+        ),
+        auto_create_bucket=parse_bool(
+            get("JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET", "false")
+        ),
+    )
+
+
+def masked_object_storage_settings(settings: ObjectStorageSettings) -> dict[str, object]:
+    """返回健康检查可展示的对象存储摘要，不暴露访问密钥。"""
+
+    return {
+        "backend": settings.backend,
+        "endpoint_url": settings.endpoint_url,
+        "bucket": settings.bucket,
+        "access_key_set": bool(settings.access_key),
+        "secret_key_set": bool(settings.secret_key),
+        "region": settings.region,
+        "force_path_style": settings.force_path_style,
+        "auto_create_bucket": settings.auto_create_bucket,
+    }
+
+
+def load_task_queue_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> TaskQueueSettings:
+    """从环境变量或 `.env` 读取 Redis/Celery 后台任务配置。
+
+    本地直接运行 Web 时默认关闭，保持教学和单元测试不依赖 Redis；Docker Compose
+    会显式开启，并把容器内 Redis 地址注入 Web 与 Worker。
+    """
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(key: str, default: str | None = None) -> str | None:
+        """按系统环境变量优先级读取单个任务队列配置项。"""
+
+        value = environment.get(key) or file_values.get(key)
+        return value if value not in {None, ""} else default
+
+    enabled = parse_bool(get("JOB_AGENT_TASK_QUEUE_ENABLED", "false"))
+    if not enabled:
+        return TaskQueueSettings(enabled=False)
+
+    redis_url = get("JOB_AGENT_REDIS_URL")
+    if not redis_url:
+        raise ValueError("启用后台任务队列时必须配置 JOB_AGENT_REDIS_URL。")
+    parsed_url = urlsplit(redis_url)
+    if parsed_url.scheme not in {"redis", "rediss"} or not parsed_url.netloc:
+        raise ValueError("JOB_AGENT_REDIS_URL 必须使用 redis:// 或 rediss:// 地址。")
+
+    queue_name = (get("JOB_AGENT_TASK_QUEUE_NAME", "job_agent") or "job_agent").strip()
+    if not queue_name:
+        raise ValueError("JOB_AGENT_TASK_QUEUE_NAME 不能为空。")
+    time_limit = parse_positive_int(
+        get("JOB_AGENT_TASK_TIME_LIMIT_SECONDS", "900"),
+        "JOB_AGENT_TASK_TIME_LIMIT_SECONDS",
+    )
+    soft_time_limit = parse_positive_int(
+        get("JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS", "840"),
+        "JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS",
+    )
+    if soft_time_limit >= time_limit:
+        raise ValueError(
+            "JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS 必须小于 JOB_AGENT_TASK_TIME_LIMIT_SECONDS。"
+        )
+    return TaskQueueSettings(
+        enabled=True,
+        redis_url=redis_url,
+        queue_name=queue_name,
+        task_time_limit_seconds=time_limit,
+        task_soft_time_limit_seconds=soft_time_limit,
+    )
+
+
+def masked_task_queue_settings(settings: TaskQueueSettings) -> dict[str, object]:
+    """返回可用于健康检查的任务队列摘要，不回显 Redis 密码。"""
+
+    if not settings.enabled or not settings.redis_url:
+        return {"enabled": False}
+    parsed_url = urlsplit(settings.redis_url)
+    hostname = parsed_url.hostname or ""
+    port = f":{parsed_url.port}" if parsed_url.port else ""
+    return {
+        "enabled": True,
+        "redis_url": f"{parsed_url.scheme}://{hostname}{port}{parsed_url.path or '/0'}",
+        "queue_name": settings.queue_name,
+        "task_time_limit_seconds": settings.task_time_limit_seconds,
+        "task_soft_time_limit_seconds": settings.task_soft_time_limit_seconds,
     }
 
 

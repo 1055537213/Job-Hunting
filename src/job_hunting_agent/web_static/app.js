@@ -78,6 +78,8 @@ if (!window.Vue) {
         matches: [],
         resumeArtifacts: [],
         resumeJobSelections: {},
+        projectCards: [],
+        githubProjectUrl: "",
         messages: [],
         currentProfileId: Number(localStorage.getItem("currentProfileId") || 0),
         messageInput: "",
@@ -112,6 +114,16 @@ if (!window.Vue) {
         tailoringArtifactId: 0,
         deletingResumeArtifactId: 0,
         resumeError: "",
+        submittingGitHubProject: false,
+        confirmingProjectCardId: 0,
+        githubProjectError: "",
+        // 当前页面正在跟踪的后台 RAG 任务；任务事实仍以 PostgreSQL API 返回值为准。
+        backgroundTasks: {},
+        ragTaskByArtifact: {},
+        ragTaskPollers: {},
+        ragTaskNotified: {},
+        projectTaskPollers: {},
+        projectTaskNotified: {},
         sending: false,
         chatAbortController: null,
         deletingSessionId: "",
@@ -196,6 +208,14 @@ if (!window.Vue) {
             disabled: !this.currentProfileId || this.uploadingResume,
           },
           {
+            key: "github-project",
+            title: "分析 GitHub 项目",
+            description: "提交当前候选人的公开仓库链接并生成待确认项目卡片。",
+            shortcut: "GitHub",
+            action: "focusGitHubProject",
+            disabled: !this.currentProfileId || this.submittingGitHubProject,
+          },
+          {
             key: "match",
             title: "匹配当前候选人",
             description: "按学历、年限、技能和偏好规则重算职位排序。",
@@ -251,6 +271,10 @@ if (!window.Vue) {
       document.removeEventListener("keydown", this.handleGlobalShortcut);
       document.body.classList.remove("cmdk-lock");
       this.clearAuthFeedback();
+      Object.values(this.ragTaskPollers).forEach((timerId) => window.clearTimeout(timerId));
+      this.ragTaskPollers = {};
+      Object.values(this.projectTaskPollers).forEach((timerId) => window.clearTimeout(timerId));
+      this.projectTaskPollers = {};
     },
 
     methods: {
@@ -552,6 +576,17 @@ if (!window.Vue) {
         this.$refs.resumeFileInput?.click();
       },
 
+      /** 聚焦公开 GitHub 仓库链接输入框。 */
+      focusGitHubProject() {
+        if (!this.currentProfileId) {
+          this.appendAssistant("请先创建或选择候选人档案，再分析 GitHub 项目。", true);
+          return;
+        }
+        nextTick(() => {
+          this.$refs.githubProjectUrl?.focus();
+        });
+      },
+
       /**
        * 初始化页面所需数据。
        *
@@ -598,6 +633,7 @@ if (!window.Vue) {
             this.setWelcomeMessage();
             this.matches = [];
             this.resumeArtifacts = [];
+            this.projectCards = [];
             return;
           }
 
@@ -609,6 +645,8 @@ if (!window.Vue) {
           await this.loadChatSessions();
           await this.loadChatHistory();
           await this.loadResumeArtifacts();
+          await this.loadProjectCards();
+          this.resumePendingProjectTasks();
           await this.matchJobs(true);
         } finally {
           this.loadingProfiles = false;
@@ -622,6 +660,7 @@ if (!window.Vue) {
           this.setWelcomeMessage();
           this.matches = [];
           this.resumeArtifacts = [];
+          this.projectCards = [];
           this.resumeJobSelections = {};
           return;
         }
@@ -629,6 +668,8 @@ if (!window.Vue) {
         await this.loadChatSessions();
         await this.loadChatHistory();
         await this.loadResumeArtifacts();
+        await this.loadProjectCards();
+        this.resumePendingProjectTasks();
         await this.matchJobs(true);
       },
 
@@ -878,12 +919,15 @@ if (!window.Vue) {
             assistantMessage,
             data.display_reply || this.buildChatReply(data)
           );
+          this.captureProjectTasksFromChat(data.tool_outputs || []);
           if (data.profile) {
             this.updateProfileInState(data.profile);
           }
           await this.loadJobs(abortController.signal);
           // Agent 可能在本轮生成了职位定制文件，侧栏必须同步刷新版本列表。
           await this.loadResumeArtifacts(abortController.signal);
+          // Agent 也可能刚刚提交或确认 GitHub 项目卡片，保持侧栏与任务事实同步。
+          await this.loadProjectCards(abortController.signal);
           await this.matchJobs(true, abortController.signal);
         } catch (error) {
           const wasCancelled = error?.name === "AbortError";
@@ -923,6 +967,7 @@ if (!window.Vue) {
           this.matches = [];
           this.resumeArtifacts = [];
           this.resumeJobSelections = {};
+          this.projectCards = [];
           await this.loadProfiles();
         } catch (error) {
           this.appendAssistant(`删除档案失败：${error.message || "未知错误"}`, true);
@@ -1214,11 +1259,14 @@ if (!window.Vue) {
           if (Array.isArray(data.matches) && data.matches.length) {
             lines.push(`匹配结果：共 ${data.matches.length} 个职位，已按推荐顺序返回。`);
           }
+          if (data.task?.task_type === "github_project_analysis") {
+            lines.push("GitHub 项目分析：任务已排队，完成后会生成待确认项目卡片。");
+          }
         }
         return lines.join("\n");
       },
 
-      /** 上传当前选择的 DOCX/PDF，并让后端完成解析、保存和增量 RAG。 */
+      /** 上传当前选择的 DOCX/PDF，并跟踪后端安排的 OCR 或 RAG 任务。 */
       async uploadResume(event) {
         const input = event?.target || this.$refs.resumeFileInput;
         const file = input?.files?.[0];
@@ -1245,17 +1293,352 @@ if (!window.Vue) {
           const data = await this.requestFormJson("/api/resumes/upload", form);
           await this.loadResumeArtifacts();
           const method = this.resumeExtractionLabel(data.artifact.extraction_method);
-          const indexLine = data.warning || "简历正文已增量同步到当前账号的 RAG。";
-          this.appendAssistant(
-            `已上传简历：**${data.artifact.download_filename}**\n\n解析方式：${method}\n\n${indexLine}`,
-            Boolean(data.warning)
-          );
+          if (data.task?.task_key) {
+            // 记录任务键，刷新页面后仍能恢复 OCR/RAG 轮询，不把状态只留在内存里。
+            this.rememberRagTask(data.task.task_key, data.artifact.id);
+            this.backgroundTasks[data.task.task_key] = data.task;
+            this.ragTaskByArtifact[data.artifact.id] = data.task.task_key;
+            const taskLabel = data.task.task_type === "resume_ocr" ? "扫描 PDF OCR" : "RAG 增量索引";
+            this.appendAssistant(
+              `已上传简历：**${data.artifact.download_filename}**\n\n解析方式：${method}\n\n${taskLabel}任务已排队（${data.task.progress}%）。`
+            );
+            this.pollBackgroundTask(data.task.task_key, data.artifact.download_filename, this.currentProfileId);
+          } else {
+            const indexLine = data.warning || "简历正文已增量同步到当前账号的 RAG。";
+            this.appendAssistant(
+              `已上传简历：**${data.artifact.download_filename}**\n\n解析方式：${method}\n\n${indexLine}`,
+              Boolean(data.warning)
+            );
+          }
+          if (data.warning && data.task?.task_key) {
+            this.resumeError = data.warning;
+          }
         } catch (error) {
           this.resumeError = error.message || "简历上传失败。";
           this.appendAssistant(this.resumeError, true);
         } finally {
           this.uploadingResume = false;
           input.value = "";
+        }
+      },
+
+      /** 返回当前账号和候选人对应的本地任务键存储位置。 */
+      ragTaskStorageKey(candidateId = this.currentProfileId) {
+        return `pendingRagTasks:${this.auth.account?.id || "legacy"}:${candidateId}`;
+      },
+
+      /** 把任务键写入本地索引，供页面刷新后恢复轮询。 */
+      rememberRagTask(taskKey, artifactId) {
+        if (!taskKey) return;
+        const key = this.ragTaskStorageKey();
+        let entries = [];
+        try {
+          entries = JSON.parse(localStorage.getItem(key) || "[]");
+        } catch (_error) {
+          entries = [];
+        }
+        const next = entries.filter((entry) => entry?.task_key !== taskKey);
+        next.push({ task_key: taskKey, artifact_id: Number(artifactId || 0) });
+        localStorage.setItem(key, JSON.stringify(next.slice(-20)));
+      },
+
+      /** 任务结束后从本地待恢复列表中移除任务键。 */
+      forgetRagTask(taskKey, candidateId = this.currentProfileId) {
+        if (!taskKey) return;
+        const key = this.ragTaskStorageKey(candidateId);
+        let entries = [];
+        try {
+          entries = JSON.parse(localStorage.getItem(key) || "[]");
+        } catch (_error) {
+          entries = [];
+        }
+        const next = entries.filter((entry) => entry?.task_key !== taskKey);
+        if (next.length) localStorage.setItem(key, JSON.stringify(next));
+        else localStorage.removeItem(key);
+      },
+
+      /** 把 OCR 或 RAG 后台任务状态转换成页面上的短标签。 */
+      ragTaskStatus(artifact) {
+        const taskKey = this.ragTaskByArtifact[artifact?.id];
+        const task = taskKey ? this.backgroundTasks[taskKey] : null;
+        if (!task) {
+          if (artifact?.status === "processing") return "OCR 等待任务恢复";
+          if (artifact?.status === "failed") return "OCR 解析失败";
+          return "";
+        }
+        const taskName = task.task_type === "resume_ocr" ? "OCR" : "RAG";
+        return {
+          queued: `${taskName} 排队中 ${task.progress}%`,
+          running: `${taskName}${taskName === "OCR" ? " 识别中" : " 索引中"} ${task.progress}%`,
+          succeeded: `${taskName} 已完成`,
+          failed: `${taskName} 失败`,
+          cancelled: `${taskName} 已取消`,
+        }[task.status] || `${taskName} 状态未知`;
+      },
+
+      /** 轮询一个后台任务；OCR 完成后自动继续轮询其创建的 RAG 任务。 */
+      async pollBackgroundTask(taskKey, artifactName = "简历", candidateId = this.currentProfileId) {
+        if (!taskKey || this.ragTaskPollers[taskKey]) return;
+        const poll = async () => {
+          try {
+            const data = await this.requestJson(`/api/tasks/${encodeURIComponent(taskKey)}`);
+            const task = data.task || {};
+            this.backgroundTasks[taskKey] = task;
+            if (["succeeded", "failed", "cancelled"].includes(task.status)) {
+              delete this.ragTaskPollers[taskKey];
+              this.forgetRagTask(taskKey, candidateId);
+              if (task.status === "succeeded" && task.task_type === "resume_ocr") {
+                if (this.currentProfileId === Number(candidateId)) {
+                  await this.loadResumeArtifacts();
+                }
+                const ragTaskKey = task.result?.rag_task_key;
+                const artifactId = Number(task.result?.artifact_id || 0);
+                if (ragTaskKey) {
+                  this.rememberRagTask(ragTaskKey, artifactId);
+                  this.backgroundTasks[ragTaskKey] = {
+                    task_key: ragTaskKey,
+                    task_type: "rag_index",
+                    status: "queued",
+                    progress: 0,
+                  };
+                  if (artifactId) this.ragTaskByArtifact[artifactId] = ragTaskKey;
+                  this.pollBackgroundTask(ragTaskKey, artifactName, candidateId);
+                }
+              }
+              if (this.currentProfileId === Number(candidateId) && !this.ragTaskNotified[taskKey]) {
+                this.ragTaskNotified[taskKey] = true;
+                if (task.status === "succeeded") {
+                  if (task.task_type === "resume_ocr") {
+                    const ragLine = task.result?.rag_task_key
+                      ? "OCR 正文已保存，RAG 增量索引已自动开始。"
+                      : "OCR 正文已保存。";
+                    this.appendAssistant(`**${artifactName}** 的扫描 PDF OCR 已完成。${ragLine}`);
+                  } else {
+                    const stats = task.result?.index_stats || {};
+                    this.appendAssistant(
+                      `**${artifactName}** 的 RAG 增量索引已完成，共写入 ${stats.chunk_count || 0} 个文本片段。`
+                    );
+                  }
+                } else {
+                  const taskLabel = task.task_type === "resume_ocr" ? "扫描 PDF OCR" : "RAG 增量索引";
+                  this.appendAssistant(
+                    `**${artifactName}** 的${taskLabel}${task.status === "cancelled" ? "已取消" : "失败"}：${task.error_summary || "请稍后重试。"}`,
+                    true
+                  );
+                }
+              }
+              return;
+            }
+            this.ragTaskPollers[taskKey] = window.setTimeout(poll, 1200);
+          } catch (error) {
+            // 临时网络错误不立即丢弃任务；下一次轮询继续从 PostgreSQL 状态恢复。
+            this.ragTaskPollers[taskKey] = window.setTimeout(poll, 3000);
+            this.resumeError = error.message || "后台任务状态读取失败。";
+          }
+        };
+        await poll();
+      },
+
+      /** 页面刷新或切换档案后恢复仍在排队/执行的 OCR 与 RAG 任务。 */
+      resumePendingRagTasks() {
+        if (!this.currentProfileId) return;
+        const key = this.ragTaskStorageKey();
+        let entries = [];
+        try {
+          entries = JSON.parse(localStorage.getItem(key) || "[]");
+        } catch (_error) {
+          entries = [];
+        }
+        for (const entry of entries) {
+          if (!entry?.task_key) continue;
+          if (entry.artifact_id) this.ragTaskByArtifact[entry.artifact_id] = entry.task_key;
+          const artifact = this.resumeArtifacts.find((item) => item.id === Number(entry.artifact_id));
+          this.pollBackgroundTask(
+            entry.task_key,
+            artifact?.download_filename || "简历",
+            this.currentProfileId
+          );
+        }
+      },
+
+      /** 返回当前账号和候选人对应的 GitHub 项目任务恢复索引。 */
+      projectTaskStorageKey(candidateId = this.currentProfileId) {
+        return `pendingGitHubProjectTasks:${this.auth.account?.id || "legacy"}:${candidateId}`;
+      },
+
+      /** 记录待完成的项目分析任务，页面刷新后仍可继续从 PostgreSQL 轮询。 */
+      rememberProjectTask(taskKey) {
+        if (!taskKey) return;
+        const key = this.projectTaskStorageKey();
+        let taskKeys = [];
+        try {
+          taskKeys = JSON.parse(localStorage.getItem(key) || "[]");
+        } catch (_error) {
+          taskKeys = [];
+        }
+        const next = [...new Set([...taskKeys, taskKey])].slice(-20);
+        localStorage.setItem(key, JSON.stringify(next));
+      },
+
+      /** 任务结束后清理本地恢复索引，权威历史仍保留在 PostgreSQL。 */
+      forgetProjectTask(taskKey, candidateId = this.currentProfileId) {
+        if (!taskKey) return;
+        const key = this.projectTaskStorageKey(candidateId);
+        let taskKeys = [];
+        try {
+          taskKeys = JSON.parse(localStorage.getItem(key) || "[]");
+        } catch (_error) {
+          taskKeys = [];
+        }
+        const next = taskKeys.filter((item) => item !== taskKey);
+        if (next.length) localStorage.setItem(key, JSON.stringify(next));
+        else localStorage.removeItem(key);
+      },
+
+      /** 读取当前候选人的待确认与已确认项目经历卡片。 */
+      async loadProjectCards(signal = null) {
+        if (!this.currentProfileId) {
+          this.projectCards = [];
+          return;
+        }
+        try {
+          const data = await this.requestJson(
+            `/api/projects?candidate_id=${encodeURIComponent(this.currentProfileId)}`,
+            signal ? { signal } : {}
+          );
+          this.projectCards = data.project_cards || [];
+        } catch (error) {
+          this.projectCards = [];
+          this.githubProjectError = error.message || "项目卡片加载失败。";
+        }
+      },
+
+      /** 提交当前候选人的公开 GitHub 仓库，默认由 Worker 异步下载与分析。 */
+      async submitGitHubProject() {
+        if (!this.currentProfileId) {
+          this.appendAssistant("请先创建或选择候选人档案，再分析 GitHub 项目。", true);
+          return;
+        }
+        const repositoryUrl = this.githubProjectUrl.trim();
+        if (!repositoryUrl || this.submittingGitHubProject) return;
+
+        this.submittingGitHubProject = true;
+        this.githubProjectError = "";
+        try {
+          const data = await this.requestJson("/api/projects/github", {
+            method: "POST",
+            body: JSON.stringify({
+              candidate_id: this.currentProfileId,
+              repository_url: repositoryUrl,
+            }),
+          });
+          this.githubProjectUrl = "";
+          if (data.task?.task_key) {
+            this.backgroundTasks[data.task.task_key] = data.task;
+            this.rememberProjectTask(data.task.task_key);
+            this.appendAssistant("GitHub 项目分析任务已排队，完成后会生成待确认项目经历卡片。");
+            this.pollGitHubProjectTask(data.task.task_key, this.currentProfileId);
+          } else {
+            await this.loadProjectCards();
+            this.appendAssistant("GitHub 项目分析已完成，已生成待确认项目经历卡片。");
+          }
+        } catch (error) {
+          this.githubProjectError = error.message || "GitHub 项目分析提交失败。";
+          this.appendAssistant(this.githubProjectError, true);
+        } finally {
+          this.submittingGitHubProject = false;
+        }
+      },
+
+      /** 轮询一项 GitHub 项目分析任务，完成后刷新项目卡片而非等待聊天刷新。 */
+      async pollGitHubProjectTask(taskKey, candidateId = this.currentProfileId) {
+        if (!taskKey || this.projectTaskPollers[taskKey]) return;
+        const poll = async () => {
+          try {
+            const data = await this.requestJson(`/api/tasks/${encodeURIComponent(taskKey)}`);
+            const task = data.task || {};
+            this.backgroundTasks[taskKey] = task;
+            if (["succeeded", "failed", "cancelled"].includes(task.status)) {
+              delete this.projectTaskPollers[taskKey];
+              this.forgetProjectTask(taskKey, candidateId);
+              if (this.currentProfileId === Number(candidateId)) {
+                await this.loadProjectCards();
+                if (!this.projectTaskNotified[taskKey]) {
+                  this.projectTaskNotified[taskKey] = true;
+                  if (task.status === "succeeded") {
+                    const projectName = task.result?.project_name || "GitHub 项目";
+                    this.appendAssistant(`**${projectName}** 已分析完成，请在左侧确认你的实际职责。`);
+                  } else {
+                    this.githubProjectError = task.error_summary || "GitHub 项目分析失败，请稍后重试。";
+                    this.appendAssistant(this.githubProjectError, true);
+                  }
+                }
+              }
+              return;
+            }
+            this.projectTaskPollers[taskKey] = window.setTimeout(poll, 1200);
+          } catch (_error) {
+            // 网络暂时中断时保留任务键，后续页面刷新或下一次轮询仍能恢复。
+            this.projectTaskPollers[taskKey] = window.setTimeout(poll, 3000);
+          }
+        };
+        await poll();
+      },
+
+      /** 页面刷新或切换档案后恢复未结束的 GitHub 项目分析任务。 */
+      resumePendingProjectTasks() {
+        if (!this.currentProfileId) return;
+        let taskKeys = [];
+        try {
+          taskKeys = JSON.parse(localStorage.getItem(this.projectTaskStorageKey()) || "[]");
+        } catch (_error) {
+          taskKeys = [];
+        }
+        for (const taskKey of taskKeys) {
+          if (typeof taskKey === "string" && taskKey) {
+            this.pollGitHubProjectTask(taskKey, this.currentProfileId);
+          }
+        }
+      },
+
+      /** 由候选人明确确认项目卡片，才把其摘要作为后续可检索证据。 */
+      async confirmProjectCard(record) {
+        if (!record || record.status !== "待确认" || this.confirmingProjectCardId) return;
+        this.confirmingProjectCardId = record.id;
+        this.githubProjectError = "";
+        try {
+          const data = await this.requestJson(`/api/projects/${encodeURIComponent(record.id)}/confirm`, {
+            method: "POST",
+            body: JSON.stringify({ confirmed_summary: null }),
+          });
+          const index = this.projectCards.findIndex((item) => item.id === record.id);
+          if (index >= 0) this.projectCards[index] = data.project_card;
+          const projectName = data.project_card?.card?.project_name || "项目";
+          if (data.task?.task_key) {
+            this.backgroundTasks[data.task.task_key] = data.task;
+            this.rememberRagTask(data.task.task_key, 0);
+            this.pollBackgroundTask(data.task.task_key, projectName, this.currentProfileId);
+            this.appendAssistant(`已确认项目经历：**${projectName}**。RAG 增量索引已自动开始。`);
+          } else {
+            this.appendAssistant(`已确认项目经历：**${projectName}**。`);
+          }
+        } catch (error) {
+          this.githubProjectError = error.message || "确认项目经历失败。";
+          this.appendAssistant(this.githubProjectError, true);
+        } finally {
+          this.confirmingProjectCardId = 0;
+        }
+      },
+
+      /** 从 Agent 工具输出中接管 GitHub 分析任务，支持“把链接发给 Agent”这一入口。 */
+      captureProjectTasksFromChat(toolOutputs) {
+        for (const item of toolOutputs || []) {
+          if (item?.tool_name !== "analyze_github_project_for_candidate") continue;
+          const task = item.data?.task;
+          if (!task?.task_key) continue;
+          this.backgroundTasks[task.task_key] = task;
+          this.rememberProjectTask(task.task_key);
+          this.pollGitHubProjectTask(task.task_key, this.currentProfileId);
         }
       },
 
@@ -1288,6 +1671,7 @@ if (!window.Vue) {
             }
           }
           this.resumeJobSelections = nextSelections;
+          this.resumePendingRagTasks();
         } catch (error) {
           this.resumeArtifacts = [];
           this.resumeError = error.message || "简历列表加载失败。";
@@ -1362,6 +1746,8 @@ if (!window.Vue) {
           pdf_text: "PDF 文本层",
           pdf_ocr: "扫描 PDF OCR",
           pdf_mixed: "PDF 文本 + OCR",
+          pending_ocr: "等待 OCR",
+          ocr_failed: "OCR 失败",
           generated: "Agent 定制",
         }[method] || "已解析";
       },

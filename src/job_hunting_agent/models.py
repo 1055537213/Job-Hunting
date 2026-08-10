@@ -140,10 +140,13 @@ class MatchResult:
 
 @dataclass
 class ProjectExperienceCard:
-    """本地项目分析产出的待确认项目经历卡片。
+    """项目证据分析产出的待确认项目经历卡片。
 
     这张卡片不能直接写入候选人档案；它只是把项目证据材料整理成
     技术栈、功能、职责草稿和待确认问题，等待候选人确认。
+
+    ``source_*`` 字段记录证据来自本地目录还是公开 GitHub 仓库。它们只用于
+    溯源和复核，不代表候选人已经确认自己负责过仓库中的全部代码。
     """
 
     card_type: str
@@ -156,6 +159,9 @@ class ProjectExperienceCard:
     highlight_draft: list[str]
     resume_expression_draft: list[str]
     questions_for_candidate: list[str]
+    source_type: str = "local_directory"
+    source_url: str | None = None
+    source_ref: str | None = None
 
 
 @dataclass
@@ -480,3 +486,31 @@ class UsageEventRecord:
     created_at: str
     billable: bool
     pricing_version: str | None
+
+
+@dataclass
+class BackgroundTaskRecord:
+    """一条可跨 Web 重启恢复的后台任务状态。
+
+    `task_key` 同时作为 Celery 消息 ID 和对外查询标识；`payload` 仅保存资源 ID
+    等受控引用，不能保存简历正文、密码或模型提示词。Web API 不直接回显 payload。
+    """
+
+    id: int
+    task_key: str
+    account_id: int
+    candidate_id: int | None
+    session_id: str | None
+    task_type: str
+    status: str
+    progress: int
+    attempt: int
+    max_attempts: int
+    idempotency_key: str | None
+    payload: dict[str, object]
+    result: dict[str, object]
+    error_summary: str | None
+    created_at: str
+    started_at: str | None
+    finished_at: str | None
+    updated_at: str

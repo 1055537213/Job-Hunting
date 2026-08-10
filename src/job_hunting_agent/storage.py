@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Protocol
+from uuid import uuid4
 
 from .auth import AuthSession, AuthUser, is_session_expired, session_expiry, session_token_hash, utc_now
 from .city_catalog import normalize_city_list
@@ -19,6 +20,7 @@ from .job_parser import classify_skill_requirements, parse_job_text, validate_jo
 from .models import (
     AccountRecord,
     AuthSessionRecord,
+    BackgroundTaskRecord,
     CandidateProfile,
     CandidateProfileInput,
     CandidateProfilePatch,
@@ -35,6 +37,9 @@ from .models import (
     UsageEventRecord,
     sanitize_preference_weights,
 )
+
+
+RESUME_ARTIFACT_STATUSES = {"ready", "processing", "failed"}
 
 
 class RepositoryRow(Protocol):
@@ -553,6 +558,318 @@ class RepositoryStore:
             {key: int(row[key]) for key in row.keys()}
             for row in rows
         ]
+
+    # 后台任务状态
+    # ------------------------------------------------------------------
+
+    def create_background_task(
+        self,
+        *,
+        account_id: int,
+        task_type: str,
+        payload: Mapping[str, object] | None = None,
+        candidate_id: int | None = None,
+        session_id: str | None = None,
+        idempotency_key: str | None = None,
+        max_attempts: int = 3,
+    ) -> BackgroundTaskRecord:
+        """创建一条待执行任务；相同账号和幂等键重复提交会复用原任务。"""
+
+        if account_id <= 0:
+            raise ValueError("后台任务必须属于一个有效账号。")
+        normalized_type = task_type.strip()
+        if not normalized_type:
+            raise ValueError("后台任务类型不能为空。")
+        if max_attempts <= 0:
+            raise ValueError("后台任务最大尝试次数必须大于 0。")
+        self.get_account(account_id)
+        if candidate_id is not None:
+            self.get_candidate_profile(candidate_id, account_id=account_id)
+
+        payload_json = json.dumps(dict(payload or {}), ensure_ascii=False)
+        now = now_iso()
+        task_key = uuid4().hex
+        with self.connect() as conn:
+            # 先复用幂等任务，避免网络重试重复创建队列消息和计费操作。
+            if idempotency_key:
+                existing = conn.execute(
+                    """
+                    SELECT * FROM background_tasks
+                    WHERE account_id = ? AND idempotency_key = ?
+                    """,
+                    (account_id, idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    return background_task_from_row(existing)
+            conn.execute(
+                """
+                INSERT INTO background_tasks (
+                    task_key, account_id, candidate_id, session_id, task_type,
+                    status, progress, attempt, max_attempts, idempotency_key,
+                    payload_json, result_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (account_id, idempotency_key) DO NOTHING
+                """,
+                (
+                    task_key,
+                    account_id,
+                    candidate_id,
+                    session_id,
+                    normalized_type,
+                    max_attempts,
+                    idempotency_key,
+                    payload_json,
+                    json.dumps({}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM background_tasks WHERE task_key = ?",
+                (task_key,),
+            ).fetchone()
+            if row is None and idempotency_key:
+                row = conn.execute(
+                    """
+                    SELECT * FROM background_tasks
+                    WHERE account_id = ? AND idempotency_key = ?
+                    """,
+                    (account_id, idempotency_key),
+                ).fetchone()
+        if row is None:  # pragma: no cover - 仅在数据库异常时触发
+            raise RuntimeError("后台任务创建后无法读取任务记录。")
+        return background_task_from_row(row)
+
+    def get_background_task(
+        self,
+        task_key: str,
+        account_id: int | None = None,
+    ) -> BackgroundTaskRecord:
+        """按任务键读取状态，并可按账号强制隔离。"""
+
+        with self.connect() as conn:
+            if account_id is None:
+                row = conn.execute(
+                    "SELECT * FROM background_tasks WHERE task_key = ?",
+                    (task_key,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT * FROM background_tasks
+                    WHERE task_key = ? AND account_id = ?
+                    """,
+                    (task_key, account_id),
+                ).fetchone()
+        if row is None:
+            raise KeyError(f"Background task not found: {task_key}")
+        return background_task_from_row(row)
+
+    def get_background_task_by_idempotency(
+        self,
+        account_id: int,
+        idempotency_key: str,
+    ) -> BackgroundTaskRecord | None:
+        """按账号和幂等键读取既有任务，避免重复投递同一消息。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM background_tasks
+                WHERE account_id = ? AND idempotency_key = ?
+                """,
+                (account_id, idempotency_key),
+            ).fetchone()
+        return background_task_from_row(row) if row is not None else None
+
+    def list_background_tasks(
+        self,
+        *,
+        account_id: int,
+        candidate_id: int | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[BackgroundTaskRecord]:
+        """列出当前账号的任务，默认按最近更新时间倒序。"""
+
+        conditions = ["account_id = ?"]
+        parameters: list[object] = [account_id]
+        if candidate_id is not None:
+            conditions.append("candidate_id = ?")
+            parameters.append(candidate_id)
+        if status is not None:
+            conditions.append("status = ?")
+            parameters.append(status)
+        parameters.append(max(1, min(limit, 500)))
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM background_tasks
+                WHERE {' AND '.join(conditions)}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                tuple(parameters),
+            ).fetchall()
+        return [background_task_from_row(row) for row in rows]
+
+    def claim_background_task(self, task_key: str) -> BackgroundTaskRecord | None:
+        """原子认领 queued 任务；没有取得执行权时返回 ``None``。
+
+        Celery 在 Worker 丢失或 broker 重投时可能再次交付同一 ``task_key``。调用方
+        只有在条件更新确实把状态从 queued 改为 running 后才能执行任务正文，避免
+        两个 Worker 同时生成重复文件、项目卡片或模型调用。
+        """
+
+        now = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE background_tasks
+                SET status = 'running',
+                    progress = GREATEST(progress, 1),
+                    attempt = attempt + 1,
+                    started_at = COALESCE(started_at, ?),
+                    updated_at = ?
+                WHERE task_key = ? AND status = 'queued'
+                """,
+                (now, now, task_key),
+            )
+        if cursor.rowcount == 0:
+            # 记录可能已被其他 Worker 认领或已经结束；调用方读取现有状态后直接退出。
+            self.get_background_task(task_key)
+            return None
+        return self.get_background_task(task_key)
+
+    def retry_failed_background_task(self, task_key: str) -> BackgroundTaskRecord:
+        """把失败任务恢复为 queued，让同一幂等请求可以重新投递。
+
+        任务 payload 和 task_key 保持不变，便于审计和前端继续轮询；尝试次数归零，
+        使人工重试拥有一组新的 Worker 重试预算。并发恢复只有第一次更新生效，重复
+        投递仍会由 ``claim_background_task`` 的原子认领保护。
+        """
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE background_tasks
+                SET status = 'queued', progress = 0, attempt = 0,
+                    result_json = ?, error_summary = NULL,
+                    started_at = NULL, finished_at = NULL, updated_at = ?
+                WHERE task_key = ? AND status = 'failed'
+                """,
+                (json.dumps({}, ensure_ascii=False), now_iso(), task_key),
+            )
+        return self.get_background_task(task_key)
+
+    def update_background_task_progress(self, task_key: str, progress: int) -> BackgroundTaskRecord:
+        """更新运行中任务的进度，始终限制在 0 到 100。"""
+
+        bounded_progress = max(0, min(100, int(progress)))
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE background_tasks
+                SET progress = ?, updated_at = ?
+                WHERE task_key = ? AND status = 'running'
+                """,
+                (bounded_progress, now_iso(), task_key),
+            )
+        return self.get_background_task(task_key)
+
+    def complete_background_task(
+        self,
+        task_key: str,
+        result: Mapping[str, object] | None = None,
+    ) -> BackgroundTaskRecord:
+        """把任务标记为成功，并保存不含正文的结果摘要。"""
+
+        now = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE background_tasks
+                SET status = 'succeeded', progress = 100, result_json = ?,
+                    error_summary = NULL, finished_at = ?, updated_at = ?
+                WHERE task_key = ? AND status = 'running'
+                """,
+                (json.dumps(dict(result or {}), ensure_ascii=False), now, now, task_key),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Running background task not found: {task_key}")
+        return self.get_background_task(task_key)
+
+    def requeue_background_task(self, task_key: str, error_summary: str | None = None) -> BackgroundTaskRecord:
+        """把本轮可重试的任务放回 queued 状态，保留尝试次数和错误摘要。"""
+
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE background_tasks
+                SET status = 'queued', error_summary = ?, updated_at = ?
+                WHERE task_key = ? AND status = 'running'
+                """,
+                (trim_task_error(error_summary), now_iso(), task_key),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Running background task not found: {task_key}")
+        return self.get_background_task(task_key)
+
+    def fail_background_task(self, task_key: str, error_summary: str) -> BackgroundTaskRecord:
+        """把任务标记为失败，只保存截断后的运维摘要。"""
+
+        now = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE background_tasks
+                SET status = 'failed', error_summary = ?, finished_at = ?, updated_at = ?
+                WHERE task_key = ? AND status = 'running'
+                """,
+                (trim_task_error(error_summary) or "后台任务执行失败。", now, now, task_key),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Running background task not found: {task_key}")
+        return self.get_background_task(task_key)
+
+    def fail_queued_background_task(
+        self,
+        task_key: str,
+        error_summary: str,
+    ) -> BackgroundTaskRecord:
+        """记录消息投递失败；任务尚未进入 Worker，因此状态仍是 queued。"""
+
+        now = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE background_tasks
+                SET status = 'failed', error_summary = ?, finished_at = ?, updated_at = ?
+                WHERE task_key = ? AND status = 'queued'
+                """,
+                (trim_task_error(error_summary) or "后台任务投递失败。", now, now, task_key),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Queued background task not found: {task_key}")
+        return self.get_background_task(task_key)
+
+    def cancel_background_task(self, task_key: str, account_id: int) -> BackgroundTaskRecord:
+        """取消尚未开始的任务；运行中的任务由后续 Worker 取消协议处理。"""
+
+        now = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE background_tasks
+                SET status = 'cancelled', finished_at = ?, updated_at = ?
+                WHERE task_key = ? AND account_id = ? AND status = 'queued'
+                """,
+                (now, now, task_key, account_id),
+            )
+            if cursor.rowcount == 0:
+                # 仍然返回现有记录，让 API 区分已完成、运行中和不存在的任务。
+                return self.get_background_task(task_key, account_id=account_id)
+        return self.get_background_task(task_key, account_id=account_id)
 
     def save_candidate_profile(
         self,
@@ -1241,18 +1558,24 @@ class RepositoryStore:
         """
 
         existing = self.get_project_card(record_id, account_id=account_id)
+        if existing.status == "已确认":
+            # 重复确认必须保持幂等，不能再次创建一份相同 long_texts 材料。
+            return existing
         summary = confirmed_summary if confirmed_summary is not None else existing.confirmed_summary
         confirmed_at = now_iso()
         with self.connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE project_experience_cards
                 SET status = ?, confirmed_summary = ?, confirmed_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status = '待确认'
                   AND COALESCE(account_id, -1) = COALESCE(?, COALESCE(account_id, -1))
                 """,
                 ("已确认", summary, confirmed_at, record_id, account_id),
             )
+            if cursor.rowcount == 0:
+                # 另一个请求已经完成确认；不再登记第二份相同长文本。
+                return self.get_project_card(record_id, account_id=account_id)
             # 如果候选人没有写确认摘要，就把卡片草稿作为可检索材料保存，
             # 但界面仍然应该提示它来自候选人确认过的卡片而不是原始档案事实。
             text_for_index = summary or project_card_index_text(existing.card)
@@ -1266,6 +1589,36 @@ class RepositoryStore:
                 candidate_id=existing.candidate_id,
             )
         return self.get_project_card(record_id, account_id=account_id)
+
+    def get_long_text_for_entity(
+        self,
+        entity_type: str,
+        entity_id: int,
+        *,
+        source_label: str | None = None,
+        account_id: int | None = None,
+    ) -> LongTextRecord | None:
+        """读取某个业务实体最近登记的长文本，供增量 RAG 任务取得来源 ID。"""
+
+        conditions = ["entity_type = ?", "entity_id = ?"]
+        parameters: list[object] = [entity_type, entity_id]
+        if source_label is not None:
+            conditions.append("source_label = ?")
+            parameters.append(source_label)
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            parameters.append(account_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT * FROM long_texts
+                WHERE {' AND '.join(conditions)}
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                tuple(parameters),
+            ).fetchone()
+        return long_text_from_row(row) if row is not None else None
 
     def save_resume_draft(
         self,
@@ -1419,6 +1772,12 @@ class RepositoryStore:
 
         if artifact_type not in {"source", "tailored"}:
             raise ValueError("简历文件类型只能是 source 或 tailored。")
+        if status not in RESUME_ARTIFACT_STATUSES:
+            raise ValueError("简历文件状态只能是 ready、processing 或 failed。")
+        if artifact_type == "tailored" and status != "ready":
+            raise ValueError("职位定制简历只能保存为 ready 状态。")
+        if register_long_text and status != "ready":
+            raise ValueError("只有解析完成的简历才能登记 RAG 长文本。")
         # 这些读取同时承担所有权校验，防止跨账号拼接候选人、职位、草稿或父文件。
         self.get_candidate_profile(candidate_id, account_id=account_id)
         if job_id is not None:
@@ -1490,6 +1849,104 @@ class RepositoryStore:
                     "UPDATE resume_artifacts SET long_text_id = ? WHERE id = ?",
                     (long_text_id, artifact_id),
                 )
+        return self.get_resume_artifact(artifact_id, account_id=account_id)
+
+    def complete_resume_artifact_extraction(
+        self,
+        artifact_id: int,
+        *,
+        extraction_method: str,
+        extracted_text: str,
+        page_count: int | None,
+        account_id: int | None = None,
+    ) -> ResumeArtifactRecord:
+        """把 OCR 成功结果原子写入原始简历，并登记一次可追溯长文本来源。
+
+        Worker 可能因进程中断或消息重投再次执行；如果上一次已把正文和
+        ``long_text_id`` 写完整，本方法直接返回已有结果，不会创建重复材料。
+        """
+
+        if not extracted_text.strip():
+            raise ValueError("简历提取正文不能为空。")
+        artifact = self.get_resume_artifact(artifact_id, account_id=account_id)
+        if artifact.artifact_type != "source":
+            raise ValueError("只有原始上传简历可以写入 OCR 解析结果。")
+
+        owner_clause = ""
+        owner_parameters: tuple[object, ...] = ()
+        if account_id is not None:
+            owner_clause = " AND account_id = ?"
+            owner_parameters = (account_id,)
+
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT * FROM resume_artifacts WHERE id = ?{owner_clause}",
+                (artifact_id, *owner_parameters),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Resume artifact not found: {artifact_id}")
+            current_status = str(row["status"])
+            existing_long_text_id = row["long_text_id"]
+            if current_status == "ready" and existing_long_text_id is not None:
+                return self.get_resume_artifact(artifact_id, account_id=account_id)
+            if current_status not in {"processing", "ready"}:
+                raise ValueError("这份简历不处于可完成 OCR 的状态。")
+
+            conn.execute(
+                f"""
+                UPDATE resume_artifacts
+                SET extraction_method = ?, extracted_text = ?, text_length = ?,
+                    page_count = ?, status = 'ready'
+                WHERE id = ?{owner_clause}
+                """,
+                (
+                    extraction_method,
+                    extracted_text,
+                    len(extracted_text),
+                    page_count,
+                    artifact_id,
+                    *owner_parameters,
+                ),
+            )
+            long_text_id = int(existing_long_text_id) if existing_long_text_id is not None else None
+            if long_text_id is None:
+                long_text_id = self._add_long_text(
+                    conn,
+                    "resume_artifact",
+                    artifact_id,
+                    f"uploaded:{row['original_filename']}",
+                    extracted_text,
+                    account_id=account_id,
+                    candidate_id=int(row["candidate_id"]),
+                )
+                conn.execute(
+                    f"UPDATE resume_artifacts SET long_text_id = ? WHERE id = ?{owner_clause}",
+                    (long_text_id, artifact_id, *owner_parameters),
+                )
+        return self.get_resume_artifact(artifact_id, account_id=account_id)
+
+    def fail_resume_artifact_extraction(
+        self,
+        artifact_id: int,
+        *,
+        account_id: int | None = None,
+    ) -> ResumeArtifactRecord:
+        """把未完成的 OCR 简历标记为失败，保留原文件供用户下载或删除。"""
+
+        owner_clause = ""
+        owner_parameters: tuple[object, ...] = ()
+        if account_id is not None:
+            owner_clause = " AND account_id = ?"
+            owner_parameters = (account_id,)
+        with self.connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE resume_artifacts
+                SET extraction_method = 'ocr_failed', status = 'failed'
+                WHERE id = ?{owner_clause} AND status = 'processing'
+                """,
+                (artifact_id, *owner_parameters),
+            )
         return self.get_resume_artifact(artifact_id, account_id=account_id)
 
     def get_resume_artifact(
@@ -1991,6 +2448,53 @@ def usage_event_from_row(row: RepositoryRow) -> UsageEventRecord:
         billable=bool(row["billable"]),
         pricing_version=row["pricing_version"],
     )
+
+
+def background_task_from_row(row: RepositoryRow) -> BackgroundTaskRecord:
+    """把后台任务数据库行转换为领域记录。"""
+
+    return BackgroundTaskRecord(
+        id=int(row["id"]),
+        task_key=str(row["task_key"]),
+        account_id=int(row["account_id"]),
+        candidate_id=int(row["candidate_id"]) if row["candidate_id"] is not None else None,
+        session_id=row["session_id"],
+        task_type=str(row["task_type"]),
+        status=str(row["status"]),
+        progress=int(row["progress"]),
+        attempt=int(row["attempt"]),
+        max_attempts=int(row["max_attempts"]),
+        idempotency_key=row["idempotency_key"],
+        payload=_json_object(row["payload_json"]),
+        result=_json_object(row["result_json"]),
+        error_summary=row["error_summary"],
+        created_at=str(row["created_at"]),
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _json_object(value: object) -> dict[str, object]:
+    """兼容 SQLAlchemy JSONB 行和旧适配器返回的 JSON 字符串。"""
+
+    if isinstance(value, Mapping):
+        return {str(key): item for key, item in value.items()}
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def trim_task_error(value: str | None) -> str | None:
+    """限制任务错误摘要长度，避免把上游原始响应或正文写入数据库。"""
+
+    if not value:
+        return None
+    return " ".join(str(value).split())[:500]
 
 
 def candidate_profile_from_row(row: RepositoryRow) -> CandidateProfile:

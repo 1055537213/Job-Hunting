@@ -9,6 +9,7 @@ from job_hunting_agent.config import load_database_settings, require_postgresql_
 from job_hunting_agent.database_migrations import (
     current_database_revision,
     downgrade_database,
+    latest_database_revision,
     upgrade_database,
 )
 
@@ -74,8 +75,9 @@ def test_upgrade_database_creates_versioned_postgresql_schema(temporary_database
         "resume_artifacts",
         "resume_drafts",
         "usage_events",
+        "background_tasks",
     }.issubset(tables)
-    assert version == "20260807_0001"
+    assert version == latest_database_revision()
 
 
 def test_downgrade_database_returns_an_empty_revision_chain(temporary_database_url):

@@ -32,15 +32,26 @@ def test_compose_mounts_env_read_only_and_starts_postgres_before_web():
     compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
 
     assert "./.env:/app/.env:ro" in compose
-    assert "./data:/app/data" in compose
+    assert "./data:/app/data" not in compose
     assert "8000:8000" in compose
     assert "JOB_AGENT_DOCKER_BASE_IMAGE" in compose
     assert "pgvector/pgvector:pg16" in compose
     assert "JOB_AGENT_DATABASE_URL" in compose
     assert '["alembic", "upgrade", "head"]' in compose
-    assert "job-agent" not in compose
+    # 仅禁止已删除的旧 CLI 启动命令；对象存储 bucket 可以包含项目名称。
+    assert '["job-agent"' not in compose
     assert "service_completed_successfully" in compose
     assert "postgres_data" in compose
+    assert "minio_data" in compose
+    assert "minio/minio" in compose
+    assert "redis_data" in compose
+    assert "redis:" in compose
+    assert "JOB_AGENT_REDIS_URL" in compose
+    assert "worker:" in compose
+    assert "job-agent-worker" in compose
+    assert "JOB_AGENT_OBJECT_STORAGE_BACKEND" in compose
+    assert "http://minio:9000" in compose
+    assert "JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET" in compose
     assert "/api/health" in compose
     # 不把整个 .env 作为 env_file 注入，避免 compose config 展开 API Key。
     assert "env_file:" not in compose

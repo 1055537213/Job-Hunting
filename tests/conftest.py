@@ -57,6 +57,7 @@ def postgres_test_schema() -> Iterator[str]:
     schema = f"job_agent_test_{uuid.uuid4().hex}"
     base_engine = sa.create_engine(base_url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
     previous_runtime_url = os.environ.get("JOB_AGENT_DATABASE_URL")
+    previous_object_storage_backend = os.environ.get("JOB_AGENT_OBJECT_STORAGE_BACKEND")
     try:
         try:
             with base_engine.begin() as connection:
@@ -70,6 +71,8 @@ def postgres_test_schema() -> Iterator[str]:
 
         database_url = _schema_url(base_url, schema)
         os.environ["JOB_AGENT_DATABASE_URL"] = database_url
+        # 测试使用显式临时目录或内存替身，不要求 CI 额外启动 MinIO。
+        os.environ["JOB_AGENT_OBJECT_STORAGE_BACKEND"] = "local"
         upgrade_database(database_url)
         yield database_url
     finally:
@@ -77,6 +80,10 @@ def postgres_test_schema() -> Iterator[str]:
             os.environ.pop("JOB_AGENT_DATABASE_URL", None)
         else:
             os.environ["JOB_AGENT_DATABASE_URL"] = previous_runtime_url
+        if previous_object_storage_backend is None:
+            os.environ.pop("JOB_AGENT_OBJECT_STORAGE_BACKEND", None)
+        else:
+            os.environ["JOB_AGENT_OBJECT_STORAGE_BACKEND"] = previous_object_storage_backend
         with base_engine.begin() as connection:
             connection.execute(sa.text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         base_engine.dispose()

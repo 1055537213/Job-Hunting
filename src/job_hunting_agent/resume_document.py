@@ -13,7 +13,7 @@ import hashlib
 import os
 import re
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -22,6 +22,8 @@ from xml.etree import ElementTree
 
 import pdfplumber
 from PIL import Image
+
+from .object_storage import ObjectNotFoundError, ObjectStorageError, build_storage_key, validate_storage_key
 
 
 DOCX_EXTENSION = ".docx"
@@ -51,6 +53,14 @@ class ResumeExtraction:
 
 
 @dataclass(frozen=True)
+class PDFTextLayerInspection:
+    """PDF 文本层检查结果，用于决定是否应把 OCR 交给后台 Worker。"""
+
+    page_count: int
+    pages_needing_ocr: list[int]
+
+
+@dataclass(frozen=True)
 class StoredResumeFile:
     """写入受控目录后的文件摘要。"""
 
@@ -77,13 +87,18 @@ class ResumeFileStore:
         candidate_id: int,
         filename: str,
         content: bytes,
+        media_type: str | None = None,
     ) -> StoredResumeFile:
         """用随机存储键原子写入文件，避免同名覆盖和部分写入。"""
 
+        # 本地测试实现不需要使用 MIME 类型；保留参数以满足对象存储统一接口。
+        del media_type
         extension = supported_resume_extension(filename)
-        owner_segment = f"account-{account_id}" if account_id is not None else "account-legacy"
-        candidate_segment = f"candidate-{candidate_id}"
-        storage_key = (Path(owner_segment) / candidate_segment / f"{uuid4().hex}{extension}").as_posix()
+        storage_key = build_storage_key(
+            account_id=account_id,
+            candidate_id=candidate_id,
+            filename=f"resume{extension}",
+        )
         target = self.path_for(storage_key)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
@@ -102,10 +117,40 @@ class ResumeFileStore:
     def path_for(self, storage_key: str) -> Path:
         """解析数据库存储键，并拒绝任何逃逸文件根目录的路径。"""
 
-        candidate = (self.root / Path(storage_key)).resolve()
+        try:
+            key = validate_storage_key(storage_key)
+        except ObjectStorageError as error:
+            raise ResumeDocumentError(str(error)) from error
+        candidate = (self.root / Path(key)).resolve()
         if not candidate.is_relative_to(self.root):
             raise ResumeDocumentError("简历文件存储路径越过了允许目录。")
         return candidate
+
+    def read(self, storage_key: str) -> bytes:
+        """读取本地测试文件，并把缺失文件映射为统一对象存储异常。"""
+
+        target = self.path_for(storage_key)
+        if not target.is_file():
+            raise ObjectNotFoundError("对象不存在。")
+        return target.read_bytes()
+
+    def stream(self, storage_key: str, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
+        """分块读取本地测试文件，保持和 S3 下载接口一致。"""
+
+        target = self.path_for(storage_key)
+        if not target.is_file():
+            raise ObjectNotFoundError("对象不存在。")
+        if chunk_size <= 0:
+            raise ValueError("对象流的分块大小必须大于 0。")
+
+        def chunks() -> Iterator[bytes]:
+            """在响应完成或中断时自动关闭本地文件句柄。"""
+
+            with target.open("rb") as handle:
+                while chunk := handle.read(chunk_size):
+                    yield chunk
+
+        return chunks()
 
     def delete(self, storage_key: str) -> None:
         """数据库写入失败时清理刚保存的孤立文件。"""
@@ -228,21 +273,7 @@ def extract_ooxml_paragraphs(xml_content: bytes) -> list[str]:
 def extract_pdf(content: bytes, *, ocr_runner: OCRRunner | None = None) -> ResumeExtraction:
     """逐页读取 PDF 文本层，只对文本不足的页面执行 OCR。"""
 
-    if not content.startswith(b"%PDF-"):
-        raise ResumeDocumentError("PDF 文件签名无效，文件可能已损坏或扩展名不正确。")
-    try:
-        with pdfplumber.open(BytesIO(content)) as pdf:
-            page_count = len(pdf.pages)
-            if page_count == 0:
-                raise ResumeDocumentError("PDF 中没有可读取的页面。")
-            if page_count > MAX_PDF_PAGES:
-                raise ResumeDocumentError(f"PDF 页数不能超过 {MAX_PDF_PAGES} 页。")
-            page_texts = [normalize_extracted_text(page.extract_text() or "") for page in pdf.pages]
-    except ResumeDocumentError:
-        raise
-    except Exception as error:  # noqa: BLE001 - 第三方 PDF 解析器异常统一转成用户可读错误。
-        raise ResumeDocumentError(f"无法读取 PDF 简历：{error}") from error
-
+    page_count, page_texts = _read_pdf_text_layers(content)
     pages_needing_ocr = [
         index
         for index, text in enumerate(page_texts)
@@ -263,6 +294,41 @@ def extract_pdf(content: bytes, *, ocr_runner: OCRRunner | None = None) -> Resum
     else:
         method = "pdf_mixed"
     return ResumeExtraction(text=text, method=method, page_count=page_count)
+
+
+def inspect_pdf_for_ocr(content: bytes) -> PDFTextLayerInspection:
+    """只检查 PDF 文本层，不渲染页面也不加载 RapidOCR 模型。"""
+
+    validate_resume_file_size(content)
+    page_count, page_texts = _read_pdf_text_layers(content)
+    return PDFTextLayerInspection(
+        page_count=page_count,
+        pages_needing_ocr=[
+            index
+            for index, text in enumerate(page_texts)
+            if len(text) < MIN_PDF_TEXT_CHARS_PER_PAGE
+        ],
+    )
+
+
+def _read_pdf_text_layers(content: bytes) -> tuple[int, list[str]]:
+    """校验 PDF 并读取每页文字层，供同步解析和异步任务判定共用。"""
+
+    if not content.startswith(b"%PDF-"):
+        raise ResumeDocumentError("PDF 文件签名无效，文件可能已损坏或扩展名不正确。")
+    try:
+        with pdfplumber.open(BytesIO(content)) as pdf:
+            page_count = len(pdf.pages)
+            if page_count == 0:
+                raise ResumeDocumentError("PDF 中没有可读取的页面。")
+            if page_count > MAX_PDF_PAGES:
+                raise ResumeDocumentError(f"PDF 页数不能超过 {MAX_PDF_PAGES} 页。")
+            page_texts = [normalize_extracted_text(page.extract_text() or "") for page in pdf.pages]
+    except ResumeDocumentError:
+        raise
+    except Exception as error:  # noqa: BLE001 - 第三方 PDF 解析器异常统一转成用户可读错误。
+        raise ResumeDocumentError(f"无法读取 PDF 简历：{error}") from error
+    return page_count, page_texts
 
 
 def render_and_ocr_pdf_pages(
