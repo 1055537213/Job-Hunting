@@ -8,14 +8,20 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import asdict
-from datetime import datetime
-from typing import Any, Protocol
+from datetime import UTC, datetime
+from typing import Any, Protocol, Self
 from uuid import uuid4
 
-from .auth import AuthSession, AuthUser, is_session_expired, session_expiry, session_token_hash, utc_now
 from .city_catalog import normalize_city_list
+from .deduplication import (
+    DuplicateResourceError,
+    candidate_profile_content_fingerprint,
+    is_unique_constraint_violation,
+    job_text_content_fingerprint,
+    project_card_content_fingerprint,
+)
 from .job_parser import classify_skill_requirements, parse_job_text, validate_job_text
 from .models import (
     AccountRecord,
@@ -38,7 +44,6 @@ from .models import (
     sanitize_preference_weights,
 )
 
-
 RESUME_ARTIFACT_STATUSES = {"ready", "processing", "failed"}
 
 
@@ -51,11 +56,20 @@ class RepositoryRow(Protocol):
     def keys(self) -> list[str]:
         ...
 
+    def __contains__(self, key: str) -> bool:
+        ...
+
+    def get(self, key: str, default: Any = None) -> Any:
+        ...
+
+    def __iter__(self) -> Iterator[str]:
+        ...
+
 
 class RepositoryConnection(Protocol):
     """仓储方法需要的最小事务连接接口。"""
 
-    def __enter__(self) -> "RepositoryConnection":
+    def __enter__(self) -> Self:
         ...
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
@@ -533,7 +547,7 @@ class RepositoryStore:
                 """,
                 parameters,
             ).fetchone()
-        return {key: int(row[key]) for key in row.keys()}
+        return {key: int(row[key]) for key in row}
 
     def summarize_usage_by_account(self) -> list[dict[str, int]]:
         """按账号聚合 Token，供管理员查看不同计费主体的用量。"""
@@ -555,7 +569,7 @@ class RepositoryStore:
                 """
             ).fetchall()
         return [
-            {key: int(row[key]) for key in row.keys()}
+            {key: int(row[key]) for key in row}
             for row in rows
         ]
 
@@ -885,44 +899,95 @@ class RepositoryStore:
             if city not in preferred_cities
         ]
         preference_weights = sanitize_preference_weights(profile.preference_weights)
+        fingerprint = candidate_profile_content_fingerprint(profile)
+        if self.find_candidate_profile_by_content_fingerprint(account_id, fingerprint) is not None:
+            raise DuplicateResourceError("候选人档案")
+        try:
+            with self.connect() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO candidate_profiles (
+                        account_id, name, status, education, experience_years, salary_floor_k,
+                        expected_salary_k, skills_json, preferred_cities_json,
+                        acceptable_cities_json, preference_weights_json,
+                        target_directions_json, unacceptable_json, content_fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        account_id,
+                        profile.name,
+                        profile.status,
+                        profile.education,
+                        profile.experience_years,
+                        profile.salary_floor_k,
+                        profile.expected_salary_k,
+                        json.dumps(profile.skills, ensure_ascii=False),
+                        json.dumps(preferred_cities, ensure_ascii=False),
+                        json.dumps(acceptable_cities, ensure_ascii=False),
+                        json.dumps(preference_weights, ensure_ascii=False),
+                        json.dumps(profile.target_directions, ensure_ascii=False),
+                        json.dumps(profile.unacceptable, ensure_ascii=False),
+                        fingerprint,
+                    ),
+                )
+                candidate_id = int(cursor.lastrowid)
+                # 同一个事务里写 long_texts，保证 PostgreSQL 外键和长文本登记原子完成。
+                self._add_long_text(
+                    conn,
+                    "candidate_profile",
+                    candidate_id,
+                    "skills",
+                    " ".join(profile.skills),
+                    account_id=account_id,
+                    candidate_id=candidate_id,
+                )
+                return candidate_id
+        except Exception as error:
+            if is_unique_constraint_violation(
+                error,
+                "uq_candidate_profiles_account_content_fingerprint",
+            ):
+                raise DuplicateResourceError("候选人档案") from error
+            raise
+
+    def find_candidate_profile_by_content_fingerprint(
+        self,
+        account_id: int | None,
+        fingerprint: str,
+    ) -> CandidateProfile | None:
+        """查找相同候选人档案，并兼容迁移前尚未回填指纹的历史记录。"""
+
         with self.connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO candidate_profiles (
-                    account_id, name, status, education, experience_years, salary_floor_k,
-                    expected_salary_k, skills_json, preferred_cities_json,
-                    acceptable_cities_json, preference_weights_json,
-                    target_directions_json, unacceptable_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    account_id,
-                    profile.name,
-                    profile.status,
-                    profile.education,
-                    profile.experience_years,
-                    profile.salary_floor_k,
-                    profile.expected_salary_k,
-                    json.dumps(profile.skills, ensure_ascii=False),
-                    json.dumps(preferred_cities, ensure_ascii=False),
-                    json.dumps(acceptable_cities, ensure_ascii=False),
-                    json.dumps(preference_weights, ensure_ascii=False),
-                    json.dumps(profile.target_directions, ensure_ascii=False),
-                    json.dumps(profile.unacceptable, ensure_ascii=False),
-                ),
-            )
-            candidate_id = int(cursor.lastrowid)
-            # 同一个事务里写 long_texts，保证 PostgreSQL 外键和长文本登记原子完成。
-            self._add_long_text(
-                conn,
-                "candidate_profile",
-                candidate_id,
-                "skills",
-                " ".join(profile.skills),
-                account_id=account_id,
-                candidate_id=candidate_id,
-            )
-            return candidate_id
+            if account_id is None:
+                row = conn.execute(
+                    "SELECT * FROM candidate_profiles WHERE content_fingerprint = ?",
+                    (fingerprint,),
+                ).fetchone()
+                legacy_rows = conn.execute(
+                    "SELECT * FROM candidate_profiles WHERE content_fingerprint IS NULL"
+                ).fetchall()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT * FROM candidate_profiles
+                    WHERE account_id = ? AND content_fingerprint = ?
+                    """,
+                    (account_id, fingerprint),
+                ).fetchone()
+                legacy_rows = conn.execute(
+                    """
+                    SELECT * FROM candidate_profiles
+                    WHERE account_id = ? AND content_fingerprint IS NULL
+                    """,
+                    (account_id,),
+                ).fetchall()
+        if row is not None:
+            return candidate_profile_from_row(row)
+        for legacy_row in legacy_rows:
+            profile = candidate_profile_from_row(legacy_row)
+            if candidate_profile_content_fingerprint(profile) == fingerprint:
+                return profile
+        return None
 
     def get_candidate_profile(
         self,
@@ -1041,15 +1106,32 @@ class RepositoryStore:
         if not updated_fields:
             return []
 
-        with self.connect() as conn:
-            conn.execute(
+        updated_profile = CandidateProfileInput(
+            name=current.name,
+            status=status,
+            education=education,
+            experience_years=experience_years,
+            skills=skills,
+            preferred_cities=preferred_cities,
+            acceptable_cities=acceptable_cities,
+            salary_floor_k=salary_floor_k,
+            expected_salary_k=expected_salary_k,
+            target_directions=target_directions,
+            unacceptable=unacceptable,
+            preference_weights=preference_weights,
+        )
+        fingerprint = candidate_profile_content_fingerprint(updated_profile)
+
+        try:
+            with self.connect() as conn:
+                conn.execute(
                 """
                 UPDATE candidate_profiles
                 SET status = ?, education = ?, experience_years = ?,
                     salary_floor_k = ?, expected_salary_k = ?,
                     skills_json = ?, preferred_cities_json = ?,
                     acceptable_cities_json = ?, preference_weights_json = ?,
-                    target_directions_json = ?, unacceptable_json = ?
+                    target_directions_json = ?, unacceptable_json = ?, content_fingerprint = ?
                 WHERE id = ?
                   AND COALESCE(account_id, -1) = COALESCE(?, COALESCE(account_id, -1))
                 """,
@@ -1065,20 +1147,28 @@ class RepositoryStore:
                     json.dumps(preference_weights, ensure_ascii=False),
                     json.dumps(target_directions, ensure_ascii=False),
                     json.dumps(unacceptable, ensure_ascii=False),
+                    fingerprint,
                     candidate_id,
                     account_id,
                 ),
-            )
-            # 记录自动更新摘要，方便 RAG 和审计追溯“这次对话改了哪些结构化字段”。
-            self._add_long_text(
-                conn,
-                "candidate_profile",
-                candidate_id,
-                "conversation_structured_update",
-                "自动更新字段：" + "、".join(updated_fields),
-                account_id=account_id,
-                candidate_id=candidate_id,
-            )
+                )
+                # 记录自动更新摘要，方便 RAG 和审计追溯“这次对话改了哪些结构化字段”。
+                self._add_long_text(
+                    conn,
+                    "candidate_profile",
+                    candidate_id,
+                    "conversation_structured_update",
+                    "自动更新字段：" + "、".join(updated_fields),
+                    account_id=account_id,
+                    candidate_id=candidate_id,
+                )
+        except Exception as error:
+            if is_unique_constraint_violation(
+                error,
+                "uq_candidate_profiles_account_content_fingerprint",
+            ):
+                raise DuplicateResourceError("候选人档案") from error
+            raise
         return updated_fields
 
     def save_job_text(
@@ -1086,7 +1176,8 @@ class RepositoryStore:
         raw_text: str,
         source_url: str | None = None,
         account_id: int | None = None,
-        llm_client=None,  # noqa: ANN001 - 保持存储层只依赖最小 complete 协议
+        llm_client=None,
+        import_method: str = "text",
     ) -> ImportedJob:
         """保存一段职位原文。
 
@@ -1094,29 +1185,41 @@ class RepositoryStore:
         长文本副本。后续接入 LLM 时，可以替换 `parse_job_text` 的内部逻辑。
         """
 
-        parsed = parse_job_text(raw_text, source_url=source_url)
+        captured_at = now_iso()
+        parsed = parse_job_text(
+            raw_text,
+            source_url=source_url,
+            import_method=import_method,
+            captured_at=captured_at,
+        )
+        fingerprint = job_text_content_fingerprint(parsed.raw_text)
+        if self.find_job_by_content_fingerprint(account_id, fingerprint) is not None:
+            raise DuplicateResourceError("职位信息")
         if llm_client is not None:
             parsed.skill_requirements = classify_skill_requirements(
                 parsed.raw_text,
                 parsed.skills,
                 llm_client,
             )
-        with self.connect() as conn:
-            cursor = conn.execute(
+        try:
+            with self.connect() as conn:
+                cursor = conn.execute(
                 """
                 INSERT INTO jobs (
-                    account_id, raw_text, source_url, title, city, salary_min_k, salary_max_k,
+                    account_id, raw_text, source_url, import_method, captured_at, title, city, salary_min_k, salary_max_k,
                     salary_months, salary_unit, experience_min_years,
                     experience_max_years, experience_label, education,
                     company_name, industry, company_size, skills_json,
                     skill_requirements_json, description_text, field_confidence_json,
-                    uncertainty_notes_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    uncertainty_notes_json, content_fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     account_id,
                     parsed.raw_text,
                     parsed.source_url,
+                    parsed.import_method,
+                    parsed.captured_at,
                     parsed.title,
                     parsed.city,
                     parsed.salary_min_k,
@@ -1135,19 +1238,57 @@ class RepositoryStore:
                     parsed.description_text,
                     json.dumps(parsed.field_confidence, ensure_ascii=False),
                     json.dumps(parsed.uncertainty_notes, ensure_ascii=False),
+                    fingerprint,
                 ),
-            )
-            job_id = int(cursor.lastrowid)
-            # 职位描述先进入 long_texts，后续可以同步到真正的向量数据库。
-            self._add_long_text(
-                conn,
-                "job",
-                job_id,
-                "description",
-                parsed.description_text,
-                account_id=account_id,
-            )
+                )
+                job_id = int(cursor.lastrowid)
+                # 职位描述先进入 long_texts，后续可以同步到真正的向量数据库。
+                self._add_long_text(
+                    conn,
+                    "job",
+                    job_id,
+                    "description",
+                    parsed.description_text,
+                    account_id=account_id,
+                )
+        except Exception as error:
+            if is_unique_constraint_violation(error, "uq_jobs_account_content_fingerprint"):
+                raise DuplicateResourceError("职位信息") from error
+            raise
         return self.get_job(job_id)
+
+    def find_job_by_content_fingerprint(
+        self,
+        account_id: int | None,
+        fingerprint: str,
+    ) -> ImportedJob | None:
+        """查找相同职位原文，并兼容迁移前没有内容指纹的职位。"""
+
+        with self.connect() as conn:
+            if account_id is None:
+                row = conn.execute(
+                    "SELECT * FROM jobs WHERE content_fingerprint = ?",
+                    (fingerprint,),
+                ).fetchone()
+                legacy_rows = conn.execute(
+                    "SELECT * FROM jobs WHERE content_fingerprint IS NULL"
+                ).fetchall()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM jobs WHERE account_id = ? AND content_fingerprint = ?",
+                    (account_id, fingerprint),
+                ).fetchone()
+                legacy_rows = conn.execute(
+                    "SELECT * FROM jobs WHERE account_id = ? AND content_fingerprint IS NULL",
+                    (account_id,),
+                ).fetchall()
+        if row is not None:
+            return self._job_from_row(row)
+        for legacy_row in legacy_rows:
+            job = self._job_from_row(legacy_row)
+            if job_text_content_fingerprint(job.raw_text) == fingerprint:
+                return job
+        return None
 
     def get_job(self, job_id: int, account_id: int | None = None) -> ImportedJob:
         """按 ID 读取标准化职位信息。"""
@@ -1469,28 +1610,84 @@ class RepositoryStore:
         `candidate_profiles.skills_json` 等已确认事实字段。
         """
 
+        fingerprint = project_card_content_fingerprint(card)
+        if self.find_project_card_by_content_fingerprint(account_id, candidate_id, fingerprint) is not None:
+            raise DuplicateResourceError("项目")
         now = now_iso()
-        with self.connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO project_experience_cards (
-                    account_id, candidate_id, status, project_name, card_json,
-                    confirmed_summary, created_at, confirmed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    account_id,
-                    candidate_id,
-                    "待确认",
-                    card.project_name,
-                    json.dumps(asdict(card), ensure_ascii=False),
-                    None,
-                    now,
-                    None,
-                ),
-            )
-            record_id = int(cursor.lastrowid)
+        try:
+            with self.connect() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO project_experience_cards (
+                        account_id, candidate_id, status, project_name, card_json,
+                        confirmed_summary, created_at, confirmed_at, content_fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        account_id,
+                        candidate_id,
+                        "待确认",
+                        card.project_name,
+                        json.dumps(asdict(card), ensure_ascii=False),
+                        None,
+                        now,
+                        None,
+                        fingerprint,
+                    ),
+                )
+                record_id = int(cursor.lastrowid)
+        except Exception as error:
+            if is_unique_constraint_violation(error, "uq_project_cards_candidate_content_fingerprint"):
+                raise DuplicateResourceError("项目") from error
+            raise
         return self.get_project_card(record_id)
+
+    def find_project_card_by_content_fingerprint(
+        self,
+        account_id: int | None,
+        candidate_id: int,
+        fingerprint: str,
+    ) -> ProjectExperienceRecord | None:
+        """查找同一候选人的相同项目卡片，并兼容迁移前未记录指纹的卡片。"""
+
+        with self.connect() as conn:
+            if account_id is None:
+                row = conn.execute(
+                    """
+                    SELECT * FROM project_experience_cards
+                    WHERE candidate_id = ? AND content_fingerprint = ?
+                    """,
+                    (candidate_id, fingerprint),
+                ).fetchone()
+                legacy_rows = conn.execute(
+                    """
+                    SELECT * FROM project_experience_cards
+                    WHERE candidate_id = ? AND content_fingerprint IS NULL
+                    """,
+                    (candidate_id,),
+                ).fetchall()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT * FROM project_experience_cards
+                    WHERE account_id = ? AND candidate_id = ? AND content_fingerprint = ?
+                    """,
+                    (account_id, candidate_id, fingerprint),
+                ).fetchone()
+                legacy_rows = conn.execute(
+                    """
+                    SELECT * FROM project_experience_cards
+                    WHERE account_id = ? AND candidate_id = ? AND content_fingerprint IS NULL
+                    """,
+                    (account_id, candidate_id),
+                ).fetchall()
+        if row is not None:
+            return self._project_card_from_row(row)
+        for legacy_row in legacy_rows:
+            record = self._project_card_from_row(legacy_row)
+            if project_card_content_fingerprint(record.card) == fingerprint:
+                return record
+        return None
 
     def get_project_card(
         self,
@@ -1789,67 +1986,107 @@ class RepositoryStore:
             if parent.candidate_id != candidate_id:
                 raise ValueError("派生简历与源简历必须属于同一候选人。")
 
+        fingerprint = sha256 if artifact_type == "source" else None
+        if fingerprint and self.find_resume_source_by_content_fingerprint(account_id, candidate_id, fingerprint) is not None:
+            raise DuplicateResourceError("简历")
+
         created_at = now_iso()
+        try:
+            with self.connect() as conn:
+                actual_version = version
+                if actual_version is None:
+                    row = conn.execute(
+                        """
+                        SELECT COALESCE(MAX(version), 0) AS latest_version
+                        FROM resume_artifacts
+                        WHERE candidate_id = ? AND artifact_type = ?
+                        """,
+                        (candidate_id, artifact_type),
+                    ).fetchone()
+                    actual_version = int(row["latest_version"]) + 1
+                cursor = conn.execute(
+                    """
+                    INSERT INTO resume_artifacts (
+                        account_id, candidate_id, job_id, draft_id, parent_artifact_id,
+                        version, artifact_type, original_filename, download_filename,
+                        storage_key, media_type, file_size, sha256, extraction_method,
+                        extracted_text, text_length, page_count, status, long_text_id, created_at,
+                        content_fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        account_id,
+                        candidate_id,
+                        job_id,
+                        draft_id,
+                        parent_artifact_id,
+                        actual_version,
+                        artifact_type,
+                        original_filename,
+                        download_filename,
+                        storage_key,
+                        media_type,
+                        file_size,
+                        sha256,
+                        extraction_method,
+                        extracted_text,
+                        len(extracted_text),
+                        page_count,
+                        status,
+                        None,
+                        created_at,
+                        fingerprint,
+                    ),
+                )
+                artifact_id = int(cursor.lastrowid)
+                if register_long_text:
+                    long_text_id = self._add_long_text(
+                        conn,
+                        "resume_artifact",
+                        artifact_id,
+                        f"uploaded:{original_filename}",
+                        extracted_text,
+                        account_id=account_id,
+                        candidate_id=candidate_id,
+                    )
+                    conn.execute(
+                        "UPDATE resume_artifacts SET long_text_id = ? WHERE id = ?",
+                        (long_text_id, artifact_id),
+                    )
+        except Exception as error:
+            if is_unique_constraint_violation(error, "uq_resume_artifacts_candidate_content_fingerprint"):
+                raise DuplicateResourceError("简历") from error
+            raise
+        return self.get_resume_artifact(artifact_id, account_id=account_id)
+
+    def find_resume_source_by_content_fingerprint(
+        self,
+        account_id: int | None,
+        candidate_id: int,
+        fingerprint: str,
+    ) -> ResumeArtifactRecord | None:
+        """查找同一候选人上传的同字节简历，历史记录回退到原 SHA-256。"""
+
         with self.connect() as conn:
-            actual_version = version
-            if actual_version is None:
+            if account_id is None:
                 row = conn.execute(
                     """
-                    SELECT COALESCE(MAX(version), 0) AS latest_version
-                    FROM resume_artifacts
-                    WHERE candidate_id = ? AND artifact_type = ?
+                    SELECT * FROM resume_artifacts
+                    WHERE candidate_id = ? AND artifact_type = 'source'
+                      AND (content_fingerprint = ? OR (content_fingerprint IS NULL AND sha256 = ?))
                     """,
-                    (candidate_id, artifact_type),
+                    (candidate_id, fingerprint, fingerprint),
                 ).fetchone()
-                actual_version = int(row["latest_version"]) + 1
-            cursor = conn.execute(
-                """
-                INSERT INTO resume_artifacts (
-                    account_id, candidate_id, job_id, draft_id, parent_artifact_id,
-                    version, artifact_type, original_filename, download_filename,
-                    storage_key, media_type, file_size, sha256, extraction_method,
-                    extracted_text, text_length, page_count, status, long_text_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    account_id,
-                    candidate_id,
-                    job_id,
-                    draft_id,
-                    parent_artifact_id,
-                    actual_version,
-                    artifact_type,
-                    original_filename,
-                    download_filename,
-                    storage_key,
-                    media_type,
-                    file_size,
-                    sha256,
-                    extraction_method,
-                    extracted_text,
-                    len(extracted_text),
-                    page_count,
-                    status,
-                    None,
-                    created_at,
-                ),
-            )
-            artifact_id = int(cursor.lastrowid)
-            if register_long_text:
-                long_text_id = self._add_long_text(
-                    conn,
-                    "resume_artifact",
-                    artifact_id,
-                    f"uploaded:{original_filename}",
-                    extracted_text,
-                    account_id=account_id,
-                    candidate_id=candidate_id,
-                )
-                conn.execute(
-                    "UPDATE resume_artifacts SET long_text_id = ? WHERE id = ?",
-                    (long_text_id, artifact_id),
-                )
-        return self.get_resume_artifact(artifact_id, account_id=account_id)
+            else:
+                row = conn.execute(
+                    """
+                    SELECT * FROM resume_artifacts
+                    WHERE account_id = ? AND candidate_id = ? AND artifact_type = 'source'
+                      AND (content_fingerprint = ? OR (content_fingerprint IS NULL AND sha256 = ?))
+                    """,
+                    (account_id, candidate_id, fingerprint, fingerprint),
+                ).fetchone()
+        return self._resume_artifact_from_row(row) if row is not None else None
 
     def complete_resume_artifact_extraction(
         self,
@@ -2160,6 +2397,8 @@ class RepositoryStore:
             id=int(row["id"]),
             raw_text=row["raw_text"],
             source_url=row["source_url"],
+            import_method=row.get("import_method", "text"),
+            captured_at=row.get("captured_at"),
             title=row["title"],
             city=row["city"],
             salary_min_k=row["salary_min_k"],
@@ -2179,7 +2418,7 @@ class RepositoryStore:
                 for item in json.loads(row["skill_requirements_json"] or "[]")
                 if isinstance(item, dict)
             ]
-            if "skill_requirements_json" in row.keys()
+            if "skill_requirements_json" in row
             else [],
             description_text=row["description_text"],
             field_confidence=json.loads(row["field_confidence_json"]),
@@ -2369,7 +2608,7 @@ class RepositoryStore:
 def now_iso() -> str:
     """返回秒级 ISO 时间字符串，用于记录本地确认时间。"""
 
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def account_from_row(row: RepositoryRow) -> AccountRecord:
@@ -2514,12 +2753,12 @@ def candidate_profile_from_row(row: RepositoryRow) -> CandidateProfile:
         unacceptable=json.loads(row["unacceptable_json"]),
         acceptable_cities=normalize_city_list(
             json.loads(row["acceptable_cities_json"] or "[]")
-            if "acceptable_cities_json" in row.keys()
+            if "acceptable_cities_json" in row
             else []
         ),
         preference_weights=sanitize_preference_weights(
             json.loads(row["preference_weights_json"] or "{}")
-            if "preference_weights_json" in row.keys()
+            if "preference_weights_json" in row
             else {}
         ),
     )
@@ -2534,8 +2773,8 @@ def long_text_from_row(row: RepositoryRow) -> LongTextRecord:
         entity_id=int(row["entity_id"]),
         source_label=row["source_label"],
         text=row["text"],
-        account_id=row["account_id"] if "account_id" in row.keys() else None,
-        candidate_id=row["candidate_id"] if "candidate_id" in row.keys() else None,
+        account_id=row.get("account_id"),
+        candidate_id=row.get("candidate_id"),
     )
 
 

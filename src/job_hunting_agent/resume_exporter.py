@@ -137,7 +137,7 @@ def configure_docx_styles(document: Document) -> None:
     bullet.paragraph_format.line_spacing = 1.25
 
 
-def set_style_font(style, ascii_font: str, east_asia_font: str, size: float, bold: bool = False) -> None:  # noqa: ANN001
+def set_style_font(style, ascii_font: str, east_asia_font: str, size: float, bold: bool = False) -> None:
     """同时设置西文字体和东亚字体，避免 Word/LibreOffice 字体回退不一致。"""
 
     style.font.name = ascii_font
@@ -163,7 +163,7 @@ def add_docx_title(document: Document, candidate_name: str, job_title: str) -> N
     set_run_font(run, size=10.5, color=MUTED_GRAY)
 
 
-def set_run_font(run, *, size: float, color: RGBColor, bold: bool = False) -> None:  # noqa: ANN001
+def set_run_font(run, *, size: float, color: RGBColor, bold: bool = False) -> None:
     """给直接格式化的标题 run 同时设置中西文字体。"""
 
     run.font.name = BODY_FONT_ASCII

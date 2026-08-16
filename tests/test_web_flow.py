@@ -8,19 +8,22 @@
 import re
 
 from fastapi.testclient import TestClient
-from langchain_core.language_models.fake_chat_models import FakeListChatModel, FakeMessagesListChatModel
+from langchain_core.language_models.fake_chat_models import (
+    FakeListChatModel,
+    FakeMessagesListChatModel,
+)
 from langchain_core.messages import AIMessage
 
 from job_hunting_agent.agent import JobHuntingAgent
 from job_hunting_agent.app import JobHuntingApp
-from job_hunting_agent.models import CandidateProfileInput
+from job_hunting_agent.models import CandidateProfileInput, CandidateProfilePatch
 from job_hunting_agent.web import ChatPayload, create_web_app
 
 
 class ToolCallingFakeChatModel(FakeMessagesListChatModel):
     """测试用假模型：支持 `create_agent` 的工具绑定。"""
 
-    def bind_tools(self, tools, *, tool_choice=None, **kwargs):  # noqa: ANN001,D401
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
         """直接返回自身，让测试可以手工指定工具调用序列。"""
 
         return self
@@ -29,7 +32,7 @@ class ToolCallingFakeChatModel(FakeMessagesListChatModel):
 class StreamingFakeChatModel(FakeListChatModel):
     """测试用流式假模型：用于验证 Web SSE 不会退化成单次完整输出。"""
 
-    def bind_tools(self, tools, *, tool_choice=None, **kwargs):  # noqa: ANN001,D401
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
         """直接返回自身，让 `create_agent` 保留 fake 模型的 `_stream` 行为。"""
 
         return self
@@ -147,8 +150,8 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert home.status_code == 200
     assert "Job Hunting Agent" in home.text
     assert "syncAuthPageClass" in script.text
-    assert '/static/app.js?v=20260806-multi-city' in home.text
-    assert '/static/styles.css?v=20260806-multi-city' in home.text
+    assert '/static/app.js?v=20260814-dedup-dialog' in home.text
+    assert '/static/styles.css?v=20260814-dedup-dialog' in home.text
     assert "本地运行 · 用户复制职位文本" not in home.text
     assert "Conversation Workspace" not in home.text
     assert "整理求职证据" not in home.text
@@ -311,6 +314,131 @@ def test_web_can_create_profile_and_ingest_chat_message_incrementally(tmp_path):
     assert profile["education"] == "本科"
     assert profile["skills"]["Python"] == "待确认"
     assert any("FastAPI" in item["content"] for item in rag["results"])
+
+
+def test_web_rejects_exact_duplicate_profile_and_job_per_account(tmp_path):
+    """同账号重复保存档案或职位必须返回 409，其他账号仍可独立保存。"""
+
+    profile_payload = {
+        "name": "小林",
+        "status": "离职",
+        "education": "本科",
+        "experience_years": 1,
+        "skills": {"Python": "项目使用", "FastAPI": "项目使用"},
+        "preferred_cities": ["杭州市", "上海市"],
+        "acceptable_cities": [],
+        "salary_floor_k": 10,
+        "expected_salary_k": 15,
+        "target_directions": ["Python 后端开发"],
+        "unacceptable": [],
+    }
+    job_payload = {
+        "raw_text": """
+        Python 后端开发工程师
+        15-20K
+        杭州
+        1-3年
+        本科
+        职位描述：负责 Python 和 FastAPI 后端开发。
+        """,
+        "source_url": "https://www.zhipin.com/job_detail/example.html",
+    }
+    owner = legacy_client()
+    other = login_test_account(TestClient(create_web_app()), "dedup-other@example.com")
+
+    created = owner.post("/api/profiles", json=profile_payload)
+    duplicate_profile = owner.post("/api/profiles", json={**profile_payload, "preferred_cities": ["上海市", "杭州市"]})
+    other_profile = other.post("/api/profiles", json=profile_payload)
+    imported = owner.post("/api/jobs", json=job_payload)
+    duplicate_job = owner.post("/api/jobs", json={**job_payload, "raw_text": job_payload["raw_text"].replace("\n", "\r\n")})
+    other_job = other.post("/api/jobs", json=job_payload)
+
+    assert created.status_code == 200
+    assert duplicate_profile.status_code == 409
+    assert "候选人档案" in duplicate_profile.json()["detail"]
+    assert other_profile.status_code == 200
+    assert imported.status_code == 200
+    assert duplicate_job.status_code == 409
+    assert "职位信息" in duplicate_job.json()["detail"]
+    assert other_job.status_code == 200
+    assert len(owner.get("/api/profiles").json()["profiles"]) == 1
+    assert len(owner.get("/api/jobs").json()["jobs"]) == 1
+
+
+def test_profile_content_fingerprint_tracks_conversation_updates(tmp_path):
+    """对话更新后的档案指纹也必须更新，才能继续拦住等价的新建档案。"""
+
+    app = JobHuntingApp(semantic_matching=False)
+    app.initialize()
+    account = app.auth.register("fingerprint-update@example.com", "password-123")
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="小林",
+            status="待补充",
+            education="本科",
+            experience_years=0,
+            skills={},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        ),
+        account_id=account.id,
+    )
+    app.store.update_candidate_profile(
+        candidate_id,
+        CandidateProfilePatch(skills={"Python": "待确认"}),
+        account_id=account.id,
+    )
+
+    duplicate = CandidateProfileInput(
+        name="小林",
+        status="待补充",
+        education="本科",
+        experience_years=0,
+        skills={"Python": "待确认"},
+        preferred_cities=[],
+        salary_floor_k=None,
+        expected_salary_k=None,
+        target_directions=[],
+        unacceptable=[],
+    )
+    response = login_test_account(TestClient(create_web_app()), "fingerprint-update@example.com").post(
+        "/api/profiles",
+        json={
+            "name": duplicate.name,
+            "status": duplicate.status,
+            "education": duplicate.education,
+            "experience_years": duplicate.experience_years,
+            "skills": duplicate.skills,
+            "preferred_cities": duplicate.preferred_cities,
+            "acceptable_cities": duplicate.acceptable_cities,
+            "salary_floor_k": duplicate.salary_floor_k,
+            "expected_salary_k": duplicate.expected_salary_k,
+            "target_directions": duplicate.target_directions,
+            "unacceptable": duplicate.unacceptable,
+        },
+    )
+
+    assert response.status_code == 409
+
+
+def test_web_frontend_shows_centered_duplicate_dialog(tmp_path):
+    """所有 409 重复冲突都应走同一个居中弹窗，而非散落在各表单错误区。"""
+
+    client = legacy_client()
+    home = client.get("/").text
+    script = client.get("/static/app.js").text
+    styles = client.get("/static/styles.css").text
+
+    assert 'class="duplicate-dialog"' in home
+    assert 'role="alertdialog"' in home
+    assert "showDuplicateNotice(error" in script
+    assert "duplicate-dialog-lock" in script
+    assert "error.status = response.status" in script
+    assert ".duplicate-dialog" in styles
+    assert ".duplicate-dialog-panel" in styles
 
 
 def test_web_can_import_job_and_return_matches(tmp_path):
@@ -804,20 +932,24 @@ def test_web_chat_stream_preserves_multiple_token_events(tmp_path):
     assert '{"content": "K"}' in response.text
 
 
-def test_web_chat_bubble_uses_markdown_renderer(tmp_path):
-    """Vue 聊天气泡应渲染 Markdown，而不是把模型回复按纯文本展示。"""
+def test_web_chat_bubble_renders_final_markdown_without_stream_reparse(tmp_path):
+    """流式阶段展示纯文本，定稿后仍保留安全 Markdown 渲染。"""
 
     client = legacy_client()
     script = client.get("/static/app.js").text
     home = client.get("/").text
 
-    # 这个测试锁住用户报告的具体问题：Vue 模板必须通过 v-html 使用安全 Markdown 渲染器，
-    # 否则 **加粗**、列表和代码块都会在页面上原样显示。
+    # 流式阶段不应在每个 token 上重跑完整 Markdown 解析；定稿后仍要通过
+    # 安全 HTML 缓存保留 **加粗**、列表和代码块展示。
     assert 'id="app"' in home
     assert "/static/vendor/vue.global.prod.js?v=20260731-auth-admin" in home
-    assert 'v-html="renderMarkdown(message.content)"' in home
+    assert 'v-if="message.isStreaming"' in home
+    assert 'v-html="message.renderedHtml"' in home
+    assert 'v-html="renderMarkdown(message.content)"' not in home
     assert "Vue.createApp" in script or "createApp({" in script
     assert "renderMarkdown(text)" in script
+    assert "renderedHtml" in script
+    assert "isStreaming" in script
     assert '"/api/chat/stream"' in script
     assert "response.body.getReader()" in script
     assert "splitStreamDisplayChunks(content)" in script

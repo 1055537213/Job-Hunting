@@ -13,15 +13,15 @@ from job_hunting_agent.config import (
 from job_hunting_agent.rag import (
     HttpReranker,
     NativeMultimodalEmbeddings,
-    RerankResult,
     OpenAICompatibleEmbeddings,
+    RerankResult,
     build_rag_embeddings,
     build_reranker,
     rag_embedding_model_name,
 )
 
 
-def write_native_env(path) -> None:  # noqa: ANN001
+def write_native_env(path) -> None:
     """写入不含真实密钥的 provider-native RAG 测试配置。"""
 
     path.write_text(
@@ -100,7 +100,7 @@ def test_native_multimodal_embeddings_use_native_payload_and_restore_input_order
 
     captured: dict[str, object] = {}
 
-    def fake_transport(url, headers, payload, timeout):  # noqa: ANN001
+    def fake_transport(url, headers, payload, timeout):
         captured.update(url=url, headers=headers, payload=payload, timeout=timeout)
         # 服务端可能返回乱序条目，适配器需按 text_index 还原为原输入顺序。
         return {
@@ -140,7 +140,7 @@ def test_native_reranker_uses_query_documents_payload_and_preserves_indexes():
 
     captured: dict[str, object] = {}
 
-    def fake_transport(url, headers, payload, timeout):  # noqa: ANN001
+    def fake_transport(url, headers, payload, timeout):
         captured.update(url=url, headers=headers, payload=payload, timeout=timeout)
         return {
             "output": {
@@ -180,7 +180,7 @@ def test_standard_reranker_uses_common_rerank_payload():
 
     captured: dict[str, object] = {}
 
-    def fake_transport(url, headers, payload, timeout):  # noqa: ANN001
+    def fake_transport(url, headers, payload, timeout):
         captured.update(url=url, headers=headers, payload=payload, timeout=timeout)
         return {"results": [{"index": 0, "score": 0.8}, {"index": 1, "score": 0.2}]}
 

@@ -6,16 +6,15 @@
 
 from __future__ import annotations
 
-from alembic import context
 from sqlalchemy import engine_from_config, pool, text
 
+from alembic import context
 from job_hunting_agent.config import (
     load_database_settings,
     normalize_database_url,
     require_postgresql_database_url,
 )
 from job_hunting_agent.database_schema import metadata
-
 
 config = context.config
 # 应用运行时不能依赖 alembic.ini 中的静态 URL。Docker 和宿主机都从环境

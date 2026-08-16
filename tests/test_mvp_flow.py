@@ -302,7 +302,7 @@ def test_semantic_direction_score_combines_embedding_and_rerank_protocols(tmp_pa
     class FakeEmbeddings:
         """让查询和职位正文相似、标题不相似的离线替身。"""
 
-        def embed_documents(self, texts):  # noqa: ANN001
+        def embed_documents(self, texts):
             return [
                 [1.0, 0.0] if index in {0, 2} else [0.0, 1.0]
                 for index, _ in enumerate(texts)
@@ -311,7 +311,7 @@ def test_semantic_direction_score_combines_embedding_and_rerank_protocols(tmp_pa
     class FakeReranker:
         """返回与正文更相关的重排分数。"""
 
-        def rerank(self, query, documents, top_n):  # noqa: ANN001
+        def rerank(self, query, documents, top_n):
             from job_hunting_agent.rag import RerankResult
 
             return [RerankResult(index=0, relevance_score=0.2), RerankResult(index=1, relevance_score=0.9)]

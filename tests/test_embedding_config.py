@@ -9,7 +9,10 @@ import json
 
 import pytest
 
-from job_hunting_agent.config import load_embedding_settings, load_semantic_matching_enabled
+from job_hunting_agent.config import (
+    load_embedding_settings,
+    load_semantic_matching_enabled,
+)
 from job_hunting_agent.rag import (
     LocalHashEmbeddings,
     OpenAICompatibleEmbeddings,

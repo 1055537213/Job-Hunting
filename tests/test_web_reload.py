@@ -6,7 +6,7 @@ import os
 import sys
 from types import SimpleNamespace
 
-import job_hunting_agent.web as web
+from job_hunting_agent import web
 
 
 def test_reloadable_web_app_reads_runtime_paths_from_reloader_environment(monkeypatch, tmp_path):

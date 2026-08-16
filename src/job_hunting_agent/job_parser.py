@@ -10,12 +10,11 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 from .city_catalog import all_cities, cities_in_text, normalize_city_name
 from .llm import LLMClient
 from .models import ImportedJob, SkillRequirement
-
 
 EDUCATION_ORDER = {
     # 学历等级来自决策地图 #7：学历是硬性条件，候选人学历不能低于职位要求。
@@ -151,7 +150,14 @@ class JobTextValidationResult:
         )
 
 
-def parse_job_text(raw_text: str, job_id: int = 0, source_url: str | None = None) -> ImportedJob:
+def parse_job_text(
+    raw_text: str,
+    job_id: int = 0,
+    source_url: str | None = None,
+    *,
+    import_method: str = "text",
+    captured_at: str | None = None,
+) -> ImportedJob:
     """把候选人导入的职位原文解析成 `ImportedJob`。
 
     解析目标不是做到百分百准确，而是先得到可比较字段，并明确标记字段置信度。
@@ -207,6 +213,8 @@ def parse_job_text(raw_text: str, job_id: int = 0, source_url: str | None = None
         field_confidence=field_confidence,
         uncertainty_notes=uncertainty_notes,
         skill_requirements=skill_requirements,
+        import_method=import_method,
+        captured_at=captured_at,
     )
 
 
@@ -331,7 +339,7 @@ def classify_skill_requirements(
             return fallback
         fallback_by_name = {item.name: item for item in fallback}
         return [parsed.get(name, fallback_by_name[name]) for name in skills]
-    except Exception:
+    except Exception:  # noqa: BLE001 - 供应商实现只受最小 LLMClient 协议约束。
         # 分类是增强能力；网络、协议或模型异常时必须回退规则结果，不能阻断职位导入。
         return fallback
 
@@ -569,4 +577,4 @@ def extract_skills(text: str) -> list[str]:
 def now_iso() -> str:
     """返回秒级 ISO 时间字符串，预留给后续记录导入时间。"""
 
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")

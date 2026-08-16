@@ -10,10 +10,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import sqlalchemy as sa
-from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
+
+from alembic import command
 
 from .config import normalize_database_url
 

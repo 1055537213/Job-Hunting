@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>求职助手 Agent</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260806-multi-city" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260814-dedup-dialog" />
   </head>
   <body>
     <!-- Vue 还没有挂载完成时隐藏模板，避免用户短暂看到未编译的 {{ }}。 -->
@@ -139,7 +139,27 @@
       </header>
 
       <div v-if="auth.authenticated && activeView === 'workspace'" class="workspace-grid">
-        <aside id="profilePanel" class="sidebar" aria-label="候选人档案">
+        <aside
+          id="profilePanel"
+          class="sidebar"
+          :class="{ 'is-open': workspaceRailOpen }"
+          aria-label="候选人档案与工作台功能"
+        >
+          <div class="sidebar-drawer-head">
+            <div>
+              <p class="eyebrow">Workspace Tools</p>
+              <strong>工作台功能</strong>
+            </div>
+            <button
+              class="sidebar-close"
+              type="button"
+              aria-label="关闭工作台功能"
+              title="关闭工作台功能"
+              @click="closeWorkspaceRail"
+            >
+              关闭
+            </button>
+          </div>
           <section class="panel panel-hero">
             <div class="panel-title-row">
               <div>
@@ -182,13 +202,29 @@
             </button>
           </section>
 
-          <section class="panel">
+          <section class="panel panel-summary" aria-labelledby="profileSummaryTitle">
             <div class="panel-title-row">
               <div>
-                <p class="eyebrow">New Candidate</p>
-                <h2 class="panel-title">新建候选人</h2>
+                <p class="eyebrow">Structured Snapshot</p>
+                <h2 id="profileSummaryTitle" class="panel-title">当前档案摘要</h2>
               </div>
             </div>
+            <pre class="summary-box">{{ profileSummary }}</pre>
+          </section>
+
+          <nav class="tool-menu" aria-label="工作台功能菜单">
+          <section class="panel tool-panel" :class="{ 'is-open': activeWorkspacePanel === 'profile-create' }">
+            <button
+              class="tool-panel-trigger"
+              type="button"
+              :aria-expanded="String(activeWorkspacePanel === 'profile-create')"
+              aria-controls="profileCreatePanel"
+              @click="toggleWorkspacePanel('profile-create')"
+            >
+              <span class="tool-panel-trigger-title">新建候选人</span>
+              <span class="tool-panel-chevron" aria-hidden="true">⌄</span>
+            </button>
+            <div v-show="activeWorkspacePanel === 'profile-create'" id="profileCreatePanel" class="tool-panel-body">
             <form class="form-stack" @submit.prevent="createProfile">
               <label class="field-group" for="profileName">
                 <span>姓名</span>
@@ -290,16 +326,22 @@
                 {{ creatingProfile ? "创建中" : "创建并选择" }}
               </button>
             </form>
+            </div>
           </section>
 
-          <section class="panel" aria-labelledby="resumePanelTitle">
-            <div class="panel-title-row">
-              <div>
-                <p class="eyebrow">Resume Files</p>
-                <h2 id="resumePanelTitle" class="panel-title">简历文件</h2>
-              </div>
-              <span class="count-chip">{{ resumeArtifacts.length }} 份</span>
-            </div>
+          <section class="panel tool-panel" :class="{ 'is-open': activeWorkspacePanel === 'resume' }">
+            <button
+              class="tool-panel-trigger"
+              type="button"
+              :aria-expanded="String(activeWorkspacePanel === 'resume')"
+              aria-controls="resumePanelBody"
+              @click="toggleWorkspacePanel('resume')"
+            >
+              <span class="tool-panel-trigger-title">简历文件</span>
+              <span class="tool-panel-status">{{ resumeArtifacts.length }} 份</span>
+              <span class="tool-panel-chevron" aria-hidden="true">⌄</span>
+            </button>
+            <div v-show="activeWorkspacePanel === 'resume'" id="resumePanelBody" class="tool-panel-body">
             <input
               ref="resumeFileInput"
               class="sr-only"
@@ -379,16 +421,22 @@
                 </div>
               </article>
             </div>
+            </div>
           </section>
 
-          <section class="panel" aria-labelledby="githubProjectPanelTitle">
-            <div class="panel-title-row">
-              <div>
-                <p class="eyebrow">Project Evidence</p>
-                <h2 id="githubProjectPanelTitle" class="panel-title">GitHub 项目</h2>
-              </div>
-              <span class="count-chip">{{ projectCards.length }} 个</span>
-            </div>
+          <section class="panel tool-panel" :class="{ 'is-open': activeWorkspacePanel === 'github' }">
+            <button
+              class="tool-panel-trigger"
+              type="button"
+              :aria-expanded="String(activeWorkspacePanel === 'github')"
+              aria-controls="githubProjectPanelBody"
+              @click="toggleWorkspacePanel('github')"
+            >
+              <span class="tool-panel-trigger-title">GitHub 项目</span>
+              <span class="tool-panel-status">{{ projectCards.length }} 个</span>
+              <span class="tool-panel-chevron" aria-hidden="true">⌄</span>
+            </button>
+            <div v-show="activeWorkspacePanel === 'github'" id="githubProjectPanelBody" class="tool-panel-body">
             <form class="form-stack" @submit.prevent="submitGitHubProject">
               <label class="field-group" for="githubProjectUrl">
                 <span>公开仓库链接</span>
@@ -465,9 +513,241 @@
                 </button>
               </article>
             </div>
+            </div>
+          </section>
+          <section class="panel tool-panel" :class="{ 'is-open': activeWorkspacePanel === 'job-import' }">
+            <button
+              class="tool-panel-trigger"
+              type="button"
+              :aria-expanded="String(activeWorkspacePanel === 'job-import')"
+              aria-controls="jobImportPanelBody"
+              @click="toggleWorkspacePanel('job-import')"
+            >
+              <span class="tool-panel-trigger-title">导入 BOSS 职位</span>
+              <span v-if="importingJob" class="tool-panel-status">审核中</span>
+              <span v-else-if="jobImportError" class="tool-panel-status is-error">需处理</span>
+              <span class="tool-panel-chevron" aria-hidden="true">⌄</span>
+            </button>
+            <div v-show="activeWorkspacePanel === 'job-import'" id="jobImportPanelBody" class="tool-panel-body">
+              <form class="form-stack" @submit.prevent="importJob">
+                <div class="field-group">
+                  <span>导入方式</span>
+                  <div class="job-import-mode" role="group" aria-label="职位导入方式">
+                    <button
+                      class="job-import-mode-button"
+                      :class="{ 'is-active': jobImportMode === 'text' }"
+                      type="button"
+                      :aria-pressed="String(jobImportMode === 'text')"
+                      @click="setJobImportMode('text')"
+                    >
+                      粘贴文本
+                    </button>
+                    <button
+                      class="job-import-mode-button"
+                      :class="{ 'is-active': jobImportMode === 'screenshot' }"
+                      type="button"
+                      :aria-pressed="String(jobImportMode === 'screenshot')"
+                      @click="setJobImportMode('screenshot')"
+                    >
+                      上传截图
+                    </button>
+                  </div>
+                </div>
+                <label v-if="jobImportMode === 'text'" class="field-group" for="jobRawText">
+                  <span>职位详情文本</span>
+                  <textarea
+                    id="jobRawText"
+                    ref="jobText"
+                    v-model="jobForm.rawText"
+                    class="field tall"
+                    :aria-invalid="String(Boolean(jobImportError))"
+                    :aria-describedby="jobImportError ? 'jobImportError' : null"
+                    placeholder="把 BOSS 职位详情页里你能看到的文本复制到这里。"
+                  ></textarea>
+                </label>
+                <div v-else id="jobScreenshotImport" class="field-group">
+                  <label for="jobScreenshotFiles"><span>职位截图</span></label>
+                  <input
+                    id="jobScreenshotFiles"
+                    ref="jobScreenshotFiles"
+                    class="field"
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp"
+                    multiple
+                    :aria-invalid="String(Boolean(jobImportError))"
+                    :aria-describedby="jobImportError ? 'jobImportError' : null"
+                    @change="onJobScreenshotChange"
+                  />
+                  <div v-if="jobForm.screenshots.length" class="job-screenshot-selection" aria-live="polite">
+                    <span>{{ jobForm.screenshots.length }} 张待识别</span>
+                    <ul>
+                      <li v-for="file in jobForm.screenshots" :key="`${file.name}-${file.size}-${file.lastModified}`">
+                        {{ file.name }} · {{ formatFileSize(file.size) }}
+                      </li>
+                    </ul>
+                  </div>
+                </div>
+                <label class="field-group" for="jobSourceUrl">
+                  <span>职位来源（可选）</span>
+                  <input
+                    id="jobSourceUrl"
+                    v-model.trim="jobForm.sourceUrl"
+                    class="field"
+                    placeholder="https://www.zhipin.com/job_detail/..."
+                  />
+                </label>
+                <button
+                  class="primary-button"
+                  type="submit"
+                  :disabled="importingJob"
+                  :data-state="importingJob ? 'loading' : 'idle'"
+                >
+                  {{ importingJob ? (jobImportMode === "screenshot" ? "识别中" : "审核中") : (jobImportMode === "screenshot" ? "识别并导入" : "审核并导入") }}
+                </button>
+                <div v-if="jobImportError" id="jobImportError" class="inline-error" role="alert">
+                  {{ jobImportError }}
+                </div>
+              </form>
+            </div>
           </section>
 
+          <section class="panel tool-panel" :class="{ 'is-open': activeWorkspacePanel === 'jobs' }">
+            <button
+              class="tool-panel-trigger"
+              type="button"
+              :aria-expanded="String(activeWorkspacePanel === 'jobs')"
+              aria-controls="jobsPanelBody"
+              @click="toggleWorkspacePanel('jobs')"
+            >
+              <span class="tool-panel-trigger-title">已导入职位</span>
+              <span class="tool-panel-status">{{ jobs.length }} 个</span>
+              <span class="tool-panel-chevron" aria-hidden="true">⌄</span>
+            </button>
+            <div v-show="activeWorkspacePanel === 'jobs'" id="jobsPanelBody" class="tool-panel-body">
+              <div class="tool-panel-inline-actions">
+                <button
+                  class="ghost-button compact"
+                  type="button"
+                  :disabled="loadingJobs"
+                  :data-state="loadingJobs ? 'loading' : 'idle'"
+                  @click="loadJobs"
+                >
+                  {{ loadingJobs ? "刷新中" : "刷新职位" }}
+                </button>
+              </div>
+              <div id="jobList" class="job-list">
+                <div v-if="!jobs.length" class="empty-state">
+                  <strong>还没有导入职位。</strong>
+                  <span>把 BOSS 职位详情文本粘贴到导入功能后，会显示在这里。</span>
+                </div>
+                <article v-for="job in jobs" :key="job.id" class="job-card">
+                  <div class="job-card-head">
+                    <h3 class="job-card-title">{{ job.title }}</h3>
+                    <button
+                      class="danger-button compact"
+                      type="button"
+                      :disabled="deletingJobId === job.id"
+                      :data-state="deletingJobId === job.id ? 'loading' : 'idle'"
+                      @click="deleteJob(job)"
+                    >
+                      {{ deletingJobId === job.id ? "删除中" : "删除" }}
+                    </button>
+                  </div>
+                  <div class="job-card-meta">{{ formatJobMeta(job) }}</div>
+                  <p class="job-card-desc">{{ trimText(job.description_text || job.raw_text || "", 110) }}</p>
+                  <details v-if="job.skill_requirements?.length" class="job-skill-editor">
+                    <summary>调整技能重要性</summary>
+                    <div class="job-skill-editor-list">
+                      <label v-for="requirement in job.skill_requirements" :key="requirement.name" class="job-skill-row">
+                        <span>{{ requirement.name }}</span>
+                        <select v-model="requirement.category" class="field compact-field">
+                          <option value="core">核心</option>
+                          <option value="general">一般</option>
+                          <option value="bonus">加分</option>
+                          <option value="uncertain">不确定</option>
+                        </select>
+                      </label>
+                      <button
+                        class="ghost-button compact"
+                        type="button"
+                        :disabled="savingJobSkillsId === job.id"
+                        @click="saveJobSkillRequirements(job)"
+                      >
+                        {{ savingJobSkillsId === job.id ? "保存中" : "保存分类" }}
+                      </button>
+                    </div>
+                  </details>
+                </article>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel tool-panel" :class="{ 'is-open': activeWorkspacePanel === 'matches' }">
+            <button
+              class="tool-panel-trigger"
+              type="button"
+              :aria-expanded="String(activeWorkspacePanel === 'matches')"
+              aria-controls="matchesPanelBody"
+              @click="toggleWorkspacePanel('matches')"
+            >
+              <span class="tool-panel-trigger-title">职位匹配结果</span>
+              <span class="tool-panel-status">{{ matches.length }} 项</span>
+              <span class="tool-panel-chevron" aria-hidden="true">⌄</span>
+            </button>
+            <div v-show="activeWorkspacePanel === 'matches'" id="matchesPanelBody" class="tool-panel-body">
+              <div class="tool-panel-inline-actions">
+                <button
+                  class="ghost-button compact"
+                  type="button"
+                  :disabled="loadingMatches"
+                  :data-state="loadingMatches ? 'loading' : 'idle'"
+                  @click="matchJobs(false)"
+                >
+                  {{ loadingMatches ? "匹配中" : "重算匹配" }}
+                </button>
+              </div>
+              <div class="match-list">
+                <div v-if="!matches.length" class="empty-state">
+                  <strong>还没有匹配结果。</strong>
+                  <span>选择候选人并导入职位后，可以在这里查看排序。</span>
+                </div>
+                <article v-for="item in matches" :key="item.job.id" class="match-card">
+                  <div class="match-card-head">
+                    <h3>{{ item.job.title }}</h3>
+                    <span class="score-chip">{{ item.match.score }} 分</span>
+                  </div>
+                  <div class="match-meta">
+                    {{ item.job.city || "未知城市" }} · {{ item.match.tier }}
+                  </div>
+                  <div class="match-meta">
+                    {{ item.match.eliminated ? "已淘汰：" : "理由：" }} {{ matchReason(item) }}
+                  </div>
+                  <div v-if="matchDimensionRows(item.match).length" class="match-breakdown" aria-label="匹配分数构成">
+                    <span v-for="row in matchDimensionRows(item.match)" :key="row.key" class="match-breakdown-item">
+                      {{ row.label }} {{ row.score }}分 · 权重 {{ row.weight }}
+                    </span>
+                  </div>
+                  <div v-if="matchDetailGroups(item.match).length" class="match-detail-groups">
+                    <div v-for="group in matchDetailGroups(item.match)" :key="group.key" class="match-detail-group">
+                      <strong>{{ group.label }}</strong>
+                      <span v-for="entry in group.items" :key="entry">{{ entry }}</span>
+                    </div>
+                  </div>
+                </article>
+              </div>
+            </div>
+          </section>
+          </nav>
+
         </aside>
+
+        <button
+          v-if="workspaceRailOpen"
+          class="workspace-scrim"
+          type="button"
+          aria-label="关闭工作台功能"
+          @click="closeWorkspaceRail"
+        ></button>
 
         <main id="chatPanel" class="chat-column" aria-label="Agent 对话">
           <header class="chat-head">
@@ -476,6 +756,17 @@
               <h1 class="chat-title">{{ currentProfile ? `${currentProfile.name} 的求职对话` : "选择一个档案开始" }}</h1>
             </div>
             <div class="chat-session-actions">
+              <button
+                class="workspace-toggle"
+                type="button"
+                :aria-expanded="String(workspaceRailOpen)"
+                aria-controls="profilePanel"
+                title="打开工作台功能"
+                @click.stop="toggleWorkspaceRail"
+              >
+                <span aria-hidden="true">☷</span>
+                <span>功能</span>
+              </button>
               <div class="session-picker" @click.stop>
                 <span class="sr-only" id="sessionPickerLabel">当前会话</span>
                 <button
@@ -534,9 +825,15 @@
             >
               <div class="avatar">{{ message.role === "user" ? "你" : "A" }}</div>
               <div
+                v-if="message.isStreaming"
+                class="bubble streaming-text"
+                :class="{ error: message.isError }"
+              >{{ message.content || "生成中..." }}</div>
+              <div
+                v-else
                 class="bubble"
                 :class="{ error: message.isError }"
-                v-html="renderMarkdown(message.content)"
+                v-html="message.renderedHtml"
               ></div>
             </div>
           </section>
@@ -564,174 +861,6 @@
           </footer>
         </main>
 
-        <aside id="jobPanel" class="right-panel" aria-label="职位导入与匹配">
-          <section class="panel">
-            <div class="panel-title-row">
-              <div>
-                <p class="eyebrow">Structured Snapshot</p>
-                <h2 class="panel-title">当前档案摘要</h2>
-              </div>
-            </div>
-            <pre class="summary-box">{{ profileSummary }}</pre>
-          </section>
-
-          <section class="panel">
-            <div class="panel-title-row">
-              <div>
-                <p class="eyebrow">BOSS Import</p>
-                <h2 class="panel-title">导入 BOSS 职位文本</h2>
-              </div>
-            </div>
-            <form class="form-stack" @submit.prevent="importJob">
-              <label class="field-group" for="jobSourceUrl">
-                <span>职位链接，可选</span>
-                <input
-                  id="jobSourceUrl"
-                  v-model.trim="jobForm.sourceUrl"
-                  class="field"
-                  placeholder="https://www.zhipin.com/job_detail/..."
-                />
-              </label>
-              <label class="field-group" for="jobRawText">
-                <span>职位详情文本</span>
-                <textarea
-                  id="jobRawText"
-                  ref="jobText"
-                  v-model="jobForm.rawText"
-                  class="field tall"
-                  :aria-invalid="String(Boolean(jobImportError))"
-                  aria-describedby="jobImportError"
-                  placeholder="把 BOSS 职位详情页里你能看到的文本复制到这里。"
-                ></textarea>
-              </label>
-              <button
-                class="primary-button"
-                type="submit"
-                :disabled="importingJob"
-                :data-state="importingJob ? 'loading' : 'idle'"
-              >
-                {{ importingJob ? "审核中" : "审核并导入" }}
-              </button>
-              <div
-                v-if="jobImportError"
-                id="jobImportError"
-                class="inline-error"
-                role="alert"
-              >
-                {{ jobImportError }}
-              </div>
-            </form>
-          </section>
-
-          <section class="panel">
-            <div class="panel-title-row">
-              <div>
-                <p class="eyebrow">Imported Jobs</p>
-                <h2 class="panel-title">已导入职位</h2>
-              </div>
-              <button
-                class="ghost-button compact"
-                type="button"
-                :disabled="loadingJobs"
-                :data-state="loadingJobs ? 'loading' : 'idle'"
-                @click="loadJobs"
-              >
-                {{ loadingJobs ? "刷新中" : "刷新" }}
-              </button>
-            </div>
-            <div id="jobList" class="job-list">
-              <div v-if="!jobs.length" class="empty-state">
-                <strong>还没有导入职位。</strong>
-                <span>把 BOSS 职位详情文本粘贴到上方后，会显示在这里。</span>
-              </div>
-              <article v-for="job in jobs" :key="job.id" class="job-card">
-                <div class="job-card-head">
-                  <h3 class="job-card-title">{{ job.title }}</h3>
-                  <button
-                    class="danger-button compact"
-                    type="button"
-                    :disabled="deletingJobId === job.id"
-                    :data-state="deletingJobId === job.id ? 'loading' : 'idle'"
-                    @click="deleteJob(job)"
-                  >
-                    {{ deletingJobId === job.id ? "删除中" : "删除" }}
-                  </button>
-                </div>
-                <div class="job-card-meta">{{ formatJobMeta(job) }}</div>
-                <p class="job-card-desc">{{ trimText(job.description_text || job.raw_text || "", 110) }}</p>
-                <details v-if="job.skill_requirements?.length" class="job-skill-editor">
-                  <summary>调整技能重要性</summary>
-                  <div class="job-skill-editor-list">
-                    <label v-for="requirement in job.skill_requirements" :key="requirement.name" class="job-skill-row">
-                      <span>{{ requirement.name }}</span>
-                      <select v-model="requirement.category" class="field compact-field">
-                        <option value="core">核心</option>
-                        <option value="general">一般</option>
-                        <option value="bonus">加分</option>
-                        <option value="uncertain">不确定</option>
-                      </select>
-                    </label>
-                    <button
-                      class="ghost-button compact"
-                      type="button"
-                      :disabled="savingJobSkillsId === job.id"
-                      @click="saveJobSkillRequirements(job)"
-                    >
-                      {{ savingJobSkillsId === job.id ? "保存中" : "保存分类" }}
-                    </button>
-                  </div>
-                </details>
-              </article>
-            </div>
-          </section>
-
-          <section class="panel">
-            <div class="panel-title-row">
-              <div>
-                <p class="eyebrow">Match Queue</p>
-                <h2 class="panel-title">职位匹配结果</h2>
-              </div>
-              <button
-                class="ghost-button compact"
-                type="button"
-                :disabled="loadingMatches"
-                :data-state="loadingMatches ? 'loading' : 'idle'"
-                @click="matchJobs(false)"
-              >
-                {{ loadingMatches ? "匹配中" : "重算" }}
-              </button>
-            </div>
-            <div class="match-list">
-              <div v-if="!matches.length" class="empty-state">
-                <strong>还没有匹配结果。</strong>
-                <span>选择候选人并导入职位后，可以在这里查看排序。</span>
-              </div>
-              <article v-for="item in matches" :key="item.job.id" class="match-card">
-                <div class="match-card-head">
-                  <h3>{{ item.job.title }}</h3>
-                  <span class="score-chip">{{ item.match.score }} 分</span>
-                </div>
-                <div class="match-meta">
-                  {{ item.job.city || "未知城市" }} · {{ item.match.tier }}
-                </div>
-                <div class="match-meta">
-                  {{ item.match.eliminated ? "已淘汰：" : "理由：" }} {{ matchReason(item) }}
-                </div>
-                <div v-if="matchDimensionRows(item.match).length" class="match-breakdown" aria-label="匹配分数构成">
-                  <span v-for="row in matchDimensionRows(item.match)" :key="row.key" class="match-breakdown-item">
-                    {{ row.label }} {{ row.score }}分 · 权重 {{ row.weight }}
-                  </span>
-                </div>
-                <div v-if="matchDetailGroups(item.match).length" class="match-detail-groups">
-                  <div v-for="group in matchDetailGroups(item.match)" :key="group.key" class="match-detail-group">
-                    <strong>{{ group.label }}</strong>
-                    <span v-for="entry in group.items" :key="entry">{{ entry }}</span>
-                  </div>
-                </div>
-              </article>
-            </div>
-          </section>
-        </aside>
       </div>
 
       <section v-if="auth.authenticated && activeView === 'admin'" class="admin-shell" aria-labelledby="adminTitle">
@@ -828,11 +957,46 @@
           </div>
         </section>
       </div>
+
+      <div
+        v-if="duplicateNotice.open"
+        class="duplicate-dialog"
+        @keydown.esc.prevent.stop="closeDuplicateNotice"
+      >
+        <button
+          class="duplicate-dialog-backdrop"
+          type="button"
+          aria-label="关闭重复提示"
+          @click="closeDuplicateNotice"
+        ></button>
+        <section
+          class="duplicate-dialog-panel"
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="duplicateDialogTitle"
+          aria-describedby="duplicateDialogMessage"
+          @click.stop
+        >
+          <p class="eyebrow">重复内容</p>
+          <h2 id="duplicateDialogTitle">{{ duplicateNotice.title }}</h2>
+          <p id="duplicateDialogMessage">{{ duplicateNotice.message }}</p>
+          <div class="duplicate-dialog-actions">
+            <button
+              ref="duplicateDialogClose"
+              class="primary-button"
+              type="button"
+              @click="closeDuplicateNotice"
+            >
+              知道了
+            </button>
+          </div>
+        </section>
+      </div>
     </div>
 
     <!-- Vue 3 global build 已放入本地静态目录，避免本地页面依赖外部 CDN。 -->
     <script src="/static/vendor/vue.global.prod.js?v=20260731-auth-admin"></script>
     <script src="/static/china_cities.js?v=20260803-cities"></script>
-    <script src="/static/app.js?v=20260806-multi-city"></script>
+    <script src="/static/app.js?v=20260814-dedup-dialog"></script>
   </body>
 </html>

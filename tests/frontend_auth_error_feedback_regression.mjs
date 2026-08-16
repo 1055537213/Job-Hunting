@@ -69,6 +69,10 @@ const context = {
   authLoading: false,
   authMode: "login",
   authSuccess: false,
+  // 登录错误回归不覆盖重复内容弹窗；为真实提交方法提供最小 UI 上下文。
+  showDuplicateNotice() {
+    return false;
+  },
   clearAuthFeedback,
   showAuthError,
   async requestJson() {

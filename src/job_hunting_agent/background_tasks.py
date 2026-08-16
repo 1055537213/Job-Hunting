@@ -13,6 +13,7 @@ from typing import Any
 
 from .app import JobHuntingApp
 from .config import DEFAULT_ENV_PATH
+from .deduplication import DuplicateResourceError, github_project_content_fingerprint
 from .github_project import (
     GitHubRepositoryError,
     GitHubRepositoryUnavailableError,
@@ -27,7 +28,6 @@ from .task_queue import (
     RAG_INDEX_TASK_TYPE,
     RESUME_OCR_TASK_TYPE,
 )
-
 
 SYSTEM_PROBE_TASK_TYPE = "system_probe"
 
@@ -137,11 +137,11 @@ def run_registered_task(
     record = claimed_record or backend.store.claim_background_task(task_key)
     if record is None:
         # 重复消息没有取得执行权，只返回权威状态，绝不再次执行任务正文。
-        existing = backend.store.get_background_task(task_key)
+        current_task = backend.store.get_background_task(task_key)
         return {
-            "task_key": existing.task_key,
-            "status": existing.status,
-            "result": existing.result,
+            "task_key": current_task.task_key,
+            "status": current_task.status,
+            "result": current_task.result,
         }
 
     if record.task_type == RESUME_OCR_TASK_TYPE:
@@ -202,6 +202,16 @@ def run_registered_task(
                 repository_url,
                 account_id=record.account_id,
             )
+        except DuplicateResourceError as error:
+            # 提交阶段已经去重；若 Worker 重投或与同步入口发生竞态，复用已保存的卡片。
+            existing_card = backend.store.find_project_card_by_content_fingerprint(
+                record.account_id,
+                record.candidate_id,
+                github_project_content_fingerprint(repository_url),
+            )
+            if existing_card is None:
+                raise NonRetryableTaskError(str(error)) from error
+            project_card = existing_card
         except GitHubRepositoryError as error:
             # 链接错误、仓库删除或私有仓库不会因重试而恢复，直接结束任务。
             if isinstance(error, GitHubRepositoryUnavailableError):
@@ -281,11 +291,11 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
             # 先认领任务再做外部基础设施检查；检查失败时也能把 running 任务安全放回队列。
             claimed_record = backend.store.claim_background_task(task_key)
             if claimed_record is None:
-                existing = backend.store.get_background_task(task_key)
+                current_task = backend.store.get_background_task(task_key)
                 return {
-                    "task_key": existing.task_key,
-                    "status": existing.status,
-                    "result": existing.result,
+                    "task_key": current_task.task_key,
+                    "status": current_task.status,
+                    "result": current_task.result,
                 }
             backend.initialize()
             return run_registered_task(backend, task_key, claimed_record=claimed_record)
@@ -300,12 +310,9 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
             except (KeyError, RuntimeError):
                 pass
             raise
-        except Exception as error:  # noqa: BLE001 - Worker 统一处理可重试失败
-            try:
-                record = backend.store.get_background_task(task_key)
-            except (KeyError, RuntimeError):
-                # 数据库本身不可用时交给 Celery 的 broker 重试机制处理。
-                raise
+        except Exception as error:
+            # 数据库本身不可用时这里会直接抛出，由 Celery 的 broker 重试机制处理。
+            record = backend.store.get_background_task(task_key)
             if record.task_type == RESUME_OCR_TASK_TYPE:
                 safe_summary = "扫描版 PDF OCR 失败，请确认文件清晰且未加密后重试。"
             elif record.task_type == GITHUB_PROJECT_ANALYSIS_TASK_TYPE:

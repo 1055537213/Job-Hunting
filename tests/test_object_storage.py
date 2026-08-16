@@ -39,13 +39,13 @@ class FakeS3Client:
         self.objects: dict[tuple[str, str], bytes] = {}
         self.last_put: dict[str, object] | None = None
 
-    def head_bucket(self, *, Bucket: str) -> None:  # noqa: N803 - boto3 参数名保持一致
+    def head_bucket(self, *, Bucket: str) -> None:
         """模拟 bucket 不存在时的 S3 404 响应。"""
 
         if Bucket not in self.buckets:
             raise FakeS3Error("404")
 
-    def create_bucket(self, *, Bucket: str) -> None:  # noqa: N803 - boto3 参数名保持一致
+    def create_bucket(self, *, Bucket: str) -> None:
         """记录新建 bucket。"""
 
         self.buckets.add(Bucket)
@@ -60,7 +60,7 @@ class FakeS3Client:
         self.objects[(bucket, key)] = body
         self.last_put = kwargs
 
-    def get_object(self, *, Bucket: str, Key: str) -> dict[str, object]:  # noqa: N803 - boto3 参数名保持一致
+    def get_object(self, *, Bucket: str, Key: str) -> dict[str, object]:
         """返回可关闭的对象流，缺失时模拟 NoSuchKey。"""
 
         try:
@@ -69,7 +69,7 @@ class FakeS3Client:
             raise FakeS3Error("NoSuchKey") from error
         return {"Body": BytesIO(content)}
 
-    def delete_object(self, *, Bucket: str, Key: str) -> None:  # noqa: N803 - boto3 参数名保持一致
+    def delete_object(self, *, Bucket: str, Key: str) -> None:
         """模拟 S3 的幂等删除行为。"""
 
         self.objects.pop((Bucket, Key), None)

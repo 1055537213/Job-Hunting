@@ -11,7 +11,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time
-from typing import Any
+from typing import Any, Self
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection, CursorResult, Engine
@@ -19,7 +19,6 @@ from sqlalchemy.engine import Connection, CursorResult, Engine
 from .config import normalize_database_url
 from .database_migrations import current_database_revision, latest_database_revision
 from .storage import RepositoryConnection, RepositoryStore
-
 
 INSERT_PATTERN = re.compile(r"^\s*INSERT\s+INTO\s+", re.IGNORECASE)
 
@@ -39,6 +38,21 @@ class SQLAlchemyRow:
         if isinstance(value, (datetime, date, time)):
             return value.isoformat()
         return value
+
+    def __contains__(self, key: str) -> bool:
+        """支持仓储层检测兼容性字段是否存在。"""
+
+        return key in self._values
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """按映射语义读取可选列，旧迁移行缺少字段时返回默认值。"""
+
+        return self._values.get(key, default)
+
+    def __iter__(self):
+        """按列名遍历，兼容映射类型的标准行为。"""
+
+        return iter(self._values)
 
     def keys(self) -> list[str]:
         """返回列名列表，兼容现有的可选字段检测逻辑。"""
@@ -74,7 +88,7 @@ class SQLAlchemyConnection:
         self._connection: Connection | None = None
         self._transaction: Any | None = None
 
-    def __enter__(self) -> "SQLAlchemyConnection":
+    def __enter__(self) -> Self:
         """打开连接并为每个仓储方法创建一个显式事务。"""
 
         self._connection = self._engine.connect()

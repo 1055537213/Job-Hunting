@@ -21,21 +21,28 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
-from collections.abc import Iterator
 from typing import Any, TypedDict
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
 from langchain.tools import ToolRuntime, tool
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    ToolMessage,
+)
 from langgraph.checkpoint.memory import MemorySaver
 
 from .app import JobHuntingApp
-from .config import AgentMemorySettings, DEFAULT_ENV_PATH, load_agent_memory_settings
+from .config import DEFAULT_ENV_PATH, AgentMemorySettings, load_agent_memory_settings
 from .conversation_memory import build_restored_context_messages
+from .deduplication import DuplicateResourceError
 from .job_parser import InvalidJobTextError
 from .llm import extract_message_text
 from .models import AgentChatResult, BackgroundTaskRecord
@@ -133,7 +140,7 @@ class JobHuntingAgent:
             # 注入主模型常用于离线测试或自托管模型。工具内的二次单轮 LLM 仍由
             # `.env` 独立创建；配置不存在时使用规则实现，而不是让整轮 Agent 返回 502。
             try:
-                self.model_gateway.llm_settings
+                _ = self.model_gateway.llm_settings
             except ValueError:
                 self.tool_llm_available = False
             else:
@@ -434,8 +441,15 @@ def build_job_hunting_tools(app: JobHuntingApp) -> list[object]:
         """导入用户主动复制回来的职位文本，并解析成标准化职位记录。"""
 
         try:
-            job = app.import_job_text(raw_text, source_url, account_id=runtime.context.get("account_id"))
-        except InvalidJobTextError as error:
+            # Agent 的 `use_tool_llm=False` 不仅用于资料入库和简历工具，也必须传给
+            # 职位技能分类。否则测试或离线规则模式仍可能意外发起真实模型请求。
+            job = app.import_job_text(
+                raw_text,
+                source_url,
+                account_id=runtime.context.get("account_id"),
+                classify_with_llm=runtime.context["use_tool_llm"],
+            )
+        except (InvalidJobTextError, DuplicateResourceError) as error:
             # 工具返回可读失败结果，避免 Agent 把非职位文本误认为已经成功入库。
             return dumps_tool_output({"saved": False, "error": str(error)})
         return dumps_tool_output({"job": asdict(job)})
@@ -492,27 +506,30 @@ def build_job_hunting_tools(app: JobHuntingApp) -> list[object]:
         context = require_runtime_context(runtime)
         candidate_id = require_candidate_id(context)
         account_id = context.get("account_id")
-        if app.task_queue_enabled:
-            if account_id is None:
-                raise ValueError("GitHub 项目分析任务缺少账号归属。")
-            task = app.enqueue_github_project_analysis_task(
-                repository_url=repository_url,
+        try:
+            if app.task_queue_enabled:
+                if account_id is None:
+                    raise ValueError("GitHub 项目分析任务缺少账号归属。")
+                task = app.enqueue_github_project_analysis_task(
+                    repository_url=repository_url,
+                    account_id=account_id,
+                    candidate_id=candidate_id,
+                    session_id=context.get("session_id"),
+                    root_request_id=context.get("root_request_id"),
+                )
+                return dumps_tool_output(
+                    {
+                        "task": background_task_tool_payload(task),
+                        "message": "GitHub 项目分析任务已排队，完成后会生成待确认项目经历卡片。",
+                    }
+                )
+            record = app.analyze_github_project_for_candidate(
+                candidate_id,
+                repository_url,
                 account_id=account_id,
-                candidate_id=candidate_id,
-                session_id=context.get("session_id"),
-                root_request_id=context.get("root_request_id"),
             )
-            return dumps_tool_output(
-                {
-                    "task": background_task_tool_payload(task),
-                    "message": "GitHub 项目分析任务已排队，完成后会生成待确认项目经历卡片。",
-                }
-            )
-        record = app.analyze_github_project_for_candidate(
-            candidate_id,
-            repository_url,
-            account_id=account_id,
-        )
+        except DuplicateResourceError as error:
+            return dumps_tool_output({"saved": False, "error": str(error)})
         return dumps_tool_output(asdict(record))
 
     @tool
@@ -717,12 +734,17 @@ def build_tool_usage_callback(
 
 
 def dumps_tool_output(value: dict[str, Any]) -> str:
-    """统一序列化工具输出，方便 Agent 阅读，也方便 Web API 再解析。"""
+    """统一序列化工具输出，方便 Agent 阅读，也方便 Web API 再解析。
 
-    return json.dumps(value, ensure_ascii=False, indent=2)
+    数据库驱动在读取 ``jobs.captured_at`` 等时间列时可能返回 ``datetime``，
+    而 dataclass 转字典不会自动把它变成 JSON 标量。工具输出不应因某个可展示的
+    数据库标量而中断 Agent 循环，因此把这类未知标量降级为其字符串表示。
+    """
+
+    return json.dumps(value, ensure_ascii=False, indent=2, default=str)
 
 
-def resume_artifact_tool_payload(artifact) -> dict[str, Any]:  # noqa: ANN001
+def resume_artifact_tool_payload(artifact) -> dict[str, Any]:
     """把简历文件记录转换为 Agent 可读且不泄露服务器路径的工具结果。"""
 
     payload = asdict(artifact)

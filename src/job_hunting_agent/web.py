@@ -14,16 +14,27 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import threading
 import uuid
 from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
+from starlette.concurrency import run_in_threadpool
 
 from .agent import JobHuntingAgent
 from .app import JobHuntingApp
@@ -40,13 +51,13 @@ from .auth import (
 from .config import (
     load_agent_memory_settings,
     load_bootstrap_admin_settings,
+    load_cookie_secure,
     load_database_settings,
     load_embedding_settings,
+    load_llm_settings,
     load_object_storage_settings,
     load_rerank_settings,
     load_task_queue_settings,
-    load_cookie_secure,
-    load_llm_settings,
     masked_agent_memory_settings,
     masked_embedding_settings,
     masked_llm_settings,
@@ -55,7 +66,17 @@ from .config import (
     masked_task_queue_settings,
     require_postgresql_database_url,
 )
+from .deduplication import DuplicateResourceError
 from .github_project import GitHubRepositoryError
+from .job_parser import InvalidJobTextError
+from .job_screenshot import (
+    MAX_JOB_SCREENSHOT_FILE_BYTES,
+    MAX_JOB_SCREENSHOT_FILES,
+    JobScreenshot,
+    JobScreenshotError,
+    JobScreenshotModelError,
+)
+from .llm import LLMClient, LLMRequestError
 from .models import (
     AccountRecord,
     BackgroundTaskRecord,
@@ -63,12 +84,9 @@ from .models import (
     ResumeArtifactRecord,
     SkillRequirement,
 )
-from .job_parser import InvalidJobTextError
-from .llm import LLMClient, LLMRequestError
 from .rag import RAGProviderRequestError
 from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
 from .task_queue import BackgroundTaskQueue, TaskQueueError
-
 
 STATIC_DIR = Path(__file__).with_name("web_static")
 SESSION_COOKIE_NAME = "job_agent_session"
@@ -108,7 +126,7 @@ class NoCacheStaticFiles(StaticFiles):
     但浏览器仍拿旧脚本导致 `**加粗**` 原样显示。
     """
 
-    async def get_response(self, path: str, scope):  # noqa: ANN001
+    async def get_response(self, path: str, scope):
         """返回静态文件，并要求浏览器每次重新获取。"""
 
         response = await super().get_response(path, scope)
@@ -258,6 +276,10 @@ def create_web_app(
 
     web_app = FastAPI(title="Job Hunting Agent Web", version="0.1.0")
     web_app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")
+    # 截图本体不持久化，无法安全地只向 Worker 投递 task_key；因此它是一个有界的
+    # 前台导入例外。实际模型调用在工作线程执行，避免阻塞 FastAPI 事件循环，同时最多
+    # 允许两个请求占用多模态模型和图片内存。
+    screenshot_import_slots = threading.BoundedSemaphore(value=2)
 
     def current_account(request: Request, required: bool = True) -> AccountRecord | None:
         """从 HttpOnly Cookie 解析当前账号，并顺延 Session 闲置窗口。"""
@@ -470,22 +492,25 @@ def create_web_app(
         account = current_account(request)
         if not payload.name.strip():
             raise HTTPException(status_code=400, detail="候选人姓名不能为空。")
-        candidate_id = backend.save_candidate_profile(
-            CandidateProfileInput(
-                name=payload.name.strip(),
-                status=payload.status.strip() or "待补充",
-                education=payload.education.strip() or "待补充",
-                experience_years=payload.experience_years,
-                skills=clean_string_dict(payload.skills),
-                preferred_cities=clean_string_list(payload.preferred_cities),
-                acceptable_cities=clean_string_list(payload.acceptable_cities),
-                salary_floor_k=payload.salary_floor_k,
-                expected_salary_k=payload.expected_salary_k,
-                target_directions=clean_string_list(payload.target_directions),
-                unacceptable=clean_string_list(payload.unacceptable),
-            ),
-            account_id=account.id if account else None,
-        )
+        try:
+            candidate_id = backend.save_candidate_profile(
+                CandidateProfileInput(
+                    name=payload.name.strip(),
+                    status=payload.status.strip() or "待补充",
+                    education=payload.education.strip() or "待补充",
+                    experience_years=payload.experience_years,
+                    skills=clean_string_dict(payload.skills),
+                    preferred_cities=clean_string_list(payload.preferred_cities),
+                    acceptable_cities=clean_string_list(payload.acceptable_cities),
+                    salary_floor_k=payload.salary_floor_k,
+                    expected_salary_k=payload.expected_salary_k,
+                    target_directions=clean_string_list(payload.target_directions),
+                    unacceptable=clean_string_list(payload.unacceptable),
+                ),
+                account_id=account.id if account else None,
+            )
+        except DuplicateResourceError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         return {"candidate_id": candidate_id, "profile": asdict(backend.get_candidate_profile(candidate_id, account_id=account.id if account else None))}
 
     @web_app.get("/api/profiles/{candidate_id}")
@@ -617,13 +642,16 @@ def create_web_app(
                     user_message,
                     candidate_id=payload.candidate_id,
                     session_id=session_id,
-                    use_tool_llm=True,
+                    # 顶层 Agent 已经负责理解意图和组织回复；工具层保持本地规则，
+                    # 避免一次聊天因资料入库、职位分类或草稿生成而串行发起多次模型请求。
+                    # 需要视觉识别或独立简历改写时，用户会通过对应的显式上传/改写接口触发。
+                    use_tool_llm=False,
                     auto_rag=payload.auto_rag,
                     account_id=account_id,
                 )
             except RAGProviderRequestError as error:
                 raise HTTPException(status_code=502, detail=str(error)) from error
-            except Exception as error:  # noqa: BLE001 - 对 Web 层统一转成可读错误。
+            except Exception as error:
                 raise HTTPException(status_code=502, detail=str(error)) from error
             tool_outputs = result.tool_outputs
             display_reply = format_web_chat_reply(
@@ -764,10 +792,79 @@ def create_web_app(
         if not payload.raw_text.strip():
             raise HTTPException(status_code=400, detail="职位文本不能为空。")
         try:
-            job = backend.import_job_text(payload.raw_text, payload.source_url, account_id=account.id if account else None)
+            # 网页文本导入优先走可预测的本地审核和规则分类，不能因可选模型服务
+            # 超时而阻塞用户导入职位。Agent 工具在用户允许模型时另行显式开启分类。
+            job = backend.import_job_text(
+                payload.raw_text,
+                payload.source_url,
+                account_id=account.id if account else None,
+                classify_with_llm=False,
+            )
         except InvalidJobTextError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+        except DuplicateResourceError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         return {"job": asdict(job)}
+
+    @web_app.post("/api/jobs/screenshots")
+    async def import_job_screenshots(
+        request: Request,
+        screenshots: list[UploadFile] = File(...),  # noqa: B008 - FastAPI declares multipart fields this way.
+        source_url: str | None = Form(default=None),
+    ) -> dict[str, object]:
+        """识别用户主动上传的可见职位截图，不访问来源链接。"""
+
+        account = current_account(request)
+        assert account is not None
+        if len(screenshots) > MAX_JOB_SCREENSHOT_FILES:
+            raise HTTPException(status_code=400, detail=f"一次最多上传 {MAX_JOB_SCREENSHOT_FILES} 张职位截图。")
+
+        uploaded_screenshots: list[JobScreenshot] = []
+        try:
+            for screenshot in screenshots:
+                # 多读一个字节即可拒绝超限文件，避免把任意大图片交给模型或长期保留。
+                content = await screenshot.read(MAX_JOB_SCREENSHOT_FILE_BYTES + 1)
+                uploaded_screenshots.append(
+                    JobScreenshot(
+                        content=content,
+                        media_type=screenshot.content_type,
+                    )
+                )
+        finally:
+            for screenshot in screenshots:
+                await screenshot.close()
+
+        if not screenshot_import_slots.acquire(blocking=False):
+            raise HTTPException(
+                status_code=429,
+                detail="职位截图识别请求较多，请稍后重试。",
+            )
+        try:
+            # `invoke()` 是同步 SDK 调用；转到线程池后，其他登录、聊天和任务轮询请求
+            # 仍可由事件循环处理。Gateway 自己的超时配置限制这次前台等待时间。
+            job = await run_in_threadpool(
+                backend.import_job_screenshots,
+                uploaded_screenshots,
+                source_url.strip() if source_url and source_url.strip() else None,
+                account_id=account.id,
+            )
+        except JobScreenshotModelError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        except JobScreenshotError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except InvalidJobTextError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except DuplicateResourceError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        finally:
+            screenshot_import_slots.release()
+        return {
+            "job": asdict(job),
+            "extraction": {
+                "source": "screenshot",
+                "screenshot_count": len(uploaded_screenshots),
+            },
+        }
 
     @web_app.get("/api/jobs")
     def list_jobs(request: Request) -> dict[str, object]:
@@ -887,6 +984,8 @@ def create_web_app(
             )
         except GitHubRepositoryError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+        except DuplicateResourceError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         except TaskQueueError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         return {
@@ -926,7 +1025,7 @@ def create_web_app(
     async def upload_resume(
         request: Request,
         candidate_id: int = Form(...),
-        file: UploadFile = File(...),
+        file: UploadFile = File(...),  # noqa: B008 - FastAPI declares multipart fields this way.
     ) -> dict[str, object]:
         """上传简历，并按文件类型安排同步解析、OCR 或 RAG 增量索引。"""
 
@@ -948,6 +1047,8 @@ def create_web_app(
             )
         except ResumeDocumentError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+        except DuplicateResourceError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
         rag_update = None
         rag_warning = None
@@ -1198,9 +1299,12 @@ def create_web_app(
             raise HTTPException(status_code=404, detail="账号不存在。") from error
         if payload.status == "disabled" and target.id == actor.id:
             raise HTTPException(status_code=400, detail="不能禁用当前正在使用的管理员账号。")
-        if payload.status == "disabled" and target.role == "admin":
-            if backend.store.count_active_admins() <= 1:
-                raise HTTPException(status_code=400, detail="至少需要保留一个可用管理员账号。")
+        if (
+            payload.status == "disabled"
+            and target.role == "admin"
+            and backend.store.count_active_admins() <= 1
+        ):
+            raise HTTPException(status_code=400, detail="至少需要保留一个可用管理员账号。")
         account = backend.store.update_account_status(account_id, payload.status)
         if payload.status != "active":
             backend.store.revoke_all_auth_sessions(account_id)
@@ -1267,7 +1371,9 @@ def stream_web_chat_events(
                 user_message,
                 candidate_id=payload.candidate_id,
                 session_id=session_id,
-                use_tool_llm=True,
+                # 与非流式接口保持一致：LangChain Agent 使用模型回复，但工具调用不
+                # 隐式叠加外部模型请求，以便控制首 token 延迟、失败面和 Token 成本。
+                use_tool_llm=False,
                 auto_rag=payload.auto_rag,
                 account_id=account_id,
             ):

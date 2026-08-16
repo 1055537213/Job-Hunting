@@ -19,7 +19,6 @@ from job_hunting_agent.database_migrations import upgrade_database
 from job_hunting_agent.database_schema import metadata
 from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
 
-
 TEST_DATABASE_URL_ENV = "JOB_AGENT_TEST_DATABASE_URL"
 # Docker Compose 仅把 PostgreSQL 端口绑定到本机，因此这个默认值不会暴露测试数据库。
 DEFAULT_TEST_DATABASE_URL = "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent"

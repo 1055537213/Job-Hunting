@@ -16,10 +16,11 @@ from PIL import Image
 from reportlab.pdfgen import canvas
 
 from job_hunting_agent import app as app_module
+from job_hunting_agent import resume_document
 from job_hunting_agent.app import JobHuntingApp
+from job_hunting_agent.deduplication import DuplicateResourceError
 from job_hunting_agent.llm import StaticLLMClient
 from job_hunting_agent.models import CandidateProfileInput
-from job_hunting_agent import resume_document
 from job_hunting_agent.resume_document import (
     ResumeDocumentError,
     ResumeExtraction,
@@ -240,6 +241,60 @@ def test_app_saves_uploaded_resume_as_versioned_artifact_and_rag_source(tmp_path
         app.list_resume_artifacts(candidate_id, account_id=account_b.id)
     with pytest.raises(KeyError):
         app.get_resume_artifact(first.id, account_id=account_b.id)
+
+
+def test_app_rejects_duplicate_resume_bytes_for_the_same_candidate(tmp_path) -> None:
+    """同一候选人重复上传相同文件时，不应再创建新版本或额外文件。"""
+
+    app = JobHuntingApp(resume_dir=tmp_path / "resume-files")
+    app.initialize()
+    account = app.auth.register("duplicate-resume@example.com", "password-123")
+    candidate_id = app.save_candidate_profile(profile_input(), account_id=account.id)
+    content = build_docx_bytes("小林", "Python 与 FastAPI 项目经历")
+
+    first = app.upload_resume_document(
+        candidate_id,
+        "resume.docx",
+        content,
+        account_id=account.id,
+    )
+    with pytest.raises(DuplicateResourceError, match="简历"):
+        app.upload_resume_document(
+            candidate_id,
+            "same-content-renamed.docx",
+            content,
+            account_id=account.id,
+        )
+
+    assert [item.id for item in app.list_resume_artifacts(candidate_id, account_id=account.id)] == [first.id]
+
+
+def test_same_resume_bytes_can_belong_to_another_candidate_in_shared_account(tmp_path) -> None:
+    """共享账号的不同候选人可以各自保存同一份源简历。"""
+
+    app = JobHuntingApp(resume_dir=tmp_path / "resume-files")
+    app.initialize()
+    account = app.auth.register("shared-resume@example.com", "password-123")
+    first_candidate_id = app.save_candidate_profile(profile_input("小林"), account_id=account.id)
+    second_candidate_id = app.save_candidate_profile(profile_input("小周"), account_id=account.id)
+    content = build_docx_bytes("共享模板", "Python 与 FastAPI 项目经历")
+
+    first = app.upload_resume_document(
+        first_candidate_id,
+        "resume.docx",
+        content,
+        account_id=account.id,
+    )
+    second = app.upload_resume_document(
+        second_candidate_id,
+        "resume.docx",
+        content,
+        account_id=account.id,
+    )
+
+    assert first.id != second.id
+    assert first.candidate_id == first_candidate_id
+    assert second.candidate_id == second_candidate_id
 
 
 def test_app_defers_scanned_pdf_ocr_then_registers_one_rag_source(tmp_path, monkeypatch) -> None:
@@ -506,7 +561,7 @@ def test_tailored_resume_creates_docx_and_pdf_without_overwriting_profile_or_sou
 def test_web_can_tailor_uploaded_resume_and_return_download_urls(tmp_path, monkeypatch) -> None:
     """网页职位定制接口应返回独立草稿和两个可直接下载的文件版本。"""
 
-    def fail_search(*_args, **_kwargs):  # noqa: ANN002,ANN003
+    def fail_search(*_args, **_kwargs):
         raise AssertionError("Web 禁用 RAG 时不应执行语义检索")
 
     monkeypatch.setattr(JobHuntingApp, "search_rag", fail_search)

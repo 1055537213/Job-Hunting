@@ -19,7 +19,6 @@ from .models import (
     sanitize_preference_weights,
 )
 
-
 SKILL_PROFICIENCY_SCORE = {
     "精通": 100.0,
     "熟练": 100.0,

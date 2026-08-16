@@ -5,7 +5,7 @@ from job_hunting_agent.city_catalog import cities_in_text, nearby_cities
 from job_hunting_agent.models import CandidateProfileInput
 
 
-def build_profile(**overrides) -> CandidateProfileInput:  # noqa: ANN003
+def build_profile(**overrides) -> CandidateProfileInput:
     """构造城市偏好测试使用的最小候选人档案。"""
 
     values = {

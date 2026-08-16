@@ -177,7 +177,7 @@ class S3ObjectStorage:
                 return
             try:
                 self.client.head_bucket(Bucket=self.bucket)
-            except Exception as error:  # noqa: BLE001 - SDK 异常需统一映射
+            except Exception as error:
                 if self._error_code(error) not in {"404", "NoSuchBucket", "NotFound"}:
                     raise ObjectStorageError("对象存储 bucket 检查失败。") from error
                 if not self.auto_create_bucket:
@@ -192,7 +192,7 @@ class S3ObjectStorage:
                             "LocationConstraint": self.region
                         }
                     self.client.create_bucket(**create_kwargs)
-                except Exception as create_error:  # noqa: BLE001 - 处理并发建桶
+                except Exception as create_error:
                     if self._error_code(create_error) not in {
                         "BucketAlreadyOwnedByYou",
                         "BucketAlreadyExists",
@@ -231,7 +231,7 @@ class S3ObjectStorage:
             if media_type:
                 kwargs["ContentType"] = media_type
             self.client.put_object(**kwargs)
-        except Exception as error:  # noqa: BLE001 - SDK 异常需统一映射
+        except Exception as error:
             raise ObjectStorageError("对象存储写入失败。") from error
         return StoredObject(
             storage_key=storage_key,
@@ -252,7 +252,7 @@ class S3ObjectStorage:
             raise ValueError("对象流的分块大小必须大于 0。")
         try:
             response = self.client.get_object(Bucket=self.bucket, Key=key)
-        except Exception as error:  # noqa: BLE001 - SDK 异常需统一映射
+        except Exception as error:
             if self._error_code(error) in {"404", "NoSuchKey", "NoSuchObject", "NotFound"}:
                 raise ObjectNotFoundError("对象不存在。") from error
             raise ObjectStorageError("对象存储读取失败。") from error
@@ -279,5 +279,5 @@ class S3ObjectStorage:
         key = validate_storage_key(storage_key)
         try:
             self.client.delete_object(Bucket=self.bucket, Key=key)
-        except Exception as error:  # noqa: BLE001 - SDK 异常需统一映射
+        except Exception as error:
             raise ObjectStorageError("对象存储删除失败。") from error

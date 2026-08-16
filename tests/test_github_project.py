@@ -13,6 +13,7 @@ from job_hunting_agent import app as app_module
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.background_tasks import run_registered_task
 from job_hunting_agent.config import TaskQueueSettings
+from job_hunting_agent.deduplication import DuplicateResourceError
 from job_hunting_agent.github_project import (
     InvalidGitHubRepositoryUrlError,
     analyze_public_github_repository,
@@ -47,11 +48,11 @@ class RecordingQueue:
         self.task_keys.append(task_key)
 
 
-def candidate_input() -> CandidateProfileInput:
+def candidate_input(name: str = "GitHub 测试候选人") -> CandidateProfileInput:
     """生成本组测试使用的最小候选人档案。"""
 
     return CandidateProfileInput(
-        name="GitHub 测试候选人",
+        name=name,
         status="待补充",
         education="本科",
         experience_years=1,
@@ -166,6 +167,49 @@ def test_github_project_card_stays_pending_and_does_not_overwrite_profile(
     assert app.get_candidate_profile(candidate_id, account_id=account_id).skills == {"Python": "项目使用"}
 
 
+def test_same_github_repository_can_be_analyzed_for_two_candidates(
+    account_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """共享账号下，项目去重范围应是候选人，而不是整账号。"""
+
+    card = ProjectExperienceCard(
+        card_type="待确认项目经历卡片",
+        project_name="shared-project",
+        read_files=["README.md"],
+        skipped_summary={},
+        detected_tech_stack=["FastAPI"],
+        detected_core_features=["接口/API 服务"],
+        responsibility_draft=["可能负责接口/API 服务设计"],
+        highlight_draft=[],
+        resume_expression_draft=["等待确认"],
+        questions_for_candidate=["你负责什么？"],
+        source_type="github_public_repository",
+        source_url="https://github.com/example/shared-project",
+        source_ref="main",
+    )
+    monkeypatch.setattr(app_module, "analyze_public_github_repository", lambda _url: card)
+    app = JobHuntingApp(semantic_matching=False)
+    app.initialize()
+    first_candidate_id = app.save_candidate_profile(candidate_input("候选人甲"), account_id=account_id)
+    second_candidate_id = app.save_candidate_profile(candidate_input("候选人乙"), account_id=account_id)
+
+    first = app.analyze_github_project_for_candidate(
+        first_candidate_id,
+        "https://github.com/example/shared-project",
+        account_id=account_id,
+    )
+    second = app.analyze_github_project_for_candidate(
+        second_candidate_id,
+        "https://github.com/example/shared-project",
+        account_id=account_id,
+    )
+
+    assert first.id != second.id
+    assert first.candidate_id == first_candidate_id
+    assert second.candidate_id == second_candidate_id
+
+
 def test_github_project_worker_reads_only_repository_url(
     database_url: str,
     account_id: int,
@@ -230,7 +274,7 @@ def test_github_project_worker_reads_only_repository_url(
     assert "README.md" not in str(producer.calls[0])
 
 
-def test_github_project_submission_and_confirmation_are_idempotent(
+def test_github_project_submission_rejects_duplicate_and_confirmation_stays_idempotent(
     database_url: str,
     account_id: int,
     tmp_path: Path,
@@ -249,18 +293,18 @@ def test_github_project_submission_and_confirmation_are_idempotent(
     )
     candidate_id = app.save_candidate_profile(candidate_input(), account_id=account_id)
 
-    first = app.enqueue_github_project_analysis_task(
+    app.enqueue_github_project_analysis_task(
         repository_url="https://github.com/Example/Sample-Repository",
         account_id=account_id,
         candidate_id=candidate_id,
     )
-    duplicate = app.enqueue_github_project_analysis_task(
-        repository_url="https://github.com/example/sample-repository",
-        account_id=account_id,
-        candidate_id=candidate_id,
-    )
+    with pytest.raises(DuplicateResourceError, match="GitHub 项目"):
+        app.enqueue_github_project_analysis_task(
+            repository_url="https://github.com/example/sample-repository",
+            account_id=account_id,
+            candidate_id=candidate_id,
+        )
 
-    assert duplicate.task_key == first.task_key
     assert len(producer.calls) == 1
 
     card = app.store.save_project_card(
@@ -354,4 +398,15 @@ def test_web_queues_github_project_analysis_and_rejects_non_github_url() -> None
     payload = queued.json()
     assert payload["processing_async"] is True
     assert payload["task"]["task_type"] == "github_project_analysis"
+    assert queue.task_keys == [payload["task"]["task_key"]]
+
+    duplicate = client.post(
+        "/api/projects/github",
+        json={
+            "candidate_id": candidate_id,
+            "repository_url": "https://github.com/Example/Sample-Repository/",
+        },
+    )
+    assert duplicate.status_code == 409
+    assert "GitHub 项目" in duplicate.json()["detail"]
     assert queue.task_keys == [payload["task"]["task_key"]]

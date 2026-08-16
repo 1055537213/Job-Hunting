@@ -87,7 +87,7 @@ def test_llm_resume_draft_discards_unsupported_claims_and_saves_version(tmp_path
     )
 
     fake_llm = UnsafeFakeLLM()
-    def fail_search(*_args, **_kwargs):  # noqa: ANN002,ANN003
+    def fail_search(*_args, **_kwargs):
         raise AssertionError("禁用 RAG 时不应执行语义检索")
 
     monkeypatch.setattr(app, "search_rag", fail_search)

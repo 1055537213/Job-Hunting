@@ -31,9 +31,10 @@ services:
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      # 仅限本机回环地址开发的默认凭据；生产环境必须通过 Secret 注入强凭据。
-      MINIO_ROOT_USER: "${JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY:-job_agent_minio}"
-      MINIO_ROOT_PASSWORD: "${JOB_AGENT_OBJECT_STORAGE_SECRET_KEY:-job_agent_minio_local_secret}"
+      # 即使仅绑定到本机，也不保留仓库内固定对象存储凭据；必须由忽略的 `.env`
+      # 或部署平台 Secret 提供。
+      MINIO_ROOT_USER: "${JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY:?set JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY in .env}"
+      MINIO_ROOT_PASSWORD: "${JOB_AGENT_OBJECT_STORAGE_SECRET_KEY:?set JOB_AGENT_OBJECT_STORAGE_SECRET_KEY in .env}"
     ports:
       # API 和管理控制台均只绑定回环地址，不暴露到局域网。
       - "127.0.0.1:${JOB_AGENT_MINIO_PORT:-9000}:9000"
@@ -51,10 +52,10 @@ services:
     # Redis 只作为 Celery broker；任务的权威状态保存在 PostgreSQL。
     image: "${JOB_AGENT_REDIS_IMAGE:-redis:7.4-alpine}"
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${JOB_AGENT_REDIS_PASSWORD:-job_agent_redis_local_secret}"]
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${JOB_AGENT_REDIS_PASSWORD:?set JOB_AGENT_REDIS_PASSWORD in .env}"]
     environment:
       # REDISCLI_AUTH 只供健康检查使用，不把密码写进命令行参数。
-      REDISCLI_AUTH: "${JOB_AGENT_REDIS_PASSWORD:-job_agent_redis_local_secret}"
+      REDISCLI_AUTH: "${JOB_AGENT_REDIS_PASSWORD:?set JOB_AGENT_REDIS_PASSWORD in .env}"
     ports:
       # 只绑定本机回环地址，供开发者调试；线上应放在内部网络。
       - "127.0.0.1:${JOB_AGENT_REDIS_PORT:-6379}:6379"
@@ -106,15 +107,15 @@ services:
       JOB_AGENT_OBJECT_STORAGE_BACKEND: "s3"
       JOB_AGENT_OBJECT_STORAGE_ENDPOINT: "http://minio:9000"
       JOB_AGENT_OBJECT_STORAGE_BUCKET: "${JOB_AGENT_OBJECT_STORAGE_BUCKET:-job-agent-files}"
-      JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY: "${JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY:-job_agent_minio}"
-      JOB_AGENT_OBJECT_STORAGE_SECRET_KEY: "${JOB_AGENT_OBJECT_STORAGE_SECRET_KEY:-job_agent_minio_local_secret}"
+      JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY: "${JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY:?set JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY in .env}"
+      JOB_AGENT_OBJECT_STORAGE_SECRET_KEY: "${JOB_AGENT_OBJECT_STORAGE_SECRET_KEY:?set JOB_AGENT_OBJECT_STORAGE_SECRET_KEY in .env}"
       JOB_AGENT_OBJECT_STORAGE_REGION: "${JOB_AGENT_OBJECT_STORAGE_REGION:-us-east-1}"
       JOB_AGENT_OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
       # 本地开发首次启动允许应用自动创建 bucket；生产环境应改为 false 并由基础设施预创建。
       JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET: "${JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET:-true}"
       # Web 与 Worker 使用容器内 Redis 服务名；宿主机 .env 中的 127.0.0.1 只用于本地脚本。
       JOB_AGENT_TASK_QUEUE_ENABLED: "true"
-      JOB_AGENT_REDIS_URL: "redis://:${JOB_AGENT_REDIS_PASSWORD:-job_agent_redis_local_secret}@redis:6379/0"
+      JOB_AGENT_REDIS_URL: "redis://:${JOB_AGENT_REDIS_PASSWORD:?set JOB_AGENT_REDIS_PASSWORD in .env}@redis:6379/0"
       JOB_AGENT_TASK_QUEUE_NAME: "${JOB_AGENT_TASK_QUEUE_NAME:-job_agent}"
       JOB_AGENT_TASK_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_TIME_LIMIT_SECONDS:-900}"
       JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS:-840}"
@@ -154,13 +155,13 @@ services:
       JOB_AGENT_OBJECT_STORAGE_BACKEND: "s3"
       JOB_AGENT_OBJECT_STORAGE_ENDPOINT: "http://minio:9000"
       JOB_AGENT_OBJECT_STORAGE_BUCKET: "${JOB_AGENT_OBJECT_STORAGE_BUCKET:-job-agent-files}"
-      JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY: "${JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY:-job_agent_minio}"
-      JOB_AGENT_OBJECT_STORAGE_SECRET_KEY: "${JOB_AGENT_OBJECT_STORAGE_SECRET_KEY:-job_agent_minio_local_secret}"
+      JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY: "${JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY:?set JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY in .env}"
+      JOB_AGENT_OBJECT_STORAGE_SECRET_KEY: "${JOB_AGENT_OBJECT_STORAGE_SECRET_KEY:?set JOB_AGENT_OBJECT_STORAGE_SECRET_KEY in .env}"
       JOB_AGENT_OBJECT_STORAGE_REGION: "${JOB_AGENT_OBJECT_STORAGE_REGION:-us-east-1}"
       JOB_AGENT_OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
       JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET: "${JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET:-true}"
       JOB_AGENT_TASK_QUEUE_ENABLED: "true"
-      JOB_AGENT_REDIS_URL: "redis://:${JOB_AGENT_REDIS_PASSWORD:-job_agent_redis_local_secret}@redis:6379/0"
+      JOB_AGENT_REDIS_URL: "redis://:${JOB_AGENT_REDIS_PASSWORD:?set JOB_AGENT_REDIS_PASSWORD in .env}@redis:6379/0"
       JOB_AGENT_TASK_QUEUE_NAME: "${JOB_AGENT_TASK_QUEUE_NAME:-job_agent}"
       JOB_AGENT_TASK_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_TIME_LIMIT_SECONDS:-900}"
       JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS:-840}"

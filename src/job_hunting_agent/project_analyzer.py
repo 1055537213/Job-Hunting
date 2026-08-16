@@ -13,7 +13,6 @@ from pathlib import Path
 
 from .models import ProjectExperienceCard
 
-
 MAX_FILE_BYTES = 120_000
 MAX_FILES = 80
 
@@ -46,7 +45,7 @@ IMPORTANT_NAMES = {
     "dockerfile", "docker-compose.yml", "docker-compose.yaml", "makefile", "go.mod",
     "pom.xml", "build.gradle", "cargo.toml",
 }
-SENSITIVE_PATTERNS = [re.compile(pattern, re.I) for pattern in (r"^\.env", r"secret", r"credential", r"password", r"token", r"private[_-]?key")]
+SENSITIVE_PATTERNS = [re.compile(pattern, re.IGNORECASE) for pattern in (r"^\.env", r"secret", r"credential", r"password", r"token", r"private[_-]?key")]
 
 # 技术栈识别先用规则词表，后续可以让 LLM 基于 read_files 和证据片段生成更稳的卡片。
 TECH_PATTERNS = {
@@ -158,10 +157,10 @@ def build_project_experience_card(
         # 误判成项目实际使用的技术。
         haystack = detection_haystack(path, text).lower()
         for tech, patterns in TECH_PATTERNS.items():
-            if any(re.search(pattern, haystack, re.I) for pattern in patterns):
+            if any(re.search(pattern, haystack, re.IGNORECASE) for pattern in patterns):
                 tech_evidence[tech].add(relative)
         for feature, patterns in FEATURE_PATTERNS.items():
-            if any(re.search(pattern, haystack, re.I) for pattern in patterns):
+            if any(re.search(pattern, haystack, re.IGNORECASE) for pattern in patterns):
                 feature_evidence[feature].add(relative)
 
     techs = sorted(tech_evidence)

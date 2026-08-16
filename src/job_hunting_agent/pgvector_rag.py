@@ -29,7 +29,6 @@ from .rag import (
     split_rag_documents,
 )
 
-
 PGVECTOR_COLLECTION_NAME = "rag_chunks"
 PGVECTOR_PERSISTENCE_LABEL = "postgresql+pgvector"
 

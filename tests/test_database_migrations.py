@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-import sqlalchemy as sa
 import pytest
+import sqlalchemy as sa
 
-from job_hunting_agent.config import load_database_settings, require_postgresql_database_url
+from alembic import command
+from job_hunting_agent.config import (
+    load_database_settings,
+    require_postgresql_database_url,
+)
 from job_hunting_agent.database_migrations import (
+    build_alembic_config,
     current_database_revision,
     downgrade_database,
     latest_database_revision,
@@ -59,6 +64,24 @@ def test_upgrade_database_creates_versioned_postgresql_schema(temporary_database
                 )
             }
             version = connection.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+            candidate_columns = {
+                row[0]
+                for row in connection.execute(
+                    sa.text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() AND table_name = 'candidate_profiles'"
+                    )
+                )
+            }
+            job_columns = {
+                row[0]
+                for row in connection.execute(
+                    sa.text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() AND table_name = 'jobs'"
+                    )
+                )
+            }
     finally:
         engine.dispose()
 
@@ -77,6 +100,37 @@ def test_upgrade_database_creates_versioned_postgresql_schema(temporary_database
         "usage_events",
         "background_tasks",
     }.issubset(tables)
+    assert version == latest_database_revision()
+    assert "content_fingerprint" in candidate_columns
+    assert {"content_fingerprint", "import_method", "captured_at"}.issubset(job_columns)
+
+
+def test_upgrade_repairs_legacy_0003_without_job_import_provenance(temporary_database_url):
+    """版本已到 0003 但缺少来源列的旧库，应被后续迁移安全修复。"""
+
+    upgrade_database(temporary_database_url, "20260810_0002")
+    engine = sa.create_engine(temporary_database_url)
+    try:
+        with engine.begin() as connection:
+            # 模拟历史上已经写入内容去重列、但尚未写入来源追溯列的已发布 0003 状态。
+            connection.execute(sa.text("ALTER TABLE jobs ADD COLUMN content_fingerprint VARCHAR(64)"))
+        command.stamp(build_alembic_config(temporary_database_url), "20260814_0003")
+        upgrade_database(temporary_database_url)
+        with engine.connect() as connection:
+            job_columns = {
+                row[0]
+                for row in connection.execute(
+                    sa.text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() AND table_name = 'jobs'"
+                    )
+                )
+            }
+            version = connection.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert {"content_fingerprint", "import_method", "captured_at"}.issubset(job_columns)
     assert version == latest_database_revision()
 
 

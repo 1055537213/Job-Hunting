@@ -11,7 +11,6 @@ from typing import Any, Protocol
 
 from .config import TaskQueueSettings
 
-
 BACKGROUND_TASK_NAME = "job_hunting_agent.background_tasks.execute_background_task"
 # RAG 增量索引使用独立任务类型，Web、应用门面和 Worker 共用这个稳定标识。
 RAG_INDEX_TASK_TYPE = "rag_index"
@@ -90,7 +89,7 @@ class CeleryTaskQueue:
                 decode_responses=True,
             )
             client.ping()
-        except Exception as error:  # noqa: BLE001 - 统一隐藏连接细节
+        except Exception as error:
             raise TaskQueueError("Redis 任务队列不可用。") from error
         finally:
             close = locals().get("client")
@@ -110,5 +109,5 @@ class CeleryTaskQueue:
                 task_id=task_key,
                 queue=self.settings.queue_name,
             )
-        except Exception as error:  # noqa: BLE001 - 不把 broker 异常泄露到 API
+        except Exception as error:
             raise TaskQueueError("后台任务投递失败。") from error

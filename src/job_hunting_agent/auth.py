@@ -14,9 +14,9 @@ from __future__ import annotations
 import hashlib
 import re
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Callable
+from datetime import UTC, datetime, timedelta
 
 try:  # Argon2id 是首选；未安装可退回到标准库 scrypt，便于本地最小环境启动。
     from argon2 import PasswordHasher
@@ -128,7 +128,7 @@ def session_token_hash(token: str) -> str:
 def utc_now() -> datetime:
     """返回带时区的 UTC 时间，统一用于 Session 和用量记录。"""
 
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def iso_utc(value: datetime | None = None) -> str:
@@ -240,7 +240,7 @@ class AuthService:
                 display_name=(display_name or "").strip() or None,
                 role="user",
             )
-        except Exception as error:  # noqa: BLE001 - 并发注册也统一成占用错误
+        except Exception as error:
             if "UNIQUE" in str(error).upper():
                 raise AccountAlreadyExistsError("该邮箱已经注册。") from error
             raise
@@ -264,7 +264,7 @@ class AuthService:
                 display_name=(display_name or "").strip() or None,
                 role="admin",
             )
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             if "UNIQUE" in str(error).upper():
                 raise AccountAlreadyExistsError("该邮箱已经注册。") from error
             raise

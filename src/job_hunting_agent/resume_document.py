@@ -23,8 +23,12 @@ from xml.etree import ElementTree
 import pdfplumber
 from PIL import Image
 
-from .object_storage import ObjectNotFoundError, ObjectStorageError, build_storage_key, validate_storage_key
-
+from .object_storage import (
+    ObjectNotFoundError,
+    ObjectStorageError,
+    build_storage_key,
+    validate_storage_key,
+)
 
 DOCX_EXTENSION = ".docx"
 PDF_EXTENSION = ".pdf"
@@ -326,7 +330,7 @@ def _read_pdf_text_layers(content: bytes) -> tuple[int, list[str]]:
             page_texts = [normalize_extracted_text(page.extract_text() or "") for page in pdf.pages]
     except ResumeDocumentError:
         raise
-    except Exception as error:  # noqa: BLE001 - 第三方 PDF 解析器异常统一转成用户可读错误。
+    except Exception as error:
         raise ResumeDocumentError(f"无法读取 PDF 简历：{error}") from error
     return page_count, page_texts
 
@@ -355,7 +359,7 @@ def render_and_ocr_pdf_pages(
         return results
     except ResumeDocumentError:
         raise
-    except Exception as error:  # noqa: BLE001 - OCR 依赖异常统一映射为上传错误。
+    except Exception as error:
         raise ResumeDocumentError(f"扫描版 PDF OCR 失败：{error}") from error
 
 
@@ -366,7 +370,7 @@ def run_rapidocr(image: Image.Image) -> str:
         from rapidocr import RapidOCR
 
         result = RapidOCR()(image)
-    except Exception as error:  # noqa: BLE001 - 模型或 ONNX 初始化问题需要返回明确原因。
+    except Exception as error:
         raise ResumeDocumentError(f"本地 OCR 不可用：{error}") from error
     texts = getattr(result, "txts", None) or ()
     return "\n".join(str(text).strip() for text in texts if str(text).strip())

@@ -3,7 +3,7 @@
 当前项目已经把真实聊天模型统一切到 LangChain ChatModel，所以这里主要验证：
 
 - `.env` 仍然是唯一配置来源。
-- DeepSeek 仍然通过 OpenAI-compatible 方式接入。
+- 第三方模型服务仍然通过 OpenAI-compatible 方式接入。
 - 业务层拿到的仍然是 `LLMClient` 边界，而不是直接裸用 SDK。
 """
 
@@ -21,20 +21,20 @@ from job_hunting_agent.llm import (
 )
 
 
-def test_load_llm_settings_reads_project_env_and_deepseek_aliases(tmp_path):
-    """配置加载器能从项目 `.env` 读取 DeepSeek API 信息。"""
+def test_load_llm_settings_reads_project_env_and_provider_options(tmp_path):
+    """配置加载器能从项目 `.env` 读取模型服务及可选参数。"""
 
     env_file = tmp_path / ".env"
     env_file.write_text(
         "\n".join(
             [
-                "JOB_AGENT_LLM_PROVIDER=deepseek",
-                "JOB_AGENT_LLM_MODEL=deepseek-v4-pro",
-                "DEEPSEEK_API_KEY=sk-test",
-                "DEEPSEEK_BASE_URL=https://api.deepseek.com",
+                "JOB_AGENT_LLM_PROVIDER=siliconflow",
+                "JOB_AGENT_LLM_MODEL=Qwen/Qwen3.5-35B-A3B",
+                "JOB_AGENT_LLM_API_KEY=sk-test",
+                "JOB_AGENT_LLM_BASE_URL=https://api.siliconflow.cn/v1",
                 "JOB_AGENT_LLM_TIMEOUT_SECONDS=45",
-                "JOB_AGENT_LLM_THINKING=enabled",
-                "JOB_AGENT_LLM_REASONING_EFFORT=high",
+                "JOB_AGENT_LLM_ENABLE_THINKING=true",
+                "JOB_AGENT_LLM_REASONING_EFFORT=",
             ]
         ),
         encoding="utf-8",
@@ -42,13 +42,13 @@ def test_load_llm_settings_reads_project_env_and_deepseek_aliases(tmp_path):
 
     settings = load_llm_settings(env_file, environ={})
 
-    assert settings.provider == "deepseek"
-    assert settings.model == "deepseek-v4-pro"
+    assert settings.provider == "siliconflow"
+    assert settings.model == "Qwen/Qwen3.5-35B-A3B"
     assert settings.api_key == "sk-test"
-    assert settings.base_url == "https://api.deepseek.com"
+    assert settings.base_url == "https://api.siliconflow.cn/v1"
     assert settings.timeout_seconds == 45
-    assert settings.thinking == "enabled"
-    assert settings.reasoning_effort == "high"
+    assert settings.enable_thinking is True
+    assert settings.reasoning_effort is None
 
 
 def test_build_chat_model_uses_openai_compatible_langchain_model(tmp_path):
@@ -58,12 +58,11 @@ def test_build_chat_model_uses_openai_compatible_langchain_model(tmp_path):
     env_file.write_text(
         "\n".join(
             [
-                "JOB_AGENT_LLM_PROVIDER=deepseek",
-                "JOB_AGENT_LLM_MODEL=deepseek-v4-pro",
+                "JOB_AGENT_LLM_PROVIDER=siliconflow",
+                "JOB_AGENT_LLM_MODEL=Qwen/Qwen3.5-35B-A3B",
                 "JOB_AGENT_LLM_API_KEY=sk-from-job-agent",
-                "JOB_AGENT_LLM_BASE_URL=https://api.deepseek.com/chat/completions",
-                "JOB_AGENT_LLM_REASONING_EFFORT=high",
-                "JOB_AGENT_LLM_THINKING=enabled",
+                "JOB_AGENT_LLM_BASE_URL=https://api.siliconflow.cn/v1/chat/completions",
+                "JOB_AGENT_LLM_ENABLE_THINKING=false",
             ]
         ),
         encoding="utf-8",
@@ -72,11 +71,11 @@ def test_build_chat_model_uses_openai_compatible_langchain_model(tmp_path):
     model = build_chat_model(load_llm_settings(env_file, environ={}))
 
     assert isinstance(model, ChatOpenAI)
-    assert model.model_name == "deepseek-v4-pro"
-    assert str(model.openai_api_base) == "https://api.deepseek.com"
-    assert model.reasoning_effort == "high"
+    assert model.model_name == "Qwen/Qwen3.5-35B-A3B"
+    assert str(model.openai_api_base) == "https://api.siliconflow.cn/v1"
+    assert model.reasoning_effort is None
     assert model.use_responses_api is False
-    assert model.extra_body == {"thinking": {"type": "enabled"}}
+    assert model.extra_body == {"enable_thinking": False}
     assert model.streaming is True
 
 
@@ -101,6 +100,28 @@ def test_build_llm_client_returns_langchain_wrapper(tmp_path):
     assert isinstance(client, LangChainLLMClient)
     assert isinstance(client.model, ChatOpenAI)
     assert client.model.model_name == "deepseek-v4-pro"
+
+
+def test_legacy_thinking_setting_remains_compatible(tmp_path):
+    """已有 DeepSeek 风格 `.env` 不应在升级通用模型配置后失去思考参数。"""
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_LLM_PROVIDER=deepseek",
+                "JOB_AGENT_LLM_MODEL=deepseek-v4-pro",
+                "JOB_AGENT_LLM_API_KEY=sk-from-job-agent",
+                "JOB_AGENT_LLM_BASE_URL=https://api.deepseek.com",
+                "JOB_AGENT_LLM_THINKING=enabled",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    model = build_chat_model(load_llm_settings(env_file, environ={}))
+
+    assert model.extra_body == {"thinking": {"type": "enabled"}}
 
 
 def test_custom_relay_provider_uses_openai_compatible_chat_model(tmp_path):

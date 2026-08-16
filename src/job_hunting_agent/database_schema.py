@@ -13,7 +13,6 @@ import sqlalchemy as sa
 from pgvector.sqlalchemy import Vector
 from sqlalchemy.dialects import postgresql
 
-
 # 统一约束命名，方便 Alembic 在升级和回退时稳定定位数据库对象。
 NAMING_CONVENTION = {
     "ix": "ix_%(table_name)s_%(column_0_name)s",
@@ -71,6 +70,12 @@ candidate_profiles = sa.Table(
     sa.Column("preference_weights_json", json_type, nullable=False, server_default=sa.text("'{}'")),
     sa.Column("target_directions_json", json_type, nullable=False),
     sa.Column("unacceptable_json", json_type, nullable=False),
+    sa.Column("content_fingerprint", sa.String(64)),
+    sa.UniqueConstraint(
+        "account_id",
+        "content_fingerprint",
+        name="uq_candidate_profiles_account_content_fingerprint",
+    ),
 )
 sa.Index("idx_candidate_profiles_account", candidate_profiles.c.account_id, candidate_profiles.c.id)
 
@@ -87,6 +92,8 @@ jobs = sa.Table(
     ),
     sa.Column("raw_text", sa.Text, nullable=False),
     sa.Column("source_url", sa.Text),
+    sa.Column("import_method", sa.String(32), nullable=False, server_default=sa.text("'text'")),
+    sa.Column("captured_at", timestamp_type),
     sa.Column("title", sa.String(256), nullable=False),
     sa.Column("city", sa.String(128)),
     sa.Column("salary_min_k", sa.Integer),
@@ -105,6 +112,12 @@ jobs = sa.Table(
     sa.Column("description_text", sa.Text, nullable=False),
     sa.Column("field_confidence_json", json_type, nullable=False),
     sa.Column("uncertainty_notes_json", json_type, nullable=False),
+    sa.Column("content_fingerprint", sa.String(64)),
+    sa.UniqueConstraint(
+        "account_id",
+        "content_fingerprint",
+        name="uq_jobs_account_content_fingerprint",
+    ),
 )
 sa.Index("idx_jobs_account", jobs.c.account_id, jobs.c.id)
 
@@ -252,6 +265,12 @@ project_experience_cards = sa.Table(
     sa.Column("confirmed_summary", sa.Text),
     sa.Column("created_at", timestamp_type, nullable=False),
     sa.Column("confirmed_at", timestamp_type),
+    sa.Column("content_fingerprint", sa.String(64)),
+    sa.UniqueConstraint(
+        "candidate_id",
+        "content_fingerprint",
+        name="uq_project_cards_candidate_content_fingerprint",
+    ),
     sa.CheckConstraint(
         "status IN ('待确认', '已确认', '已拒绝')",
         name="project_experience_cards_status",
@@ -342,7 +361,13 @@ resume_artifacts = sa.Table(
     sa.Column("status", sa.String(32), nullable=False),
     sa.Column("long_text_id", sa.Integer, sa.ForeignKey("long_texts.id", ondelete="SET NULL")),
     sa.Column("created_at", timestamp_type, nullable=False),
+    sa.Column("content_fingerprint", sa.String(64)),
     sa.UniqueConstraint("storage_key", name="uq_resume_artifacts_storage_key"),
+    sa.UniqueConstraint(
+        "candidate_id",
+        "content_fingerprint",
+        name="uq_resume_artifacts_candidate_content_fingerprint",
+    ),
     sa.CheckConstraint("version > 0", name="resume_artifacts_version_positive"),
     sa.CheckConstraint("file_size >= 0", name="resume_artifacts_file_size_non_negative"),
     sa.CheckConstraint("text_length >= 0", name="resume_artifacts_text_length_non_negative"),

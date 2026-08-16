@@ -34,7 +34,6 @@ from .project_analyzer import (
     is_sensitive,
 )
 
-
 # GitHub 仓库首页链接是唯一允许的用户输入网络地址。下载端点由程序从 owner/repo
 # 自行构造，避免把任意 URL 变成 Worker 可访问的网络目标（SSRF）。
 GITHUB_WEB_HOSTS = {"github.com", "www.github.com"}
@@ -317,7 +316,7 @@ def is_zip_symlink(info: zipfile.ZipInfo) -> bool:
 class GitHubOnlyRedirectHandler(HTTPRedirectHandler):
     """仅允许 GitHub 官方网络主机之间的 HTTPS 重定向。"""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001,D401
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         """拒绝重定向到任意第三方或内网地址。"""
 
         parsed = urlsplit(newurl)

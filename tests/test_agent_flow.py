@@ -11,13 +11,16 @@ import warnings
 from io import BytesIO
 
 from docx import Document
-from langchain_core.language_models.fake_chat_models import FakeListChatModel, FakeMessagesListChatModel
+from langchain_core.language_models.fake_chat_models import (
+    FakeListChatModel,
+    FakeMessagesListChatModel,
+)
 from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import Field
 
-from job_hunting_agent.config import AgentMemorySettings
 from job_hunting_agent.agent import JobHuntingAgent
 from job_hunting_agent.app import JobHuntingApp
+from job_hunting_agent.config import AgentMemorySettings
 from job_hunting_agent.models import CandidateProfileInput
 
 
@@ -35,7 +38,7 @@ def build_resume_docx_bytes(*paragraphs: str) -> bytes:
 class ToolCallingFakeChatModel(FakeMessagesListChatModel):
     """测试用假模型：支持 `create_agent` 的工具绑定。"""
 
-    def bind_tools(self, tools, *, tool_choice=None, **kwargs):  # noqa: ANN001,D401
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
         """直接返回自身，让测试可以手工指定工具调用序列。"""
 
         return self
@@ -46,7 +49,7 @@ class RecordingToolCallingFakeChatModel(ToolCallingFakeChatModel):
 
     seen_messages: list[list[BaseMessage]] = Field(default_factory=list)
 
-    def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # noqa: ANN001
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         """记录输入后继续使用父类的固定响应。"""
 
         self.seen_messages.append(list(messages))
@@ -56,7 +59,7 @@ class RecordingToolCallingFakeChatModel(ToolCallingFakeChatModel):
 class StreamingFakeChatModel(FakeListChatModel):
     """测试用流式假模型：每个字符会作为一个 AIMessageChunk 输出。"""
 
-    def bind_tools(self, tools, *, tool_choice=None, **kwargs):  # noqa: ANN001,D401
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
         """直接返回自身，让 `create_agent` 保留模型的 `_stream` 行为。"""
 
         return self
@@ -325,6 +328,32 @@ def test_langchain_agent_can_loop_across_multiple_tools(tmp_path, account_id):
     assert any(output["tool_name"] == "match_all_jobs_for_candidate" for output in result.tool_outputs)
 
 
+def test_direct_job_import_defaults_to_rule_classification(account_id, monkeypatch):
+    """普通职位导入不会隐式调用真实模型，离线流程仍可稳定完成。"""
+
+    app = JobHuntingApp()
+    app.initialize()
+
+    def unexpected_model_call(*_args, **_kwargs):
+        raise AssertionError("默认职位导入不应创建 LLM 客户端。")
+
+    monkeypatch.setattr(app.model_gateway, "llm_client", unexpected_model_call)
+    job = app.import_job_text(
+        """
+        Python 后端开发工程师
+        15-20K
+        杭州
+        1-3年
+        本科
+        职位描述：负责 Python 与 FastAPI 后端接口开发。
+        """,
+        account_id=account_id,
+    )
+
+    assert job.title == "Python 后端开发工程师"
+    assert "Python" in job.skills
+
+
 def test_langchain_agent_can_create_downloadable_resume_files_from_upload(tmp_path, account_id, monkeypatch):
     """Agent 能先查看上传文件，再生成职位定制 DOCX/PDF 下载版本。"""
 
@@ -365,7 +394,7 @@ def test_langchain_agent_can_create_downloadable_resume_files_from_upload(tmp_pa
         account_id=account_id,
     )
 
-    def fail_search(*_args, **_kwargs):  # noqa: ANN002,ANN003
+    def fail_search(*_args, **_kwargs):
         raise AssertionError("禁用 RAG 时不应执行语义检索")
 
     monkeypatch.setattr(app, "search_rag", fail_search)

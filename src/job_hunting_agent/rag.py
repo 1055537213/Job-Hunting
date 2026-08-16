@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import urllib.error
@@ -28,7 +29,9 @@ from .config import (
     load_embedding_settings,
     load_rerank_settings,
 )
-from .models import LongTextRecord, RAGIndexStats, RAGSearchResult
+from .models import LongTextRecord, RAGSearchResult
+
+logger = logging.getLogger(__name__)
 
 
 class RAGProviderRequestError(RuntimeError):
@@ -136,7 +139,7 @@ class OpenAICompatibleEmbeddings(Embeddings):
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         usage_operation: str = "embedding",
         max_retries: int = 2,
-    ) -> "OpenAICompatibleEmbeddings":
+    ) -> OpenAICompatibleEmbeddings:
         """从统一配置对象创建 embedding 客户端。"""
 
         return cls(
@@ -199,8 +202,8 @@ class OpenAICompatibleEmbeddings(Embeddings):
         if self.usage_callback is not None:
             try:
                 self.usage_callback(response)
-            except Exception:  # noqa: BLE001 - 计量旁路不能阻断向量索引。
-                pass
+            except Exception as error:  # noqa: BLE001 - 计量旁路不能阻断向量索引。
+                logger.debug("Embedding 用量记录失败：%s", type(error).__name__)
         return extract_embedding_vectors(response)
 
 
@@ -242,7 +245,7 @@ class NativeMultimodalEmbeddings(Embeddings):
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         usage_operation: str = "embedding",
         max_retries: int = 2,
-    ) -> "NativeMultimodalEmbeddings":
+    ) -> NativeMultimodalEmbeddings:
         """从项目 Embedding 配置创建 provider-native 适配器。"""
 
         return cls(
@@ -300,8 +303,8 @@ class NativeMultimodalEmbeddings(Embeddings):
         if self.usage_callback is not None:
             try:
                 self.usage_callback(response)
-            except Exception:  # noqa: BLE001 - 计量旁路不能阻断 RAG 索引。
-                pass
+            except Exception as error:  # noqa: BLE001 - 计量旁路不能阻断 RAG 索引。
+                logger.debug("原生 Embedding 用量记录失败：%s", type(error).__name__)
         return extract_native_multimodal_embedding_vectors(response)
 
 
@@ -366,7 +369,7 @@ def extract_embedding_vectors(response: dict[str, Any]) -> list[list[float]]:
     vectors_by_index: dict[int, list[float]] = {}
     for item in data:
         if not isinstance(item, dict):
-            raise ValueError("Embedding API data 项格式异常")
+            raise TypeError("Embedding API data 项格式异常")
         index = int(item.get("index", len(vectors_by_index)))
         embedding = item.get("embedding")
         if not isinstance(embedding, list) or not all(isinstance(value, (int, float)) for value in embedding):
@@ -485,7 +488,7 @@ class HttpReranker:
         settings: RerankSettings,
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         max_retries: int = 2,
-    ) -> "HttpReranker":
+    ) -> HttpReranker:
         """从项目 Rerank 配置创建 HTTP 重排适配器。"""
 
         return cls(
@@ -545,8 +548,8 @@ class HttpReranker:
         if self.usage_callback is not None:
             try:
                 self.usage_callback(response)
-            except Exception:  # noqa: BLE001 - 计量旁路不能阻断检索。
-                pass
+            except Exception as error:  # noqa: BLE001 - 计量旁路不能阻断检索。
+                logger.debug("Rerank 用量记录失败：%s", type(error).__name__)
         if self.api_style == "standard":
             return extract_standard_rerank_results(response)
         return extract_native_rerank_results(response)

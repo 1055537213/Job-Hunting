@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -20,6 +21,8 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langchain_openai import ChatOpenAI
 
 from .config import LLMSettings
+
+logger = logging.getLogger(__name__)
 
 
 class LLMClient(Protocol):
@@ -69,15 +72,16 @@ class LangChainLLMClient:
 
         try:
             response = self.model.invoke(prompt)
-        except Exception as error:  # noqa: BLE001 - 这里统一转成业务异常，便于上层处理。
+        except Exception as error:
             raise LLMRequestError(f"LLM 调用失败：{error}") from error
         if self.usage_callback is not None:
             # 计量失败不能让已经成功的业务调用失败；回调内部会把缺失 usage
             # 标记为 missing，并自行处理数据库异常。
             try:
                 self.usage_callback(response)
-            except Exception:  # noqa: BLE001 - 账单旁路失败不影响用户主流程。
-                pass
+            except Exception as error:  # noqa: BLE001 - 账单旁路失败不影响用户主流程。
+                # 不记录模型响应或 prompt，避免可观测性日志变成新的隐私副本。
+                logger.debug("LLM 用量记录失败：%s", type(error).__name__)
         return extract_message_text(response)
 
 
@@ -103,8 +107,12 @@ def build_chat_model(
     """
 
     extra_body: dict[str, object] = {}
-    # DeepSeek 的 thinking 参数不属于 OpenAI 标准字段，所以通过 extra_body 透传。
-    if settings.thinking:
+    # 部分 OpenAI-compatible 服务通过额外布尔字段切换模型思考模式。
+    if settings.enable_thinking is not None:
+        extra_body["enable_thinking"] = settings.enable_thinking
+    elif settings.thinking:
+        # 兼容早期项目 `.env` 中的 DeepSeek 风格配置；新布尔键优先，避免同一请求
+        # 同时携带两个供应商专属字段。
         extra_body["thinking"] = {"type": settings.thinking}
 
     return ChatOpenAI(

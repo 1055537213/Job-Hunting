@@ -12,7 +12,6 @@ from langchain_core.messages.utils import count_tokens_approximately
 from .config import AgentMemorySettings
 from .models import ChatMessageRecord
 
-
 RESTORED_HISTORY_SOURCE = "persistent_chat_history"
 RESTORED_SUMMARY_SOURCE = "persistent_chat_history_summary"
 

@@ -13,7 +13,6 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
-
 # 按长度从长到短处理，避免“香港特别行政区”先被截成“香港”。
 CITY_SUFFIXES = (
     "特别行政区",

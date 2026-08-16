@@ -31,6 +31,7 @@ let prevented = false;
 handleGlobalShortcut.call(
   {
     commandPaletteOpen: false,
+    duplicateNotice: { open: false },
     openCommandPalette() {
       opened = true;
     },

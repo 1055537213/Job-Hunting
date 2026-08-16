@@ -8,11 +8,10 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 from urllib.parse import urlsplit, urlunsplit
-
 
 DEFAULT_ENV_PATH = Path(".env")
 
@@ -33,6 +32,8 @@ class LLMSettings:
     api_key: str
     base_url: str
     timeout_seconds: int = 60
+    enable_thinking: bool | None = None
+    # 兼容旧版 DeepSeek 风格的 `thinking: {"type": "enabled"}` 透传字段。
     thinking: str | None = None
     reasoning_effort: str | None = None
 
@@ -239,9 +240,9 @@ def load_llm_settings(
         """按优先级读取多个候选键名。"""
 
         for key in keys:
-            if key in environment and environment[key]:
+            if environment.get(key):
                 return environment[key]
-            if key in file_values and file_values[key]:
+            if file_values.get(key):
                 return file_values[key]
         return default
 
@@ -250,6 +251,10 @@ def load_llm_settings(
     api_key = get("JOB_AGENT_LLM_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY")
     base_url = get("JOB_AGENT_LLM_BASE_URL", "OPENAI_BASE_URL", "DEEPSEEK_BASE_URL")
     timeout = int(get("JOB_AGENT_LLM_TIMEOUT_SECONDS", default="60") or 60)
+    # 新键采用布尔值，适合 OpenAI-compatible 中转站；保留旧键是为了让已经配置
+    # DeepSeek `thinking: {type: ...}` 的本地 `.env` 不会在升级后被静默忽略。
+    raw_enable_thinking = get("JOB_AGENT_LLM_ENABLE_THINKING")
+    enable_thinking = parse_bool(raw_enable_thinking) if raw_enable_thinking is not None else None
     thinking = get("JOB_AGENT_LLM_THINKING")
     reasoning_effort = get("JOB_AGENT_LLM_REASONING_EFFORT")
 
@@ -268,6 +273,7 @@ def load_llm_settings(
         api_key=api_key,
         base_url=base_url,
         timeout_seconds=timeout,
+        enable_thinking=enable_thinking,
         thinking=thinking,
         reasoning_effort=reasoning_effort,
     )
@@ -282,6 +288,7 @@ def masked_llm_settings(settings: LLMSettings) -> dict[str, object]:
         "base_url": settings.base_url,
         "api_key_set": bool(settings.api_key),
         "timeout_seconds": settings.timeout_seconds,
+        "enable_thinking": settings.enable_thinking,
         "thinking": settings.thinking,
         "reasoning_effort": settings.reasoning_effort,
     }
@@ -305,9 +312,9 @@ def load_model_gateway_settings(
         """按系统环境变量优先级读取 Gateway 配置。"""
 
         for key in keys:
-            if key in environment and environment[key]:
+            if environment.get(key):
                 return environment[key]
-            if key in file_values and file_values[key]:
+            if file_values.get(key):
                 return file_values[key]
         return default
 
@@ -663,9 +670,9 @@ def load_embedding_settings(
         """按优先级读取多个候选键名。"""
 
         for key in keys:
-            if key in environment and environment[key]:
+            if environment.get(key):
                 return environment[key]
-            if key in file_values and file_values[key]:
+            if file_values.get(key):
                 return file_values[key]
         return default
 
@@ -774,9 +781,9 @@ def load_rerank_settings(
         """按系统环境变量优先级读取 Rerank 配置。"""
 
         for key in keys:
-            if key in environment and environment[key]:
+            if environment.get(key):
                 return environment[key]
-            if key in file_values and file_values[key]:
+            if file_values.get(key):
                 return file_values[key]
         return default
 
@@ -867,9 +874,9 @@ def load_agent_memory_settings(
         """按优先级读取多个候选键名。"""
 
         for key in keys:
-            if key in environment and environment[key]:
+            if environment.get(key):
                 return environment[key]
-            if key in file_values and file_values[key]:
+            if file_values.get(key):
                 return file_values[key]
         return default
 

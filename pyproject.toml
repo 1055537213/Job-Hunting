@@ -45,3 +45,7 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 # 项目不依赖 pytest 增量缓存；关闭缓存也避免异常 ACL 的旧目录影响测试。
 addopts = "-p no:cacheprovider"
+
+[tool.ruff.lint.per-file-ignores]
+# 测试夹具用静态多行配置更易阅读；将它们改成 f-string 不会带来任何可读性或安全收益。
+"tests/**" = ["FLY002"]

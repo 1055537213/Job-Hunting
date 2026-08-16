@@ -144,7 +144,7 @@ def test_embedding_adapter_retries_transient_gateway_failure_once():
 
     calls = 0
 
-    def transport(url, headers, payload, timeout):  # noqa: ANN001
+    def transport(url, headers, payload, timeout):
         nonlocal calls
         calls += 1
         if calls == 1:

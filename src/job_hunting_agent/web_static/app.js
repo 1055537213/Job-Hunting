@@ -64,7 +64,15 @@ if (!window.Vue) {
         authSuccess: false,
         authError: "",
         authErrorTimer: null,
+        duplicateNotice: {
+          open: false,
+          title: "",
+          message: "",
+        },
+        duplicateNoticeReturnTarget: null,
         activeView: "workspace",
+        workspaceRailOpen: false,
+        activeWorkspacePanel: "",
         sessions: [],
         activeSessionId: "",
         sessionMenuOpen: false,
@@ -96,7 +104,9 @@ if (!window.Vue) {
         jobForm: {
           sourceUrl: "",
           rawText: "",
+          screenshots: [],
         },
+        jobImportMode: "text",
         health: {
           text: "检查中...",
           error: false,
@@ -132,6 +142,7 @@ if (!window.Vue) {
         commandQuery: "",
         activeCommandIndex: 0,
         nextLocalMessageId: 0,
+        messageScrollFrameId: null,
       };
     },
 
@@ -146,7 +157,7 @@ if (!window.Vue) {
         return Boolean(this.currentProfileId) && this.deletingProfileId === this.currentProfileId;
       },
 
-      /** 把结构化档案转换成右侧摘要框中的可读文本。 */
+      /** 把结构化档案转换成工作台摘要框中的可读文本。 */
       profileSummary() {
         const profile = this.currentProfile;
         if (!profile) {
@@ -249,10 +260,25 @@ if (!window.Vue) {
     watch: {
       /** 登录状态变化时同步根容器布局，登录页才能真正使用整屏背景。 */
       "auth.authenticated": {
-        immediate: true,
-        handler(authenticated) {
-          this.syncAuthPageClass(authenticated);
+          immediate: true,
+          handler(authenticated) {
+            this.syncAuthPageClass(authenticated);
+            if (!authenticated) {
+              this.setWorkspaceRailOpen(false);
+              this.activeWorkspacePanel = "";
+            }
+          },
         },
+
+      /** 错误发生在折叠菜单内时，自动打开对应功能，避免错误被隐藏。 */
+      resumeError(value) {
+        if (value) this.openWorkspacePanel("resume");
+      },
+      githubProjectError(value) {
+        if (value) this.openWorkspacePanel("github");
+      },
+      jobImportError(value) {
+        if (value) this.openWorkspacePanel("job-import");
       },
 
       /** 查询变化后重置高亮项，避免键盘选择停在不存在的结果上。 */
@@ -270,6 +296,16 @@ if (!window.Vue) {
     beforeUnmount() {
       document.removeEventListener("keydown", this.handleGlobalShortcut);
       document.body.classList.remove("cmdk-lock");
+      document.body.classList.remove("workspace-rail-lock");
+      document.body.classList.remove("duplicate-dialog-lock");
+      if (this.messageScrollFrameId !== null) {
+        if (window.requestAnimationFrame && window.cancelAnimationFrame) {
+          window.cancelAnimationFrame(this.messageScrollFrameId);
+        } else {
+          window.clearTimeout(this.messageScrollFrameId);
+        }
+        this.messageScrollFrameId = null;
+      }
       this.clearAuthFeedback();
       Object.values(this.ragTaskPollers).forEach((timerId) => window.clearTimeout(timerId));
       this.ragTaskPollers = {};
@@ -333,6 +369,32 @@ if (!window.Vue) {
         }, AUTH_ERROR_DISMISS_MS);
       },
 
+      /** 409 表示同一账号中已经存在相同内容；用统一居中提示而非表单内错误。 */
+      showDuplicateNotice(error, title) {
+        if (Number(error?.status) !== 409) {
+          return false;
+        }
+        this.duplicateNoticeReturnTarget =
+          document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        this.duplicateNotice = {
+          open: true,
+          title: title || "内容已存在",
+          message: error.message || "相同内容已存在，未重复保存。",
+        };
+        document.body.classList.add("duplicate-dialog-lock");
+        nextTick(() => this.$refs.duplicateDialogClose?.focus());
+        return true;
+      },
+
+      /** 关闭重复提示并尽量把焦点还给触发操作的控件。 */
+      closeDuplicateNotice() {
+        const returnTarget = this.duplicateNoticeReturnTarget;
+        this.duplicateNotice.open = false;
+        this.duplicateNoticeReturnTarget = null;
+        document.body.classList.remove("duplicate-dialog-lock");
+        nextTick(() => returnTarget?.focus?.());
+      },
+
       /** 提交登录或普通用户注册。 */
       async submitAuth() {
         this.authLoading = true;
@@ -364,6 +426,9 @@ if (!window.Vue) {
           await nextTick();
           document.querySelector("#chatPanel")?.focus?.();
         } catch (error) {
+          if (this.showDuplicateNotice(error, "账号已存在")) {
+            return;
+          }
           this.showAuthError(error.message || "认证请求失败。");
         } finally {
           this.authLoading = false;
@@ -470,6 +535,13 @@ if (!window.Vue) {
         if (!event || typeof event.key !== "string") {
           return;
         }
+        if (this.duplicateNotice.open) {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            this.closeDuplicateNotice();
+          }
+          return;
+        }
         const key = event.key.toLowerCase();
         if ((event.ctrlKey || event.metaKey) && key === "k") {
           event.preventDefault();
@@ -483,7 +555,38 @@ if (!window.Vue) {
             this.closeSessionMenu();
           } else if (this.commandPaletteOpen) {
             this.closeCommandPalette();
+          } else if (this.workspaceRailOpen) {
+            this.closeWorkspaceRail();
           }
+        }
+      },
+
+      /** 切换左侧工作台功能抽屉；桌面端同样保留状态，方便断点切换。 */
+      toggleWorkspaceRail() {
+        this.setWorkspaceRailOpen(!this.workspaceRailOpen);
+      },
+
+      /** 关闭窄屏工作台抽屉。 */
+      closeWorkspaceRail() {
+        this.setWorkspaceRailOpen(false);
+      },
+
+      /** 移动端抽屉打开时锁定页面滚动，关闭时恢复原有滚动行为。 */
+      setWorkspaceRailOpen(isOpen) {
+        this.workspaceRailOpen = Boolean(isOpen);
+        document.body?.classList.toggle("workspace-rail-lock", this.workspaceRailOpen);
+      },
+
+      /** 单开工作台功能；正文使用 v-show 保留用户已填写的表单状态。 */
+      toggleWorkspacePanel(panelKey) {
+        this.activeWorkspacePanel = this.activeWorkspacePanel === panelKey ? "" : panelKey;
+      },
+
+      /** 由命令面板或异步错误调用，先打开目标功能再交给 nextTick 聚焦。 */
+      openWorkspacePanel(panelKey) {
+        this.activeWorkspacePanel = panelKey;
+        if (window.matchMedia?.("(max-width: 60rem)").matches) {
+          this.setWorkspaceRailOpen(true);
         }
       },
 
@@ -562,13 +665,19 @@ if (!window.Vue) {
 
       /** 聚焦职位导入框，便于从 BOSS 复制职位详情后直接粘贴。 */
       focusJobImport() {
+        this.openWorkspacePanel("job-import");
         nextTick(() => {
+          if (this.jobImportMode === "screenshot") {
+            this.$refs.jobScreenshotFiles?.focus();
+            return;
+          }
           this.$refs.jobText?.focus();
         });
       },
 
       /** 打开当前候选人的本地 DOCX/PDF 文件选择器。 */
       triggerResumeUpload() {
+        this.openWorkspacePanel("resume");
         if (!this.currentProfileId) {
           this.appendAssistant("请先创建或选择候选人档案，再上传简历。", true);
           return;
@@ -578,6 +687,7 @@ if (!window.Vue) {
 
       /** 聚焦公开 GitHub 仓库链接输入框。 */
       focusGitHubProject() {
+        this.openWorkspacePanel("github");
         if (!this.currentProfileId) {
           this.appendAssistant("请先创建或选择候选人档案，再分析 GitHub 项目。", true);
           return;
@@ -817,6 +927,9 @@ if (!window.Vue) {
             directions: "",
           };
         } catch (error) {
+          if (this.showDuplicateNotice(error, "候选人档案已存在")) {
+            return;
+          }
           this.appendAssistant(error.message, true);
         } finally {
           this.creatingProfile = false;
@@ -871,6 +984,8 @@ if (!window.Vue) {
         this.messages = messages.map((message) => ({
           ...message,
           isError: false,
+          isStreaming: false,
+          renderedHtml: this.renderMarkdown(message.content),
         }));
       },
 
@@ -882,6 +997,8 @@ if (!window.Vue) {
             role: "assistant",
             content: WELCOME_MESSAGE,
             isError: false,
+            isStreaming: false,
+            renderedHtml: this.renderMarkdown(WELCOME_MESSAGE),
           },
         ];
       },
@@ -899,7 +1016,7 @@ if (!window.Vue) {
 
         this.messageInput = "";
         this.appendUser(message);
-        const assistantMessage = this.appendAssistant("");
+        const assistantMessage = this.appendAssistant("", false, true);
         const abortController = new AbortController();
         this.chatAbortController = abortController;
         this.sending = true;
@@ -917,7 +1034,9 @@ if (!window.Vue) {
           );
           this.updateMessage(
             assistantMessage,
-            data.display_reply || this.buildChatReply(data)
+            data.display_reply || this.buildChatReply(data),
+            false,
+            false
           );
           this.captureProjectTasksFromChat(data.tool_outputs || []);
           if (data.profile) {
@@ -934,7 +1053,7 @@ if (!window.Vue) {
           const messageText = wasCancelled
             ? "已停止生成。"
             : error?.message || "聊天请求失败，请稍后重试。";
-          this.updateMessage(assistantMessage, messageText, !wasCancelled);
+          this.updateMessage(assistantMessage, messageText, !wasCancelled, false);
         } finally {
           if (this.chatAbortController === abortController) {
             this.chatAbortController = null;
@@ -1056,7 +1175,7 @@ if (!window.Vue) {
 
             const tokensThisFrame = tokenQueue.length > 90 ? Math.ceil(tokenQueue.length / 45) : 1;
             visibleText += tokenQueue.splice(0, tokensThisFrame).join("");
-            this.updateMessage(assistantMessage, visibleText || "生成中...");
+            this.updateMessage(assistantMessage, visibleText || "生成中...", false, true);
 
             if (tokenQueue.length) {
               scheduleTokenRender();
@@ -1088,7 +1207,12 @@ if (!window.Vue) {
             if (event.event === "token") {
               enqueueTokenContent(event.data.content || "");
             } else if (event.event === "status" && !streamedText && !visibleText) {
-              this.updateMessage(assistantMessage, event.data.content || "正在调用工具...");
+              this.updateMessage(
+                assistantMessage,
+                event.data.content || "正在调用工具...",
+                false,
+                true
+              );
             } else if (event.event === "final") {
               finalPayload = event.data;
             } else if (event.event === "error") {
@@ -1268,6 +1392,7 @@ if (!window.Vue) {
 
       /** 上传当前选择的 DOCX/PDF，并跟踪后端安排的 OCR 或 RAG 任务。 */
       async uploadResume(event) {
+        this.openWorkspacePanel("resume");
         const input = event?.target || this.$refs.resumeFileInput;
         const file = input?.files?.[0];
         if (!file) {
@@ -1314,6 +1439,9 @@ if (!window.Vue) {
             this.resumeError = data.warning;
           }
         } catch (error) {
+          if (this.showDuplicateNotice(error, "简历已存在")) {
+            return;
+          }
           this.resumeError = error.message || "简历上传失败。";
           this.appendAssistant(this.resumeError, true);
         } finally {
@@ -1515,6 +1643,7 @@ if (!window.Vue) {
 
       /** 提交当前候选人的公开 GitHub 仓库，默认由 Worker 异步下载与分析。 */
       async submitGitHubProject() {
+        this.openWorkspacePanel("github");
         if (!this.currentProfileId) {
           this.appendAssistant("请先创建或选择候选人档案，再分析 GitHub 项目。", true);
           return;
@@ -1543,6 +1672,9 @@ if (!window.Vue) {
             this.appendAssistant("GitHub 项目分析已完成，已生成待确认项目经历卡片。");
           }
         } catch (error) {
+          if (this.showDuplicateNotice(error, "项目已存在")) {
+            return;
+          }
           this.githubProjectError = error.message || "GitHub 项目分析提交失败。";
           this.appendAssistant(this.githubProjectError, true);
         } finally {
@@ -1777,8 +1909,47 @@ if (!window.Vue) {
         return this.jobs.find((job) => Number(job.id) === Number(jobId))?.title || "目标职位";
       },
 
-      /** 导入职位文本；后端会先验证它是否确实像招聘职位。 */
+      /** 切换粘贴文本和截图识别模式，保留来源链接以便后续追溯。 */
+      setJobImportMode(mode) {
+        if (!["text", "screenshot"].includes(mode)) return;
+        this.jobImportMode = mode;
+        this.jobImportError = "";
+      },
+
+      /** 接住原生文件选择，并在浏览器端先阻止明显超限的上传。 */
+      onJobScreenshotChange(event) {
+        const input = event?.target || this.$refs.jobScreenshotFiles;
+        const files = Array.from(input?.files || []);
+        if (files.length > 4) {
+          this.jobImportError = "一次最多上传 4 张职位截图。";
+          this.jobForm.screenshots = [];
+          if (input) input.value = "";
+          return;
+        }
+        const oversized = files.find((file) => file.size > 8 * 1024 * 1024);
+        if (oversized) {
+          this.jobImportError = `截图 ${oversized.name} 不能超过 8 MB。`;
+          this.jobForm.screenshots = [];
+          if (input) input.value = "";
+          return;
+        }
+        this.jobForm.screenshots = files;
+        this.jobImportError = "";
+      },
+
+      /** 清理已成功导入的文件选择，允许用户再次选择同一张截图。 */
+      clearJobScreenshotSelection() {
+        this.jobForm.screenshots = [];
+        if (this.$refs.jobScreenshotFiles) this.$refs.jobScreenshotFiles.value = "";
+      },
+
+      /** 根据当前导入模式提交文本或用户主动上传的截图。 */
       async importJob() {
+        if (this.jobImportMode === "screenshot") {
+          await this.importJobScreenshots();
+          return;
+        }
+        this.openWorkspacePanel("job-import");
         const rawText = this.jobForm.rawText.trim();
         if (!rawText) {
           this.jobImportError = "请先粘贴职位文本。";
@@ -1796,11 +1967,14 @@ if (!window.Vue) {
               source_url: this.jobForm.sourceUrl.trim() || null,
             }),
           });
-          this.appendAssistant(`已导入职位：${data.job.title}。你可以点击右侧“匹配当前候选人”。`);
+          this.appendAssistant(`已导入职位：${data.job.title}。你可以打开“职位匹配结果”查看排序。`);
           this.jobForm.rawText = "";
           await this.loadJobs();
           await this.matchJobs(true);
         } catch (error) {
+          if (this.showDuplicateNotice(error, "职位信息已存在")) {
+            return;
+          }
           this.jobImportError = error.message;
           this.appendAssistant(this.jobImportError, true);
         } finally {
@@ -1816,6 +1990,39 @@ if (!window.Vue) {
           this.jobs = data.jobs || [];
         } finally {
           this.loadingJobs = false;
+        }
+      },
+
+      /** 上传截图给服务端多模态模型识别，再复用职位审核、去重和匹配流程。 */
+      async importJobScreenshots() {
+        this.openWorkspacePanel("job-import");
+        const screenshots = this.jobForm.screenshots || [];
+        if (!screenshots.length) {
+          this.jobImportError = "请先选择职位截图。";
+          this.appendAssistant(this.jobImportError, true);
+          return;
+        }
+
+        this.jobImportError = "";
+        this.importingJob = true;
+        try {
+          const form = new FormData();
+          const sourceUrl = this.jobForm.sourceUrl.trim();
+          if (sourceUrl) form.append("source_url", sourceUrl);
+          screenshots.forEach((file) => form.append("screenshots", file, file.name));
+          const data = await this.requestFormJson("/api/jobs/screenshots", form);
+          this.appendAssistant(`已识别并导入职位：${data.job.title}。你可以打开“职位匹配结果”查看排序。`);
+          this.clearJobScreenshotSelection();
+          await this.loadJobs();
+          await this.matchJobs(true);
+        } catch (error) {
+          if (this.showDuplicateNotice(error, "职位信息已存在")) {
+            return;
+          }
+          this.jobImportError = error.message;
+          this.appendAssistant(this.jobImportError, true);
+        } finally {
+          this.importingJob = false;
         }
       },
 
@@ -1873,6 +2080,9 @@ if (!window.Vue) {
 
       /** 请求当前候选人的职位匹配结果。 */
       async matchJobs(silent = false, signal = null) {
+        if (!silent) {
+          this.openWorkspacePanel("matches");
+        }
         if (!this.currentProfileId) {
           this.matches = [];
           if (!silent) {
@@ -1899,17 +2109,19 @@ if (!window.Vue) {
       },
 
       /** 追加助手消息。 */
-      appendAssistant(text, isError = false) {
-        return this.appendMessage("assistant", text, isError);
+      appendAssistant(text, isError = false, isStreaming = false) {
+        return this.appendMessage("assistant", text, isError, isStreaming);
       },
 
       /** 向响应式消息列表追加一条消息。 */
-      appendMessage(role, text, isError = false) {
+      appendMessage(role, text, isError = false, isStreaming = false) {
         const message = {
           localId: `local-${++this.nextLocalMessageId}`,
           role,
           content: text,
           isError,
+          isStreaming,
+          renderedHtml: isStreaming ? "" : this.renderMarkdown(text),
         };
         const reactiveIndex = this.messages.push(message) - 1;
         this.scrollMessages();
@@ -1920,19 +2132,32 @@ if (!window.Vue) {
       },
 
       /** 更新流式助手气泡，不创建重复消息。 */
-      updateMessage(message, text, isError = false) {
+      updateMessage(message, text, isError = false, isStreaming = message.isStreaming) {
         message.content = text;
         message.isError = isError;
+        message.isStreaming = Boolean(isStreaming);
+        if (!message.isStreaming) {
+          message.renderedHtml = this.renderMarkdown(text);
+        }
         this.scrollMessages();
       },
 
       /** 让聊天窗口自动滚动到最新消息。 */
       scrollMessages() {
-        nextTick(() => {
-          const container = this.$refs.messages;
-          if (container) {
-            container.scrollTop = container.scrollHeight;
-          }
+        if (this.messageScrollFrameId !== null) {
+          return;
+        }
+        const schedule = window.requestAnimationFrame
+          ? (callback) => window.requestAnimationFrame(callback)
+          : (callback) => window.setTimeout(callback, 16);
+        this.messageScrollFrameId = schedule(() => {
+          this.messageScrollFrameId = null;
+          nextTick(() => {
+            const container = this.$refs.messages;
+            if (container) {
+              container.scrollTop = container.scrollHeight;
+            }
+          });
         });
       },
 
@@ -2009,7 +2234,7 @@ if (!window.Vue) {
         return "薪资待确认";
       },
 
-      /** 截断职位描述，避免右侧卡片过长。 */
+      /** 截断职位描述，避免工作台卡片过长。 */
       trimText(value, maxLength) {
         const text = String(value || "").replace(/\s+/g, " ").trim();
         return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
@@ -2400,7 +2625,9 @@ if (!window.Vue) {
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-          throw new Error(data.detail || `请求失败：${response.status}`);
+          const error = new Error(data.detail || `请求失败：${response.status}`);
+          error.status = response.status;
+          throw error;
         }
         return data;
       },
@@ -2414,7 +2641,9 @@ if (!window.Vue) {
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-          throw new Error(data.detail || `请求失败：${response.status}`);
+          const error = new Error(data.detail || `请求失败：${response.status}`);
+          error.status = response.status;
+          throw error;
         }
         return data;
       },

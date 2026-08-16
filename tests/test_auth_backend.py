@@ -1,6 +1,6 @@
 """认证、账号归属和 Token 用量流水的聚焦测试。"""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -49,7 +49,7 @@ def test_session_has_idle_and_absolute_expiry(database_url):
 
     store = SQLAlchemyStore(database_url)
     store.initialize()
-    current = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+    current = [datetime(2026, 1, 1, tzinfo=UTC)]
     auth = AuthService(store, idle_days=7, max_days=30, clock=lambda: current[0])
     account = auth.register("time@example.com", "password-123")
     login = auth.login("time@example.com", "password-123")
@@ -61,7 +61,7 @@ def test_session_has_idle_and_absolute_expiry(database_url):
     assert touched.expires_at != original.expires_at
     assert touched.absolute_expires_at == original.absolute_expires_at
 
-    current[0] = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    current[0] = datetime(2026, 2, 1, tzinfo=UTC)
     with pytest.raises(SessionInvalidError):
         auth.current_account(login.session_token)
     assert store.get_auth_session(login.session.id).revoked_at is not None

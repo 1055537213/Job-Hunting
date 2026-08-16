@@ -39,7 +39,7 @@ from .config import (
     load_model_gateway_settings,
     load_rerank_settings,
 )
-from .llm import LLMClient, LangChainLLMClient, build_chat_model
+from .llm import LangChainLLMClient, LLMClient, build_chat_model
 from .models import UsageEventRecord
 from .rag import Reranker, build_rag_embeddings, build_reranker, extract_embedding_usage
 
@@ -71,7 +71,7 @@ class ModelCallContext:
     call_id: str
     attempt: int = 1
 
-    def next_attempt(self) -> "ModelCallContext":
+    def next_attempt(self) -> ModelCallContext:
         """返回同一调用的下一次重试上下文。"""
 
         return replace(self, attempt=self.attempt + 1)

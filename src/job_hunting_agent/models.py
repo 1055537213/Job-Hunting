@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-
 # 动态匹配的默认权重；用户在对话中明确表达优先级后，按字段覆盖。
 DEFAULT_PREFERENCE_WEIGHTS = {
     "city": 1.0,
@@ -112,6 +111,9 @@ class ImportedJob:
     uncertainty_notes: list[str]
     # 由规则或 LLM 分类后的技能要求；旧职位没有该字段时使用规则回退。
     skill_requirements: list[SkillRequirement] = field(default_factory=list)
+    # 用户提供职位内容的方式与服务端实际接收时间，用于来源追溯；不会读取来源链接。
+    import_method: str = "text"
+    captured_at: str | None = None
 
 
 @dataclass

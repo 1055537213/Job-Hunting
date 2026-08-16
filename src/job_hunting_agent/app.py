@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -22,14 +23,23 @@ from .config import (
     require_postgresql_database_url,
 )
 from .conversation_ingestion import decide_conversation_ingestion
-from .github_project import analyze_public_github_repository, normalize_public_github_repository_url
+from .deduplication import (
+    DuplicateResourceError,
+    github_project_content_fingerprint,
+)
+from .github_project import (
+    analyze_public_github_repository,
+    normalize_public_github_repository_url,
+)
+from .job_screenshot import JobScreenshot, JobScreenshotExtractor
 from .llm import LLMClient
 from .matcher import match_job, semantic_direction_score
+from .model_gateway import ModelGateway
 from .models import (
+    BackgroundTaskRecord,
     CandidateProfile,
     CandidateProfileInput,
     ChatMessageRecord,
-    BackgroundTaskRecord,
     ConversationIngestionResult,
     ImportedJob,
     MatchResult,
@@ -42,10 +52,9 @@ from .models import (
     SkillRequirement,
     TailoredResumeResult,
 )
-from .model_gateway import ModelGateway
 from .object_storage import ObjectNotFoundError, ObjectStorage, S3ObjectStorage
-from .project_analyzer import analyze_project
 from .pgvector_rag import PgVectorKnowledgeBase
+from .project_analyzer import analyze_project
 from .rag import Reranker
 from .resume_document import (
     PDF_EXTENSION,
@@ -109,6 +118,7 @@ class JobHuntingApp:
         # 所有真实模型/Embedding 调用都通过内部 Gateway 构造和计量；它是惰性加载的，
         # 所以纯本地规则和离线测试不需要在创建 App 时提供 API Key。
         self.model_gateway = ModelGateway(self.env_path, usage_store=self.store)
+        self.job_screenshot_extractor = JobScreenshotExtractor(self.model_gateway)
         if object_storage is not None:
             # 测试或宿主机集成可以注入一个实现，业务层不关心具体厂商。
             self.resume_files = object_storage
@@ -250,7 +260,7 @@ class JobHuntingApp:
         normalized_id_set: set[int] = set()
         for raw_id in long_text_ids:
             if isinstance(raw_id, bool):
-                raise ValueError("RAG 增量索引任务包含无效长文本 ID。")
+                raise TypeError("RAG 增量索引任务包含无效长文本 ID。")
             if isinstance(raw_id, int):
                 normalized_id = raw_id
             elif isinstance(raw_id, str) and raw_id.strip().isdigit():
@@ -324,15 +334,19 @@ class JobHuntingApp:
 
         self.store.get_candidate_profile(candidate_id, account_id=account_id)
         reference = normalize_public_github_repository_url(repository_url)
+        fingerprint = github_project_content_fingerprint(reference.canonical_url)
+        if self.store.find_project_card_by_content_fingerprint(account_id, candidate_id, fingerprint) is not None:
+            raise DuplicateResourceError("GitHub 项目")
         payload: dict[str, object] = {"repository_url": reference.canonical_url}
         if root_request_id:
             payload["root_request_id"] = str(root_request_id)
         if idempotency_key is None:
-            # GitHub 的 owner/repository 大小写不敏感；候选人 ID 纳入键后，同一账号下
-            # 不同档案仍可分别分析同一个仓库。
-            idempotency_key = (
-                f"github-project:{candidate_id}:{reference.owner.lower()}/{reference.repository.lower()}"
-            )
+            # 项目经历属于候选人而非整个共享账号：同一候选人不能重复排队，但账号
+            # 中另一个人的档案可以独立分析相同的公开仓库。
+            idempotency_key = f"github-project:{candidate_id}:{fingerprint[:40]}"
+        existing = self.store.get_background_task_by_idempotency(account_id, idempotency_key)
+        if existing is not None and existing.status != "failed":
+            raise DuplicateResourceError("GitHub 项目")
         return self.enqueue_background_task(
             account_id=account_id,
             task_type=GITHUB_PROJECT_ANALYSIS_TASK_TYPE,
@@ -440,9 +454,16 @@ class JobHuntingApp:
         raw_text: str,
         source_url: str | None = None,
         account_id: int | None = None,
-        classify_with_llm: bool = True,
+        classify_with_llm: bool = False,
+        *,
+        import_method: str = "text",
     ) -> ImportedJob:
-        """导入候选人主动带回的职位原文，并保存标准化结果。"""
+        """导入候选人主动带回的职位原文，并保存标准化结果。
+
+        默认使用本地规则解析和分类，避免普通网页导入、脚本调用或离线测试在没有
+        明确请求时同步等待外部模型。LangChain Agent 在其工具调用中会显式传入是否
+        允许模型分类；用户仍可在网页职位列表中人工修正技能重要性。
+        """
 
         llm_client = None
         if classify_with_llm:
@@ -460,6 +481,29 @@ class JobHuntingApp:
             source_url,
             account_id=account_id,
             llm_client=llm_client,
+            import_method=import_method,
+        )
+
+    def import_job_screenshots(
+        self,
+        screenshots: list[JobScreenshot],
+        source_url: str | None = None,
+        *,
+        account_id: int | None = None,
+    ) -> ImportedJob:
+        """从用户主动上传的职位截图提取原文后，复用既有审核和去重流程。
+
+        截图识别已经是一次同步模型调用，因此此处保留规则技能分类，避免同一导入操作
+        再等待一次文本模型调用。用户仍可在职位列表中人工调整技能重要性。
+        """
+
+        raw_text = self.job_screenshot_extractor.extract(screenshots, account_id=account_id)
+        return self.import_job_text(
+            raw_text,
+            source_url,
+            account_id=account_id,
+            classify_with_llm=False,
+            import_method="screenshot",
         )
 
     def list_jobs(self, account_id: int | None = None) -> list[ImportedJob]:
@@ -581,7 +625,11 @@ class JobHuntingApp:
         """分析公开 GitHub 仓库并保存为待确认项目经历卡片。"""
 
         self.store.get_candidate_profile(candidate_id, account_id=account_id)
-        card = analyze_public_github_repository(repository_url)
+        reference = normalize_public_github_repository_url(repository_url)
+        fingerprint = github_project_content_fingerprint(reference.canonical_url)
+        if self.store.find_project_card_by_content_fingerprint(account_id, candidate_id, fingerprint) is not None:
+            raise DuplicateResourceError("GitHub 项目")
+        card = analyze_public_github_repository(reference.canonical_url)
         return self.store.save_project_card(candidate_id, card, account_id=account_id)
 
     def confirm_project_card(
@@ -754,6 +802,10 @@ class JobHuntingApp:
         self.store.get_candidate_profile(candidate_id, account_id=account_id)
         clean_filename = sanitize_download_filename(filename, fallback="resume")
         extension = supported_resume_extension(clean_filename)
+        # 在解析文档和写入对象存储前检查字节内容，重复上传不浪费 OCR 或磁盘空间。
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        if self.store.find_resume_source_by_content_fingerprint(account_id, candidate_id, content_sha256) is not None:
+            raise DuplicateResourceError("简历")
         pending_ocr = False
         if defer_ocr and extension == PDF_EXTENSION:
             inspection = inspect_pdf_for_ocr(content)
@@ -882,7 +934,7 @@ class JobHuntingApp:
 
         path_for = getattr(self.resume_files, "path_for", None)
         if not callable(path_for):
-            raise RuntimeError("当前对象存储不提供本地文件路径，请使用 read_resume_file。")
+            raise NotImplementedError("当前对象存储不提供本地文件路径，请使用 read_resume_file。")
         return path_for(artifact.storage_key)
 
     def read_resume_file(self, artifact: ResumeArtifactRecord) -> bytes:
