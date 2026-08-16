@@ -109,6 +109,22 @@ def test_job_screenshot_extractor_rejects_non_job_even_when_text_looks_like_a_jo
         extractor.extract([JobScreenshot(content=png_bytes(), media_type="image/png")], account_id=7)
 
 
+def test_job_screenshot_extractor_rejects_incomplete_job_text() -> None:
+    """模型判断为职位也不够，截图必须包含足够的可比较字段。"""
+
+    gateway = RecordingGateway(
+        """{
+"is_job": true,
+"confidence": 0.96,
+"job_text": "Python 后端开发工程师\\n杭州\\n岗位职责：负责 Python 后端开发。"
+}"""
+    )
+    extractor = JobScreenshotExtractor(gateway)
+
+    with pytest.raises(JobScreenshotError, match="职位截图信息不完整"):
+        extractor.extract([JobScreenshot(content=png_bytes(), media_type="image/png")], account_id=7)
+
+
 def test_job_screenshot_extractor_rejects_non_image_before_model_call() -> None:
     """伪装文件必须在本地校验阶段被拒绝，不能消耗模型调用。"""
 
@@ -178,6 +194,42 @@ def test_web_imports_job_from_user_uploaded_screenshot(monkeypatch) -> None:
     assert uploaded[0].media_type == "image/png"
 
 
+def test_web_rejects_incomplete_job_screenshot(monkeypatch) -> None:
+    """截图审核发现字段不足时，Web API 必须拒绝保存并返回可展示原因。"""
+
+    def fake_import_screenshots(
+        self: JobHuntingApp,
+        screenshots: list[JobScreenshot],
+        source_url: str | None = None,
+        *,
+        account_id: int | None = None,
+    ):
+        assert screenshots
+        assert account_id is not None
+        raise JobScreenshotError(
+            "职位截图信息不完整，未保存任何职位信息。请上传包含职位名称和任职要求的完整截图。"
+        )
+
+    monkeypatch.setattr(JobHuntingApp, "import_job_screenshots", fake_import_screenshots, raising=False)
+    client = TestClient(create_web_app())
+    assert client.post(
+        "/api/auth/register",
+        json={"email": "screenshot-incomplete@example.com", "password": "password-123"},
+    ).status_code in {200, 409}
+    assert client.post(
+        "/api/auth/login",
+        json={"email": "screenshot-incomplete@example.com", "password": "password-123"},
+    ).status_code == 200
+
+    response = client.post(
+        "/api/jobs/screenshots",
+        files=[("screenshots", ("partial-job.png", png_bytes(), "image/png"))],
+    )
+
+    assert response.status_code == 400
+    assert "职位截图信息不完整" in response.json()["detail"]
+
+
 def test_web_rejects_duplicate_job_imported_from_screenshot(monkeypatch) -> None:
     """截图识别结果也必须进入同一份职位去重规则。"""
 
@@ -237,4 +289,6 @@ def test_frontend_exposes_screenshot_job_import_mode() -> None:
     assert home.index('id="jobScreenshotFiles"') < home.index('id="jobSourceUrl"')
     assert "jobImportMode" in script
     assert 'requestFormJson("/api/jobs/screenshots", form)' in script
+    assert "jobImportNotice" in home
+    assert "showJobImportNotice" in script
     assert ".job-import-mode" in styles

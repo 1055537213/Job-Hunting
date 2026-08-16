@@ -37,6 +37,37 @@ Web 启动时只验证 Alembic revision，不会自行执行 `CREATE TABLE`。�
 | Docker named volume | 保存 PostgreSQL、MinIO 和 Redis AOF 数据目录 | 容器重建后数据库、文件正文和未确认队列消息尽量保留 |
 | Healthcheck | 检查 PostgreSQL、MinIO、Redis 和 Web `/api/health` 可响应 | 区分“进程已启动”和“服务确实可用” |
 
+## 依赖版本锁定
+
+项目用 `pyproject.toml` 声明“允许使用的版本范围”，用 `requirements.lock` 保存一次经过解析的
+精确版本。两者分工不同：前者方便升级和表达兼容范围，后者保证 Web、Worker 和 Alembic
+迁移容器在不同时间构建时仍安装同一套依赖，避免 OCR、LangChain 或数据库驱动在无意中升级。
+
+`requirements.lock` 由开发期工具 `pip-tools` 生成，不需要安装进生产镜像。修改
+`pyproject.toml` 后，在项目根目录执行：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -m piptools compile pyproject.toml `
+  --output-file requirements.lock --resolver=backtracking --strip-extras --no-emit-index-url
+```
+
+Dockerfile 会先执行 `pip install -r requirements.lock`，再以 `--no-deps` 安装本项目；不要
+手工编辑锁文件。提交依赖变更时，应同时提交 `pyproject.toml` 和重新生成的锁文件。
+
+## Python 3.12.13 运行时
+
+项目将 Docker 和宿主机开发运行时统一到 Python 3.12.13。Dockerfile 和 Compose 默认使用
+精确的 `python:3.12.13-slim` 标签，而不是会随上游更新的 `python:3.12-slim` 浮动标签。
+
+宿主机开发继续使用现有的 `E:\Anaconda\envs\langchain1.2` Conda 环境，不需要替换或迁移
+本地环境。确认解释器版本并安装项目依赖：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe --version
+E:\Anaconda\envs\langchain1.2\python.exe -m pip install -r requirements.lock
+E:\Anaconda\envs\langchain1.2\python.exe -m pip install --no-deps -e .
+```
+
 ## 当前数据边界
 
 - PostgreSQL 是结构化事实源，也是 Web 服务实际使用的数据库。
@@ -59,7 +90,7 @@ Web 启动时只验证 Alembic revision，不会自行执行 `CREATE TABLE`。�
 Copy-Item .env.example .env
 ```
 
-默认使用 Docker Hub 镜像：
+默认使用 Docker Hub 镜像；依赖安装使用已提交的 `requirements.lock`：
 
 ```powershell
 docker compose up -d --build
@@ -69,7 +100,7 @@ docker compose ps
 网络无法访问 Docker Hub 时，可以只在当前 PowerShell 会话使用镜像镜像源：
 
 ```powershell
-$env:JOB_AGENT_DOCKER_BASE_IMAGE = "dockerproxy.net/library/python:3.12-slim"
+$env:JOB_AGENT_DOCKER_BASE_IMAGE = "dockerproxy.net/library/python:3.12.13-slim"
 $env:JOB_AGENT_POSTGRES_IMAGE = "dockerproxy.net/pgvector/pgvector:pg16"
 $env:JOB_AGENT_MINIO_IMAGE = "dockerproxy.net/minio/minio:RELEASE.2025-04-22T22-12-26Z"
 $env:JOB_AGENT_REDIS_IMAGE = "dockerproxy.net/library/redis:7.4-alpine"
@@ -115,8 +146,8 @@ JOB_AGENT_REDIS_PASSWORD=replace-with-a-strong-redis-password
 ```
 
 ```powershell
-alembic upgrade head
-python -m job_hunting_agent.web --env-file .env
+E:\Anaconda\envs\langchain1.2\python.exe -m alembic upgrade head
+E:\Anaconda\envs\langchain1.2\python.exe -m job_hunting_agent.web --env-file .env
 ```
 
 Docker 中的 Web 不使用这个 `127.0.0.1` 地址，Compose 会将其覆盖为 `postgres` 服务名。

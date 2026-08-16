@@ -19,6 +19,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage
 from PIL import Image, UnidentifiedImageError
 
+from .job_parser import validate_job_text
 from .llm import LLMRequestError, extract_message_text
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,18 @@ SUPPORTED_IMAGE_FORMATS = {
     "JPEG": "image/jpeg",
     "WEBP": "image/webp",
 }
+
+# 截图只能看到职位页面的一部分，不能像粘贴全文一样容忍大量字段缺失。候选人至少
+# 应能据此判断岗位方向和基本条件，因此除职位名称与职责/要求外，还要求两个背景字段。
+SCREENSHOT_CONTEXT_SIGNALS = frozenset(
+    {
+        "薪资",
+        "工作地点",
+        "经验要求",
+        "学历要求",
+        "公司信息",
+    }
+)
 
 
 class JobScreenshotError(ValueError):
@@ -111,7 +124,7 @@ class JobScreenshotExtractor:
             raise JobScreenshotModelError(
                 "职位截图识别没有返回可用文本，请换一张更清晰的截图或改用文本导入。"
             ) from error
-        return text
+        return ensure_complete_screenshot_job_text(text)
 
 
 def validate_job_screenshots(screenshots: Sequence[JobScreenshot]) -> list[JobScreenshot]:
@@ -222,6 +235,31 @@ def parse_screenshot_extraction(text: str) -> str:
     return job_text.strip()
 
 
+def ensure_complete_screenshot_job_text(job_text: str) -> str:
+    """拒绝只有局部字段的职位截图，避免把不完整信息写入职位池。
+
+    ``validate_job_text`` 是文本和截图共用的基础审核。截图是视觉模型从有限画面中
+    转写得到的内容，因此在基础审核通过后额外要求“职责/要求描述”和两个背景字段，
+    防止一张只露出标题或岗位卡片的图片被当作完整职位保存。
+    """
+
+    validation = validate_job_text(job_text)
+    matched = set(validation.matched_signals)
+    context_count = len(matched & SCREENSHOT_CONTEXT_SIGNALS)
+
+    if (
+        not validation.is_valid
+        or "职位名称" not in matched
+        or "职责/要求描述" not in matched
+        or context_count < 2
+    ):
+        raise JobScreenshotError(
+            "职位截图信息不完整，未保存任何职位信息。请上传包含职位名称、岗位职责或任职要求，"
+            "以及薪资、地点、经验、学历、公司信息中至少两项的完整截图。"
+        )
+    return job_text
+
+
 JOB_SCREENSHOT_EXTRACTION_PROMPT = """你是职位截图审核与转写器。请先判断用户主动上传的图片是否清楚展示了一个具体招聘职位，再转写可见信息。
 
 输出规则：
@@ -229,6 +267,7 @@ JOB_SCREENSHOT_EXTRACTION_PROMPT = """你是职位截图审核与转写器。请
 - 只返回一个 JSON 对象，不要 Markdown 代码围栏或其他解释：
   {"is_job":true,"confidence":0.95,"job_text":"职位名称\\n薪资\\n城市\\n任职要求"}
 - `is_job` 仅在截图可清楚证明是一个具体的招聘职位时为 true；聊天截图、项目页面、文章、广告、空白页或信息不足的图片必须为 false。
+- 一张可导入的截图必须同时展示职位名称、岗位职责或任职要求，并至少展示薪资、地点、经验、学历、公司信息中的两项；不满足时 `is_job` 必须为 false。
 - `confidence` 必须是 0 到 1 的数字；无法可靠判断时小于 0.8。
 - `job_text` 只能包含可见的职位名称、薪资、城市、经验、学历、岗位职责、任职要求、公司等文字；多张同一职位截图可合并重复段落，但不得补写截图未展示的内容。
 - 当 `is_job` 为 false 时，`job_text` 返回空字符串，不得编造职位信息。"""

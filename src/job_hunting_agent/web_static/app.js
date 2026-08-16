@@ -70,6 +70,12 @@ if (!window.Vue) {
           message: "",
         },
         duplicateNoticeReturnTarget: null,
+        jobImportNotice: {
+          open: false,
+          title: "",
+          message: "",
+        },
+        jobImportNoticeReturnTarget: null,
         activeView: "workspace",
         workspaceRailOpen: false,
         activeWorkspacePanel: "",
@@ -298,6 +304,7 @@ if (!window.Vue) {
       document.body.classList.remove("cmdk-lock");
       document.body.classList.remove("workspace-rail-lock");
       document.body.classList.remove("duplicate-dialog-lock");
+      document.body.classList.remove("job-import-dialog-lock");
       if (this.messageScrollFrameId !== null) {
         if (window.requestAnimationFrame && window.cancelAnimationFrame) {
           window.cancelAnimationFrame(this.messageScrollFrameId);
@@ -392,6 +399,28 @@ if (!window.Vue) {
         this.duplicateNotice.open = false;
         this.duplicateNoticeReturnTarget = null;
         document.body.classList.remove("duplicate-dialog-lock");
+        nextTick(() => returnTarget?.focus?.());
+      },
+
+      /** 显示截图审核未通过的居中提示，避免用户在折叠面板中遗漏导入失败原因。 */
+      showJobImportNotice(message, title = "无法导入职位截图") {
+        this.jobImportNoticeReturnTarget =
+          document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        this.jobImportNotice = {
+          open: true,
+          title,
+          message: message || "职位截图未通过审核，请换一张更完整的截图后重试。",
+        };
+        document.body.classList.add("job-import-dialog-lock");
+        nextTick(() => this.$refs.jobImportNoticeClose?.focus());
+      },
+
+      /** 关闭截图审核提示，并将焦点还给触发导入的控件。 */
+      closeJobImportNotice() {
+        const returnTarget = this.jobImportNoticeReturnTarget;
+        this.jobImportNotice.open = false;
+        this.jobImportNoticeReturnTarget = null;
+        document.body.classList.remove("job-import-dialog-lock");
         nextTick(() => returnTarget?.focus?.());
       },
 
@@ -539,6 +568,13 @@ if (!window.Vue) {
           if (event.key === "Escape") {
             event.preventDefault();
             this.closeDuplicateNotice();
+          }
+          return;
+        }
+        if (this.jobImportNotice.open) {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            this.closeJobImportNotice();
           }
           return;
         }
@@ -1922,6 +1958,7 @@ if (!window.Vue) {
         const files = Array.from(input?.files || []);
         if (files.length > 4) {
           this.jobImportError = "一次最多上传 4 张职位截图。";
+          this.showJobImportNotice(this.jobImportError, "无法上传职位截图");
           this.jobForm.screenshots = [];
           if (input) input.value = "";
           return;
@@ -1929,6 +1966,7 @@ if (!window.Vue) {
         const oversized = files.find((file) => file.size > 8 * 1024 * 1024);
         if (oversized) {
           this.jobImportError = `截图 ${oversized.name} 不能超过 8 MB。`;
+          this.showJobImportNotice(this.jobImportError, "无法上传职位截图");
           this.jobForm.screenshots = [];
           if (input) input.value = "";
           return;
@@ -2020,7 +2058,11 @@ if (!window.Vue) {
             return;
           }
           this.jobImportError = error.message;
-          this.appendAssistant(this.jobImportError, true);
+          if (Number(error?.status) === 400) {
+            this.showJobImportNotice(this.jobImportError);
+          } else {
+            this.appendAssistant(this.jobImportError, true);
+          }
         } finally {
           this.importingJob = false;
         }

@@ -38,7 +38,8 @@ body.workspace-rail-lock {
   overflow-y: hidden;
 }
 
-body.duplicate-dialog-lock {
+body.duplicate-dialog-lock,
+body.job-import-dialog-lock {
   overflow-y: hidden;
 }
 
@@ -1527,7 +1528,8 @@ textarea:focus-visible,
   transform: translateY(0);
 }
 
-.duplicate-dialog {
+.duplicate-dialog,
+.job-import-dialog {
   position: fixed;
   inset: 0;
   z-index: var(--z-toast);
@@ -1536,7 +1538,8 @@ textarea:focus-visible,
   padding: var(--space-lg);
 }
 
-.duplicate-dialog-backdrop {
+.duplicate-dialog-backdrop,
+.job-import-dialog-backdrop {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -1547,7 +1550,8 @@ textarea:focus-visible,
   cursor: default;
 }
 
-.duplicate-dialog-panel {
+.duplicate-dialog-panel,
+.job-import-dialog-panel {
   position: relative;
   width: min(100%, 28rem);
   display: grid;
@@ -1561,11 +1565,14 @@ textarea:focus-visible,
 }
 
 .duplicate-dialog-panel h2,
-.duplicate-dialog-panel p {
+.duplicate-dialog-panel p,
+.job-import-dialog-panel h2,
+.job-import-dialog-panel p {
   margin: 0;
 }
 
-.duplicate-dialog-panel h2 {
+.duplicate-dialog-panel h2,
+.job-import-dialog-panel h2 {
   color: var(--color-ink);
   font-family: var(--font-display);
   font-size: var(--text-xl);
@@ -1573,12 +1580,14 @@ textarea:focus-visible,
   overflow-wrap: anywhere;
 }
 
-.duplicate-dialog-panel > p:not(.eyebrow) {
+.duplicate-dialog-panel > p:not(.eyebrow),
+.job-import-dialog-panel > p:not(.eyebrow) {
   color: var(--color-muted);
   overflow-wrap: anywhere;
 }
 
-.duplicate-dialog-actions {
+.duplicate-dialog-actions,
+.job-import-dialog-actions {
   display: flex;
   justify-content: flex-end;
   padding-block-start: var(--space-xs);

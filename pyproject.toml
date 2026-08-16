@@ -3,7 +3,8 @@
 name = "job-hunting-agent"
 version = "0.1.0"
 description = "A local, read-only job hunting assistant MVP."
-requires-python = ">=3.12"
+# 本项目的本地 Conda 环境和 Docker 镜像均以 Python 3.12.13 验证，避免补丁版本漂移。
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic>=1.14.0",
     "boto3>=1.35.0",

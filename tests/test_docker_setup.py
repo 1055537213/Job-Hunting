@@ -13,8 +13,11 @@ def test_docker_files_keep_runtime_data_and_secrets_out_of_image():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
 
-    assert "ARG BASE_IMAGE=python:3.12-slim" in dockerfile
+    assert "ARG BASE_IMAGE=python:3.12.13-slim" in dockerfile
     assert "FROM ${BASE_IMAGE}" in dockerfile
+    assert "COPY requirements.lock ./" in dockerfile
+    assert "pip install --no-cache-dir -r requirements.lock" in dockerfile
+    assert "pip install --no-cache-dir --no-deps ." in dockerfile
     assert "USER appuser" in dockerfile
     assert "--host" in dockerfile
     assert "0.0.0.0" in dockerfile
@@ -23,6 +26,9 @@ def test_docker_files_keep_runtime_data_and_secrets_out_of_image():
     assert ".env" in dockerignore
     assert "data/" in dockerignore
     assert "tests/" in dockerignore
+
+    package_metadata = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'requires-python = ">=3.12,<3.13"' in package_metadata
 
 
 def test_compose_mounts_env_read_only_and_starts_postgres_before_web():
@@ -76,5 +82,14 @@ def test_docker_learning_document_explains_stack_and_boundaries():
 
     document = (ROOT / "docs" / "learning" / "docker-environment.md").read_text(encoding="utf-8")
 
-    for phrase in ("Docker", "Docker Compose", "为什么现在选用", "PostgreSQL", "pgvector", "热更新"):
+    for phrase in (
+        "Docker",
+        "Docker Compose",
+        "为什么现在选用",
+        "PostgreSQL",
+        "pgvector",
+        "热更新",
+        "requirements.lock",
+        "依赖版本",
+    ):
         assert phrase in document

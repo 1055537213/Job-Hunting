@@ -32,6 +32,7 @@ handleGlobalShortcut.call(
   {
     commandPaletteOpen: false,
     duplicateNotice: { open: false },
+    jobImportNotice: { open: false },
     openCommandPalette() {
       opened = true;
     },
@@ -47,5 +48,22 @@ handleGlobalShortcut.call(
 );
 assert.equal(opened, true);
 assert.equal(prevented, true);
+
+// 截图审核弹窗打开时，Esc 应优先关闭弹窗，不应继续触发工作台快捷键。
+let screenshotNoticeClosed = false;
+handleGlobalShortcut.call(
+  {
+    duplicateNotice: { open: false },
+    jobImportNotice: { open: true },
+    closeJobImportNotice() {
+      screenshotNoticeClosed = true;
+    },
+  },
+  {
+    key: "Escape",
+    preventDefault() {},
+  },
+);
+assert.equal(screenshotNoticeClosed, true);
 
 console.log("frontend shortcut regression: PASS");

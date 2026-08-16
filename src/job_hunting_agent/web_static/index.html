@@ -992,6 +992,41 @@
           </div>
         </section>
       </div>
+
+      <div
+        v-if="jobImportNotice.open"
+        class="job-import-dialog"
+        @keydown.esc.prevent.stop="closeJobImportNotice"
+      >
+        <button
+          class="job-import-dialog-backdrop"
+          type="button"
+          aria-label="关闭职位截图提示"
+          @click="closeJobImportNotice"
+        ></button>
+        <section
+          class="job-import-dialog-panel"
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="jobImportDialogTitle"
+          aria-describedby="jobImportDialogMessage"
+          @click.stop
+        >
+          <p class="eyebrow">职位审核未通过</p>
+          <h2 id="jobImportDialogTitle">{{ jobImportNotice.title }}</h2>
+          <p id="jobImportDialogMessage">{{ jobImportNotice.message }}</p>
+          <div class="job-import-dialog-actions">
+            <button
+              ref="jobImportNoticeClose"
+              class="primary-button"
+              type="button"
+              @click="closeJobImportNotice"
+            >
+              知道了
+            </button>
+          </div>
+        </section>
+      </div>
     </div>
 
     <!-- Vue 3 global build 已放入本地静态目录，避免本地页面依赖外部 CDN。 -->

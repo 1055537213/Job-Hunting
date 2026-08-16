@@ -75,7 +75,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        BASE_IMAGE: "${JOB_AGENT_DOCKER_BASE_IMAGE:-python:3.12-slim}"
+        BASE_IMAGE: "${JOB_AGENT_DOCKER_BASE_IMAGE:-python:3.12.13-slim}"
     image: job-hunting-agent:web-dev
     restart: "no"
     environment:
@@ -95,9 +95,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      # 默认使用官方镜像；只在当前网络无法访问 Docker Hub 时覆盖该变量。
+      # 默认固定到官方 Python 3.12.13 镜像；只在当前网络无法访问 Docker Hub 时覆盖该变量。
       args:
-        BASE_IMAGE: "${JOB_AGENT_DOCKER_BASE_IMAGE:-python:3.12-slim}"
+        BASE_IMAGE: "${JOB_AGENT_DOCKER_BASE_IMAGE:-python:3.12.13-slim}"
     image: job-hunting-agent:web-dev
     # 容器异常退出时自动重启；手动 docker compose stop 不会造成循环启动。
     restart: unless-stopped
@@ -146,7 +146,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        BASE_IMAGE: "${JOB_AGENT_DOCKER_BASE_IMAGE:-python:3.12-slim}"
+        BASE_IMAGE: "${JOB_AGENT_DOCKER_BASE_IMAGE:-python:3.12.13-slim}"
     image: job-hunting-agent:web-dev
     restart: unless-stopped
     environment:

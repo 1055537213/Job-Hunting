@@ -24,7 +24,7 @@
 | --- | --- | --- |
 | 前端 | Vue、HTML、CSS、JavaScript | 构建登录页、候选人工作台、流式聊天、职位与简历管理界面 |
 | 前端 | Server-Sent Events、Markdown 渲染 | 接收流式 Agent 回复并展示表格、列表和代码块 |
-| 后端 | Python、FastAPI、Uvicorn | 提供网页服务、认证、业务 API、文件上传下载和流式响应 |
+| 后端 | Python 3.12.13、FastAPI、Uvicorn | 提供网页服务、认证、业务 API、文件上传下载和流式响应 |
 | 后端 | LangChain、LangGraph | 创建 Agent、注册工具、编排模型调用和管理会话状态 |
 | 后端 | Celery、Redis | 异步执行 OCR、RAG 索引和 GitHub 项目分析任务 |
 | 后端 | RapidOCR、PDFium、pdfplumber、python-docx、ReportLab | 识别、解析和生成 DOCX/PDF 简历文件 |
@@ -34,6 +34,12 @@
 | 存储 | MinIO、S3-compatible API | 保存上传的原始简历和生成的职位定制文件 |
 | 开发工具 | Docker、Docker Compose | 统一启动数据库、对象存储、消息队列、迁移、Web 和 Worker |
 | 开发工具 | pytest | 验证业务规则、API、数据库迁移、RAG、后台任务和前端回归行为 |
+
+### Python 运行时基线
+
+- Docker 基础镜像固定为 `python:3.12.13-slim`，避免 `python:3.12-slim` 这类浮动标签在未来构建时自动切换补丁版本。
+- 本项目在宿主机直接使用 `E:\Anaconda\envs\langchain1.2`，其中运行的是 Python 3.12.13；该环境也是本地测试和 `pip-tools` 的运行环境。
+- 运行时依赖由 `requirements.lock` 固定，解释器版本由本地 Conda 环境和 Docker 基础镜像共同固定。
 
 ## 3. 项目架构
 
@@ -114,6 +120,7 @@ Job-hunting Agent/
 ├─ compose.yaml                  # 完整本地容器拓扑
 ├─ compose.dev.yaml              # 源码挂载和热更新覆盖配置
 ├─ Dockerfile                    # Web/Worker 镜像构建
+├─ requirements.lock             # pip-tools 生成的精确运行时依赖版本
 ├─ alembic.ini                   # Alembic 配置
 ├─ pyproject.toml                # Python 依赖、包配置和命令入口
 ├─ .env.example                  # 环境变量模板，不包含真实密钥
@@ -133,6 +140,8 @@ Job-hunting Agent/
 - `compose.yaml`：启动 PostgreSQL、MinIO、Redis、Alembic 迁移、Web 和 Worker。首次运行前需要将 `.env.example` 复制为 `.env`，替换占位凭据和模型配置，然后执行 `docker compose up -d --build`。
 - `compose.dev.yaml`：本地开发覆盖配置，挂载源码并开启 Web 热更新。
 - `pyproject.toml`：声明依赖、包数据以及 `job-agent-web`、`job-agent-worker` 命令入口。
+- `requirements.lock`：由 `pip-tools` 根据 `pyproject.toml` 生成的运行时依赖锁定文件；Docker
+  构建使用它安装依赖，修改 `pyproject.toml` 后必须重新生成。
 
 ### 核心业务实现
 
