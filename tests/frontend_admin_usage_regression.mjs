@@ -43,6 +43,10 @@ assert.match(template, /选择一个账号/);
 assert.match(template, /styles\.css\?v=20260819-tool-audit-v2/);
 assert.match(template, /app\.js\?v=20260819-tool-audit-v2/);
 assert.match(template, /工具调用/);
+assert.match(template, /HTTP 请求/);
+assert.match(template, /错误请求/);
+assert.match(template, /平均耗时/);
+assert.match(template, /安全拦截/);
 assert.match(template, /class="admin-tool-workspace"/);
 assert.match(template, /class="admin-tool-list"/);
 assert.match(template, /class="admin-tool-detail"/);
@@ -54,12 +58,14 @@ assert.doesNotMatch(template, /selectedAdminToolTrace\.trace\?\.steps/);
 assert.match(source, /selectedAccountId:\s*0/);
 assert.match(source, /loadingEvents:\s*false/);
 assert.match(source, /toolTraces:\s*\[\]/);
+assert.match(source, /requestMetrics:\s*\{\}/);
 assert.match(source, /selectedToolTraceId:\s*""/);
 assert.match(source, /selectAdminAccount\(accountId\)/);
 assert.match(source, /loadAdminUsageEvents\(accountId = this\.admin\.selectedAccountId\)/);
 assert.match(source, /loadAdminToolTraces\(accountId = this\.admin\.selectedAccountId, offset = 0\)/);
 assert.match(source, /selectAdminToolTrace\(rootRequestId\)/);
 assert.match(source, /\/api\/admin\/usage\/events\?account_id=\$\{encodeURIComponent\(selectedAccountId\)\}&limit=200/);
+assert.match(source, /\/api\/admin\/observability\/requests/);
 assert.match(source, /\/api\/admin\/tools\/traces\?account_id=\$\{encodeURIComponent\(selectedAccountId\)\}&limit=50&offset=\$\{encodeURIComponent\(offset\)\}/);
 assert.match(source, /\/api\/admin\/tools\/traces\/\$\{encodeURIComponent\(traceId\)\}/);
 assert.match(source, /usageRequestVersion/);
@@ -170,6 +176,7 @@ const adminLoadContext = {
     accounts: [],
     events: [{ id: 99 }],
     summary: {},
+    requestMetrics: {},
     activeDetailTab: "tokens",
     selectedAccountId: 0,
     loadingEvents: false,
@@ -193,6 +200,9 @@ const adminLoadContext = {
     if (url === "/api/admin/usage/summary") {
       return { summary: { event_count: 1 }, by_account: [], tool_calls_by_account: [] };
     }
+    if (url === "/api/admin/observability/requests") {
+      return { requests: { total_requests: 12, error_requests: 1, average_duration_ms: 8.5 } };
+    }
     throw new Error(`unexpected URL ${url}`);
   },
   clearAdminUsageSelection,
@@ -203,9 +213,18 @@ const adminLoadContext = {
 };
 
 await loadAdminData.call(adminLoadContext);
-assert.deepEqual(adminLoadUrls.sort(), ["/api/admin/accounts", "/api/admin/usage/summary"]);
+assert.deepEqual(adminLoadUrls.sort(), [
+  "/api/admin/accounts",
+  "/api/admin/observability/requests",
+  "/api/admin/usage/summary",
+]);
 assert.equal(adminLoadContext.admin.selectedAccountId, 0);
 assert.deepEqual(adminLoadContext.admin.events, []);
+assert.deepEqual(adminLoadContext.admin.requestMetrics, {
+  total_requests: 12,
+  error_requests: 1,
+  average_duration_ms: 8.5,
+});
 
 const toolUrls = [];
 const toolContext = {

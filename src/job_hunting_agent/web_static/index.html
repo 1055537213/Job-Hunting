@@ -1019,6 +1019,13 @@
           <div class="admin-metric"><span>请求事件</span><strong>{{ admin.summary.event_count || 0 }}</strong></div>
           <div class="admin-metric"><span>总 Token</span><strong>{{ admin.summary.total_tokens || 0 }}</strong></div>
           <div class="admin-metric"><span>可计费 Token</span><strong>{{ admin.summary.billable_tokens || 0 }}</strong></div>
+          <div class="admin-metric"><span>HTTP 请求</span><strong>{{ admin.requestMetrics.total_requests || 0 }}</strong></div>
+          <div class="admin-metric"><span>错误请求</span><strong>{{ admin.requestMetrics.error_requests || 0 }}</strong></div>
+          <div class="admin-metric"><span>平均耗时</span><strong>{{ admin.requestMetrics.average_duration_ms || 0 }}ms</strong></div>
+          <div class="admin-metric">
+            <span>安全拦截</span>
+            <strong>{{ (admin.requestMetrics.rate_limited_requests || 0) + (admin.requestMetrics.csrf_rejected_requests || 0) }}</strong>
+          </div>
         </div>
         <section class="panel admin-panel admin-account-ledger">
           <div class="panel-title-row">

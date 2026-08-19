@@ -10,6 +10,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
@@ -62,20 +63,25 @@ def install_web_hardening(
     """安装 Web 最外层安全与观测中间件。"""
 
     limiter = InMemoryRateLimiter(settings)
+    metrics = RequestMetrics()
+    web_app.state.request_metrics = metrics
 
     @web_app.middleware("http")
     async def hardening_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]):
         request_id = normalize_request_id(request.headers.get(REQUEST_ID_HEADER))
         request.state.request_id = request_id
         started_at = time.monotonic()
+        metrics.mark_started()
         response: Response | None = None
         status_code = 500
+        outcome = "handled"
         try:
             retry_after = limiter.check(
                 client_id=client_identity(request),
                 group=rate_limit_group(request),
             )
             if retry_after is not None:
+                outcome = "rate_limited"
                 response = JSONResponse(
                     {"detail": "请求过于频繁，请稍后再试。"},
                     status_code=429,
@@ -86,6 +92,7 @@ def install_web_hardening(
                 settings=settings,
                 session_cookie_name=session_cookie_name,
             ):
+                outcome = "csrf_rejected"
                 response = JSONResponse({"detail": csrf_failure}, status_code=403)
             else:
                 response = await call_next(request)
@@ -93,11 +100,20 @@ def install_web_hardening(
             return response
         except Exception:
             status_code = 500
+            outcome = "exception"
             raise
         finally:
+            duration_ms = max(0, round((time.monotonic() - started_at) * 1000))
             if response is not None:
                 apply_request_headers(response, request_id, settings)
-            log_access(request, status_code, started_at)
+            metrics.record(
+                request=request,
+                request_id=request_id,
+                status_code=status_code,
+                duration_ms=duration_ms,
+                outcome=outcome,
+            )
+            log_access(request, status_code, duration_ms)
 
 
 class InMemoryRateLimiter:
@@ -138,6 +154,102 @@ class InMemoryRateLimiter:
         if group == "auth":
             return self.settings.rate_limit_auth_requests
         return self.settings.rate_limit_default_requests
+
+
+class RequestMetrics:
+    """进程内请求指标聚合器，不保存请求正文或查询参数。"""
+
+    def __init__(self) -> None:
+        self.started_at = datetime.now(UTC).isoformat(timespec="seconds")
+        self._lock = threading.Lock()
+        self._in_flight = 0
+        self._total_requests = 0
+        self._total_duration_ms = 0
+        self._max_duration_ms = 0
+        self._status_counts: dict[str, int] = defaultdict(int)
+        self._method_counts: dict[str, int] = defaultdict(int)
+        self._endpoint_counts: dict[str, int] = defaultdict(int)
+        self._outcome_counts: dict[str, int] = defaultdict(int)
+        self._recent_errors: deque[dict[str, object]] = deque(maxlen=20)
+
+    def mark_started(self) -> None:
+        """记录当前进程内正在处理的请求数量。"""
+
+        with self._lock:
+            self._in_flight += 1
+
+    def record(
+        self,
+        *,
+        request: Request,
+        request_id: str,
+        status_code: int,
+        duration_ms: int,
+        outcome: str,
+    ) -> None:
+        """写入一次请求的低敏指标。"""
+
+        status_family = f"{max(1, min(status_code // 100, 5))}xx"
+        method = request.method.upper()
+        endpoint = route_template(request)
+        with self._lock:
+            self._in_flight = max(0, self._in_flight - 1)
+            self._total_requests += 1
+            self._total_duration_ms += duration_ms
+            self._max_duration_ms = max(self._max_duration_ms, duration_ms)
+            self._status_counts[status_family] += 1
+            self._method_counts[method] += 1
+            self._endpoint_counts[endpoint] += 1
+            self._outcome_counts[outcome] += 1
+            if status_code >= 400 or outcome in {"rate_limited", "csrf_rejected", "exception"}:
+                self._recent_errors.appendleft(
+                    {
+                        "request_id": request_id,
+                        "method": method,
+                        "endpoint": endpoint,
+                        "status_code": status_code,
+                        "outcome": outcome,
+                        "duration_ms": duration_ms,
+                        "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                    }
+                )
+
+    def snapshot(self) -> dict[str, object]:
+        """返回管理员可查看的请求指标快照。"""
+
+        with self._lock:
+            total_requests = self._total_requests
+            average_duration_ms = (
+                round(self._total_duration_ms / total_requests, 2)
+                if total_requests
+                else 0
+            )
+            error_requests = sum(
+                count
+                for family, count in self._status_counts.items()
+                if family in {"4xx", "5xx"}
+            )
+            return {
+                "started_at": self.started_at,
+                "in_flight_requests": self._in_flight,
+                "total_requests": total_requests,
+                "error_requests": error_requests,
+                "average_duration_ms": average_duration_ms,
+                "max_duration_ms": self._max_duration_ms,
+                "rate_limited_requests": self._outcome_counts.get("rate_limited", 0),
+                "csrf_rejected_requests": self._outcome_counts.get("csrf_rejected", 0),
+                "exception_requests": self._outcome_counts.get("exception", 0),
+                "status_counts": dict(sorted(self._status_counts.items())),
+                "method_counts": dict(sorted(self._method_counts.items())),
+                "endpoint_counts": dict(
+                    sorted(
+                        self._endpoint_counts.items(),
+                        key=lambda item: (-item[1], item[0]),
+                    )[:20]
+                ),
+                "outcome_counts": dict(sorted(self._outcome_counts.items())),
+                "recent_errors": list(self._recent_errors),
+            }
 
 
 def validate_csrf_request(
@@ -214,16 +326,33 @@ def rate_limit_group(request: Request) -> str:
     return "default"
 
 
+def route_template(request: Request) -> str:
+    """返回低基数 endpoint 标签，避免把用户输入或 ID 写进指标。"""
+
+    route = request.scope.get("route")
+    path = getattr(route, "path", None)
+    if isinstance(path, str) and path:
+        return path
+    raw_path = request.url.path
+    if raw_path.startswith("/static/"):
+        return "/static/*"
+    if raw_path.startswith("/api/admin/"):
+        return "/api/admin/*"
+    if raw_path.startswith("/api/"):
+        parts = [part for part in raw_path.split("/") if part]
+        return "/" + "/".join(parts[:2]) + ("/*" if len(parts) > 2 else "")
+    return raw_path or "/"
+
+
 def client_identity(request: Request) -> str:
     """返回不依赖可伪造代理头的本地客户端标识。"""
 
     return request.client.host if request.client and request.client.host else "unknown"
 
 
-def log_access(request: Request, status_code: int, started_at: float) -> None:
+def log_access(request: Request, status_code: int, duration_ms: int) -> None:
     """输出不含请求正文的结构化访问日志。"""
 
-    duration_ms = max(0, round((time.monotonic() - started_at) * 1000))
     account = getattr(request.state, "account", None)
     payload: dict[str, Any] = {
         "event": "http_request",

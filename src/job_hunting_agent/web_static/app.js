@@ -105,6 +105,7 @@ if (!window.Vue) {
           selectedToolTraceId: "",
           toolTraceDetail: null,
           summary: {},
+          requestMetrics: {},
           activeDetailTab: "tokens",
           selectedAccountId: 0,
           loadingEvents: false,
@@ -592,9 +593,10 @@ if (!window.Vue) {
       /** 加载账号列表和汇总；Token 明细在管理员选择账号后按账号请求。 */
       async loadAdminData() {
         try {
-          const [accounts, summary] = await Promise.all([
+          const [accounts, summary, requestMetrics] = await Promise.all([
             this.requestJson("/api/admin/accounts"),
             this.requestJson("/api/admin/usage/summary"),
+            this.requestJson("/api/admin/observability/requests"),
           ]);
           this.admin.accounts = accounts.accounts || [];
           this.admin.summary = {
@@ -602,6 +604,7 @@ if (!window.Vue) {
             by_account: summary.by_account || [],
             tool_calls_by_account: summary.tool_calls_by_account || [],
           };
+          this.admin.requestMetrics = requestMetrics.requests || {};
           this.admin.loadError = "";
 
           const selectedAccountId = Number(this.admin.selectedAccountId);

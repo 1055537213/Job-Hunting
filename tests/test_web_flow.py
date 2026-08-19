@@ -187,6 +187,39 @@ def test_auth_rate_limit_rejects_excessive_login_attempts(monkeypatch) -> None:
     assert int(third.headers["retry-after"]) > 0
 
 
+def test_admin_can_read_low_cardinality_request_metrics(tmp_path) -> None:
+    """管理员能读取当前 Web 进程请求指标，指标不保存查询参数或正文。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_BOOTSTRAP_ADMIN_EMAIL=metrics-admin@example.com",
+                "JOB_AGENT_BOOTSTRAP_ADMIN_PASSWORD=strong-password-123",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(create_web_app(env_file=env_path))
+    assert client.post(
+        "/api/auth/login",
+        json={"email": "metrics-admin@example.com", "password": "strong-password-123"},
+    ).status_code == 200
+    assert client.get("/api/missing?secret=should-not-appear").status_code == 404
+
+    response = client.get("/api/admin/observability/requests")
+
+    assert response.status_code == 200
+    metrics = response.json()["requests"]
+    assert metrics["total_requests"] >= 2
+    assert metrics["error_requests"] >= 1
+    assert metrics["average_duration_ms"] >= 0
+    assert "/api/auth/login" in metrics["endpoint_counts"]
+    latest_error = metrics["recent_errors"][0]
+    assert latest_error["endpoint"] == "/api/missing"
+    assert "secret" not in str(metrics)
+
+
 def test_web_bootstraps_initial_admin_once_from_env(tmp_path) -> None:
     """首次管理员只能由私有环境配置引导，公开注册接口不能提升普通用户。"""
 

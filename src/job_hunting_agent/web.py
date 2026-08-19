@@ -1447,6 +1447,13 @@ def create_web_app(
             "tool_calls_by_account": backend.store.summarize_tool_call_traces_by_account(),
         }
 
+    @web_app.get("/api/admin/observability/requests")
+    def admin_request_metrics(request: Request) -> dict[str, object]:
+        """管理员查看当前 Web 进程的低敏请求指标。"""
+
+        require_admin(request)
+        return {"requests": web_app.state.request_metrics.snapshot()}
+
     @web_app.post("/api/admin/tasks/probe")
     def admin_task_queue_probe(request: Request) -> dict[str, object]:
         """管理员登记一个无业务数据的 Worker 探针，用于运维验证。"""
