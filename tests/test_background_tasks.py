@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from job_hunting_agent.config import TaskQueueSettings, load_task_queue_settings
 from job_hunting_agent.models import CandidateProfileInput, RAGIndexStats
 from job_hunting_agent.resume_document import ResumeFileStore
 from job_hunting_agent.task_queue import CeleryTaskQueue, TaskQueueError
+from job_hunting_agent.tool_audit import tool_audit_retention_cutoff
 
 
 class FakeCeleryProducer:
@@ -264,6 +266,12 @@ def test_rag_index_task_runs_with_scoped_context(
     saved = app.get_background_task(task.task_key, account_id=account_id)
     assert saved.result["index_stats"]["chunk_count"] == 2
     assert saved.progress == 100
+
+
+def test_tool_audit_retention_cutoff_keeps_two_shanghai_natural_days() -> None:
+    """保留窗口应从上海时区的昨日 0 点开始，而不是按 UTC 自然日误删。"""
+
+    assert tool_audit_retention_cutoff(datetime(2026, 8, 19, 1, 0, tzinfo=UTC)) == "2026-08-17T16:00:00+00:00"
 
 
 def test_resume_ocr_task_creates_follow_up_rag_task(

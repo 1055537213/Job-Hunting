@@ -12,6 +12,8 @@ from typing import Any, Protocol
 from .config import TaskQueueSettings
 
 BACKGROUND_TASK_NAME = "job_hunting_agent.background_tasks.execute_background_task"
+# 工具调用审计只保留最近两个上海自然日，由 Celery Beat 每天 0 点触发清理。
+TOOL_AUDIT_RETENTION_TASK_NAME = "job_hunting_agent.background_tasks.purge_tool_call_traces"
 # RAG 增量索引使用独立任务类型，Web、应用门面和 Worker 共用这个稳定标识。
 RAG_INDEX_TASK_TYPE = "rag_index"
 # 扫描 PDF OCR 先完成正文提取，再由 Worker 创建独立的 RAG 增量索引任务。
@@ -41,6 +43,7 @@ def build_celery_app(settings: TaskQueueSettings) -> Any:
         raise TaskQueueError("后台任务队列未启用。")
     try:
         from celery import Celery
+        from celery.schedules import crontab
     except ModuleNotFoundError as error:
         raise TaskQueueError(
             "后台任务队列需要 celery[redis]，请先安装项目依赖。"
@@ -59,8 +62,17 @@ def build_celery_app(settings: TaskQueueSettings) -> Any:
         task_reject_on_worker_lost=True,
         worker_prefetch_multiplier=1,
         broker_connection_retry_on_startup=True,
+        timezone="Asia/Shanghai",
+        enable_utc=True,
         task_time_limit=settings.task_time_limit_seconds,
         task_soft_time_limit=settings.task_soft_time_limit_seconds,
+        beat_schedule={
+            "purge-tool-call-traces-at-shanghai-midnight": {
+                "task": TOOL_AUDIT_RETENTION_TASK_NAME,
+                "schedule": crontab(hour=0, minute=0),
+                "options": {"queue": settings.queue_name},
+            }
+        },
     )
     return app
 

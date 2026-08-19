@@ -64,5 +64,13 @@ assert.equal(scrollCount, 401, "every visible update still scrolls to the latest
 assert.match(template, /v-if="message\.isStreaming"/);
 assert.match(template, /v-html="message\.renderedHtml"/);
 assert.doesNotMatch(template, /v-html="renderMarkdown\(message\.content\)"/);
+assert.match(source, /我是求职助手 Agent/);
+assert.match(source, /建立属于你的专属档案/);
+assert.doesNotMatch(source, /默认通过标准 LangChain Agent 来处理你的聊天请求/);
+assert.match(template, /class="task-trace"/);
+assert.match(template, /@click="toggleTaskTrace\(message\)"/);
+assert.match(source, /event\.event === "task_started"/);
+assert.match(source, /event\.event === "step_completed"/);
+assert.match(source, /setMessageTaskTrace\(assistantMessage, data\.task_trace/);
 
 console.log("frontend stream render regression: PASS");

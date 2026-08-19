@@ -38,17 +38,21 @@ class StreamingFakeChatModel(FakeListChatModel):
         return self
 
 
-def login_test_account(client: TestClient, email: str = "web-tests@example.com") -> TestClient:
+def login_test_account(
+    client: TestClient,
+    email: str = "web-tests@example.com",
+    password: str = "password-123",
+) -> TestClient:
     """为 Web 行为测试创建真实账号并建立 HttpOnly Session。"""
 
     registered = client.post(
         "/api/auth/register",
-        json={"email": email, "password": "password-123"},
+        json={"email": email, "password": password},
     )
     assert registered.status_code in {200, 409}
     logged_in = client.post(
         "/api/auth/login",
-        json={"email": email, "password": "password-123"},
+        json={"email": email, "password": password},
     )
     assert logged_in.status_code == 200
     return client
@@ -150,8 +154,8 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert home.status_code == 200
     assert "Job Hunting Agent" in home.text
     assert "syncAuthPageClass" in script.text
-    assert '/static/app.js?v=20260814-dedup-dialog' in home.text
-    assert '/static/styles.css?v=20260814-dedup-dialog' in home.text
+    assert '/static/app.js?v=20260819-tool-audit-v2' in home.text
+    assert '/static/styles.css?v=20260819-tool-audit-v2' in home.text
     assert "本地运行 · 用户复制职位文本" not in home.text
     assert "Conversation Workspace" not in home.text
     assert "整理求职证据" not in home.text
@@ -237,8 +241,8 @@ def test_web_frontend_defaults_to_agent_and_incremental_rag_without_toggles(tmp_
     assert "this.useLlm =" not in script
 
 
-def test_web_profile_form_uses_recovered_selectors_and_auth_copy(tmp_path):
-    """保留认证与学历约束，并支持按省份连续添加多个首选城市。"""
+def test_web_profile_form_uses_city_picker_and_auth_copy(tmp_path):
+    """保留认证与学历约束，并用热门城市加省市二级菜单选择首选城市。"""
 
     client = legacy_client()
 
@@ -261,15 +265,28 @@ def test_web_profile_form_uses_recovered_selectors_and_auth_copy(tmp_path):
     assert home.count("退出所有设备") == 1
     for education in ("高中及以下", "大专", "本科", "硕士", "博士"):
         assert f'<option value="{education}">{education}</option>' in home
+    assert 'class="city-picker"' in home
+    assert 'aria-haspopup="dialog"' in home
+    assert 'v-if="cityPickerOpen"' in home
     assert 'v-for="province in cityGroups"' in home
-    assert 'v-for="city in province.cities"' in home
+    assert 'v-for="city in activeCityOptions"' in home
+    assert "热门城市" in home
+    assert "省份及直辖市" in home
+    assert '<optgroup' not in home
     assert '/static/china_cities.js?v=20260803-cities' in home
+    assert '/static/styles.css?v=20260819-tool-audit-v2' in home
+    assert '/static/app.js?v=20260819-tool-audit-v2' in home
     assert "cityGroups: buildSortedCityGroups()" in script
-    assert 'v-model="profileForm.citySelection"' in home
+    assert "HOT_CITY_NAMES" in script
+    assert "cityPickerOpen: false" in script
+    assert 'activeCityProvince: "hot"' in script
     assert 'v-for="city in profileForm.preferredCities"' in home
     assert "preferred_cities: [...this.profileForm.preferredCities]" in script
-    assert "addPreferredCity()" in script
+    assert 'addPreferredCity(cityValue = "")' in script
+    assert "togglePreferredCity(cityValue)" in script
+    assert "isPreferredCity(cityValue)" in script
     assert "removePreferredCity(city)" in script
+    assert ".city-picker-menu" in styles
     assert cities.status_code == 200
     assert "北京市" in cities.text
     assert "广州市" in cities.text
@@ -930,6 +947,166 @@ def test_web_chat_stream_preserves_multiple_token_events(tmp_path):
     assert '{"content": "式"}' in response.text
     assert '{"content": "O"}' in response.text
     assert '{"content": "K"}' in response.text
+
+
+def test_web_chat_stream_without_tools_does_not_create_admin_tool_trace(tmp_path):
+    """没有真实工具调用的流式消息，不应写入管理端工具审计。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_BOOTSTRAP_ADMIN_EMAIL=admin@example.com",
+                "JOB_AGENT_BOOTSTRAP_ADMIN_PASSWORD=strong-password-123",
+                "JOB_AGENT_BOOTSTRAP_ADMIN_DISPLAY_NAME=初始管理员",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    agent_backend = JobHuntingApp()
+    agent_backend.initialize()
+    model = ToolCallingFakeChatModel(responses=[AIMessage(content="你好，我只是打个招呼。")])
+    backend_app = create_web_app(
+        env_file=env_path,
+        chat_agent=JobHuntingAgent(
+            app=agent_backend,
+            model=model,
+        ),
+    )
+    client = login_test_account(
+        TestClient(backend_app),
+        email="admin@example.com",
+        password="strong-password-123",
+    )
+    candidate_id = client.post(
+        "/api/profiles",
+        json={
+            "name": "小林",
+            "status": "待补充",
+            "education": "本科",
+            "experience_years": 1,
+            "skills": {},
+            "preferred_cities": [],
+            "salary_floor_k": None,
+            "expected_salary_k": None,
+            "target_directions": [],
+            "unacceptable": [],
+        },
+    ).json()["candidate_id"]
+
+    response = client.post(
+        "/api/chat/stream",
+        json={
+            "candidate_id": candidate_id,
+            "message": "请先问好，不要调用工具。",
+            "auto_rag": False,
+            "use_env_llm": True,
+            "session_id": f"web-candidate-{candidate_id}",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "event: final" in response.text
+    assert "event: step_started" not in response.text
+    assert client.get("/api/admin/usage/summary").json()["tool_calls_by_account"] == []
+    assert client.get("/api/admin/tools/traces").json()["traces"] == []
+
+
+def test_web_chat_stream_records_admin_tool_trace_detail(tmp_path):
+    """真实工具调用的流式消息应能在管理端看到同一条任务链路与步骤结果。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_BOOTSTRAP_ADMIN_EMAIL=admin@example.com",
+                "JOB_AGENT_BOOTSTRAP_ADMIN_PASSWORD=strong-password-123",
+                "JOB_AGENT_BOOTSTRAP_ADMIN_DISPLAY_NAME=初始管理员",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    agent_backend = JobHuntingApp()
+    agent_backend.initialize()
+    model = ToolCallingFakeChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "name": "ingest_candidate_message",
+                        "args": {
+                            "message": "我是本科，1年经验，会 Python 和 FastAPI。",
+                            "auto_rag": True,
+                        },
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="我已经通过工具保存了你的资料。"),
+        ]
+    )
+    backend_app = create_web_app(
+        env_file=env_path,
+        chat_agent=JobHuntingAgent(
+            app=agent_backend,
+            model=model,
+        ),
+    )
+    client = login_test_account(
+        TestClient(backend_app),
+        email="admin@example.com",
+        password="strong-password-123",
+    )
+    candidate_id = client.post(
+        "/api/profiles",
+        json={
+            "name": "小林",
+            "status": "待补充",
+            "education": "本科",
+            "experience_years": 1,
+            "skills": {},
+            "preferred_cities": [],
+            "salary_floor_k": None,
+            "expected_salary_k": None,
+            "target_directions": [],
+            "unacceptable": [],
+        },
+    ).json()["candidate_id"]
+
+    response = client.post(
+        "/api/chat/stream",
+        json={
+            "candidate_id": candidate_id,
+            "message": "我是本科，1年经验，会 Python 和 FastAPI。",
+            "auto_rag": True,
+            "use_env_llm": True,
+            "session_id": f"web-candidate-{candidate_id}",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert "event: step_started" in response.text
+    assert "event: step_completed" in response.text
+    assert "event: final" in response.text
+
+    summary = client.get("/api/admin/usage/summary").json()
+    tool_counts = summary["tool_calls_by_account"]
+    assert len(tool_counts) == 1
+    assert tool_counts[0]["trace_count"] == 1
+    assert tool_counts[0]["failed_trace_count"] == 0
+
+    trace_list = client.get("/api/admin/tools/traces").json()
+    assert trace_list["total"] == 1
+    assert len(trace_list["traces"]) == 1
+    assert trace_list["traces"][0]["step_count"] == 1
+    trace_id = trace_list["traces"][0]["root_request_id"]
+
+    detail = client.get(f"/api/admin/tools/traces/{trace_id}").json()["trace"]
+    assert detail["root_request_id"] == trace_id
+    assert detail["trace"]["steps"][0]["name"] == "ingest_candidate_message"
+    assert detail["trace"]["steps"][0]["summary"].startswith("已保存")
 
 
 def test_web_chat_bubble_renders_final_markdown_without_stream_reparse(tmp_path):

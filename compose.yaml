@@ -120,7 +120,8 @@ services:
       JOB_AGENT_TASK_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_TIME_LIMIT_SECONDS:-900}"
       JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS:-840}"
     ports:
-      - "8000:8000"
+      # 显式只绑定 IPv4 回环，避免 Windows/Docker 的 IPv6 localhost 转发异常。
+      - "127.0.0.1:8000:8000"
     # .env 只读挂载给应用解析；文件正文不再使用宿主机 data 目录。
     volumes:
       - ./.env:/app/.env:ro
@@ -173,6 +174,31 @@ services:
         condition: service_completed_successfully
       minio:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    # Celery Beat 只负责周期性投递维护任务；具体执行仍由 worker 消费。
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: "${JOB_AGENT_DOCKER_BASE_IMAGE:-python:3.12.13-slim}"
+    image: job-hunting-agent:web-dev
+    restart: unless-stopped
+    environment:
+      JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
+      JOB_AGENT_TASK_QUEUE_ENABLED: "true"
+      JOB_AGENT_REDIS_URL: "redis://:${JOB_AGENT_REDIS_PASSWORD:?set JOB_AGENT_REDIS_PASSWORD in .env}@redis:6379/0"
+      JOB_AGENT_TASK_QUEUE_NAME: "${JOB_AGENT_TASK_QUEUE_NAME:-job_agent}"
+      JOB_AGENT_TASK_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_TIME_LIMIT_SECONDS:-900}"
+      JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS:-840}"
+    volumes:
+      - ./.env:/app/.env:ro
+    command: ["job-agent-beat", "--env-file", "/app/.env", "--log-level", "INFO"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
 

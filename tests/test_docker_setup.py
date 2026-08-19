@@ -38,7 +38,8 @@ def test_compose_mounts_env_read_only_and_starts_postgres_before_web():
 
     assert "./.env:/app/.env:ro" in compose
     assert "./data:/app/data" not in compose
-    assert "8000:8000" in compose
+    assert '- "127.0.0.1:8000:8000"' in compose
+    assert '- "8000:8000"' not in compose
     assert "JOB_AGENT_DOCKER_BASE_IMAGE" in compose
     assert "pgvector/pgvector:pg16" in compose
     assert "JOB_AGENT_DATABASE_URL" in compose
@@ -54,6 +55,9 @@ def test_compose_mounts_env_read_only_and_starts_postgres_before_web():
     assert "JOB_AGENT_REDIS_URL" in compose
     assert "worker:" in compose
     assert "job-agent-worker" in compose
+    assert "beat:" in compose
+    assert "job-agent-beat" in compose
+    assert "purge_tool_call_traces" not in compose
     assert "JOB_AGENT_OBJECT_STORAGE_BACKEND" in compose
     assert "http://minio:9000" in compose
     assert "JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET" in compose

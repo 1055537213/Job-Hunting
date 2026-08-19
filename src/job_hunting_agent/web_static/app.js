@@ -43,8 +43,24 @@ if (!window.Vue) {
     return city;
   }
 
+  // 热门城市只作为快捷入口，完整城市目录仍由 china_cities.js 提供。
+  const HOT_CITY_NAMES = [
+    "北京市",
+    "上海市",
+    "广州市",
+    "深圳市",
+    "杭州市",
+    "成都市",
+    "南京市",
+    "武汉市",
+    "西安市",
+    "苏州市",
+    "重庆市",
+    "天津市",
+  ];
+
   const WELCOME_MESSAGE =
-    "你好，我会默认通过标准 LangChain Agent 来处理你的聊天请求，并自动把新增长文本增量同步到 RAG。\n你可以先在左侧创建档案，然后直接发资料；如果模型、.env 或 embedding 配置有问题，页面会直接显示后端返回的原因。";
+    "你好，我是求职助手 Agent，我能帮你整理个人经历、分析职位匹配度、完善简历并准备求职材料。\n请你先建立属于你的专属档案，我们就可以开始了。";
 
   createApp({
     data() {
@@ -85,7 +101,23 @@ if (!window.Vue) {
         admin: {
           accounts: [],
           events: [],
+          toolTraces: [],
+          selectedToolTraceId: "",
+          toolTraceDetail: null,
           summary: {},
+          activeDetailTab: "tokens",
+          selectedAccountId: 0,
+          loadingEvents: false,
+          loadingToolTraces: false,
+          loadingToolTraceDetail: false,
+          eventsError: "",
+          toolTracesError: "",
+          toolTraceDetailError: "",
+          loadError: "",
+          usageRequestVersion: 0,
+          toolTraceRequestVersion: 0,
+          toolTraceDetailRequestVersion: 0,
+          toolTraceTotal: 0,
         },
         profiles: [],
         jobs: [],
@@ -98,12 +130,13 @@ if (!window.Vue) {
         currentProfileId: Number(localStorage.getItem("currentProfileId") || 0),
         messageInput: "",
         cityGroups: buildSortedCityGroups(),
+        cityPickerOpen: false,
+        activeCityProvince: "hot",
         profileForm: {
           name: "",
           education: "",
           experienceYears: 0,
           skills: "",
-          citySelection: "",
           preferredCities: [],
           directions: "",
         },
@@ -132,6 +165,7 @@ if (!window.Vue) {
         resumeError: "",
         submittingGitHubProject: false,
         confirmingProjectCardId: 0,
+        confirmingTaskApprovalId: 0,
         githubProjectError: "",
         // 当前页面正在跟踪的后台 RAG 任务；任务事实仍以 PostgreSQL API 返回值为准。
         backgroundTasks: {},
@@ -193,6 +227,50 @@ if (!window.Vue) {
           this.sessions.find((session) => session.session_id === this.activeSessionId)?.title ||
           (this.sessions.length ? "选择会话" : "暂无会话")
         );
+      },
+
+      /** 管理后台当前展开的账号；未选择时不预先展示任何账号流水。 */
+      selectedAdminAccount() {
+        const selectedAccountId = Number(this.admin.selectedAccountId);
+        return this.admin.accounts.find(
+          (account) => Number(account.id) === selectedAccountId
+        ) || null;
+      },
+
+      /** 当前选中的工具调用轨迹摘要。 */
+      selectedAdminToolTrace() {
+        const rootRequestId = String(this.admin.selectedToolTraceId || "");
+        return this.admin.toolTraces.find(
+          (trace) => String(trace.root_request_id || "") === rootRequestId
+        ) || null;
+      },
+
+      /** 当前选中的工具调用完整详情。 */
+      selectedAdminToolTraceDetail() {
+        return this.admin.toolTraceDetail || this.selectedAdminToolTrace;
+      },
+
+      /** 当前城市选择面板右侧展示的一级地区。 */
+      activeCityGroup() {
+        return this.cityGroups.find((group) => group.province === this.activeCityProvince) || null;
+      },
+
+      /** 只保留目录中确实存在的热门城市，避免快捷入口与数据源漂移。 */
+      hotCityOptions() {
+        const availableCities = new Set(this.cityGroups.flatMap((group) => group.cities));
+        return HOT_CITY_NAMES.filter((city) => availableCities.has(city));
+      },
+
+      /** 根据一级菜单返回二级城市；热门城市是一个独立的一级入口。 */
+      activeCityOptions() {
+        return this.activeCityProvince === "hot"
+          ? this.hotCityOptions
+          : this.activeCityGroup?.cities || [];
+      },
+
+      cityPickerTitle() {
+        if (this.activeCityProvince === "hot") return "热门城市";
+        return this.activeCityGroup?.province || "选择城市";
       },
 
       /** 命令面板展示的动作清单；只调用已有页面方法，不绕过后端接口边界。 */
@@ -511,22 +589,208 @@ if (!window.Vue) {
         await this.loadAdminData();
       },
 
-      /** 加载账号列表和 Token 用量流水；普通用户不会调用这些接口。 */
+      /** 加载账号列表和汇总；Token 明细在管理员选择账号后按账号请求。 */
       async loadAdminData() {
         try {
-          const [accounts, summary, events] = await Promise.all([
+          const [accounts, summary] = await Promise.all([
             this.requestJson("/api/admin/accounts"),
             this.requestJson("/api/admin/usage/summary"),
-            this.requestJson("/api/admin/usage/events?limit=200"),
           ]);
           this.admin.accounts = accounts.accounts || [];
           this.admin.summary = {
             ...(summary.summary || {}),
             by_account: summary.by_account || [],
+            tool_calls_by_account: summary.tool_calls_by_account || [],
           };
-          this.admin.events = events.events || [];
+          this.admin.loadError = "";
+
+          const selectedAccountId = Number(this.admin.selectedAccountId);
+          const selectedAccountStillExists = this.admin.accounts.some(
+            (account) => Number(account.id) === selectedAccountId
+          );
+          if (!selectedAccountStillExists) {
+            this.clearAdminUsageSelection();
+            return;
+          }
+          await this.loadAdminActiveDetail(selectedAccountId);
         } catch (error) {
-          this.appendAssistant(`后台数据加载失败：${error.message || "未知错误"}`, true);
+          this.admin.loadError = error.message || "后台数据加载失败，请稍后重试。";
+        }
+      },
+
+      /** 点击左侧账号项后才读取右侧的 Token 明细；已选账号保持展开状态。 */
+      async selectAdminAccount(accountId) {
+        const selectedAccountId = Number(accountId);
+        if (!Number.isInteger(selectedAccountId) || selectedAccountId <= 0) return;
+        if (this.isAdminAccountSelected(selectedAccountId)) {
+          return;
+        }
+        this.admin.selectedAccountId = selectedAccountId;
+        this.admin.events = [];
+        this.admin.toolTraces = [];
+        this.admin.selectedToolTraceId = "";
+        this.admin.toolTraceDetail = null;
+        this.admin.eventsError = "";
+        this.admin.toolTracesError = "";
+        this.admin.toolTraceDetailError = "";
+        await this.loadAdminActiveDetail(selectedAccountId);
+      },
+
+      /** 返回账号是否为当前展开的一级项。 */
+      isAdminAccountSelected(accountId) {
+        return Number(this.admin.selectedAccountId) === Number(accountId);
+      },
+
+      /** 清空已展开账号及其二级流水，并让先前未完成的请求失效。 */
+      clearAdminUsageSelection() {
+        this.admin.usageRequestVersion += 1;
+        this.admin.toolTraceRequestVersion += 1;
+        this.admin.toolTraceDetailRequestVersion += 1;
+        this.admin.selectedAccountId = 0;
+        this.admin.events = [];
+        this.admin.toolTraces = [];
+        this.admin.selectedToolTraceId = "";
+        this.admin.toolTraceDetail = null;
+        this.admin.eventsError = "";
+        this.admin.toolTracesError = "";
+        this.admin.toolTraceDetailError = "";
+        this.admin.loadingEvents = false;
+        this.admin.loadingToolTraces = false;
+        this.admin.loadingToolTraceDetail = false;
+        this.admin.toolTraceTotal = 0;
+      },
+
+      /** 根据当前标签加载账号右侧明细。 */
+      async loadAdminActiveDetail(accountId = this.admin.selectedAccountId) {
+        if (this.admin.activeDetailTab === "tools") {
+          await this.loadAdminToolTraces(accountId);
+        } else {
+          await this.loadAdminUsageEvents(accountId);
+        }
+      },
+
+      /** 切换账号详情标签；只加载当前用户正在看的数据。 */
+      async setAdminDetailTab(tab) {
+        if (!["tokens", "tools"].includes(tab)) return;
+        if (this.admin.activeDetailTab === tab) return;
+        this.admin.activeDetailTab = tab;
+        await this.loadAdminActiveDetail();
+      },
+
+      /** 使用已有 account_id 查询参数读取单个账号的最多 200 条最新流水。 */
+      async loadAdminUsageEvents(accountId = this.admin.selectedAccountId) {
+        const selectedAccountId = Number(accountId);
+        if (!Number.isInteger(selectedAccountId) || selectedAccountId <= 0) return;
+
+        const requestVersion = this.admin.usageRequestVersion + 1;
+        this.admin.usageRequestVersion = requestVersion;
+        this.admin.loadingEvents = true;
+        this.admin.eventsError = "";
+        try {
+          const data = await this.requestJson(
+            `/api/admin/usage/events?account_id=${encodeURIComponent(selectedAccountId)}&limit=200`
+          );
+          if (
+            requestVersion !== this.admin.usageRequestVersion ||
+            !this.isAdminAccountSelected(selectedAccountId)
+          ) {
+            return;
+          }
+          this.admin.events = data.events || [];
+        } catch (error) {
+          if (
+            requestVersion !== this.admin.usageRequestVersion ||
+            !this.isAdminAccountSelected(selectedAccountId)
+          ) {
+            return;
+          }
+          this.admin.events = [];
+          this.admin.eventsError = error.message || "Token 明细加载失败，请稍后重试。";
+        } finally {
+          if (requestVersion === this.admin.usageRequestVersion) {
+            this.admin.loadingEvents = false;
+          }
+        }
+      },
+
+      /** 按账号分页读取最近两天内的工具调用任务摘要。 */
+      async loadAdminToolTraces(accountId = this.admin.selectedAccountId, offset = 0) {
+        const selectedAccountId = Number(accountId);
+        if (!Number.isInteger(selectedAccountId) || selectedAccountId <= 0) return;
+
+        const requestVersion = this.admin.toolTraceRequestVersion + 1;
+        this.admin.toolTraceRequestVersion = requestVersion;
+        this.admin.loadingToolTraces = true;
+        this.admin.toolTracesError = "";
+        try {
+          const data = await this.requestJson(
+            `/api/admin/tools/traces?account_id=${encodeURIComponent(selectedAccountId)}&limit=50&offset=${encodeURIComponent(offset)}`
+          );
+          if (
+            requestVersion !== this.admin.toolTraceRequestVersion ||
+            !this.isAdminAccountSelected(selectedAccountId)
+          ) {
+            return;
+          }
+          this.admin.toolTraces = data.traces || [];
+          this.admin.toolTraceTotal = Number(data.total || 0);
+          const selectedStillExists = this.admin.toolTraces.some(
+            (trace) => String(trace.root_request_id || "") === String(this.admin.selectedToolTraceId || "")
+          );
+          if (!selectedStillExists) {
+            this.admin.selectedToolTraceId = "";
+            this.admin.toolTraceDetail = null;
+          }
+        } catch (error) {
+          if (
+            requestVersion !== this.admin.toolTraceRequestVersion ||
+            !this.isAdminAccountSelected(selectedAccountId)
+          ) {
+            return;
+          }
+          this.admin.toolTraces = [];
+          this.admin.toolTraceTotal = 0;
+          this.admin.toolTracesError = error.message || "工具调用记录加载失败，请稍后重试。";
+        } finally {
+          if (requestVersion === this.admin.toolTraceRequestVersion) {
+            this.admin.loadingToolTraces = false;
+          }
+        }
+      },
+
+      /** 点击任务后按需读取完整工具调用流程。 */
+      async selectAdminToolTrace(rootRequestId) {
+        const traceId = String(rootRequestId || "");
+        if (!traceId) return;
+        if (this.admin.selectedToolTraceId === traceId && this.admin.toolTraceDetail) return;
+
+        const requestVersion = this.admin.toolTraceDetailRequestVersion + 1;
+        this.admin.toolTraceDetailRequestVersion = requestVersion;
+        this.admin.selectedToolTraceId = traceId;
+        this.admin.toolTraceDetail = null;
+        this.admin.loadingToolTraceDetail = true;
+        this.admin.toolTraceDetailError = "";
+        try {
+          const data = await this.requestJson(`/api/admin/tools/traces/${encodeURIComponent(traceId)}`);
+          if (
+            requestVersion !== this.admin.toolTraceDetailRequestVersion ||
+            this.admin.selectedToolTraceId !== traceId
+          ) {
+            return;
+          }
+          this.admin.toolTraceDetail = data.trace || null;
+        } catch (error) {
+          if (
+            requestVersion !== this.admin.toolTraceDetailRequestVersion ||
+            this.admin.selectedToolTraceId !== traceId
+          ) {
+            return;
+          }
+          this.admin.toolTraceDetailError = error.message || "工具调用详情加载失败，请稍后重试。";
+        } finally {
+          if (requestVersion === this.admin.toolTraceDetailRequestVersion) {
+            this.admin.loadingToolTraceDetail = false;
+          }
         }
       },
 
@@ -552,10 +816,37 @@ if (!window.Vue) {
 
       /** 读取管理员返回的账号级可计费用量。 */
       accountUsage(accountId) {
-        const item = (this.admin.summary.by_account || []).find(
-          (entry) => Number(entry.account_id) === Number(accountId)
-        );
+        const item = this.accountUsageSummary(accountId);
         return item?.billable_tokens || 0;
+      },
+
+      /** 返回指定账号的汇总行，供一级账号项显示 Token 和流水数量。 */
+      accountUsageSummary(accountId) {
+        return (this.admin.summary.by_account || []).find(
+          (entry) => Number(entry.account_id) === Number(accountId)
+        ) || null;
+      },
+
+      /** 返回指定账号已有的用量流水条数。 */
+      accountUsageEventCount(accountId) {
+        return this.accountUsageSummary(accountId)?.event_count || 0;
+      },
+
+      /** 返回指定账号的工具调用任务统计。 */
+      accountToolCallSummary(accountId) {
+        return (this.admin.summary.tool_calls_by_account || []).find(
+          (entry) => Number(entry.account_id) === Number(accountId)
+        ) || null;
+      },
+
+      /** 返回指定账号的工具调用任务总数。 */
+      accountToolCallCount(accountId) {
+        return this.accountToolCallSummary(accountId)?.trace_count || 0;
+      },
+
+      /** 返回指定账号的工具调用失败次数。 */
+      accountToolCallFailureCount(accountId) {
+        return this.accountToolCallSummary(accountId)?.failed_trace_count || 0;
       },
 
       /** 监听全局 Ctrl/Cmd+K 和 Esc，提供类似工作台的快速动作入口。 */
@@ -587,7 +878,9 @@ if (!window.Vue) {
             this.openCommandPalette();
           }
         } else if (event.key === "Escape") {
-          if (this.sessionMenuOpen) {
+          if (this.cityPickerOpen) {
+            this.closeCityPicker();
+          } else if (this.sessionMenuOpen) {
             this.closeSessionMenu();
           } else if (this.commandPaletteOpen) {
             this.closeCommandPalette();
@@ -637,6 +930,54 @@ if (!window.Vue) {
       /** 关闭会话菜单；根节点点击和 Escape 都会调用此方法。 */
       closeSessionMenu() {
         this.sessionMenuOpen = false;
+      },
+
+      /** 打开城市两级菜单，并在首次打开时定位到热门城市。 */
+      openCityPicker() {
+        this.cityPickerOpen = true;
+        if (!this.activeCityGroup && this.activeCityProvince !== "hot") {
+          this.activeCityProvince = "hot";
+        }
+      },
+
+      /** 关闭城市菜单，不影响已选择的首选城市。 */
+      closeCityPicker() {
+        this.cityPickerOpen = false;
+      },
+
+      /** 将城市菜单滚轮锁定在菜单内部，避免滚动链带动左侧档案栏。 */
+      handleCityPickerWheel(event) {
+        event.preventDefault();
+        event.stopPropagation();
+
+        const menu = event.currentTarget;
+        if (!menu || typeof menu.querySelector !== "function") return;
+
+        const target = event.target && typeof event.target.closest === "function"
+          ? event.target
+          : null;
+        const primary = menu.querySelector(".city-picker-primary");
+        const cityList = menu.querySelector(".city-picker-city-list");
+        const scroller = target?.closest(".city-picker-primary")
+          ? primary
+          : target?.closest(".city-picker-city-list")
+            ? cityList
+            : cityList;
+        if (!scroller) return;
+
+        const delta = Number(event.deltaY) || 0;
+        if (!delta) return;
+        const unit = event.deltaMode === 1
+          ? 16
+          : event.deltaMode === 2
+            ? scroller.clientHeight
+            : 1;
+        scroller.scrollTop += delta * unit;
+      },
+
+      /** 切换城市选择器的一级地区，不在这一步写入档案。 */
+      selectCityProvince(province) {
+        this.activeCityProvince = province;
       },
 
       /** 打开命令面板，并把焦点交给搜索输入框。 */
@@ -958,10 +1299,11 @@ if (!window.Vue) {
             education: "",
             experienceYears: 0,
             skills: "",
-            citySelection: "",
             preferredCities: [],
             directions: "",
           };
+          this.closeCityPicker();
+          this.activeCityProvince = "hot";
         } catch (error) {
           if (this.showDuplicateNotice(error, "候选人档案已存在")) {
             return;
@@ -972,12 +1314,28 @@ if (!window.Vue) {
         }
       },
 
-      /** 把省市下拉选中的城市加入首选列表。 */
-      addPreferredCity() {
-        const city = normalizeCityName(this.profileForm.citySelection);
+      /** 把两级菜单中选中的城市加入首选列表。 */
+      addPreferredCity(cityValue = "") {
+        const city = normalizeCityName(cityValue);
         if (city && !this.profileForm.preferredCities.includes(city)) {
           this.profileForm.preferredCities.push(city);
         }
+      },
+
+      /** 返回城市是否已经加入首选列表，目录值与存储值按同一规则比较。 */
+      isPreferredCity(cityValue) {
+        return this.profileForm.preferredCities.includes(normalizeCityName(cityValue));
+      },
+
+      /** 点击二级城市时在首选列表中切换，便于连续完成多城市选择。 */
+      togglePreferredCity(cityValue) {
+        const city = normalizeCityName(cityValue);
+        if (!city) return;
+        if (this.profileForm.preferredCities.includes(city)) {
+          this.removePreferredCity(city);
+          return;
+        }
+        this.addPreferredCity(city);
       },
 
       /** 从新建档案表单中移除一个首选城市。 */
@@ -985,9 +1343,6 @@ if (!window.Vue) {
         this.profileForm.preferredCities = this.profileForm.preferredCities.filter(
           (item) => item !== city
         );
-        if (normalizeCityName(this.profileForm.citySelection) === city) {
-          this.profileForm.citySelection = "";
-        }
       },
 
       /** 重新读取当前候选人档案。 */
@@ -1022,7 +1377,9 @@ if (!window.Vue) {
           isError: false,
           isStreaming: false,
           renderedHtml: this.renderMarkdown(message.content),
+          taskTrace: this.normalizeTaskTrace(message.metadata?.task_trace, { fromHistory: true }),
         }));
+        this.reconcileTaskApprovals();
       },
 
       /** 设置初始欢迎语。 */
@@ -1035,6 +1392,7 @@ if (!window.Vue) {
             isError: false,
             isStreaming: false,
             renderedHtml: this.renderMarkdown(WELCOME_MESSAGE),
+            taskTrace: null,
           },
         ];
       },
@@ -1074,6 +1432,9 @@ if (!window.Vue) {
             false,
             false
           );
+          if (data.task_trace) {
+            this.setMessageTaskTrace(assistantMessage, data.task_trace, { autoCollapse: true });
+          }
           this.captureProjectTasksFromChat(data.tool_outputs || []);
           if (data.profile) {
             this.updateProfileInState(data.profile);
@@ -1089,6 +1450,7 @@ if (!window.Vue) {
           const messageText = wasCancelled
             ? "已停止生成。"
             : error?.message || "聊天请求失败，请稍后重试。";
+          this.failMessageTaskTrace(assistantMessage, messageText, wasCancelled ? "cancelled" : "failed");
           this.updateMessage(assistantMessage, messageText, !wasCancelled, false);
         } finally {
           if (this.chatAbortController === abortController) {
@@ -1242,7 +1604,19 @@ if (!window.Vue) {
           const handleStreamEvent = (event) => {
             if (event.event === "token") {
               enqueueTokenContent(event.data.content || "");
-            } else if (event.event === "status" && !streamedText && !visibleText) {
+            } else if (event.event === "task_started") {
+              this.setMessageTaskTrace(assistantMessage, event.data.task_trace, { forceExpanded: true });
+            } else if (event.event === "step_started") {
+              this.upsertMessageTaskStep(assistantMessage, event.data.step);
+            } else if (event.event === "step_completed") {
+              this.upsertMessageTaskStep(assistantMessage, event.data.step);
+            } else if (event.event === "task_completed") {
+              this.setMessageTaskTrace(assistantMessage, event.data.task_trace, { autoCollapse: true });
+            } else if (event.event === "task_failed") {
+              this.setMessageTaskTrace(assistantMessage, event.data.task_trace, { forceExpanded: true });
+            } else if (event.event === "approval_required") {
+              this.setMessageTaskTrace(assistantMessage, event.data.task_trace, { forceExpanded: true });
+            } else if (event.event === "status" && !assistantMessage.taskTrace && !streamedText && !visibleText) {
               this.updateMessage(
                 assistantMessage,
                 event.data.content || "正在调用工具...",
@@ -1368,6 +1742,181 @@ if (!window.Vue) {
           return { event: eventName, data: JSON.parse(rawData) };
         } catch (error) {
           throw new Error("无法解析服务器返回的 SSE 数据。");
+        }
+      },
+
+      /** 把后端任务元数据规范成仅供展示的响应式结构。 */
+      normalizeTaskTrace(trace, options = {}) {
+        if (!trace || typeof trace !== "object") {
+          return null;
+        }
+        const status = String(trace.status || "running");
+        const approval = trace.approval && typeof trace.approval === "object"
+          ? {
+              ...trace.approval,
+              items: Array.isArray(trace.approval.items) ? trace.approval.items : [],
+              status: trace.approval.status || "waiting",
+            }
+          : null;
+        const shouldStayOpen = ["running", "waiting_confirmation", "failed"].includes(status);
+        const expanded = options.forceExpanded
+          ? true
+          : options.fromHistory
+            ? shouldStayOpen
+            : Boolean(trace.expanded ?? shouldStayOpen);
+        return {
+          version: Number(trace.version || 1),
+          title: String(trace.title || "本次任务"),
+          status,
+          duration_ms: Number.isFinite(Number(trace.duration_ms)) ? Number(trace.duration_ms) : null,
+          steps: (Array.isArray(trace.steps) ? trace.steps : []).map((step, index) => ({
+            id: String(step?.id || `step-${index + 1}`),
+            name: String(step?.name || "task_step"),
+            label: String(step?.label || "执行任务"),
+            status: String(step?.status || "running"),
+            summary: step?.summary ? String(step.summary) : "",
+          })),
+          approval,
+          expanded,
+        };
+      },
+
+      /** 用服务端权威任务状态替换一条助手消息上的任务过程。 */
+      setMessageTaskTrace(message, trace, options = {}) {
+        const normalized = this.normalizeTaskTrace(trace, options);
+        if (!normalized) return;
+        if (options.autoCollapse) {
+          normalized.expanded = ["waiting_confirmation", "failed"].includes(normalized.status);
+        }
+        message.taskTrace = normalized;
+        this.scrollMessages();
+      },
+
+      /** 增量更新一个步骤，避免每次 SSE 事件重建整条消息。 */
+      upsertMessageTaskStep(message, step) {
+        if (!step || typeof step !== "object") return;
+        if (!message.taskTrace) {
+          message.taskTrace = this.normalizeTaskTrace({ status: "running", steps: [] }, { forceExpanded: true });
+        }
+        const normalized = this.normalizeTaskTrace({ steps: [step] })?.steps?.[0];
+        if (!normalized) return;
+        const index = message.taskTrace.steps.findIndex((item) => item.id === normalized.id);
+        if (index >= 0) message.taskTrace.steps[index] = normalized;
+        else message.taskTrace.steps.push(normalized);
+        message.taskTrace.status = "running";
+        message.taskTrace.expanded = true;
+        this.scrollMessages();
+      },
+
+      /** 任务完成后自动折叠，用户仍可通过摘要行重新展开。 */
+      toggleTaskTrace(message) {
+        if (!message?.taskTrace) return;
+        message.taskTrace.expanded = !message.taskTrace.expanded;
+      },
+
+      /** 返回任务摘要行的标题和当前状态。 */
+      taskTraceTitle(trace) {
+        const stateLabel = {
+          running: "进行中",
+          completed: "已完成",
+          waiting_confirmation: "等待确认",
+          failed: "失败",
+          cancelled: "已取消",
+        }[trace?.status] || "已更新";
+        return `${trace?.title || "本次任务"} · ${stateLabel}`;
+      },
+
+      /** 把后端毫秒耗时转成紧凑秒数。 */
+      taskTraceDuration(trace) {
+        if (trace?.status === "running") return "";
+        const durationMs = Number(trace?.duration_ms);
+        if (!Number.isFinite(durationMs)) return "";
+        const seconds = durationMs < 1000 ? (durationMs / 1000).toFixed(1) : Math.round(durationMs / 1000);
+        return `（用时 ${seconds} 秒）`;
+      },
+
+      /** 失败或用户停止时保留展开状态，让原因可见。 */
+      failMessageTaskTrace(message, detail, status = "failed") {
+        if (!message?.taskTrace) return;
+        message.taskTrace.status = status;
+        message.taskTrace.expanded = status === "failed";
+        const runningStep = [...message.taskTrace.steps].reverse().find((step) => step.status === "running");
+        if (runningStep) {
+          runningStep.status = status;
+          runningStep.summary = detail;
+        }
+      },
+
+      /** 查看待确认项目的完整侧栏卡片，不创建新的聊天气泡。 */
+      viewTaskApproval(message) {
+        if (!message?.taskTrace?.approval) return;
+        message.taskTrace.expanded = true;
+        if (message.taskTrace.approval.kind === "project_card_confirmation") {
+          this.openWorkspacePanel("github");
+        }
+      },
+
+      /** 执行后端已有的项目经历确认接口，再原地完成任务过程。 */
+      async confirmTaskApproval(message) {
+        const trace = message?.taskTrace;
+        const approval = trace?.approval;
+        if (!approval || approval.status !== "waiting" || this.confirmingTaskApprovalId) return;
+        if (approval.kind !== "project_card_confirmation" || !approval.record_id) return;
+
+        this.confirmingTaskApprovalId = Number(approval.record_id);
+        try {
+          const data = await this.requestJson(`/api/projects/${encodeURIComponent(approval.record_id)}/confirm`, {
+            method: "POST",
+            body: JSON.stringify({ confirmed_summary: null, root_request_id: trace.root_request_id || null }),
+          });
+          const index = this.projectCards.findIndex((item) => Number(item.id) === Number(approval.record_id));
+          if (index >= 0) this.projectCards[index] = data.project_card;
+          approval.status = "confirmed";
+          approval.message = "已确认，这段项目摘要现在可以作为后续简历和匹配的证据。";
+          trace.status = "completed";
+          trace.expanded = false;
+          if (data.task?.task_key) {
+            this.backgroundTasks[data.task.task_key] = data.task;
+            this.rememberRagTask(data.task.task_key, 0);
+            this.pollBackgroundTask(
+              data.task.task_key,
+              data.project_card?.card?.project_name || "项目",
+              this.currentProfileId
+            );
+          }
+        } catch (error) {
+          approval.status = "error";
+          approval.message = error.message || "确认失败，请稍后重试。";
+          trace.status = "failed";
+          trace.expanded = true;
+        } finally {
+          this.confirmingTaskApprovalId = 0;
+        }
+      },
+
+      /** 暂不确认只关闭本次提示，不把待确认项目提升为事实证据。 */
+      cancelTaskApproval(message) {
+        const trace = message?.taskTrace;
+        if (!trace?.approval || trace.approval.status !== "waiting") return;
+        trace.approval.status = "cancelled";
+        trace.approval.message = "本次未使用；项目卡片仍保留在待确认列表中。";
+        trace.status = "cancelled";
+        trace.expanded = false;
+      },
+
+      /** 页面刷新后用项目卡片事实校正历史消息里的旧确认提示。 */
+      reconcileTaskApprovals() {
+        for (const message of this.messages) {
+          const trace = message?.taskTrace;
+          const approval = trace?.approval;
+          if (approval?.kind !== "project_card_confirmation" || !approval.record_id) continue;
+          const record = this.projectCards.find((item) => Number(item.id) === Number(approval.record_id));
+          if (record?.status === "已确认") {
+            approval.status = "confirmed";
+            approval.message = "已确认，这段项目摘要现在可以作为后续简历和匹配的证据。";
+            trace.status = "completed";
+            trace.expanded = false;
+          }
         }
       },
 
@@ -1671,6 +2220,7 @@ if (!window.Vue) {
             signal ? { signal } : {}
           );
           this.projectCards = data.project_cards || [];
+          this.reconcileTaskApprovals();
         } catch (error) {
           this.projectCards = [];
           this.githubProjectError = error.message || "项目卡片加载失败。";
@@ -2164,6 +2714,7 @@ if (!window.Vue) {
           isError,
           isStreaming,
           renderedHtml: isStreaming ? "" : this.renderMarkdown(text),
+          taskTrace: null,
         };
         const reactiveIndex = this.messages.push(message) - 1;
         this.scrollMessages();

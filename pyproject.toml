@@ -34,6 +34,8 @@ dependencies = [
 job-agent-web = "job_hunting_agent.web:main"
 # Worker 使用独立进程消费 Redis/Celery 任务，不阻塞 FastAPI 请求。
 job-agent-worker = "job_hunting_agent.worker:main"
+# Beat 使用独立进程按上海自然日投递维护任务。
+job-agent-beat = "job_hunting_agent.beat:main"
 
 [tool.setuptools.package-data]
 # Web 前端静态资源需要随 Python 包一起安装。

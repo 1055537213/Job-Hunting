@@ -165,11 +165,12 @@ class JobHuntingAgent:
         use_tool_llm: bool = True,
         auto_rag: bool = True,
         account_id: int | None = None,
+        root_request_id: str | None = None,
     ) -> AgentChatResult:
         """执行一轮标准 LangChain Agent 对话。"""
 
         resolved_session_id = session_id or default_session_id(candidate_id, account_id)
-        root_request_id = uuid.uuid4().hex
+        root_request_id = root_request_id or uuid.uuid4().hex
         result = self.graph.invoke(
             {"messages": self.build_turn_messages(message, candidate_id, resolved_session_id, account_id)},
             config={"configurable": {"thread_id": scoped_thread_id(account_id, candidate_id, resolved_session_id)}},
@@ -199,6 +200,7 @@ class JobHuntingAgent:
             used_tools=collect_used_tools(messages),
             tool_outputs=collect_tool_outputs(messages),
             usage=usage,
+            root_request_id=root_request_id,
         )
 
     def stream_chat(
@@ -209,13 +211,15 @@ class JobHuntingAgent:
         use_tool_llm: bool = True,
         auto_rag: bool = True,
         account_id: int | None = None,
+        root_request_id: str | None = None,
     ) -> Iterator[dict[str, object]]:
         """流式执行一轮标准 LangChain Agent 对话。
 
         事件格式面向 Web SSE：
 
         - `{"type": "token", "content": "..."}`：模型增量文本。
-        - `{"type": "tool", "name": "..."}`：工具调用完成提示。
+        - `{"type": "step_started", "name": "..."}`：工具步骤开始。
+        - `{"type": "step_completed", "name": "..."}`：工具步骤完成及摘要。
         - `{"type": "final", "result": AgentChatResult}`：完整结果，供落库和刷新 UI。
 
         注意：工具调用可能在模型回复中间发生，所以最终仍要发送 `final` 事件，
@@ -223,10 +227,11 @@ class JobHuntingAgent:
         """
 
         resolved_session_id = session_id or default_session_id(candidate_id, account_id)
-        root_request_id = uuid.uuid4().hex
+        root_request_id = root_request_id or uuid.uuid4().hex
         tool_and_final_messages: list[BaseMessage] = []
         streamed_reply_parts: list[str] = []
         streamed_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        active_tool_names: set[str] = set()
 
         for stream_item in self.graph.stream(
             {"messages": self.build_turn_messages(message, candidate_id, resolved_session_id, account_id)},
@@ -247,11 +252,27 @@ class JobHuntingAgent:
 
             if isinstance(streamed_message, ToolMessage):
                 tool_and_final_messages.append(streamed_message)
-                yield {"type": "tool", "name": streamed_message.name or "unknown_tool"}
+                tool_name = streamed_message.name or "unknown_tool"
+                # 某些模型不会在 AIMessageChunk 中携带完整 tool call 名称；
+                # 收到 ToolMessage 时补发开始事件，保证前端不会只看到“完成”。
+                if tool_name not in active_tool_names:
+                    active_tool_names.add(tool_name)
+                    yield {"type": "step_started", "name": tool_name}
+                tool_output = tool_message_to_output(streamed_message)
+                active_tool_names.discard(tool_name)
+                yield {
+                    "type": "step_completed",
+                    "name": tool_name,
+                    "data": tool_output.get("data"),
+                }
                 continue
 
             if isinstance(streamed_message, AIMessageChunk):
                 merge_usage(streamed_usage, extract_usage_metadata(streamed_message))
+                for tool_name in extract_tool_call_names(streamed_message):
+                    if tool_name not in active_tool_names:
+                        active_tool_names.add(tool_name)
+                        yield {"type": "step_started", "name": tool_name}
                 token = extract_stream_token(streamed_message)
                 if token:
                     streamed_reply_parts.append(token)
@@ -261,6 +282,10 @@ class JobHuntingAgent:
             if isinstance(streamed_message, AIMessage):
                 # FakeChatModel 等测试模型可能一次性给出完整 AIMessage，而不是 AIMessageChunk。
                 tool_and_final_messages.append(streamed_message)
+                for tool_name in extract_tool_call_names(streamed_message):
+                    if tool_name not in active_tool_names:
+                        active_tool_names.add(tool_name)
+                        yield {"type": "step_started", "name": tool_name}
                 token = extract_stream_token(streamed_message)
                 if token and not streamed_message.tool_calls:
                     streamed_reply_parts.append(token)
@@ -290,6 +315,7 @@ class JobHuntingAgent:
                 used_tools=collect_used_tools(tool_and_final_messages),
                 tool_outputs=collect_tool_outputs(tool_and_final_messages),
                 usage=usage,
+                root_request_id=root_request_id,
             ),
         }
 
@@ -910,6 +936,19 @@ def extract_stream_token(message: BaseMessage) -> str:
         return content if isinstance(content, str) else ""
 
 
+def extract_tool_call_names(message: BaseMessage) -> list[str]:
+    """从完整或分片的 AI 消息中取出工具名称。"""
+
+    names: list[str] = []
+    for attribute in ("tool_calls", "tool_call_chunks"):
+        calls = getattr(message, attribute, None) or []
+        for call in calls:
+            name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+            if name and str(name) not in names:
+                names.append(str(name))
+    return names
+
+
 def collect_used_tools(messages: list[BaseMessage]) -> list[str]:
     """按出现顺序收集本轮实际执行过的工具名。"""
 
@@ -930,16 +969,22 @@ def collect_tool_outputs(messages: list[BaseMessage]) -> list[dict[str, object]]
     for message in messages:
         if not isinstance(message, ToolMessage):
             continue
-        raw_content = stringify_tool_message_content(message.content)
-        item: dict[str, object] = {
-            "tool_name": message.name or "unknown_tool",
-            "raw_content": raw_content,
-        }
-        parsed = try_parse_json(raw_content)
-        if parsed is not None:
-            item["data"] = parsed
-        outputs.append(item)
+        outputs.append(tool_message_to_output(message))
     return outputs
+
+
+def tool_message_to_output(message: ToolMessage) -> dict[str, object]:
+    """把一次工具消息压平成可供 Web 摘要使用的结构。"""
+
+    raw_content = stringify_tool_message_content(message.content)
+    item: dict[str, object] = {
+        "tool_name": message.name or "unknown_tool",
+        "raw_content": raw_content,
+    }
+    parsed = try_parse_json(raw_content)
+    if parsed is not None:
+        item["data"] = parsed
+    return item
 
 
 def stringify_tool_message_content(content: Any) -> str:

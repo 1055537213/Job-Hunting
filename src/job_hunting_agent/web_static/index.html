@@ -4,11 +4,11 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>求职助手 Agent</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260814-dedup-dialog" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260819-tool-audit-v2" />
   </head>
   <body>
     <!-- Vue 还没有挂载完成时隐藏模板，避免用户短暂看到未编译的 {{ }}。 -->
-    <div id="app" class="app-shell" v-cloak @click="closeSessionMenu">
+    <div id="app" class="app-shell" v-cloak @click="closeSessionMenu(); closeCityPicker()">
       <main v-if="!auth.authenticated" class="auth-shell" aria-labelledby="authTitle">
         <section class="auth-frame">
           <div class="auth-intro">
@@ -164,7 +164,7 @@
             <div class="panel-title-row">
               <div>
                 <p class="eyebrow">Profile Source</p>
-                <h2 class="panel-title">候选人档案</h2>
+                <h2 class="panel-title">求职者档案</h2>
               </div>
               <span class="count-chip">{{ profiles.length }} 个</span>
             </div>
@@ -221,8 +221,10 @@
               aria-controls="profileCreatePanel"
               @click="toggleWorkspacePanel('profile-create')"
             >
-              <span class="tool-panel-trigger-title">新建候选人</span>
-              <span class="tool-panel-chevron" aria-hidden="true">⌄</span>
+              <span class="tool-panel-trigger-title">新建档案</span>
+              <span class="tool-panel-chevron" aria-hidden="true">
+                <svg viewBox="0 0 24 24" focusable="false"><path d="m6 9 6 6 6-6"></path></svg>
+              </span>
             </button>
             <div v-show="activeWorkspacePanel === 'profile-create'" id="profileCreatePanel" class="tool-panel-body">
             <form class="form-stack" @submit.prevent="createProfile">
@@ -272,24 +274,84 @@
                 />
               </label>
               <div class="field-group">
-                <label class="field-label" for="profileCities">首选城市</label>
-                <select
-                  id="profileCities"
-                  v-model="profileForm.citySelection"
-                  class="field"
-                  @change="addPreferredCity"
-                >
-                  <option value="">选择并添加城市</option>
-                  <optgroup
-                    v-for="province in cityGroups"
-                    :key="province.province"
-                    :label="province.province"
+                <span id="profileCitiesLabel" class="field-label">首选城市</span>
+                <div class="city-picker" @click.stop>
+                  <button
+                    id="profileCities"
+                    class="city-picker-trigger field"
+                    type="button"
+                    aria-haspopup="dialog"
+                    aria-controls="profileCityPickerMenu"
+                    :aria-expanded="String(cityPickerOpen)"
+                    :data-state="profileForm.preferredCities.length ? 'success' : 'idle'"
+                    @click="cityPickerOpen ? closeCityPicker() : openCityPicker()"
                   >
-                    <option v-for="city in province.cities" :key="city" :value="city">
-                      {{ city }}
-                    </option>
-                  </optgroup>
-                </select>
+                    <span>{{ profileForm.preferredCities.length ? `已选择 ${profileForm.preferredCities.length} 个城市` : "选择首选城市" }}</span>
+                    <span class="city-picker-trigger-chevron" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" focusable="false"><path d="m6 9 6 6 6-6"></path></svg>
+                    </span>
+                  </button>
+                  <section
+                    v-if="cityPickerOpen"
+                    id="profileCityPickerMenu"
+                    class="city-picker-menu"
+                    role="dialog"
+                    aria-modal="false"
+                    aria-labelledby="profileCitiesLabel"
+                    @keydown.esc.stop="closeCityPicker"
+                    @wheel="handleCityPickerWheel"
+                  >
+                    <nav class="city-picker-primary" aria-label="省份和直辖市">
+                      <button
+                        class="city-picker-primary-item"
+                        :class="{ 'is-active': activeCityProvince === 'hot' }"
+                        type="button"
+                        :aria-pressed="String(activeCityProvince === 'hot')"
+                        @click="selectCityProvince('hot')"
+                      >
+                        <span>热门城市</span>
+                      </button>
+                      <p class="city-picker-primary-label">省份及直辖市</p>
+                      <button
+                        v-for="province in cityGroups"
+                        :key="province.province"
+                        class="city-picker-primary-item"
+                        :class="{ 'is-active': activeCityProvince === province.province }"
+                        type="button"
+                        :aria-pressed="String(activeCityProvince === province.province)"
+                        :title="province.province"
+                        @click="selectCityProvince(province.province)"
+                      >
+                        <span>{{ province.province }}</span>
+                        <span class="city-picker-primary-chevron" aria-hidden="true">›</span>
+                      </button>
+                    </nav>
+                    <div class="city-picker-secondary" aria-live="polite">
+                      <div class="city-picker-secondary-head">
+                        <strong>{{ cityPickerTitle }}</strong>
+                        <span>{{ activeCityOptions.length }} 个城市</span>
+                      </div>
+                      <div class="city-picker-city-list" aria-label="选择城市">
+                        <button
+                          v-for="city in activeCityOptions"
+                          :key="city"
+                          class="city-picker-city"
+                          :class="{ 'is-selected': isPreferredCity(city) }"
+                          type="button"
+                          :aria-pressed="String(isPreferredCity(city))"
+                          :data-state="isPreferredCity(city) ? 'success' : 'idle'"
+                          :title="city"
+                          @click="togglePreferredCity(city)"
+                        >
+                          {{ city }}
+                        </button>
+                      </div>
+                      <button class="ghost-button compact city-picker-done" type="button" @click="closeCityPicker">
+                        完成选择
+                      </button>
+                    </div>
+                  </section>
+                </div>
                 <div v-if="profileForm.preferredCities.length" class="city-token-list">
                   <span
                     v-for="city in profileForm.preferredCities"
@@ -339,7 +401,9 @@
             >
               <span class="tool-panel-trigger-title">简历文件</span>
               <span class="tool-panel-status">{{ resumeArtifacts.length }} 份</span>
-              <span class="tool-panel-chevron" aria-hidden="true">⌄</span>
+              <span class="tool-panel-chevron" aria-hidden="true">
+                <svg viewBox="0 0 24 24" focusable="false"><path d="m6 9 6 6 6-6"></path></svg>
+              </span>
             </button>
             <div v-show="activeWorkspacePanel === 'resume'" id="resumePanelBody" class="tool-panel-body">
             <input
@@ -434,7 +498,9 @@
             >
               <span class="tool-panel-trigger-title">GitHub 项目</span>
               <span class="tool-panel-status">{{ projectCards.length }} 个</span>
-              <span class="tool-panel-chevron" aria-hidden="true">⌄</span>
+              <span class="tool-panel-chevron" aria-hidden="true">
+                <svg viewBox="0 0 24 24" focusable="false"><path d="m6 9 6 6 6-6"></path></svg>
+              </span>
             </button>
             <div v-show="activeWorkspacePanel === 'github'" id="githubProjectPanelBody" class="tool-panel-body">
             <form class="form-stack" @submit.prevent="submitGitHubProject">
@@ -526,7 +592,9 @@
               <span class="tool-panel-trigger-title">导入 BOSS 职位</span>
               <span v-if="importingJob" class="tool-panel-status">审核中</span>
               <span v-else-if="jobImportError" class="tool-panel-status is-error">需处理</span>
-              <span class="tool-panel-chevron" aria-hidden="true">⌄</span>
+              <span class="tool-panel-chevron" aria-hidden="true">
+                <svg viewBox="0 0 24 24" focusable="false"><path d="m6 9 6 6 6-6"></path></svg>
+              </span>
             </button>
             <div v-show="activeWorkspacePanel === 'job-import'" id="jobImportPanelBody" class="tool-panel-body">
               <form class="form-stack" @submit.prevent="importJob">
@@ -621,7 +689,9 @@
             >
               <span class="tool-panel-trigger-title">已导入职位</span>
               <span class="tool-panel-status">{{ jobs.length }} 个</span>
-              <span class="tool-panel-chevron" aria-hidden="true">⌄</span>
+              <span class="tool-panel-chevron" aria-hidden="true">
+                <svg viewBox="0 0 24 24" focusable="false"><path d="m6 9 6 6 6-6"></path></svg>
+              </span>
             </button>
             <div v-show="activeWorkspacePanel === 'jobs'" id="jobsPanelBody" class="tool-panel-body">
               <div class="tool-panel-inline-actions">
@@ -692,7 +762,9 @@
             >
               <span class="tool-panel-trigger-title">职位匹配结果</span>
               <span class="tool-panel-status">{{ matches.length }} 项</span>
-              <span class="tool-panel-chevron" aria-hidden="true">⌄</span>
+              <span class="tool-panel-chevron" aria-hidden="true">
+                <svg viewBox="0 0 24 24" focusable="false"><path d="m6 9 6 6 6-6"></path></svg>
+              </span>
             </button>
             <div v-show="activeWorkspacePanel === 'matches'" id="matchesPanelBody" class="tool-panel-body">
               <div class="tool-panel-inline-actions">
@@ -824,17 +896,83 @@
               :class="message.role"
             >
               <div class="avatar">{{ message.role === "user" ? "你" : "A" }}</div>
-              <div
-                v-if="message.isStreaming"
-                class="bubble streaming-text"
-                :class="{ error: message.isError }"
-              >{{ message.content || "生成中..." }}</div>
-              <div
-                v-else
-                class="bubble"
-                :class="{ error: message.isError }"
-                v-html="message.renderedHtml"
-              ></div>
+              <div class="bubble" :class="{ error: message.isError }">
+                <section
+                  v-if="message.taskTrace"
+                  class="task-trace"
+                  :class="`is-${message.taskTrace.status}`"
+                  aria-label="任务过程"
+                >
+                  <button
+                    class="task-trace-summary"
+                    type="button"
+                    :aria-expanded="String(message.taskTrace.expanded)"
+                    @click="toggleTaskTrace(message)"
+                  >
+                    <span class="task-trace-mark" aria-hidden="true">⌘</span>
+                    <span class="task-trace-title">{{ taskTraceTitle(message.taskTrace) }}</span>
+                    <span class="task-trace-duration">{{ taskTraceDuration(message.taskTrace) }}</span>
+                    <span class="task-trace-chevron" aria-hidden="true">⌄</span>
+                  </button>
+
+                  <div v-if="message.taskTrace.expanded" class="task-trace-details">
+                    <ol class="task-step-list">
+                      <li
+                        v-for="step in message.taskTrace.steps"
+                        :key="step.id"
+                        class="task-step"
+                        :class="`is-${step.status}`"
+                      >
+                        <span class="task-step-mark" aria-hidden="true"></span>
+                        <div class="task-step-copy">
+                          <strong>{{ step.label }}</strong>
+                          <span v-if="step.summary">{{ step.summary }}</span>
+                        </div>
+                      </li>
+                    </ol>
+
+                    <section v-if="message.taskTrace.approval" class="task-approval" aria-live="polite">
+                      <div class="task-approval-head">
+                        <span class="task-approval-mark" aria-hidden="true">!</span>
+                        <strong>{{ message.taskTrace.approval.title }}</strong>
+                      </div>
+                      <p>{{ message.taskTrace.approval.message }}</p>
+                      <dl class="task-approval-items">
+                        <template v-for="item in message.taskTrace.approval.items" :key="item.label">
+                          <dt>{{ item.label }}</dt>
+                          <dd>{{ item.value }}</dd>
+                        </template>
+                      </dl>
+                      <div class="task-approval-actions">
+                        <button class="ghost-button compact" type="button" @click="viewTaskApproval(message)">
+                          查看内容
+                        </button>
+                        <button
+                          class="primary-button compact"
+                          type="button"
+                          :disabled="message.taskTrace.approval.status !== 'waiting' || confirmingTaskApprovalId"
+                          :data-state="confirmingTaskApprovalId ? 'loading' : 'idle'"
+                          @click="confirmTaskApproval(message)"
+                        >
+                          {{ confirmingTaskApprovalId ? "确认中" : (message.taskTrace.approval.confirm_label || "确认使用") }}
+                        </button>
+                        <button
+                          class="text-button compact"
+                          type="button"
+                          :disabled="message.taskTrace.approval.status !== 'waiting'"
+                          @click="cancelTaskApproval(message)"
+                        >
+                          {{ message.taskTrace.approval.cancel_label || "取消" }}
+                        </button>
+                      </div>
+                    </section>
+                  </div>
+                </section>
+                <div v-if="message.isStreaming" class="bubble-text streaming-text">
+                  {{ message.content || (message.taskTrace ? "" : "生成中...") }}
+                </div>
+                <div v-else class="bubble-text" v-html="message.renderedHtml"></div>
+              </div>
             </div>
           </section>
 
@@ -882,29 +1020,169 @@
           <div class="admin-metric"><span>总 Token</span><strong>{{ admin.summary.total_tokens || 0 }}</strong></div>
           <div class="admin-metric"><span>可计费 Token</span><strong>{{ admin.summary.billable_tokens || 0 }}</strong></div>
         </div>
-        <div class="admin-grid">
-          <section class="panel admin-panel">
-            <div class="panel-title-row"><div><p class="eyebrow">Accounts</p><h2 class="panel-title">账号状态</h2></div></div>
-            <div v-if="!admin.accounts.length" class="empty-state"><strong>还没有账号</strong><span>普通用户可以从登录页自行注册。</span></div>
-            <div v-else class="admin-account-list">
-              <article v-for="account in admin.accounts" :key="account.id" class="admin-account-row">
-                <div><strong>{{ account.email }}</strong><span>{{ account.role }} · {{ account.status }} · {{ accountUsage(account.id) }} 可计费 Token</span></div>
-                <button class="ghost-button compact" type="button" @click="toggleAccountStatus(account)">
-                  {{ account.status === 'active' ? '禁用' : '恢复' }}
-                </button>
-              </article>
-            </div>
-          </section>
-          <section class="panel admin-panel admin-events">
-            <div class="panel-title-row"><div><p class="eyebrow">Usage Ledger</p><h2 class="panel-title">Token 明细</h2></div><button class="ghost-button compact" type="button" @click="loadAdminData">刷新</button></div>
-            <div v-if="!admin.events.length" class="empty-state"><strong>暂无用量流水</strong><span>供应商返回 usage 后，记录会出现在这里。</span></div>
-            <div v-else class="admin-table-wrap">
-              <table class="admin-table"><thead><tr><th>时间</th><th>账号</th><th>操作</th><th>模型</th><th>Token</th><th>来源</th><th>状态</th></tr></thead>
-                <tbody><tr v-for="event in admin.events" :key="event.id"><td>{{ formatDate(event.created_at) }}</td><td>#{{ event.account_id }}</td><td>{{ event.operation }}</td><td>{{ event.model }}</td><td>{{ event.total_tokens }}</td><td>{{ event.usage_source }}</td><td>{{ event.status }}</td></tr></tbody>
-              </table>
-            </div>
-          </section>
-        </div>
+        <section class="panel admin-panel admin-account-ledger">
+          <div class="panel-title-row">
+            <div><p class="eyebrow">Account Usage</p><h2 class="panel-title">账号与 Token 用量</h2></div>
+            <button class="ghost-button compact" type="button" @click="loadAdminData">刷新</button>
+          </div>
+          <div v-if="admin.loadError" class="inline-error" role="alert">{{ admin.loadError }}</div>
+          <div v-if="!admin.accounts.length" class="empty-state">
+            <strong>还没有账号</strong><span>普通用户可以从登录页自行注册。</span>
+          </div>
+          <div v-else class="admin-account-workspace">
+            <section class="admin-account-directory" aria-labelledby="adminAccountListTitle">
+              <div class="admin-account-directory-head">
+                <p class="eyebrow">Accounts</p><h3 id="adminAccountListTitle">账号列表</h3>
+              </div>
+              <div class="admin-account-list" role="list">
+                <article
+                  v-for="account in admin.accounts"
+                  :key="account.id"
+                  class="admin-account-entry"
+                  :class="{ 'is-selected': isAdminAccountSelected(account.id) }"
+                  role="listitem"
+                >
+                  <div class="admin-account-row">
+                    <button
+                      class="admin-account-select"
+                      type="button"
+                      :aria-pressed="String(isAdminAccountSelected(account.id))"
+                      aria-controls="adminUsageDetail"
+                      @click="selectAdminAccount(account.id)"
+                    >
+                      <span class="admin-account-summary">
+                        <strong>{{ account.email }}</strong>
+                        <span>{{ account.role }} · {{ account.status }} · {{ accountUsage(account.id) }} 可计费 Token · {{ accountToolCallCount(account.id) }} 个工具任务</span>
+                      </span>
+                      <span class="admin-account-event-count">{{ accountUsageEventCount(account.id) }} 条</span>
+                      <span class="admin-account-chevron" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" focusable="false"><path d="m6 9 6 6 6-6"></path></svg>
+                      </span>
+                    </button>
+                    <button class="ghost-button compact admin-account-status-action" type="button" @click.stop="toggleAccountStatus(account)">
+                      {{ account.status === 'active' ? '禁用' : '恢复' }}
+                    </button>
+                  </div>
+                </article>
+              </div>
+            </section>
+            <section
+              id="adminUsageDetail"
+              class="admin-account-usage"
+              :aria-label="selectedAdminAccount ? `${selectedAdminAccount.email} 的 Token 使用明细` : 'Token 使用明细'"
+            >
+              <template v-if="selectedAdminAccount">
+                <div class="admin-account-usage-head">
+                  <div>
+                    <p class="eyebrow">Usage Ledger</p>
+                    <h3>{{ selectedAdminAccount.email }} 的后台明细</h3>
+                  </div>
+                  <span>{{ accountUsageEventCount(selectedAdminAccount.id) }} Token · {{ accountToolCallCount(selectedAdminAccount.id) }} 工具</span>
+                </div>
+                <div class="admin-detail-tabs" role="tablist" aria-label="后台明细切换">
+                  <button
+                    class="tab-button"
+                    type="button"
+                    role="tab"
+                    :aria-selected="String(admin.activeDetailTab === 'tokens')"
+                    @click="setAdminDetailTab('tokens')"
+                  >
+                    Token 明细
+                  </button>
+                  <button
+                    class="tab-button"
+                    type="button"
+                    role="tab"
+                    :aria-selected="String(admin.activeDetailTab === 'tools')"
+                    @click="setAdminDetailTab('tools')"
+                  >
+                    工具调用
+                  </button>
+                </div>
+
+                <template v-if="admin.activeDetailTab === 'tokens'">
+                  <div v-if="admin.loadingEvents" class="admin-usage-notice" role="status">正在加载 Token 明细...</div>
+                  <div v-else-if="admin.eventsError" class="inline-error" role="alert">{{ admin.eventsError }}</div>
+                  <div v-else-if="!admin.events.length" class="empty-state compact-empty">
+                    <strong>暂无用量流水</strong><span>该账号尚未产生可展示的 Token 使用记录。</span>
+                  </div>
+                  <div v-else class="admin-table-wrap">
+                    <table class="admin-table">
+                      <thead><tr><th>时间</th><th>操作</th><th>模型</th><th>Token</th><th>来源</th><th>状态</th></tr></thead>
+                      <tbody><tr v-for="event in admin.events" :key="event.id"><td>{{ formatDate(event.created_at) }}</td><td>{{ event.operation }}</td><td>{{ event.model }}</td><td>{{ event.total_tokens }}</td><td>{{ event.usage_source }}</td><td>{{ event.status }}</td></tr></tbody>
+                    </table>
+                  </div>
+                </template>
+
+                <template v-else>
+                  <div v-if="admin.loadingToolTraces" class="admin-usage-notice" role="status">正在加载工具调用记录...</div>
+                  <div v-else-if="admin.toolTracesError" class="inline-error" role="alert">{{ admin.toolTracesError }}</div>
+                  <div v-else-if="!admin.toolTraces.length" class="empty-state compact-empty">
+                    <strong>暂无工具调用任务</strong><span>最近两天内没有需要记录的工具调用。</span>
+                  </div>
+                  <div v-else class="admin-tool-workspace">
+                    <div class="admin-tool-list">
+                      <button
+                        v-for="trace in admin.toolTraces"
+                        :key="trace.root_request_id"
+                        type="button"
+                        class="admin-tool-row"
+                        :class="{ 'is-selected': String(trace.root_request_id) === String(admin.selectedToolTraceId) }"
+                        @click="selectAdminToolTrace(trace.root_request_id)"
+                      >
+                        <span class="admin-tool-row-main">
+                          <strong>{{ trace.title }}</strong>
+                          <span>{{ formatDate(trace.created_at) }} · {{ trace.step_count }} 步 · {{ trace.status }}</span>
+                        </span>
+                        <span class="admin-tool-row-meta">
+                          <span>{{ trace.attempt_count }} 次尝试</span>
+                          <span v-if="trace.last_error_summary" class="admin-tool-error">{{ trace.last_error_summary }}</span>
+                        </span>
+                      </button>
+                    </div>
+                    <div class="admin-tool-detail">
+                      <div v-if="admin.loadingToolTraceDetail" class="admin-usage-notice" role="status">正在加载任务详情...</div>
+                      <div v-else-if="admin.toolTraceDetailError" class="inline-error" role="alert">{{ admin.toolTraceDetailError }}</div>
+                      <div v-else-if="selectedAdminToolTraceDetail" class="admin-tool-detail-card">
+                        <div class="admin-tool-detail-head">
+                          <div>
+                            <p class="eyebrow">Tool Trace</p>
+                            <h4>{{ selectedAdminToolTraceDetail.title }}</h4>
+                          </div>
+                          <span>{{ selectedAdminToolTraceDetail.status }}</span>
+                        </div>
+                        <dl class="admin-tool-detail-meta">
+                          <dt>链路 ID</dt><dd>{{ selectedAdminToolTraceDetail.root_request_id }}</dd>
+                          <dt>来源</dt><dd>{{ selectedAdminToolTraceDetail.source }}</dd>
+                          <dt>步骤</dt><dd>{{ selectedAdminToolTraceDetail.step_count }}</dd>
+                          <dt>尝试</dt><dd>{{ selectedAdminToolTraceDetail.attempt_count }}</dd>
+                          <dt>开始</dt><dd>{{ formatDate(selectedAdminToolTraceDetail.started_at) }}</dd>
+                          <dt>结束</dt><dd>{{ formatDate(selectedAdminToolTraceDetail.finished_at) }}</dd>
+                        </dl>
+                        <ol class="admin-tool-step-list">
+                          <li v-for="step in selectedAdminToolTraceDetail.trace?.steps || []" :key="step.id" class="admin-tool-step" :class="`is-${step.status}`">
+                            <span class="admin-tool-step-mark" aria-hidden="true"></span>
+                            <div class="admin-tool-step-copy">
+                              <strong>{{ step.label }}</strong>
+                              <span v-if="step.summary">{{ step.summary }}</span>
+                              <pre v-if="step.result" class="admin-tool-step-result">{{ JSON.stringify(step.result, null, 2) }}</pre>
+                            </div>
+                          </li>
+                        </ol>
+                      </div>
+                      <div v-else class="admin-usage-prompt">
+                        <strong>选择一条工具调用</strong><span>点击左侧任务后查看步骤和结果摘要。</span>
+                      </div>
+                    </div>
+                  </div>
+                </template>
+              </template>
+              <div v-else class="admin-usage-prompt">
+                <strong>选择一个账号</strong><span>点击左侧账号后查看其 Token 使用明细。</span>
+              </div>
+            </section>
+          </div>
+        </section>
       </section>
 
       <div v-if="auth.authenticated && activeView === 'workspace'" class="cmdk" :class="{ 'is-open': commandPaletteOpen }" :aria-hidden="String(!commandPaletteOpen)">
@@ -1032,6 +1310,6 @@
     <!-- Vue 3 global build 已放入本地静态目录，避免本地页面依赖外部 CDN。 -->
     <script src="/static/vendor/vue.global.prod.js?v=20260731-auth-admin"></script>
     <script src="/static/china_cities.js?v=20260803-cities"></script>
-    <script src="/static/app.js?v=20260814-dedup-dialog"></script>
+    <script src="/static/app.js?v=20260819-tool-audit-v2"></script>
   </body>
 </html>

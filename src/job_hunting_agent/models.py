@@ -403,6 +403,7 @@ class AgentChatResult:
     tool_outputs: list[dict[str, object]] = field(default_factory=list)
     # 当前轮可从供应商响应中确认的用量摘要；缺失时使用 None/0，不把估算值冒充精确账单。
     usage: dict[str, int | str] = field(default_factory=dict)
+    root_request_id: str = ""
 
 
 @dataclass
@@ -488,6 +489,29 @@ class UsageEventRecord:
     created_at: str
     billable: bool
     pricing_version: str | None
+
+
+@dataclass
+class ToolCallTraceRecord:
+    """一次用户任务的工具调用审计轨迹。"""
+
+    id: int
+    account_id: int
+    candidate_id: int | None
+    session_id: str | None
+    root_request_id: str
+    title: str
+    status: str
+    source: str
+    step_count: int
+    attempt_count: int
+    last_step_name: str | None
+    last_error_summary: str | None
+    trace: dict[str, object] = field(default_factory=dict)
+    created_at: str = ""
+    started_at: str | None = None
+    finished_at: str | None = None
+    updated_at: str = ""
 
 
 @dataclass

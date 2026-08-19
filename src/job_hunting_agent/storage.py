@@ -40,6 +40,7 @@ from .models import (
     ResumeDraft,
     ResumeDraftRecord,
     SkillRequirement,
+    ToolCallTraceRecord,
     UsageEventRecord,
     sanitize_preference_weights,
 )
@@ -572,6 +573,173 @@ class RepositoryStore:
             {key: int(row[key]) for key in row}
             for row in rows
         ]
+
+    def record_tool_call_trace(self, trace: ToolCallTraceRecord) -> ToolCallTraceRecord:
+        """写入或更新一次工具调用审计轨迹；同一 root_request_id 保持一条任务记录。"""
+
+        if trace.account_id <= 0:
+            raise ValueError("工具调用审计必须属于一个有效账号。")
+        root_request_id = trace.root_request_id.strip()
+        if not root_request_id:
+            raise ValueError("工具调用审计缺少 root_request_id。")
+        if trace.status not in {"running", "waiting_confirmation", "completed", "failed", "cancelled"}:
+            raise ValueError(f"Unsupported tool trace status: {trace.status}")
+        self.get_account(trace.account_id)
+        if trace.candidate_id is not None:
+            self.get_candidate_profile(trace.candidate_id, account_id=trace.account_id)
+        now = now_iso()
+        created_at = trace.created_at or now
+        updated_at = trace.updated_at or now
+        trace_payload = json.dumps(trace.trace or {}, ensure_ascii=False)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO tool_call_traces (
+                    account_id, candidate_id, session_id, root_request_id,
+                    title, status, source, step_count, attempt_count,
+                    last_step_name, last_error_summary, trace_json,
+                    created_at, started_at, finished_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (root_request_id) DO UPDATE SET
+                    account_id = EXCLUDED.account_id,
+                    candidate_id = COALESCE(EXCLUDED.candidate_id, tool_call_traces.candidate_id),
+                    session_id = COALESCE(EXCLUDED.session_id, tool_call_traces.session_id),
+                    title = EXCLUDED.title,
+                    status = EXCLUDED.status,
+                    source = EXCLUDED.source,
+                    step_count = EXCLUDED.step_count,
+                    attempt_count = EXCLUDED.attempt_count,
+                    last_step_name = EXCLUDED.last_step_name,
+                    last_error_summary = EXCLUDED.last_error_summary,
+                    trace_json = EXCLUDED.trace_json,
+                    started_at = COALESCE(tool_call_traces.started_at, EXCLUDED.started_at),
+                    finished_at = EXCLUDED.finished_at,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    trace.account_id,
+                    trace.candidate_id,
+                    trace.session_id,
+                    root_request_id,
+                    trace.title[:256],
+                    trace.status,
+                    trace.source[:32],
+                    max(0, int(trace.step_count)),
+                    max(0, int(trace.attempt_count)),
+                    trace.last_step_name[:128] if trace.last_step_name else None,
+                    trim_task_error(trace.last_error_summary),
+                    trace_payload,
+                    created_at,
+                    trace.started_at,
+                    trace.finished_at,
+                    updated_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM tool_call_traces WHERE root_request_id = ?",
+                (root_request_id,),
+            ).fetchone()
+        if row is None:  # pragma: no cover - 仅在数据库异常时触发
+            raise RuntimeError(f"Tool call trace was not persisted: {root_request_id}")
+        return tool_call_trace_from_row(row)
+
+    def get_tool_call_trace(
+        self,
+        root_request_id: str,
+        account_id: int | None = None,
+    ) -> ToolCallTraceRecord:
+        """读取一条工具调用审计轨迹，并可按账号隔离。"""
+
+        conditions = ["root_request_id = ?"]
+        parameters: list[object] = [root_request_id]
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            parameters.append(account_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT * FROM tool_call_traces
+                WHERE {' AND '.join(conditions)}
+                """,
+                tuple(parameters),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Tool call trace not found: {root_request_id}")
+        return tool_call_trace_from_row(row)
+
+    def list_tool_call_traces(
+        self,
+        account_id: int | None = None,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[ToolCallTraceRecord]:
+        """分页列出最近工具调用任务，详情由单条读取接口按需加载。"""
+
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            parameters.append(account_id)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        parameters.extend([max(1, min(limit, 200)), max(0, int(offset))])
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM tool_call_traces{where}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                tuple(parameters),
+            ).fetchall()
+        return [tool_call_trace_from_row(row) for row in rows]
+
+    def count_tool_call_traces(self, account_id: int | None = None) -> int:
+        """返回工具调用任务数量，供分页 UI 展示总数。"""
+
+        where = " WHERE account_id = ?" if account_id is not None else ""
+        parameters = (account_id,) if account_id is not None else ()
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM tool_call_traces{where}",
+                parameters,
+            ).fetchone()
+        return int(row["count"])
+
+    def summarize_tool_call_traces_by_account(self) -> list[dict[str, int]]:
+        """按账号聚合工具调用任务数量和失败数量。"""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    account_id,
+                    COUNT(*) AS trace_count,
+                    COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
+                        AS failed_trace_count
+                FROM tool_call_traces
+                GROUP BY account_id
+                ORDER BY account_id
+                """
+            ).fetchall()
+        return [
+            {
+                "account_id": int(row["account_id"]),
+                "trace_count": int(row["trace_count"]),
+                "failed_trace_count": int(row["failed_trace_count"]),
+            }
+            for row in rows
+        ]
+
+    def delete_tool_call_traces_before(self, cutoff_iso: str) -> int:
+        """删除保留窗口之前的工具调用轨迹，返回删除条数。"""
+
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM tool_call_traces WHERE created_at < ?",
+                (cutoff_iso,),
+            )
+        return max(0, int(cursor.rowcount or 0))
 
     # 后台任务状态
     # ------------------------------------------------------------------
@@ -2686,6 +2854,30 @@ def usage_event_from_row(row: RepositoryRow) -> UsageEventRecord:
         created_at=str(row["created_at"]),
         billable=bool(row["billable"]),
         pricing_version=row["pricing_version"],
+    )
+
+
+def tool_call_trace_from_row(row: RepositoryRow) -> ToolCallTraceRecord:
+    """把工具调用审计行转换为领域对象。"""
+
+    return ToolCallTraceRecord(
+        id=int(row["id"]),
+        account_id=int(row["account_id"]),
+        candidate_id=int(row["candidate_id"]) if row["candidate_id"] is not None else None,
+        session_id=row["session_id"],
+        root_request_id=str(row["root_request_id"]),
+        title=str(row["title"]),
+        status=str(row["status"]),
+        source=str(row["source"]),
+        step_count=int(row["step_count"]),
+        attempt_count=int(row["attempt_count"]),
+        last_step_name=row["last_step_name"],
+        last_error_summary=row["last_error_summary"],
+        trace=_json_object(row["trace_json"]),
+        created_at=str(row["created_at"]),
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        updated_at=str(row["updated_at"]),
     )
 
 

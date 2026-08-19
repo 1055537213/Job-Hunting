@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import threading
+import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
@@ -41,6 +42,7 @@ from .app import JobHuntingApp
 from .auth import (
     AccountAlreadyExistsError,
     hash_password,
+    iso_utc,
     is_session_expired,
     new_session_token,
     session_expiry,
@@ -83,10 +85,19 @@ from .models import (
     CandidateProfileInput,
     ResumeArtifactRecord,
     SkillRequirement,
+    ToolCallTraceRecord,
 )
 from .rag import RAGProviderRequestError
 from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
 from .task_queue import BackgroundTaskQueue, TaskQueueError
+from .tool_audit import (
+    background_task_tool_name,
+    build_tool_trace_record,
+    has_audited_steps,
+    tool_step_label as task_step_label,
+    tool_step_label,
+    tool_trace_title,
+)
 
 STATIC_DIR = Path(__file__).with_name("web_static")
 SESSION_COOKIE_NAME = "job_agent_session"
@@ -235,6 +246,7 @@ class ProjectCardConfirmationPayload(BaseModel):
     """候选人确认项目卡片时可选提供的本人职责摘要。"""
 
     confirmed_summary: str | None = None
+    root_request_id: str | None = None
 
 
 def create_web_app(
@@ -630,6 +642,8 @@ def create_web_app(
         validate_chat_session(account_id, payload.candidate_id, session_id)
         if not user_message:
             raise HTTPException(status_code=400, detail="消息不能为空。")
+        root_request_id = uuid.uuid4().hex
+        trace_started_at = time.monotonic()
 
         if payload.use_env_llm:
             if chat_agent is None:
@@ -648,12 +662,21 @@ def create_web_app(
                     use_tool_llm=False,
                     auto_rag=payload.auto_rag,
                     account_id=account_id,
+                    root_request_id=root_request_id,
                 )
             except RAGProviderRequestError as error:
                 raise HTTPException(status_code=502, detail=str(error)) from error
             except Exception as error:
                 raise HTTPException(status_code=502, detail=str(error)) from error
             tool_outputs = result.tool_outputs
+            trace = new_task_trace(root_request_id=root_request_id, source="chat")
+            reconcile_task_trace(trace, tool_outputs)
+            approval = approval_from_tool_outputs(tool_outputs)
+            trace["approval"] = approval
+            trace["status"] = "waiting_confirmation" if approval else "completed"
+            trace["duration_ms"] = max(0, round((time.monotonic() - trace_started_at) * 1000))
+            trace["finished_at"] = iso_utc() if not approval else None
+            trace["updated_at"] = iso_utc()
             display_reply = format_web_chat_reply(
                 mode=result.mode,
                 reply=result.reply,
@@ -661,14 +684,28 @@ def create_web_app(
                 tool_outputs=tool_outputs,
                 rule_based_result=None,
             )
+            task_trace_metadata = trace if has_audited_steps(trace) else None
             save_successful_web_chat_turn(
                 backend,
                 payload.candidate_id,
                 session_id,
                 user_message,
                 display_reply,
-                {"mode": result.mode, "used_tools": result.used_tools, "usage": result.usage},
+                {
+                    "mode": result.mode,
+                    "used_tools": result.used_tools,
+                    "usage": result.usage,
+                    "task_trace": task_trace_metadata,
+                },
                 account_id=account_id,
+            )
+            persist_tool_trace(
+                backend,
+                trace,
+                account_id=account_id,
+                candidate_id=payload.candidate_id,
+                session_id=session_id,
+                source="chat",
             )
             return {
                 "mode": result.mode,
@@ -678,7 +715,7 @@ def create_web_app(
                 "usage": result.usage,
                 "display_reply": display_reply,
                 "profile": asdict(backend.get_candidate_profile(payload.candidate_id, account_id=account_id)),
-            }
+        }
 
         try:
             result = backend.ingest_conversation_message(
@@ -691,6 +728,11 @@ def create_web_app(
         except RAGProviderRequestError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         tool_outputs = [{"tool_name": "ingest_conversation_message", "data": asdict(result)}]
+        trace = new_task_trace(root_request_id=root_request_id, source="chat")
+        reconcile_task_trace(trace, tool_outputs)
+        trace["duration_ms"] = max(0, round((time.monotonic() - trace_started_at) * 1000))
+        trace["finished_at"] = iso_utc()
+        trace["updated_at"] = iso_utc()
         display_reply = format_web_chat_reply(
             mode="rule_based_ingestion",
             reply=result.reply,
@@ -704,8 +746,20 @@ def create_web_app(
             session_id,
             user_message,
             display_reply,
-            {"mode": "rule_based_ingestion", "used_tools": ["ingest_conversation_message"]},
+            {
+                "mode": "rule_based_ingestion",
+                "used_tools": ["ingest_conversation_message"],
+                "task_trace": trace,
+            },
             account_id=account_id,
+        )
+        persist_tool_trace(
+            backend,
+            trace,
+            account_id=account_id,
+            candidate_id=payload.candidate_id,
+            session_id=session_id,
+            source="chat",
         )
         return {
             "mode": "rule_based_ingestion",
@@ -964,17 +1018,25 @@ def create_web_app(
         get_profile_or_404(backend, payload.candidate_id, account_id)
         try:
             if backend.task_queue_enabled:
+                request_id = uuid.uuid4().hex
                 task = backend.enqueue_github_project_analysis_task(
                     repository_url=payload.repository_url,
                     account_id=account_id,
                     candidate_id=payload.candidate_id,
                     session_id=f"github-project-candidate-{payload.candidate_id}",
-                    root_request_id=uuid.uuid4().hex,
+                    root_request_id=request_id,
+                )
+                record_background_task_enqueue_trace(
+                    backend,
+                    task=task,
+                    root_request_id=request_id,
+                    source="github_project_page",
                 )
                 return {
                     "task": serialize_background_task(task),
                     "project_card": None,
                     "processing_async": True,
+                    "root_request_id": request_id,
                 }
             # 纯本地测试或显式关闭队列时保留同步兼容，正式 Docker Web 默认不会走这里。
             project_card = backend.analyze_github_project_for_candidate(
@@ -1004,21 +1066,32 @@ def create_web_app(
 
         account = current_account(request)
         assert account is not None
+        request_id = payload.root_request_id.strip() if payload.root_request_id and payload.root_request_id.strip() else uuid.uuid4().hex
         try:
             record, rag_task = backend.confirm_project_card_and_enqueue_rag(
                 record_id,
                 payload.confirmed_summary.strip() if payload.confirmed_summary else None,
                 account_id=account.id,
                 session_id=f"project-confirmation-{record_id}",
-                root_request_id=uuid.uuid4().hex,
+                root_request_id=request_id,
             )
         except KeyError as error:
             raise HTTPException(status_code=404, detail="项目经历卡片不存在。") from error
         except TaskQueueError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
+        update_confirmation_tool_trace(
+            backend,
+            root_request_id=request_id,
+            account_id=account.id,
+            candidate_id=record.candidate_id,
+            session_id=f"project-confirmation-{record_id}",
+            record=asdict(record),
+            rag_task=serialize_background_task(rag_task) if rag_task is not None else None,
+        )
         return {
             "project_card": asdict(record),
             "task": serialize_background_task(rag_task) if rag_task is not None else None,
+            "root_request_id": request_id,
         }
 
     @web_app.post("/api/resumes/upload")
@@ -1053,6 +1126,7 @@ def create_web_app(
         rag_update = None
         rag_warning = None
         background_task = None
+        root_request_id = uuid.uuid4().hex
         workflow = "ready"
         if artifact.status == "processing":
             workflow = "ocr"
@@ -1063,8 +1137,14 @@ def create_web_app(
                     account_id=account_id,
                     candidate_id=candidate_id,
                     session_id=f"resume-upload-candidate-{candidate_id}",
-                    root_request_id=uuid.uuid4().hex,
+                    root_request_id=root_request_id,
                     idempotency_key=idempotency_key,
+                )
+                record_background_task_enqueue_trace(
+                    backend,
+                    task=background_task,
+                    root_request_id=root_request_id,
+                    source="resume_upload",
                 )
             except TaskQueueError as error:
                 # 原件已保存但没有可用 Worker 时，不能继续显示“处理中”。
@@ -1088,8 +1168,14 @@ def create_web_app(
                         account_id=account_id,
                         candidate_id=candidate_id,
                         session_id=f"resume-upload-candidate-{candidate_id}",
-                        root_request_id=uuid.uuid4().hex,
+                        root_request_id=root_request_id,
                         idempotency_key=idempotency_key,
+                    )
+                    record_background_task_enqueue_trace(
+                        backend,
+                        task=background_task,
+                        root_request_id=root_request_id,
+                        source="resume_upload",
                     )
                 except TaskQueueError as error:
                     # 原文件已经保存；把投递失败作为可见警告返回，避免用户误以为文件丢失。
@@ -1106,7 +1192,7 @@ def create_web_app(
                             account_id=account_id,
                             candidate_id=candidate_id,
                             session_id=f"resume-upload-candidate-{candidate_id}",
-                            root_request_id=uuid.uuid4().hex,
+                            root_request_id=root_request_id,
                         )
                     )
                 except RAGProviderRequestError as error:
@@ -1120,6 +1206,7 @@ def create_web_app(
             "workflow": workflow,
             "processing_async": bool(background_task is not None),
             "indexing_async": workflow == "rag" and background_task is not None,
+            "root_request_id": root_request_id if background_task is not None or rag_update is not None else None,
         }
 
     @web_app.get("/api/resumes")
@@ -1312,12 +1399,13 @@ def create_web_app(
 
     @web_app.get("/api/admin/usage/summary")
     def admin_usage_summary(request: Request) -> dict[str, object]:
-        """管理员查看全局 Token 汇总；正式账单只使用 billable_tokens。"""
+        """管理员查看全局 Token 和工具调用汇总。"""
 
         require_admin(request)
         return {
             "summary": backend.store.summarize_usage(),
             "by_account": backend.store.summarize_usage_by_account(),
+            "tool_calls_by_account": backend.store.summarize_tool_call_traces_by_account(),
         }
 
     @web_app.post("/api/admin/tasks/probe")
@@ -1345,6 +1433,40 @@ def create_web_app(
         events = backend.store.list_usage_events(account_id, candidate_id, session_id, limit)
         return {"events": [asdict(event) for event in events]}
 
+    @web_app.get("/api/admin/tools/traces")
+    def admin_tool_traces(
+        request: Request,
+        account_id: int | None = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, object]:
+        """管理员分页查看最近两天内的工具调用任务摘要。"""
+
+        require_admin(request)
+        traces = backend.store.list_tool_call_traces(
+            account_id,
+            limit=limit,
+            offset=offset,
+        )
+        total = backend.store.count_tool_call_traces(account_id)
+        return {
+            "traces": [serialize_tool_trace_summary(trace) for trace in traces],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @web_app.get("/api/admin/tools/traces/{root_request_id}")
+    def admin_tool_trace_detail(root_request_id: str, request: Request) -> dict[str, object]:
+        """管理员按需查看某次任务的工具调用流程和安全结果摘要。"""
+
+        require_admin(request)
+        try:
+            trace = backend.store.get_tool_call_trace(root_request_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="工具调用记录不存在。") from error
+        return {"trace": serialize_tool_trace_detail(trace)}
+
     return web_app
 
 
@@ -1362,6 +1484,11 @@ def stream_web_chat_events(
     才会把用户消息和助手展示文本写入聊天历史。
     """
 
+    root_request_id = uuid.uuid4().hex
+    trace = new_task_trace(root_request_id=root_request_id, source="chat")
+    trace_started_at = time.monotonic()
+    yield sse_event("task_started", {"task_trace": trace})
+
     if payload.use_env_llm:
         assert chat_agent is not None
         try:
@@ -1376,15 +1503,30 @@ def stream_web_chat_events(
                 use_tool_llm=False,
                 auto_rag=payload.auto_rag,
                 account_id=account_id,
+                root_request_id=root_request_id,
             ):
                 event_type = event.get("type")
                 if event_type == "token":
                     yield sse_event("token", {"content": event.get("content", "")})
-                elif event_type == "tool":
-                    tool_name = str(event.get("name") or "unknown_tool")
-                    yield sse_event("status", {"content": f"工具完成：{tool_name}", "tool": tool_name})
+                elif event_type == "step_started":
+                    step = start_task_step(trace, str(event.get("name") or "unknown_tool"))
+                    yield sse_event("step_started", {"step": step})
+                elif event_type == "step_completed":
+                    step = complete_task_step(
+                        trace,
+                        str(event.get("name") or "unknown_tool"),
+                        event.get("data"),
+                    )
+                    yield sse_event("step_completed", {"step": step})
                 elif event_type == "final":
                     result = event["result"]
+                    reconcile_task_trace(trace, result.tool_outputs)
+                    approval = approval_from_tool_outputs(result.tool_outputs)
+                    trace["approval"] = approval
+                    trace["status"] = "waiting_confirmation" if approval else "completed"
+                    trace["duration_ms"] = max(0, round((time.monotonic() - trace_started_at) * 1000))
+                    trace["finished_at"] = iso_utc() if not approval else None
+                    trace["updated_at"] = iso_utc()
                     display_reply = format_web_chat_reply(
                         mode=result.mode,
                         reply=result.reply,
@@ -1392,15 +1534,36 @@ def stream_web_chat_events(
                         tool_outputs=result.tool_outputs,
                         rule_based_result=None,
                     )
+                    if not trace["steps"]:
+                        start_task_step(trace, "compose_reply")
+                        complete_task_step(trace, "compose_reply", None)
+                    task_trace_metadata = trace if has_audited_steps(trace) else None
                     save_successful_web_chat_turn(
                         backend,
                         payload.candidate_id,
                         session_id,
                         user_message,
                         display_reply,
-                        {"mode": result.mode, "used_tools": result.used_tools, "usage": result.usage},
+                        {
+                            "mode": result.mode,
+                            "used_tools": result.used_tools,
+                            "usage": result.usage,
+                            "task_trace": task_trace_metadata,
+                        },
                         account_id=account_id,
                     )
+                    persist_tool_trace(
+                        backend,
+                        trace,
+                        account_id=account_id,
+                        candidate_id=payload.candidate_id,
+                        session_id=session_id,
+                        source="chat",
+                    )
+                    if approval:
+                        yield sse_event("approval_required", {"task_trace": trace})
+                    else:
+                        yield sse_event("task_completed", {"task_trace": trace})
                     yield sse_event(
                         "final",
                         {
@@ -1410,16 +1573,40 @@ def stream_web_chat_events(
                             "tool_outputs": result.tool_outputs,
                             "usage": result.usage,
                             "display_reply": display_reply,
+                            "task_trace": trace,
+                            "root_request_id": root_request_id,
                             "profile": asdict(backend.get_candidate_profile(payload.candidate_id, account_id=account_id)),
                         },
                     )
         except RAGProviderRequestError as error:
+            fail_task_trace(trace, str(error), trace_started_at)
+            persist_tool_trace(
+                backend,
+                trace,
+                account_id=account_id,
+                candidate_id=payload.candidate_id,
+                session_id=session_id,
+                source="chat",
+            )
+            yield sse_event("task_failed", {"task_trace": trace})
             yield sse_event("error", {"detail": str(error)})
         except Exception as error:  # noqa: BLE001 - SSE 内统一返回可读错误事件。
+            fail_task_trace(trace, str(error), trace_started_at)
+            persist_tool_trace(
+                backend,
+                trace,
+                account_id=account_id,
+                candidate_id=payload.candidate_id,
+                session_id=session_id,
+                source="chat",
+            )
+            yield sse_event("task_failed", {"task_trace": trace})
             yield sse_event("error", {"detail": str(error)})
         return
 
     try:
+        step = start_task_step(trace, "ingest_candidate_message")
+        yield sse_event("step_started", {"step": step})
         result = backend.ingest_conversation_message(
             payload.candidate_id,
             user_message,
@@ -1428,6 +1615,16 @@ def stream_web_chat_events(
             account_id=account_id,
         )
     except RAGProviderRequestError as error:
+        fail_task_trace(trace, str(error), trace_started_at)
+        persist_tool_trace(
+            backend,
+            trace,
+            account_id=account_id,
+            candidate_id=payload.candidate_id,
+            session_id=session_id,
+            source="rule_based_chat",
+        )
+        yield sse_event("task_failed", {"task_trace": trace})
         yield sse_event("error", {"detail": str(error)})
         return
 
@@ -1440,15 +1637,34 @@ def stream_web_chat_events(
         tool_outputs=tool_outputs,
         rule_based_result=result_dict,
     )
+    complete_task_step(trace, "ingest_candidate_message", result_dict)
+    trace["status"] = "completed"
+    trace["duration_ms"] = max(0, round((time.monotonic() - trace_started_at) * 1000))
+    trace["finished_at"] = iso_utc()
+    trace["updated_at"] = iso_utc()
+    task_trace_metadata = trace if has_audited_steps(trace) else None
     save_successful_web_chat_turn(
         backend,
         payload.candidate_id,
         session_id,
         user_message,
         display_reply,
-        {"mode": "rule_based_ingestion", "used_tools": ["ingest_conversation_message"]},
+        {
+            "mode": "rule_based_ingestion",
+            "used_tools": ["ingest_conversation_message"],
+            "task_trace": task_trace_metadata,
+        },
         account_id=account_id,
     )
+    persist_tool_trace(
+        backend,
+        trace,
+        account_id=account_id,
+        candidate_id=payload.candidate_id,
+        session_id=session_id,
+        source="rule_based_chat",
+    )
+    yield sse_event("task_completed", {"task_trace": trace})
     # 规则兜底没有真实 token 流，这里发送一次完整文本，保持前端路径统一。
     yield sse_event("token", {"content": display_reply})
     yield sse_event(
@@ -1460,8 +1676,450 @@ def stream_web_chat_events(
             "tool_outputs": tool_outputs,
             "result": result_dict,
             "display_reply": display_reply,
+            "task_trace": trace,
+            "root_request_id": root_request_id,
             "profile": asdict(backend.get_candidate_profile(payload.candidate_id, account_id=account_id)),
         },
+    )
+
+
+def new_task_trace(root_request_id: str | None = None, source: str = "chat") -> dict[str, object]:
+    """创建只包含用户可理解摘要的任务过程，不保存模型隐藏推理。"""
+
+    now = iso_utc()
+    return {
+        "version": 1,
+        "root_request_id": root_request_id or uuid.uuid4().hex,
+        "title": "本次任务",
+        "status": "running",
+        "source": source,
+        "duration_ms": None,
+        "created_at": now,
+        "started_at": now,
+        "finished_at": None,
+        "updated_at": now,
+        "steps": [],
+        "approval": None,
+    }
+
+
+def start_task_step(trace: dict[str, object], tool_name: str) -> dict[str, object]:
+    """登记一个正在执行的任务步骤。"""
+
+    steps = trace.setdefault("steps", [])
+    assert isinstance(steps, list)
+    now = iso_utc()
+    step = {
+        "id": f"step-{len(steps) + 1}",
+        "name": tool_name,
+        "label": task_step_label(tool_name),
+        "status": "running",
+        "summary": None,
+        "started_at": now,
+        "finished_at": None,
+        "attempts": [
+            {
+                "attempt": 1,
+                "phase": "tool",
+                "status": "running",
+                "started_at": now,
+                "finished_at": None,
+                "summary": None,
+            }
+        ],
+    }
+    steps.append(step)
+    trace["updated_at"] = now
+    return step
+
+
+def complete_task_step(
+    trace: dict[str, object],
+    tool_name: str,
+    data: object,
+) -> dict[str, object]:
+    """完成最近一个同名步骤，并只附加低敏摘要。"""
+
+    steps = trace.setdefault("steps", [])
+    assert isinstance(steps, list)
+    step = next(
+        (item for item in reversed(steps) if isinstance(item, dict) and item.get("name") == tool_name and item.get("status") == "running"),
+        None,
+    )
+    if step is None:
+        step = start_task_step(trace, tool_name)
+    now = iso_utc()
+    status = "failed" if isinstance(data, dict) and data.get("error") else "completed"
+    summary = summarize_task_step(tool_name, data)
+    result = summarize_tool_result(tool_name, data)
+    step["status"] = status
+    step["summary"] = summary
+    step["result"] = result
+    step["finished_at"] = now
+    if isinstance(result, dict) and result.get("task_key"):
+        step["background_task_key"] = result["task_key"]
+    attempts = step.setdefault("attempts", [])
+    if isinstance(attempts, list):
+        if not attempts:
+            attempts.append({"attempt": 1, "started_at": step.get("started_at")})
+        attempt = attempts[-1]
+        if isinstance(attempt, dict):
+            attempt["status"] = status
+            attempt["finished_at"] = now
+            attempt["summary"] = summary
+            attempt["result"] = result
+    trace["updated_at"] = now
+    return step
+
+
+def summarize_tool_result(tool_name: str, data: object) -> dict[str, object] | None:
+    """为管理端保留低敏工具结果，不保存完整简历、聊天正文或 RAG 片段。"""
+
+    if not isinstance(data, dict):
+        return None
+    if data.get("error"):
+        return {"ok": False, "error": str(data.get("error"))}
+    if tool_name == "search_candidate_evidence" and isinstance(data.get("results"), list):
+        return {"ok": True, "result_count": len(data["results"])}
+    if tool_name == "list_resume_artifacts_for_candidate" and isinstance(data.get("artifacts"), list):
+        return {"ok": True, "artifact_count": len(data["artifacts"])}
+    if tool_name == "match_all_jobs_for_candidate" and isinstance(data.get("matches"), list):
+        return {"ok": True, "match_count": len(data["matches"])}
+    if tool_name == "list_candidate_profiles" and isinstance(data.get("profiles"), list):
+        return {"ok": True, "profile_count": len(data["profiles"])}
+    if tool_name == "list_imported_jobs" and isinstance(data.get("jobs"), list):
+        return {"ok": True, "job_count": len(data["jobs"])}
+    task = data.get("task")
+    if isinstance(task, dict):
+        return {
+            "ok": task.get("status") not in {"failed", "cancelled"},
+            "task_key": task.get("task_key"),
+            "task_type": task.get("task_type"),
+            "status": task.get("status"),
+            "progress": task.get("progress"),
+            "error_summary": task.get("error_summary"),
+        }
+    job = data.get("job")
+    if isinstance(job, dict):
+        return {
+            "ok": True,
+            "job_id": job.get("id"),
+            "title": job.get("title"),
+            "city": job.get("city"),
+            "import_method": job.get("import_method"),
+        }
+    if tool_name == "ingest_candidate_message":
+        fields = data.get("saved_structured_fields") or []
+        long_text_ids = data.get("saved_long_text_ids") or []
+        return {
+            "ok": True,
+            "saved_structured_field_count": len(fields) if isinstance(fields, list) else 0,
+            "saved_long_text_count": len(long_text_ids) if isinstance(long_text_ids, list) else 0,
+            "rag_update_mode": data.get("rag_update_mode"),
+        }
+    project_card = data.get("project_card")
+    if isinstance(project_card, dict):
+        return {
+            "ok": True,
+            "project_card_id": project_card.get("id"),
+            "status": project_card.get("status"),
+        }
+    draft = data.get("draft")
+    if isinstance(draft, dict):
+        return {
+            "ok": True,
+            "draft_id": draft.get("id"),
+            "job_id": draft.get("job_id"),
+            "version": draft.get("version"),
+        }
+    return {"ok": True, "result_keys": sorted(str(key) for key in data.keys())[:12]}
+
+
+def summarize_task_step(tool_name: str, data: object) -> str | None:
+    """将工具结果压缩成任务行摘要，避免把完整候选人材料塞进聊天 UI。"""
+
+    if not isinstance(data, dict):
+        return None
+    if data.get("error"):
+        return f"{data['error']}"
+    if tool_name == "search_candidate_evidence" and isinstance(data.get("results"), list):
+        return f"找到 {len(data['results'])} 条相关证据"
+    if tool_name == "list_resume_artifacts_for_candidate" and isinstance(data.get("artifacts"), list):
+        return f"读取到 {len(data['artifacts'])} 份简历"
+    if tool_name == "match_all_jobs_for_candidate" and isinstance(data.get("matches"), list):
+        return f"完成 {len(data['matches'])} 个职位的匹配"
+    if tool_name == "list_candidate_profiles" and isinstance(data.get("profiles"), list):
+        return f"找到 {len(data['profiles'])} 份档案"
+    if tool_name == "list_imported_jobs" and isinstance(data.get("jobs"), list):
+        return f"读取到 {len(data['jobs'])} 个职位"
+    task = data.get("task")
+    if isinstance(task, dict) and task.get("task_key"):
+        return "任务已排队，完成后继续更新"
+    job = data.get("job")
+    if isinstance(job, dict) and job.get("title"):
+        return f"已识别职位：{job['title']}"
+    if tool_name == "ingest_candidate_message":
+        fields = data.get("saved_structured_fields") or []
+        return f"已保存 {len(fields)} 项结构化资料" if fields else "已完成资料整理"
+    return None
+
+
+def reconcile_task_trace(trace: dict[str, object], tool_outputs: list[dict[str, object]]) -> None:
+    """用最终工具摘要补齐模型未显式报告开始事件的步骤。"""
+
+    steps = trace.setdefault("steps", [])
+    assert isinstance(steps, list)
+    matched_step_ids: set[str] = set()
+    tool_names: list[str] = []
+    for item in tool_outputs:
+        if not isinstance(item, dict):
+            continue
+        tool_name = str(item.get("tool_name") or "unknown_tool")
+        tool_names.append(tool_name)
+        existing = next(
+            (
+                step
+                for step in steps
+                if isinstance(step, dict)
+                and step.get("name") == tool_name
+                and str(step.get("id")) not in matched_step_ids
+            ),
+            None,
+        )
+        if existing is None:
+            existing = complete_task_step(trace, tool_name, item.get("data"))
+        else:
+            now = iso_utc()
+            status = (
+                "failed"
+                if isinstance(item.get("data"), dict) and item["data"].get("error")
+                else "completed"
+            )
+            summary = summarize_task_step(tool_name, item.get("data"))
+            result = summarize_tool_result(tool_name, item.get("data"))
+            existing["status"] = status
+            existing["summary"] = summary
+            existing["result"] = result
+            existing["finished_at"] = now
+            if isinstance(result, dict) and result.get("task_key"):
+                existing["background_task_key"] = result["task_key"]
+            attempts = existing.setdefault("attempts", [])
+            if isinstance(attempts, list):
+                if not attempts:
+                    attempts.append({"attempt": 1, "started_at": existing.get("started_at")})
+                attempt = attempts[-1]
+                if isinstance(attempt, dict):
+                    attempt["status"] = status
+                    attempt["finished_at"] = now
+                    attempt["summary"] = summary
+                    attempt["result"] = result
+        matched_step_ids.add(str(existing.get("id")))
+    trace["title"] = task_trace_title(tool_names)
+    trace["updated_at"] = iso_utc()
+
+
+def task_trace_title(tool_names: list[str]) -> str:
+    """根据本轮真实工具选择比“本次任务”更具体的摘要标题。"""
+
+    return tool_trace_title(tool_names)
+
+
+def fail_task_trace(trace: dict[str, object], detail: str, started_at: float) -> None:
+    """标记任务失败并保留失败步骤，便于前端显示可读错误。"""
+
+    steps = trace.setdefault("steps", [])
+    assert isinstance(steps, list)
+    for step in steps:
+        if isinstance(step, dict) and step.get("status") == "running":
+            step["status"] = "failed"
+            step["summary"] = detail
+            step["result"] = {"ok": False, "error": detail}
+            step["finished_at"] = iso_utc()
+            attempts = step.setdefault("attempts", [])
+            if isinstance(attempts, list):
+                if not attempts:
+                    attempts.append({"attempt": 1, "started_at": step.get("started_at")})
+                attempt = attempts[-1]
+                if isinstance(attempt, dict):
+                    attempt["status"] = "failed"
+                    attempt["finished_at"] = step["finished_at"]
+                    attempt["summary"] = detail
+                    attempt["result"] = {"ok": False, "error": detail}
+    trace["status"] = "failed"
+    trace["duration_ms"] = max(0, round((time.monotonic() - started_at) * 1000))
+    trace["finished_at"] = iso_utc()
+    trace["updated_at"] = iso_utc()
+
+
+def approval_from_tool_outputs(tool_outputs: list[dict[str, object]]) -> dict[str, object] | None:
+    """为已安全落到“待确认”状态的项目卡片生成确认区。"""
+
+    for item in tool_outputs:
+        data = item.get("data") if isinstance(item, dict) else None
+        card = data.get("project_card") if isinstance(data, dict) else None
+        if card is None and isinstance(data, dict) and data.get("status") == "待确认":
+            card = data
+        if not isinstance(card, dict) or card.get("status") != "待确认":
+            continue
+        card_data = card.get("card") if isinstance(card.get("card"), dict) else {}
+        return {
+            "kind": "project_card_confirmation",
+            "record_id": card.get("id"),
+            "title": "等待确认项目经历",
+            "message": "确认后，这段项目摘要才会作为后续简历和匹配的可引用证据。",
+            "items": [
+                {
+                    "label": "项目",
+                    "value": str(card_data.get("project_name") or "未命名项目"),
+                },
+                {
+                    "label": "摘要",
+                    "value": str(card_data.get("summary") or "暂无摘要"),
+                },
+            ],
+            "confirm_label": "确认使用",
+            "cancel_label": "暂不使用",
+            "status": "waiting",
+        }
+    return None
+
+
+def persist_tool_trace(
+    backend: JobHuntingApp,
+    trace: dict[str, object],
+    *,
+    account_id: int,
+    candidate_id: int | None,
+    session_id: str | None,
+    source: str,
+) -> None:
+    """只在存在真实工具步骤时，把任务轨迹写入管理端审计表。"""
+
+    if not has_audited_steps(trace):
+        return
+    backend.store.record_tool_call_trace(
+        build_tool_trace_record(
+            trace,
+            account_id=account_id,
+            candidate_id=candidate_id,
+            session_id=session_id,
+            source=source,
+        )
+    )
+
+
+def load_or_new_tool_trace(
+    backend: JobHuntingApp,
+    *,
+    root_request_id: str,
+    source: str,
+) -> dict[str, object]:
+    """读取既有审计轨迹；不存在时创建一条新的非 SSE 轨迹。"""
+
+    try:
+        return dict(backend.store.get_tool_call_trace(root_request_id).trace)
+    except KeyError:
+        return new_task_trace(root_request_id=root_request_id, source=source)
+
+
+def update_confirmation_tool_trace(
+    backend: JobHuntingApp,
+    *,
+    root_request_id: str,
+    account_id: int,
+    candidate_id: int,
+    session_id: str,
+    record: dict[str, object],
+    rag_task: dict[str, object] | None,
+) -> None:
+    """把候选人确认项目卡片的工具动作写入审计轨迹。"""
+
+    trace = load_or_new_tool_trace(
+        backend,
+        root_request_id=root_request_id,
+        source="project_confirmation",
+    )
+    trace["source"] = trace.get("source") or "project_confirmation"
+    steps = trace.setdefault("steps", [])
+    existing = next(
+        (
+            item
+            for item in reversed(steps)
+            if isinstance(item, dict) and item.get("name") == "confirm_project_card"
+        ),
+        None,
+    )
+    if isinstance(existing, dict):
+        existing["status"] = "running"
+        existing["started_at"] = existing.get("started_at") or iso_utc()
+    else:
+        start_task_step(trace, "confirm_project_card")
+    complete_task_step(
+        trace,
+        "confirm_project_card",
+        {
+            "project_card": record,
+            "task": rag_task,
+        },
+    )
+    trace["title"] = task_trace_title(
+        [str(item.get("name") or "") for item in trace.get("steps", []) if isinstance(item, dict)]
+    )
+    trace["status"] = "running" if rag_task is not None else "completed"
+    trace["finished_at"] = None if rag_task is not None else iso_utc()
+    trace["updated_at"] = iso_utc()
+    persist_tool_trace(
+        backend,
+        trace,
+        account_id=account_id,
+        candidate_id=candidate_id,
+        session_id=session_id,
+        source="project_confirmation",
+    )
+
+
+def record_background_task_enqueue_trace(
+    backend: JobHuntingApp,
+    *,
+    task: BackgroundTaskRecord,
+    root_request_id: str,
+    source: str,
+) -> None:
+    """把页面直接触发的后台任务排队状态写入审计轨迹。"""
+
+    trace = load_or_new_tool_trace(
+        backend,
+        root_request_id=root_request_id,
+        source=source,
+    )
+    tool_name = background_task_tool_name(task.task_type)
+    trace["title"] = trace.get("title") or task_trace_title([tool_name])
+    trace["source"] = source
+    step = start_task_step(trace, tool_name)
+    queued_result = {
+        "ok": True,
+        "task_key": task.task_key,
+        "task_type": task.task_type,
+        "status": task.status,
+        "progress": task.progress,
+    }
+    step["summary"] = "任务已排队，完成后继续更新"
+    step["result"] = queued_result
+    step["background_task_key"] = task.task_key
+    for attempt in step.get("attempts", []):
+        if isinstance(attempt, dict):
+            attempt["summary"] = step["summary"]
+            attempt["result"] = queued_result
+    trace["status"] = "running"
+    trace["finished_at"] = None
+    trace["updated_at"] = iso_utc()
+    persist_tool_trace(
+        backend,
+        trace,
+        account_id=task.account_id,
+        candidate_id=task.candidate_id,
+        session_id=task.session_id,
+        source=source,
     )
 
 
@@ -1498,6 +2156,37 @@ def serialize_background_task(task: BackgroundTaskRecord) -> dict[str, object]:
         "finished_at": task.finished_at,
         "updated_at": task.updated_at,
     }
+
+
+def serialize_tool_trace_summary(trace: ToolCallTraceRecord) -> dict[str, object]:
+    """返回管理端列表所需的工具调用任务摘要。"""
+
+    return {
+        "id": trace.id,
+        "account_id": trace.account_id,
+        "candidate_id": trace.candidate_id,
+        "session_id": trace.session_id,
+        "root_request_id": trace.root_request_id,
+        "title": trace.title,
+        "status": trace.status,
+        "source": trace.source,
+        "step_count": trace.step_count,
+        "attempt_count": trace.attempt_count,
+        "last_step_name": trace.last_step_name,
+        "last_error_summary": trace.last_error_summary,
+        "created_at": trace.created_at,
+        "started_at": trace.started_at,
+        "finished_at": trace.finished_at,
+        "updated_at": trace.updated_at,
+    }
+
+
+def serialize_tool_trace_detail(trace: ToolCallTraceRecord) -> dict[str, object]:
+    """返回管理端详情所需的完整工具调用轨迹。"""
+
+    payload = serialize_tool_trace_summary(trace)
+    payload["trace"] = trace.trace
+    return payload
 
 
 def default_web_session_id(candidate_id: int, account_id: int) -> str:

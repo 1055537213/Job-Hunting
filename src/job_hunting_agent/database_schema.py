@@ -426,6 +426,49 @@ sa.Index("idx_usage_events_session", usage_events.c.session_id, usage_events.c.c
 sa.Index("idx_usage_events_request", usage_events.c.root_request_id, usage_events.c.created_at)
 
 
+# 工具调用审计只保留最近两天的任务轨迹，不保存 prompt、正文或完整模型上下文。
+tool_call_traces = sa.Table(
+    "tool_call_traces",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column(
+        "account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "candidate_id",
+        sa.Integer,
+        sa.ForeignKey("candidate_profiles.id", ondelete="CASCADE"),
+    ),
+    sa.Column("session_id", sa.String(128)),
+    sa.Column("root_request_id", sa.String(128), nullable=False),
+    sa.Column("title", sa.String(256), nullable=False),
+    sa.Column("status", sa.String(32), nullable=False, server_default=sa.text("'running'")),
+    sa.Column("source", sa.String(32), nullable=False, server_default=sa.text("'chat'")),
+    sa.Column("step_count", sa.Integer, nullable=False, server_default=sa.text("0")),
+    sa.Column("attempt_count", sa.Integer, nullable=False, server_default=sa.text("0")),
+    sa.Column("last_step_name", sa.String(128)),
+    sa.Column("last_error_summary", sa.Text),
+    sa.Column("trace_json", json_type, nullable=False, server_default=sa.text("'{}'")),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.Column("started_at", timestamp_type),
+    sa.Column("finished_at", timestamp_type),
+    sa.Column("updated_at", timestamp_type, nullable=False),
+    sa.UniqueConstraint("root_request_id", name="uq_tool_call_traces_root_request_id"),
+    sa.CheckConstraint(
+        "status IN ('running', 'waiting_confirmation', 'completed', 'failed', 'cancelled')",
+        name="tool_call_traces_status",
+    ),
+    sa.CheckConstraint("step_count >= 0", name="tool_call_traces_step_count_non_negative"),
+    sa.CheckConstraint("attempt_count >= 0", name="tool_call_traces_attempt_count_non_negative"),
+)
+sa.Index("idx_tool_call_traces_account_time", tool_call_traces.c.account_id, tool_call_traces.c.created_at)
+sa.Index("idx_tool_call_traces_account_update", tool_call_traces.c.account_id, tool_call_traces.c.updated_at.desc())
+sa.Index("idx_tool_call_traces_request", tool_call_traces.c.root_request_id)
+
+
 # 后台任务的状态以 PostgreSQL 为准；Redis/Celery 只传递 task_key，不保存业务事实。
 background_tasks = sa.Table(
     "background_tasks",

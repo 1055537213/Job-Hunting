@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from job_hunting_agent.app import JobHuntingApp
-from job_hunting_agent.models import CandidateProfileInput, UsageEventRecord
+from job_hunting_agent.models import CandidateProfileInput, ToolCallTraceRecord, UsageEventRecord
 from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
 
 
@@ -86,3 +86,136 @@ def test_app_uses_sqlalchemy_store_when_a_database_url_is_explicit(database_url)
 
     assert app.store.__class__.__name__ == "SQLAlchemyStore"
     app.store.close()
+
+
+def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(database_url):
+    """工具调用审计表按任务 upsert，并支持管理端列表、详情、聚合和保留清理。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    account = store.create_account("tools@example.com", "hashed-password")
+    other = store.create_account("other-tools@example.com", "hashed-password")
+
+    first = store.record_tool_call_trace(
+        ToolCallTraceRecord(
+            id=0,
+            account_id=account.id,
+            candidate_id=None,
+            session_id="session-1",
+            root_request_id="root-1",
+            title="导入职位信息",
+            status="running",
+            source="chat",
+            step_count=1,
+            attempt_count=1,
+            last_step_name="import_job_from_text",
+            last_error_summary=None,
+            trace={
+                "steps": [
+                    {
+                        "id": "step-1",
+                        "name": "import_job_from_text",
+                        "status": "running",
+                        "attempts": [{"attempt": 1, "status": "running"}],
+                    }
+                ]
+            },
+            created_at="2026-08-18T16:01:00+00:00",
+            started_at="2026-08-18T16:01:00+00:00",
+            finished_at=None,
+            updated_at="2026-08-18T16:01:00+00:00",
+        )
+    )
+    updated = store.record_tool_call_trace(
+        ToolCallTraceRecord(
+            id=0,
+            account_id=account.id,
+            candidate_id=None,
+            session_id=None,
+            root_request_id="root-1",
+            title="导入职位信息",
+            status="completed",
+            source="chat",
+            step_count=1,
+            attempt_count=1,
+            last_step_name="import_job_from_text",
+            last_error_summary=None,
+            trace={
+                "steps": [
+                    {
+                        "id": "step-1",
+                        "name": "import_job_from_text",
+                        "status": "completed",
+                        "result": {"ok": True, "job_title": "Python 后端"},
+                        "attempts": [{"attempt": 1, "status": "completed"}],
+                    }
+                ]
+            },
+            created_at="2026-08-18T16:01:00+00:00",
+            started_at="2026-08-18T16:01:00+00:00",
+            finished_at="2026-08-18T16:02:00+00:00",
+            updated_at="2026-08-18T16:02:00+00:00",
+        )
+    )
+    store.record_tool_call_trace(
+        ToolCallTraceRecord(
+            id=0,
+            account_id=other.id,
+            candidate_id=None,
+            session_id=None,
+            root_request_id="root-other",
+            title="分析项目经历",
+            status="failed",
+            source="background_task",
+            step_count=1,
+            attempt_count=2,
+            last_step_name="github_project_analysis",
+            last_error_summary="GitHub 不可访问",
+            trace={"steps": [{"id": "step-1", "name": "github_project_analysis", "status": "failed"}]},
+            created_at="2026-08-18T16:03:00+00:00",
+            started_at="2026-08-18T16:03:00+00:00",
+            finished_at="2026-08-18T16:04:00+00:00",
+            updated_at="2026-08-18T16:04:00+00:00",
+        )
+    )
+    old = store.record_tool_call_trace(
+        ToolCallTraceRecord(
+            id=0,
+            account_id=account.id,
+            candidate_id=None,
+            session_id=None,
+            root_request_id="root-old",
+            title="旧任务",
+            status="completed",
+            source="chat",
+            step_count=1,
+            attempt_count=1,
+            last_step_name="ingest_candidate_message",
+            last_error_summary=None,
+            trace={"steps": [{"id": "step-1", "name": "ingest_candidate_message", "status": "completed"}]},
+            created_at="2026-08-17T15:59:59+00:00",
+            started_at="2026-08-17T15:59:59+00:00",
+            finished_at="2026-08-17T16:00:10+00:00",
+            updated_at="2026-08-17T16:00:10+00:00",
+        )
+    )
+
+    assert updated.id == first.id
+    assert store.get_tool_call_trace("root-1").status == "completed"
+    assert store.count_tool_call_traces(account.id) == 2
+    assert [trace.root_request_id for trace in store.list_tool_call_traces(account.id)] == ["root-1", "root-old"]
+    summary = store.summarize_tool_call_traces_by_account()
+    assert {"account_id": account.id, "trace_count": 2, "failed_trace_count": 0} in summary
+    assert {"account_id": other.id, "trace_count": 1, "failed_trace_count": 1} in summary
+
+    deleted = store.delete_tool_call_traces_before("2026-08-17T16:00:00+00:00")
+
+    assert deleted == 1
+    assert store.count_tool_call_traces(account.id) == 1
+    try:
+        store.get_tool_call_trace(old.root_request_id)
+    except KeyError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("旧工具调用记录没有被清理")
+    store.close()

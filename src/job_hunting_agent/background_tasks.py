@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .app import JobHuntingApp
+from .auth import iso_utc
 from .config import DEFAULT_ENV_PATH
 from .deduplication import DuplicateResourceError, github_project_content_fingerprint
 from .github_project import (
@@ -27,9 +28,167 @@ from .task_queue import (
     GITHUB_PROJECT_ANALYSIS_TASK_TYPE,
     RAG_INDEX_TASK_TYPE,
     RESUME_OCR_TASK_TYPE,
+    TOOL_AUDIT_RETENTION_TASK_NAME,
+)
+from .tool_audit import (
+    background_task_tool_name,
+    build_tool_trace_record,
+    tool_audit_retention_cutoff,
+    tool_step_label,
 )
 
 SYSTEM_PROBE_TASK_TYPE = "system_probe"
+
+
+def _background_task_root_request_id(record: BackgroundTaskRecord) -> str:
+    """读取任务链路 ID；缺失时用 task_key 保证后台任务仍可审计。"""
+
+    root_request_id = record.payload.get("root_request_id")
+    if isinstance(root_request_id, str) and root_request_id.strip():
+        return root_request_id.strip()[:128]
+    return record.task_key
+
+
+def _record_background_task_trace(
+    backend: JobHuntingApp,
+    record: BackgroundTaskRecord,
+    *,
+    step_status: str,
+    trace_status: str,
+    attempt_status: str,
+    summary: str | None,
+    result: dict[str, object] | None = None,
+    finish_attempt: bool = False,
+) -> None:
+    """把后台任务执行状态合并进工具调用审计轨迹。"""
+
+    root_request_id = _background_task_root_request_id(record)
+    now = iso_utc()
+    try:
+        existing = backend.store.get_tool_call_trace(root_request_id)
+        trace = dict(existing.trace)
+        steps = trace.setdefault("steps", [])
+        if not isinstance(steps, list):
+            steps = []
+            trace["steps"] = steps
+        created_at = existing.created_at
+        started_at = existing.started_at or record.started_at or now
+        source = existing.source
+    except KeyError:
+        trace = {
+            "version": 1,
+            "root_request_id": root_request_id,
+            "title": tool_step_label(background_task_tool_name(record.task_type)),
+            "status": "running",
+            "source": "background_task",
+            "duration_ms": None,
+            "created_at": record.created_at or now,
+            "started_at": record.started_at or now,
+            "finished_at": None,
+            "updated_at": now,
+            "steps": [],
+            "approval": None,
+        }
+        steps = trace["steps"]
+        created_at = str(trace["created_at"])
+        started_at = str(trace["started_at"])
+        source = "background_task"
+
+    assert isinstance(steps, list)
+    tool_name = background_task_tool_name(record.task_type)
+    step = next(
+        (
+            item
+            for item in steps
+            if isinstance(item, dict) and item.get("background_task_key") == record.task_key
+        ),
+        None,
+    )
+    if step is None:
+        step = {
+            "id": f"step-{len(steps) + 1}",
+            "name": tool_name,
+            "label": tool_step_label(tool_name),
+            "status": "running",
+            "summary": None,
+            "result": None,
+            "started_at": record.started_at or now,
+            "finished_at": None,
+            "background_task_key": record.task_key,
+            "attempts": [],
+        }
+        steps.append(step)
+    step["name"] = str(step.get("name") or tool_name)
+    step["label"] = str(step.get("label") or tool_step_label(step["name"]))
+    step["background_task_key"] = record.task_key
+    step["status"] = step_status
+    step["summary"] = summary
+    step["result"] = result or {
+        "ok": step_status not in {"failed", "cancelled"},
+        "task_key": record.task_key,
+        "task_type": record.task_type,
+        "status": record.status,
+        "progress": record.progress,
+        "error_summary": record.error_summary,
+    }
+    if step_status in {"completed", "failed", "cancelled"}:
+        step["finished_at"] = record.finished_at or now
+
+    attempts = step.setdefault("attempts", [])
+    if not isinstance(attempts, list):
+        attempts = []
+        step["attempts"] = attempts
+    attempt_number = max(1, int(record.attempt or 1))
+    attempt = next(
+        (
+            item
+            for item in attempts
+            if isinstance(item, dict)
+            and int(item.get("attempt") or 0) == attempt_number
+            and item.get("phase") == "background_task"
+        ),
+        None,
+    )
+    if attempt is None:
+        attempt = {
+            "attempt": attempt_number,
+            "phase": "background_task",
+            "started_at": record.started_at or now,
+            "finished_at": None,
+        }
+        attempts.append(attempt)
+    attempt["status"] = attempt_status
+    attempt["summary"] = summary
+    attempt["result"] = step["result"]
+    if finish_attempt or attempt_status in {"completed", "failed", "cancelled"}:
+        attempt["finished_at"] = record.finished_at or now
+
+    trace["root_request_id"] = root_request_id
+    trace["source"] = source
+    trace["created_at"] = created_at
+    trace["started_at"] = started_at
+    trace["status"] = trace_status
+    trace["updated_at"] = now
+    if trace_status in {"completed", "failed", "cancelled"}:
+        trace["finished_at"] = record.finished_at or now
+    elif trace.get("finished_at") and trace_status == "running":
+        trace["finished_at"] = None
+    backend.store.record_tool_call_trace(
+        build_tool_trace_record(
+            trace,
+            account_id=record.account_id,
+            candidate_id=record.candidate_id,
+            session_id=record.session_id,
+            source=source,
+        )
+    )
+
+
+def purge_old_tool_call_traces(backend: JobHuntingApp) -> int:
+    """删除保留窗口之前的工具调用审计记录。"""
+
+    cutoff = tool_audit_retention_cutoff()
+    return backend.store.delete_tool_call_traces_before(cutoff)
 
 
 class NonRetryableTaskError(RuntimeError):
@@ -144,6 +303,22 @@ def run_registered_task(
             "result": current_task.result,
         }
 
+    _record_background_task_trace(
+        backend,
+        record,
+        step_status="running",
+        trace_status="running",
+        attempt_status="running",
+        summary="后台任务已开始执行",
+        result={
+            "ok": True,
+            "task_key": record.task_key,
+            "task_type": record.task_type,
+            "status": record.status,
+            "progress": record.progress,
+        },
+    )
+
     if record.task_type == RESUME_OCR_TASK_TYPE:
         artifact_id, root_request_id = _resume_ocr_task_payload(record)
         if record.candidate_id is None:
@@ -183,6 +358,24 @@ def run_registered_task(
                 "long_text_id": artifact.long_text_id,
                 "rag_task_key": rag_task.task_key,
             },
+        )
+        _record_background_task_trace(
+            backend,
+            completed,
+            step_status="completed",
+            trace_status="running",
+            attempt_status="completed",
+            summary="OCR 已完成，RAG 索引任务已排队",
+            result={
+                "ok": True,
+                "task_key": completed.task_key,
+                "task_type": completed.task_type,
+                "status": completed.status,
+                "artifact_id": artifact.id,
+                "long_text_id": artifact.long_text_id,
+                "rag_task_key": rag_task.task_key,
+            },
+            finish_attempt=True,
         )
         return {
             "task_key": completed.task_key,
@@ -226,6 +419,24 @@ def run_registered_task(
                 "source_url": project_card.card.source_url,
             },
         )
+        _record_background_task_trace(
+            backend,
+            completed,
+            step_status="completed",
+            trace_status="completed",
+            attempt_status="completed",
+            summary=f"已生成项目经历卡片：{project_card.card.project_name}",
+            result={
+                "ok": True,
+                "task_key": completed.task_key,
+                "task_type": completed.task_type,
+                "status": completed.status,
+                "project_card_id": project_card.id,
+                "project_name": project_card.card.project_name,
+                "source_url": project_card.card.source_url,
+            },
+            finish_attempt=True,
+        )
         return {
             "task_key": completed.task_key,
             "status": completed.status,
@@ -251,6 +462,23 @@ def run_registered_task(
                 "index_stats": asdict(stats),
             },
         )
+        _record_background_task_trace(
+            backend,
+            completed,
+            step_status="completed",
+            trace_status="completed",
+            attempt_status="completed",
+            summary=f"已更新 {stats.chunk_count} 个检索切片",
+            result={
+                "ok": True,
+                "task_key": completed.task_key,
+                "task_type": completed.task_type,
+                "status": completed.status,
+                "long_text_ids": long_text_ids,
+                "index_stats": asdict(stats),
+            },
+            finish_attempt=True,
+        )
         return {
             "task_key": completed.task_key,
             "status": completed.status,
@@ -266,6 +494,22 @@ def run_registered_task(
         task_key,
         {"worker": "ready", "task_type": SYSTEM_PROBE_TASK_TYPE},
     )
+    _record_background_task_trace(
+        backend,
+        completed,
+        step_status="completed",
+        trace_status="completed",
+        attempt_status="completed",
+        summary="Worker 探针已完成",
+        result={
+            "ok": True,
+            "task_key": completed.task_key,
+            "task_type": completed.task_type,
+            "status": completed.status,
+            "worker": "ready",
+        },
+        finish_attempt=True,
+    )
     return {
         "task_key": completed.task_key,
         "status": completed.status,
@@ -275,6 +519,22 @@ def run_registered_task(
 
 def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_ENV_PATH) -> Any:
     """向一个 Celery 应用注册任务处理函数。"""
+
+    @celery_app.task(
+        bind=True,
+        name=TOOL_AUDIT_RETENTION_TASK_NAME,
+        ignore_result=True,
+    )
+    def purge_tool_call_traces(self: Any) -> dict[str, object]:
+        """按上海自然日清理过期工具调用审计记录。"""
+
+        backend = JobHuntingApp(env_path=env_path)
+        try:
+            backend.initialize()
+            deleted_count = purge_old_tool_call_traces(backend)
+            return {"status": "succeeded", "deleted_count": deleted_count}
+        finally:
+            backend.store.close()
 
     @celery_app.task(
         bind=True,
@@ -303,6 +563,24 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
             # 不把异常正文写入任务表，避免供应商或用户输入意外进入运维数据。
             try:
                 _mark_resume_ocr_artifact_failed(backend, task_key)
+                failed_record = backend.store.get_background_task(task_key)
+                _record_background_task_trace(
+                    backend,
+                    failed_record,
+                    step_status="failed",
+                    trace_status="failed",
+                    attempt_status="failed",
+                    summary=str(error),
+                    result={
+                        "ok": False,
+                        "task_key": task_key,
+                        "task_type": failed_record.task_type,
+                        "status": "failed",
+                        "error": type(error).__name__,
+                        "error_summary": str(error),
+                    },
+                    finish_attempt=True,
+                )
                 backend.store.fail_background_task(
                     task_key,
                     f"不可重试任务：{type(error).__name__}",
@@ -320,11 +598,46 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
             else:
                 safe_summary = f"任务执行异常：{type(error).__name__}"
             if record.attempt < record.max_attempts:
+                _record_background_task_trace(
+                    backend,
+                    record,
+                    step_status="running",
+                    trace_status="running",
+                    attempt_status="failed",
+                    summary=safe_summary,
+                    result={
+                        "ok": False,
+                        "task_key": record.task_key,
+                        "task_type": record.task_type,
+                        "status": record.status,
+                        "error": type(error).__name__,
+                        "error_summary": safe_summary,
+                        "retrying": True,
+                    },
+                    finish_attempt=True,
+                )
                 backend.store.requeue_background_task(task_key, safe_summary)
                 # 退避时间随 Celery 重试次数增长，避免上游服务短暂故障时打满队列。
                 countdown = min(60, 2 ** max(0, int(getattr(self.request, "retries", 0))))
                 raise self.retry(exc=RuntimeError(safe_summary), countdown=countdown)
             _mark_resume_ocr_artifact_failed(backend, task_key)
+            _record_background_task_trace(
+                backend,
+                record,
+                step_status="failed",
+                trace_status="failed",
+                attempt_status="failed",
+                summary=safe_summary,
+                result={
+                    "ok": False,
+                    "task_key": record.task_key,
+                    "task_type": record.task_type,
+                    "status": "failed",
+                    "error": type(error).__name__,
+                    "error_summary": safe_summary,
+                },
+                finish_attempt=True,
+            )
             backend.store.fail_background_task(task_key, safe_summary)
             raise
         finally:

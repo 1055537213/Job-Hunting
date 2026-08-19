@@ -98,6 +98,7 @@ def test_upgrade_database_creates_versioned_postgresql_schema(temporary_database
         "resume_artifacts",
         "resume_drafts",
         "usage_events",
+        "tool_call_traces",
         "background_tasks",
     }.issubset(tables)
     assert version == latest_database_revision()
