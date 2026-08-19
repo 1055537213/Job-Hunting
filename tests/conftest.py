@@ -57,6 +57,7 @@ def postgres_test_schema() -> Iterator[str]:
     base_engine = sa.create_engine(base_url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
     previous_runtime_url = os.environ.get("JOB_AGENT_DATABASE_URL")
     previous_object_storage_backend = os.environ.get("JOB_AGENT_OBJECT_STORAGE_BACKEND")
+    previous_csrf_enabled = os.environ.get("JOB_AGENT_CSRF_ENABLED")
     try:
         try:
             with base_engine.begin() as connection:
@@ -72,6 +73,8 @@ def postgres_test_schema() -> Iterator[str]:
         os.environ["JOB_AGENT_DATABASE_URL"] = database_url
         # 测试使用显式临时目录或内存替身，不要求 CI 额外启动 MinIO。
         os.environ["JOB_AGENT_OBJECT_STORAGE_BACKEND"] = "local"
+        # 业务测试不逐条携带浏览器 CSRF header；CSRF 行为由专门 Web 安全测试覆盖。
+        os.environ["JOB_AGENT_CSRF_ENABLED"] = "false"
         upgrade_database(database_url)
         yield database_url
     finally:
@@ -83,6 +86,10 @@ def postgres_test_schema() -> Iterator[str]:
             os.environ.pop("JOB_AGENT_OBJECT_STORAGE_BACKEND", None)
         else:
             os.environ["JOB_AGENT_OBJECT_STORAGE_BACKEND"] = previous_object_storage_backend
+        if previous_csrf_enabled is None:
+            os.environ.pop("JOB_AGENT_CSRF_ENABLED", None)
+        else:
+            os.environ["JOB_AGENT_CSRF_ENABLED"] = previous_csrf_enabled
         with base_engine.begin() as connection:
             connection.execute(sa.text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         base_engine.dispose()

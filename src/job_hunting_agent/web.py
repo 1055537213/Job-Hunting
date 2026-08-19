@@ -60,12 +60,14 @@ from .config import (
     load_object_storage_settings,
     load_rerank_settings,
     load_task_queue_settings,
+    load_web_security_settings,
     masked_agent_memory_settings,
     masked_embedding_settings,
     masked_llm_settings,
     masked_object_storage_settings,
     masked_rerank_settings,
     masked_task_queue_settings,
+    masked_web_security_settings,
     require_postgresql_database_url,
 )
 from .deduplication import DuplicateResourceError
@@ -97,6 +99,13 @@ from .tool_audit import (
     tool_step_label as task_step_label,
     tool_step_label,
     tool_trace_title,
+)
+from .web_hardening import (
+    CSRF_COOKIE_NAME,
+    delete_csrf_cookie,
+    install_web_hardening,
+    new_csrf_token,
+    set_csrf_cookie,
 )
 
 STATIC_DIR = Path(__file__).with_name("web_static")
@@ -277,6 +286,7 @@ def create_web_app(
     env_path = Path(env_file)
     bootstrap_initial_admin(backend, env_path)
     cookie_secure = load_cookie_secure(env_path)
+    web_security_settings = load_web_security_settings(env_path)
 
     agent_error: str | None = None
     if chat_agent is None:
@@ -287,6 +297,11 @@ def create_web_app(
             agent_error = str(error)
 
     web_app = FastAPI(title="Job Hunting Agent Web", version="0.1.0")
+    install_web_hardening(
+        web_app,
+        settings=web_security_settings,
+        session_cookie_name=SESSION_COOKIE_NAME,
+    )
     web_app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")
     # 截图本体不持久化，无法安全地只向 Worker 投递 task_key；因此它是一个有界的
     # 前台导入例外。实际模型调用在工作线程执行，避免阻塞 FastAPI 事件循环，同时最多
@@ -385,15 +400,25 @@ def create_web_app(
             samesite="lax",
             path="/",
         )
+        csrf_token = new_csrf_token()
+        set_csrf_cookie(response, csrf_token, secure=cookie_secure)
         backend.store.touch_account_login(account.id)
-        return {"account": asdict(account)}
+        return {"account": asdict(account), "csrf_token": csrf_token}
 
     @web_app.get("/api/auth/me")
-    def auth_me(request: Request) -> dict[str, object]:
+    def auth_me(request: Request, response: Response) -> dict[str, object]:
         """返回当前登录账号；未登录用于前端显示登录页。"""
 
         account = current_account(request, required=False)
-        return {"authenticated": account is not None, "account": asdict(account) if account else None}
+        csrf_token = None
+        if account is not None:
+            csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or new_csrf_token()
+            set_csrf_cookie(response, csrf_token, secure=cookie_secure)
+        return {
+            "authenticated": account is not None,
+            "account": asdict(account) if account else None,
+            "csrf_token": csrf_token,
+        }
 
     @web_app.post("/api/auth/logout")
     def logout(request: Request, response: Response) -> dict[str, bool]:
@@ -405,6 +430,7 @@ def create_web_app(
             if session is not None:
                 backend.store.revoke_auth_session(session.id)
         response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+        delete_csrf_cookie(response)
         return {"ok": True}
 
     @web_app.post("/api/auth/logout-all")
@@ -415,6 +441,7 @@ def create_web_app(
         assert account is not None
         count = backend.store.revoke_all_auth_sessions(account.id)
         response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+        delete_csrf_cookie(response)
         return {"ok": True, "revoked_sessions": count}
 
     @web_app.get("/")
@@ -463,6 +490,10 @@ def create_web_app(
             task_queue_config["configured"] = bool(task_queue_config.get("enabled"))
         except ValueError as error:
             task_queue_config = {"configured": False, "error": str(error)}
+        try:
+            web_security_config = masked_web_security_settings(load_web_security_settings(env_path))
+        except ValueError as error:
+            web_security_config = {"configured": False, "error": str(error)}
         if account is None or account.role != "admin":
             return {
                 "status": "ok",
@@ -472,6 +503,13 @@ def create_web_app(
                 "rerank": {"configured": bool(rerank_config.get("configured"))},
                 "memory": {"configured": bool(memory_config.get("enabled"))},
                 "task_queue": {"configured": bool(task_queue_config.get("configured"))},
+                "web_security": {
+                    "configured": not bool(web_security_config.get("error")),
+                    "security_headers_enabled": bool(
+                        web_security_config.get("security_headers_enabled")
+                    ),
+                    "rate_limit_enabled": bool(web_security_config.get("rate_limit_enabled")),
+                },
             }
         return {
             "status": "ok",
@@ -484,6 +522,7 @@ def create_web_app(
             "rerank": rerank_config,
             "memory": memory_config,
             "task_queue": task_queue_config,
+            "web_security": web_security_config,
             "agent": {
                 "configured": chat_agent is not None,
                 "error": agent_error,

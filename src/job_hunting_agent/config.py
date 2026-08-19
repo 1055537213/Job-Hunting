@@ -120,6 +120,19 @@ class TaskQueueSettings:
 
 
 @dataclass(frozen=True)
+class WebSecuritySettings:
+    """Web 边缘安全和基础观测配置。"""
+
+    environment: str = "development"
+    csrf_enabled: bool = True
+    security_headers_enabled: bool = True
+    rate_limit_enabled: bool = True
+    rate_limit_window_seconds: int = 60
+    rate_limit_default_requests: int = 240
+    rate_limit_auth_requests: int = 20
+
+
+@dataclass(frozen=True)
 class BootstrapAdminSettings:
     """首次启动时创建管理员账号的一次性配置。
 
@@ -607,6 +620,64 @@ def masked_task_queue_settings(settings: TaskQueueSettings) -> dict[str, object]
         "queue_name": settings.queue_name,
         "task_time_limit_seconds": settings.task_time_limit_seconds,
         "task_soft_time_limit_seconds": settings.task_soft_time_limit_seconds,
+    }
+
+
+def load_web_security_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> WebSecuritySettings:
+    """读取 Web 安全、限流和请求观测配置。"""
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(*keys: str, default: str | None = None) -> str | None:
+        for key in keys:
+            if environment.get(key):
+                return environment[key]
+            if file_values.get(key):
+                return file_values[key]
+        return default
+
+    runtime_environment = (get("JOB_AGENT_ENVIRONMENT", default="development") or "development").lower()
+    if runtime_environment not in {"development", "test", "production"}:
+        raise ValueError(
+            "JOB_AGENT_ENVIRONMENT 只能是 development、test 或 production"
+        )
+    return WebSecuritySettings(
+        environment=runtime_environment,
+        csrf_enabled=parse_bool(get("JOB_AGENT_CSRF_ENABLED", default="true")),
+        security_headers_enabled=parse_bool(
+            get("JOB_AGENT_SECURITY_HEADERS_ENABLED", default="true")
+        ),
+        rate_limit_enabled=parse_bool(get("JOB_AGENT_RATE_LIMIT_ENABLED", default="true")),
+        rate_limit_window_seconds=parse_positive_int(
+            get("JOB_AGENT_RATE_LIMIT_WINDOW_SECONDS", default="60"),
+            "JOB_AGENT_RATE_LIMIT_WINDOW_SECONDS",
+        ),
+        rate_limit_default_requests=parse_positive_int(
+            get("JOB_AGENT_RATE_LIMIT_DEFAULT_REQUESTS", default="240"),
+            "JOB_AGENT_RATE_LIMIT_DEFAULT_REQUESTS",
+        ),
+        rate_limit_auth_requests=parse_positive_int(
+            get("JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS", default="20"),
+            "JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS",
+        ),
+    )
+
+
+def masked_web_security_settings(settings: WebSecuritySettings) -> dict[str, object]:
+    """返回适合管理员健康检查展示的 Web 安全配置。"""
+
+    return {
+        "environment": settings.environment,
+        "csrf_enabled": settings.csrf_enabled,
+        "security_headers_enabled": settings.security_headers_enabled,
+        "rate_limit_enabled": settings.rate_limit_enabled,
+        "rate_limit_window_seconds": settings.rate_limit_window_seconds,
+        "rate_limit_default_requests": settings.rate_limit_default_requests,
+        "rate_limit_auth_requests": settings.rate_limit_auth_requests,
     }
 
 

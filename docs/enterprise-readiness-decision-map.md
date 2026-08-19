@@ -166,6 +166,14 @@ RAG 增量 Embedding 迁移：Web 先保存文件和 `long_texts`，再登记 `r
 - 建立请求指标、任务指标、模型调用指标、Token 成本指标和告警。
 - 为管理员操作、账号禁用、文件访问和计费调整建立追加式审计日志。
 
+实施状态：第 4.1 步已完成 Web 边缘硬化切片。FastAPI 统一安装请求硬化中间件，
+为每个 HTTP 响应写入 `X-Request-ID`，输出不含请求正文的 JSON 访问日志，并附加
+`Content-Security-Policy`、`X-Frame-Options`、`X-Content-Type-Options`、
+`Referrer-Policy` 和 `Permissions-Policy`。已登录浏览器的 POST/PUT/DELETE
+请求启用双提交 CSRF token，前端统一从 `job_agent_csrf` cookie 写入 `X-CSRF-Token`；
+登录和普通请求也接入基础进程内限流。后续仍需补齐反向代理层限流、集中日志采集、指标、
+告警、恶意文件扫描和管理员审计日志。
+
 完成门槛：可以从 request ID 追踪一次请求到任务、模型调用和用量流水；安全扫描无高危项。
 
 ### 阶段 5：计费与额度

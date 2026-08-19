@@ -1529,7 +1529,11 @@ if (!window.Vue) {
         try {
           const response = await fetch("/api/chat/stream", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            credentials: "same-origin",
+            headers: {
+              "Content-Type": "application/json",
+              ...(this.csrfHeaders ? this.csrfHeaders("POST") : {}),
+            },
             body: JSON.stringify(payload),
             signal: controller.signal,
           });
@@ -3206,13 +3210,37 @@ if (!window.Vue) {
           .replaceAll("'", "&#039;");
       },
 
+      /** 读取 CSRF cookie，用于浏览器同源状态变更请求。 */
+      csrfToken() {
+        const match = document.cookie
+          .split(";")
+          .map((item) => item.trim())
+          .find((item) => item.startsWith("job_agent_csrf="));
+        if (!match) {
+          return "";
+        }
+        return decodeURIComponent(match.slice("job_agent_csrf=".length));
+      },
+
+      /** 只给状态变更请求附加 CSRF header。 */
+      csrfHeaders(method = "GET") {
+        const normalizedMethod = String(method || "GET").toUpperCase();
+        if (["GET", "HEAD", "OPTIONS", "TRACE"].includes(normalizedMethod)) {
+          return {};
+        }
+        const token = this.csrfToken();
+        return token ? { "X-CSRF-Token": token } : {};
+      },
+
       /** 统一请求 JSON API，并把后端 detail 转成前端异常。 */
       async requestJson(url, options = {}) {
+        const method = options.method || "GET";
         const response = await fetch(url, {
           ...options,
           credentials: "same-origin",
           headers: {
             "Content-Type": "application/json",
+            ...(this.csrfHeaders ? this.csrfHeaders(method) : {}),
             ...(options.headers || {}),
           },
         });
@@ -3230,6 +3258,7 @@ if (!window.Vue) {
         const response = await fetch(url, {
           method: "POST",
           credentials: "same-origin",
+          headers: this.csrfHeaders ? this.csrfHeaders("POST") : {},
           body: formData,
         });
         const data = await response.json().catch(() => ({}));

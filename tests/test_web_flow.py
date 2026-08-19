@@ -5,6 +5,8 @@
 边界不变。
 """
 
+import json
+import logging
 import re
 
 from fastapi.testclient import TestClient
@@ -96,6 +98,93 @@ def test_secure_cookie_setting_is_loaded_from_project_env(tmp_path, monkeypatch)
     assert registered.status_code == 200
     assert response.status_code == 200
     assert "; secure" in response.headers["set-cookie"].lower()
+
+
+def test_web_hardening_adds_request_id_security_headers_and_access_log(caplog) -> None:
+    """所有 Web 响应都应带请求 ID、安全响应头，并输出不含正文的结构化访问日志。"""
+
+    caplog.set_level(logging.INFO, logger="job_hunting_agent.web.access")
+    client = TestClient(create_web_app())
+
+    response = client.get("/", headers={"X-Request-ID": "request-test-123"})
+
+    assert response.status_code == 200
+    assert response.headers["x-request-id"] == "request-test-123"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["referrer-policy"] == "same-origin"
+    assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+    records = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "job_hunting_agent.web.access"
+    ]
+    assert {
+        "event": "http_request",
+        "request_id": "request-test-123",
+        "method": "GET",
+        "path": "/",
+        "status_code": 200,
+    }.items() <= records[-1].items()
+    assert "body" not in records[-1]
+
+
+def test_csrf_header_is_required_for_authenticated_mutations(monkeypatch) -> None:
+    """启用 CSRF 后，已登录浏览器的状态变更请求必须带双提交 token。"""
+
+    monkeypatch.setenv("JOB_AGENT_CSRF_ENABLED", "true")
+    client = TestClient(create_web_app())
+    assert client.post(
+        "/api/auth/register",
+        json={"email": "csrf@example.com", "password": "password-123"},
+    ).status_code == 200
+    login = client.post(
+        "/api/auth/login",
+        json={"email": "csrf@example.com", "password": "password-123"},
+    )
+    assert login.status_code == 200
+    csrf_token = login.json()["csrf_token"]
+
+    blocked = client.post(
+        "/api/profiles",
+        json={"name": "CSRF 测试候选人"},
+    )
+    allowed = client.post(
+        "/api/profiles",
+        headers={"X-CSRF-Token": csrf_token},
+        json={"name": "CSRF 测试候选人"},
+    )
+
+    assert blocked.status_code == 403
+    assert "CSRF" in blocked.json()["detail"]
+    assert allowed.status_code == 200
+
+
+def test_auth_rate_limit_rejects_excessive_login_attempts(monkeypatch) -> None:
+    """认证入口应有独立低阈值限流，避免暴力尝试密码。"""
+
+    monkeypatch.setenv("JOB_AGENT_RATE_LIMIT_ENABLED", "true")
+    monkeypatch.setenv("JOB_AGENT_RATE_LIMIT_WINDOW_SECONDS", "60")
+    monkeypatch.setenv("JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS", "2")
+    client = TestClient(create_web_app())
+
+    first = client.post(
+        "/api/auth/login",
+        json={"email": "nobody@example.com", "password": "bad-password"},
+    )
+    second = client.post(
+        "/api/auth/login",
+        json={"email": "nobody@example.com", "password": "bad-password"},
+    )
+    third = client.post(
+        "/api/auth/login",
+        json={"email": "nobody@example.com", "password": "bad-password"},
+    )
+
+    assert first.status_code == 401
+    assert second.status_code == 401
+    assert third.status_code == 429
+    assert int(third.headers["retry-after"]) > 0
 
 
 def test_web_bootstraps_initial_admin_once_from_env(tmp_path) -> None:

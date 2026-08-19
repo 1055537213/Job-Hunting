@@ -135,6 +135,7 @@ Job-hunting Agent/
 ### 项目入口和配置
 
 - `src/job_hunting_agent/web.py`：网页主入口，提供注册登录、候选人档案、会话、职位、匹配、项目、简历、RAG、后台任务和管理员 API。
+- `src/job_hunting_agent/web_hardening.py`：Web 边缘安全和基础观测中间件，统一处理请求 ID、安全响应头、CSRF、限流和访问日志。
 - `src/job_hunting_agent/worker.py`：独立 Worker 入口，注册 Celery 任务并消费 Redis 队列。
 - `src/job_hunting_agent/config.py`：读取 `.env`，校验数据库、对象存储、队列、模型、Embedding、Rerank、记忆和 Session 配置。
 - `compose.yaml`：启动 PostgreSQL、MinIO、Redis、Alembic 迁移、Web 和 Worker。首次运行前需要将 `.env.example` 复制为 `.env`，替换占位凭据和模型配置，然后执行 `docker compose up -d --build`。
