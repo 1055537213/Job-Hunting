@@ -469,6 +469,43 @@ sa.Index("idx_tool_call_traces_account_update", tool_call_traces.c.account_id, t
 sa.Index("idx_tool_call_traces_request", tool_call_traces.c.root_request_id)
 
 
+# 管理员审计日志是追加式流水，只保存动作、资源 ID 和低敏摘要，不保存正文或密钥。
+admin_audit_events = sa.Table(
+    "admin_audit_events",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column(
+        "actor_account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="SET NULL"),
+    ),
+    sa.Column(
+        "target_account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="SET NULL"),
+    ),
+    sa.Column("action", sa.String(96), nullable=False),
+    sa.Column("target_type", sa.String(64), nullable=False),
+    sa.Column("target_id", sa.String(160)),
+    sa.Column("outcome", sa.String(32), nullable=False, server_default=sa.text("'succeeded'")),
+    sa.Column("summary", sa.Text, nullable=False),
+    sa.Column("details_json", json_type, nullable=False, server_default=sa.text("'{}'")),
+    sa.Column("request_id", sa.String(128)),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.CheckConstraint(
+        "outcome IN ('succeeded', 'blocked', 'failed')",
+        name="admin_audit_events_outcome",
+    ),
+)
+sa.Index(
+    "idx_admin_audit_events_actor_time",
+    admin_audit_events.c.actor_account_id,
+    admin_audit_events.c.created_at.desc(),
+)
+sa.Index("idx_admin_audit_events_action_time", admin_audit_events.c.action, admin_audit_events.c.created_at.desc())
+sa.Index("idx_admin_audit_events_created", admin_audit_events.c.created_at.desc())
+
+
 # 后台任务的状态以 PostgreSQL 为准；Redis/Celery 只传递 task_key，不保存业务事实。
 background_tasks = sa.Table(
     "background_tasks",

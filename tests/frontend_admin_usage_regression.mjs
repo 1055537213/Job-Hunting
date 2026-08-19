@@ -40,13 +40,27 @@ assert.match(template, /@click\.stop="toggleAccountStatus\(account\)"/);
 assert.match(template, /v-for="event in admin\.events"/);
 assert.doesNotMatch(template, /<th>账号<\/th>/);
 assert.match(template, /选择一个账号/);
-assert.match(template, /styles\.css\?v=20260819-tool-audit-v2/);
-assert.match(template, /app\.js\?v=20260819-tool-audit-v2/);
+assert.match(template, /styles\.css\?v=20260820-admin-audit-v1/);
+assert.match(template, /app\.js\?v=20260820-admin-audit-v1/);
 assert.match(template, /工具调用/);
 assert.match(template, /HTTP 请求/);
 assert.match(template, /错误请求/);
 assert.match(template, /平均耗时/);
 assert.match(template, /安全拦截/);
+assert.match(template, /class="panel admin-panel admin-observability"/);
+assert.match(template, /请求观测/);
+assert.match(template, /class="admin-observability-summary"/);
+assert.match(template, /class="admin-observability-grid"/);
+assert.match(template, /class="admin-observability-errors"/);
+assert.match(template, /adminRequestStatusRows/);
+assert.match(template, /adminRequestMethodRows/);
+assert.match(template, /adminRequestEndpointRows/);
+assert.match(template, /adminRecentRequestErrors/);
+assert.match(template, /class="panel admin-panel admin-audit-panel"/);
+assert.match(template, /管理员审计/);
+assert.match(template, /v-for="event in adminAuditEvents"/);
+assert.match(template, /adminAuditActionLabel\(event\.action\)/);
+assert.match(template, /adminAuditTargetLabel\(event\)/);
 assert.match(template, /class="admin-tool-workspace"/);
 assert.match(template, /class="admin-tool-list"/);
 assert.match(template, /class="admin-tool-detail"/);
@@ -58,14 +72,26 @@ assert.doesNotMatch(template, /selectedAdminToolTrace\.trace\?\.steps/);
 assert.match(source, /selectedAccountId:\s*0/);
 assert.match(source, /loadingEvents:\s*false/);
 assert.match(source, /toolTraces:\s*\[\]/);
+assert.match(source, /auditEvents:\s*\[\]/);
 assert.match(source, /requestMetrics:\s*\{\}/);
 assert.match(source, /selectedToolTraceId:\s*""/);
 assert.match(source, /selectAdminAccount\(accountId\)/);
 assert.match(source, /loadAdminUsageEvents\(accountId = this\.admin\.selectedAccountId\)/);
 assert.match(source, /loadAdminToolTraces\(accountId = this\.admin\.selectedAccountId, offset = 0\)/);
 assert.match(source, /selectAdminToolTrace\(rootRequestId\)/);
+assert.match(source, /adminRequestStatusRows\(\)/);
+assert.match(source, /adminRequestMethodRows\(\)/);
+assert.match(source, /adminRequestEndpointRows\(\)/);
+assert.match(source, /adminRecentRequestErrors\(\)/);
+assert.match(source, /adminAuditEvents\(\)/);
+assert.match(source, /loadAdminAuditEvents\(\)/);
+assert.match(source, /adminAccountLabel\(accountId\)/);
+assert.match(source, /adminAuditTargetLabel\(event\)/);
+assert.match(source, /adminAuditActionLabel\(action\)/);
+assert.match(source, /sortedMetricRows\(source, limit = Infinity\)/);
 assert.match(source, /\/api\/admin\/usage\/events\?account_id=\$\{encodeURIComponent\(selectedAccountId\)\}&limit=200/);
 assert.match(source, /\/api\/admin\/observability\/requests/);
+assert.match(source, /\/api\/admin\/audit\/events\?limit=30/);
 assert.match(source, /\/api\/admin\/tools\/traces\?account_id=\$\{encodeURIComponent\(selectedAccountId\)\}&limit=50&offset=\$\{encodeURIComponent\(offset\)\}/);
 assert.match(source, /\/api\/admin\/tools\/traces\/\$\{encodeURIComponent\(traceId\)\}/);
 assert.match(source, /usageRequestVersion/);
@@ -83,6 +109,16 @@ assert.match(styles, /\.admin-account-directory\s*\{[\s\S]*?border-inline-end:\s
 assert.match(styles, /\.admin-account-select\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\) auto var\(--space-lg\);/);
 assert.match(styles, /\.admin-account-usage\s*\{[\s\S]*?min-block-size:\s*17rem;/);
 assert.match(styles, /\.admin-account-usage\s*\{[\s\S]*?grid-template-rows:\s*auto auto minmax\(0, 1fr\);/);
+assert.match(styles, /\.admin-observability\s*\{[\s\S]*?display:\s*grid;/);
+assert.match(styles, /\.admin-observability-summary\s*\{[\s\S]*?grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\);/);
+assert.match(styles, /\.admin-observability-grid\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\) minmax\(0, 1\.08fr\);/);
+assert.match(styles, /\.admin-observability-section,[\s\S]*?border:\s*1px solid var\(--auth-rule\);/);
+assert.match(styles, /\.admin-observability-table-wrap\s*\{[\s\S]*?max-block-size:\s*min\(19rem, 36svh\);/);
+assert.match(styles, /\.admin-observability-error-list\s*\{[\s\S]*?display:\s*grid;/);
+assert.match(styles, /\.admin-audit-panel\s*\{[\s\S]*?display:\s*grid;/);
+assert.match(styles, /\.admin-audit-list\s*\{[\s\S]*?max-block-size:\s*min\(34rem, 56svh\);/);
+assert.match(styles, /\.admin-audit-event\s*\{[\s\S]*?border:\s*1px solid var\(--auth-rule\);/);
+assert.match(styles, /\.admin-audit-event-meta\s*\{[\s\S]*?grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\);/);
 assert.match(styles, /\.admin-detail-tabs\s*\{[\s\S]*?width:\s*100%;[\s\S]*?display:\s*grid;[\s\S]*?grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);[\s\S]*?align-items:\s*start;/);
 assert.match(styles, /\.tab-button\s*\{[\s\S]*?min-height:\s*calc\(var\(--size-control\) - var\(--space-sm\)\);[\s\S]*?width:\s*100%;[\s\S]*?padding:\s*var\(--space-3xs\) var\(--space-sm\);[\s\S]*?text-align:\s*center;/);
 assert.match(styles, /\.tab-button\[aria-selected="true"\]\s*\{[\s\S]*?border-color:\s*var\(--auth-rule-strong\);/);
@@ -93,6 +129,10 @@ assert.match(styles, /\.admin-table th\s*\{[\s\S]*?position:\s*sticky;[\s\S]*?in
 const loadAdminData = extractMethod(
   "async loadAdminData() {",
   "async function loadAdminData() {",
+);
+const loadAdminAuditEvents = extractMethod(
+  "async loadAdminAuditEvents() {",
+  "async function loadAdminAuditEvents() {",
 );
 const selectAdminAccount = extractMethod(
   "async selectAdminAccount(accountId) {",
@@ -126,6 +166,24 @@ const setAdminDetailTab = extractMethod(
   "async setAdminDetailTab(tab) {",
   "async function setAdminDetailTab(tab) {",
 );
+const sortedMetricRows = extractMethod(
+  "sortedMetricRows(source, limit = Infinity) {",
+  "function sortedMetricRows(source, limit = Infinity) {",
+);
+const adminAccountLabel = extractMethod(
+  "adminAccountLabel(accountId) {",
+  "function adminAccountLabel(accountId) {",
+);
+const adminAuditTargetLabel = extractMethod(
+  "adminAuditTargetLabel(event) {",
+  "function adminAuditTargetLabel(event) {",
+);
+const adminAuditActionLabel = extractMethod(
+  "adminAuditActionLabel(action) {",
+  "function adminAuditActionLabel(action) {",
+);
+
+globalThis.PINYIN_COLLATOR = new Intl.Collator("zh-CN-u-co-pinyin");
 
 const requestUrls = [];
 const selectionContext = {
@@ -148,6 +206,10 @@ const selectionContext = {
     toolTraceDetailError: "",
     toolTraceRequestVersion: 0,
     toolTraceDetailRequestVersion: 0,
+    auditEvents: [],
+    loadingAuditEvents: false,
+    auditLoadError: "",
+    auditRequestVersion: 0,
     toolTraceTotal: 0,
   },
   requestJson: async (url) => {
@@ -171,6 +233,7 @@ assert.equal(selectionContext.admin.selectedAccountId, 7);
 assert.deepEqual(requestUrls, ["/api/admin/usage/events?account_id=7&limit=200"]);
 
 const adminLoadUrls = [];
+let adminAuditLoaded = false;
 const adminLoadContext = {
   admin: {
     accounts: [],
@@ -188,10 +251,14 @@ const adminLoadContext = {
     toolTraceDetail: null,
     toolTracesError: "",
     toolTraceDetailError: "",
+    auditEvents: [],
+    loadingAuditEvents: false,
+    auditLoadError: "",
     loadError: "",
     usageRequestVersion: 0,
     toolTraceRequestVersion: 0,
     toolTraceDetailRequestVersion: 0,
+    auditRequestVersion: 0,
     toolTraceTotal: 0,
   },
   requestJson: async (url) => {
@@ -206,6 +273,10 @@ const adminLoadContext = {
     throw new Error(`unexpected URL ${url}`);
   },
   clearAdminUsageSelection,
+  loadAdminAuditEvents: async function () {
+    adminAuditLoaded = true;
+    this.admin.auditEvents = [{ id: 17, action: "account.status_updated" }];
+  },
   loadAdminActiveDetail,
   loadAdminUsageEvents: async () => {
     throw new Error("details should not load before an account is selected");
@@ -220,11 +291,51 @@ assert.deepEqual(adminLoadUrls.sort(), [
 ]);
 assert.equal(adminLoadContext.admin.selectedAccountId, 0);
 assert.deepEqual(adminLoadContext.admin.events, []);
+assert.equal(adminAuditLoaded, true);
+assert.deepEqual(adminLoadContext.admin.auditEvents, [{ id: 17, action: "account.status_updated" }]);
 assert.deepEqual(adminLoadContext.admin.requestMetrics, {
   total_requests: 12,
   error_requests: 1,
   average_duration_ms: 8.5,
 });
+
+const auditUrls = [];
+const auditContext = {
+  admin: {
+    auditEvents: [],
+    loadingAuditEvents: false,
+    auditLoadError: "",
+    auditRequestVersion: 0,
+  },
+  requestJson: async (url) => {
+    auditUrls.push(url);
+    return {
+      events: [
+        {
+          id: 1,
+          actor_account_id: 7,
+          target_account_id: 8,
+          action: "account.status_updated",
+          target_type: "account",
+          outcome: "succeeded",
+        },
+      ],
+    };
+  },
+};
+await loadAdminAuditEvents.call(auditContext);
+assert.deepEqual(auditUrls, ["/api/admin/audit/events?limit=30"]);
+assert.equal(auditContext.admin.loadingAuditEvents, false);
+assert.deepEqual(auditContext.admin.auditEvents, [
+  {
+    id: 1,
+    actor_account_id: 7,
+    target_account_id: 8,
+    action: "account.status_updated",
+    target_type: "account",
+    outcome: "succeeded",
+  },
+]);
 
 const toolUrls = [];
 const toolContext = {
@@ -282,5 +393,32 @@ assert.deepEqual(toolUrls, [
   "/api/admin/tools/traces?account_id=7&limit=50&offset=0",
   "/api/admin/tools/traces/root-1",
 ]);
+
+assert.deepEqual(
+  sortedMetricRows.call({}, { c: 0, b: 1, a: 3 }, 2),
+  [
+    { label: "a", count: 3 },
+    { label: "b", count: 1 },
+  ],
+);
+
+const labelContext = {
+  admin: {
+    accounts: [{ id: 7, email: "admin@example.com" }],
+  },
+  adminAccountLabel,
+};
+assert.equal(adminAccountLabel.call(labelContext, 7), "admin@example.com");
+assert.equal(adminAccountLabel.call(labelContext, 9), "账号 #9");
+assert.equal(
+  adminAuditTargetLabel.call(labelContext, { target_account_id: 7 }),
+  "admin@example.com",
+);
+assert.equal(
+  adminAuditTargetLabel.call(labelContext, { target_type: "background_task", target_id: "task-1" }),
+  "background_task #task-1",
+);
+assert.equal(adminAuditActionLabel.call({}, "account.status_updated"), "账号状态变更");
+assert.equal(adminAuditActionLabel.call({}, "unknown.action"), "unknown.action");
 
 console.log("frontend admin usage regression: PASS");

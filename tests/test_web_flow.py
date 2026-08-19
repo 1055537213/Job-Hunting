@@ -114,6 +114,7 @@ def test_web_hardening_adds_request_id_security_headers_and_access_log(caplog) -
     assert response.headers["x-frame-options"] == "DENY"
     assert response.headers["referrer-policy"] == "same-origin"
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+    assert "script-src 'self' 'unsafe-eval'" in response.headers["content-security-policy"]
     records = [
         json.loads(record.getMessage())
         for record in caplog.records
@@ -220,6 +221,66 @@ def test_admin_can_read_low_cardinality_request_metrics(tmp_path) -> None:
     assert "secret" not in str(metrics)
 
 
+def test_admin_account_status_change_is_visible_in_audit_log(tmp_path) -> None:
+    """管理员账号状态变更应写入低敏审计日志，并保留 request_id。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_BOOTSTRAP_ADMIN_EMAIL=audit-admin@example.com",
+                "JOB_AGENT_BOOTSTRAP_ADMIN_PASSWORD=strong-password-123",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    app = create_web_app(env_file=env_path)
+    admin_client = TestClient(app)
+    user_client = TestClient(app)
+    target = admin_client.post(
+        "/api/auth/register",
+        json={"email": "audit-target@example.com", "password": "password-123"},
+    ).json()["account"]
+    admin_login = admin_client.post(
+        "/api/auth/login",
+        json={"email": "audit-admin@example.com", "password": "strong-password-123"},
+    )
+    user_client.post(
+        "/api/auth/register",
+        json={"email": "audit-user@example.com", "password": "password-123"},
+    )
+    user_login = user_client.post(
+        "/api/auth/login",
+        json={"email": "audit-user@example.com", "password": "password-123"},
+    )
+
+    assert admin_login.status_code == 200
+    assert user_login.status_code == 200
+    blocked = user_client.get("/api/admin/audit/events")
+    response = admin_client.patch(
+        f"/api/admin/accounts/{target['id']}/status",
+        headers={"X-Request-ID": "audit-request-123"},
+        json={"status": "disabled"},
+    )
+    audit = admin_client.get("/api/admin/audit/events?limit=10")
+
+    assert blocked.status_code == 403
+    assert response.status_code == 200
+    assert audit.status_code == 200
+    event = audit.json()["events"][0]
+    assert event["action"] == "account.status_updated"
+    assert event["target_account_id"] == target["id"]
+    assert event["target_type"] == "account"
+    assert event["outcome"] == "succeeded"
+    assert event["request_id"] == "audit-request-123"
+    assert event["details"] == {
+        "previous_status": "active",
+        "next_status": "disabled",
+        "target_role": "user",
+    }
+    assert "audit-target@example.com" not in event["summary"]
+
+
 def test_web_bootstraps_initial_admin_once_from_env(tmp_path) -> None:
     """首次管理员只能由私有环境配置引导，公开注册接口不能提升普通用户。"""
 
@@ -276,8 +337,8 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert home.status_code == 200
     assert "Job Hunting Agent" in home.text
     assert "syncAuthPageClass" in script.text
-    assert '/static/app.js?v=20260819-tool-audit-v2' in home.text
-    assert '/static/styles.css?v=20260819-tool-audit-v2' in home.text
+    assert '/static/app.js?v=20260820-admin-audit-v1' in home.text
+    assert '/static/styles.css?v=20260820-admin-audit-v1' in home.text
     assert "本地运行 · 用户复制职位文本" not in home.text
     assert "Conversation Workspace" not in home.text
     assert "整理求职证据" not in home.text
@@ -396,8 +457,8 @@ def test_web_profile_form_uses_city_picker_and_auth_copy(tmp_path):
     assert "省份及直辖市" in home
     assert '<optgroup' not in home
     assert '/static/china_cities.js?v=20260803-cities' in home
-    assert '/static/styles.css?v=20260819-tool-audit-v2' in home
-    assert '/static/app.js?v=20260819-tool-audit-v2' in home
+    assert '/static/styles.css?v=20260820-admin-audit-v1' in home
+    assert '/static/app.js?v=20260820-admin-audit-v1' in home
     assert "cityGroups: buildSortedCityGroups()" in script
     assert "HOT_CITY_NAMES" in script
     assert "cityPickerOpen: false" in script

@@ -25,6 +25,7 @@ from .deduplication import (
 from .job_parser import classify_skill_requirements, parse_job_text, validate_job_text
 from .models import (
     AccountRecord,
+    AdminAuditEventRecord,
     AuthSessionRecord,
     BackgroundTaskRecord,
     CandidateProfile,
@@ -740,6 +741,74 @@ class RepositoryStore:
                 (cutoff_iso,),
             )
         return max(0, int(cursor.rowcount or 0))
+
+    def record_admin_audit_event(self, event: AdminAuditEventRecord) -> AdminAuditEventRecord:
+        """追加记录一次管理员动作，不保存正文、查询参数或密钥。"""
+
+        if event.actor_account_id is not None:
+            if event.actor_account_id <= 0:
+                raise ValueError("管理员审计事件的操作者账号无效。")
+            self.get_account(event.actor_account_id)
+        if event.target_account_id is not None:
+            if event.target_account_id <= 0:
+                raise ValueError("管理员审计事件的目标账号无效。")
+            self.get_account(event.target_account_id)
+        if event.outcome not in {"succeeded", "blocked", "failed"}:
+            raise ValueError(f"Unsupported admin audit outcome: {event.outcome}")
+        action = event.action.strip()[:96]
+        target_type = event.target_type.strip()[:64]
+        if not action:
+            raise ValueError("管理员审计事件缺少动作。")
+        if not target_type:
+            raise ValueError("管理员审计事件缺少目标类型。")
+        created_at = event.created_at or now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO admin_audit_events (
+                    actor_account_id, target_account_id, action, target_type,
+                    target_id, outcome, summary, details_json, request_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.actor_account_id,
+                    event.target_account_id,
+                    action,
+                    target_type,
+                    str(event.target_id)[:160] if event.target_id else None,
+                    event.outcome,
+                    trim_audit_text(event.summary) or "管理员操作已记录。",
+                    json.dumps(event.details or {}, ensure_ascii=False),
+                    str(event.request_id)[:128] if event.request_id else None,
+                    created_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM admin_audit_events WHERE id = ?",
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        if row is None:  # pragma: no cover - 仅在数据库异常时触发
+            raise RuntimeError("Admin audit event was not persisted.")
+        return admin_audit_event_from_row(row)
+
+    def list_admin_audit_events(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[AdminAuditEventRecord]:
+        """按时间倒序列出最近管理员审计事件。"""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM admin_audit_events
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (max(1, min(limit, 200)), max(0, int(offset))),
+            ).fetchall()
+        return [admin_audit_event_from_row(row) for row in rows]
 
     # 后台任务状态
     # ------------------------------------------------------------------
@@ -2881,6 +2950,24 @@ def tool_call_trace_from_row(row: RepositoryRow) -> ToolCallTraceRecord:
     )
 
 
+def admin_audit_event_from_row(row: RepositoryRow) -> AdminAuditEventRecord:
+    """把管理员审计行转换为领域对象。"""
+
+    return AdminAuditEventRecord(
+        id=int(row["id"]),
+        actor_account_id=int(row["actor_account_id"]) if row["actor_account_id"] is not None else None,
+        target_account_id=int(row["target_account_id"]) if row["target_account_id"] is not None else None,
+        action=str(row["action"]),
+        target_type=str(row["target_type"]),
+        target_id=row["target_id"],
+        outcome=str(row["outcome"]),
+        summary=str(row["summary"]),
+        details=_json_object(row["details_json"]),
+        request_id=row["request_id"],
+        created_at=str(row["created_at"]),
+    )
+
+
 def background_task_from_row(row: RepositoryRow) -> BackgroundTaskRecord:
     """把后台任务数据库行转换为领域记录。"""
 
@@ -2922,6 +3009,14 @@ def _json_object(value: object) -> dict[str, object]:
 
 def trim_task_error(value: str | None) -> str | None:
     """限制任务错误摘要长度，避免把上游原始响应或正文写入数据库。"""
+
+    if not value:
+        return None
+    return " ".join(str(value).split())[:500]
+
+
+def trim_audit_text(value: str | None) -> str | None:
+    """限制审计摘要长度，避免把长正文写入后台日志。"""
 
     if not value:
         return None

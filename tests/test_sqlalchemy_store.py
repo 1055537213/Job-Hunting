@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from job_hunting_agent.app import JobHuntingApp
-from job_hunting_agent.models import CandidateProfileInput, ToolCallTraceRecord, UsageEventRecord
+from job_hunting_agent.models import (
+    AdminAuditEventRecord,
+    CandidateProfileInput,
+    ToolCallTraceRecord,
+    UsageEventRecord,
+)
 from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
 
 
@@ -218,4 +223,53 @@ def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(d
         pass
     else:  # pragma: no cover
         raise AssertionError("旧工具调用记录没有被清理")
+    store.close()
+
+
+def test_sqlalchemy_store_records_admin_audit_events(database_url):
+    """管理员审计表以追加方式保存低敏动作和 request_id。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    actor = store.create_account("admin-audit@example.com", "hashed-password", role="admin")
+    target = store.create_account("target-audit@example.com", "hashed-password")
+
+    first = store.record_admin_audit_event(
+        AdminAuditEventRecord(
+            id=0,
+            actor_account_id=actor.id,
+            target_account_id=target.id,
+            action="account.status_updated",
+            target_type="account",
+            target_id=str(target.id),
+            outcome="succeeded",
+            summary="账号状态从 active 更新为 disabled。",
+            details={"previous_status": "active", "next_status": "disabled"},
+            request_id="audit-request-1",
+            created_at="2026-08-20T01:00:00+00:00",
+        )
+    )
+    second = store.record_admin_audit_event(
+        AdminAuditEventRecord(
+            id=0,
+            actor_account_id=actor.id,
+            target_account_id=None,
+            action="system.probe_enqueued",
+            target_type="background_task",
+            target_id="task-1",
+            outcome="succeeded",
+            summary="投递系统探针任务。",
+            details={"task_type": "system_probe"},
+            request_id="audit-request-2",
+            created_at="2026-08-20T01:01:00+00:00",
+        )
+    )
+
+    events = store.list_admin_audit_events(limit=10)
+
+    assert [event.id for event in events] == [second.id, first.id]
+    assert events[0].action == "system.probe_enqueued"
+    assert events[0].request_id == "audit-request-2"
+    assert events[1].target_account_id == target.id
+    assert events[1].details == {"previous_status": "active", "next_status": "disabled"}
     store.close()

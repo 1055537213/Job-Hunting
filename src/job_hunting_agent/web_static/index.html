@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>求职助手 Agent</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260819-tool-audit-v2" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260820-admin-audit-v1" />
   </head>
   <body>
     <!-- Vue 还没有挂载完成时隐藏模板，避免用户短暂看到未编译的 {{ }}。 -->
@@ -1027,6 +1027,175 @@
             <strong>{{ (admin.requestMetrics.rate_limited_requests || 0) + (admin.requestMetrics.csrf_rejected_requests || 0) }}</strong>
           </div>
         </div>
+        <section class="panel admin-panel admin-observability">
+          <div class="panel-title-row">
+            <div>
+              <p class="eyebrow">Request Observability</p>
+              <h2 class="panel-title">请求观测</h2>
+            </div>
+            <button class="ghost-button compact" type="button" @click="loadAdminData">刷新</button>
+          </div>
+          <p class="admin-observability-lede">
+            仅显示进程内低基数统计、最近错误摘要和路由热度，不包含正文、查询参数或密钥。
+          </p>
+          <div class="admin-observability-summary" aria-label="请求观测摘要">
+            <div class="admin-observability-stat">
+              <span>当前处理中</span>
+              <strong>{{ admin.requestMetrics.in_flight_requests || 0 }}</strong>
+            </div>
+            <div class="admin-observability-stat">
+              <span>最大耗时</span>
+              <strong>{{ admin.requestMetrics.max_duration_ms || 0 }}ms</strong>
+            </div>
+            <div class="admin-observability-stat">
+              <span>限流次数</span>
+              <strong>{{ admin.requestMetrics.rate_limited_requests || 0 }}</strong>
+            </div>
+            <div class="admin-observability-stat">
+              <span>CSRF 拦截</span>
+              <strong>{{ admin.requestMetrics.csrf_rejected_requests || 0 }}</strong>
+            </div>
+            <div class="admin-observability-stat">
+              <span>异常请求</span>
+              <strong>{{ admin.requestMetrics.exception_requests || 0 }}</strong>
+            </div>
+            <div class="admin-observability-stat">
+              <span>最近错误</span>
+              <strong>{{ adminRecentRequestErrors.length }}</strong>
+            </div>
+          </div>
+          <div class="admin-observability-grid">
+            <section class="admin-observability-section">
+              <div class="admin-observability-section-head">
+                <div>
+                  <p class="eyebrow">Status Families</p>
+                  <h3>状态分布</h3>
+                </div>
+                <span>{{ adminRequestStatusRows.length }} 项</span>
+              </div>
+              <div v-if="!adminRequestStatusRows.length" class="admin-observability-empty">
+                当前没有状态分布数据。
+              </div>
+              <div v-else class="admin-table-wrap admin-observability-table-wrap">
+                <table class="admin-table admin-observability-table">
+                  <thead>
+                    <tr><th>状态族</th><th>数量</th></tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="row in adminRequestStatusRows" :key="row.label">
+                      <td>{{ row.label }}</td><td>{{ row.count }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="admin-observability-divider"></div>
+              <div class="admin-observability-section-head">
+                <div>
+                  <p class="eyebrow">Methods</p>
+                  <h3>请求方法</h3>
+                </div>
+                <span>{{ adminRequestMethodRows.length }} 项</span>
+              </div>
+              <div v-if="!adminRequestMethodRows.length" class="admin-observability-empty">
+                当前没有请求方法统计。
+              </div>
+              <div v-else class="admin-table-wrap admin-observability-table-wrap">
+                <table class="admin-table admin-observability-table">
+                  <thead>
+                    <tr><th>方法</th><th>数量</th></tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="row in adminRequestMethodRows" :key="row.label">
+                      <td>{{ row.label }}</td><td>{{ row.count }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+            <section class="admin-observability-section">
+              <div class="admin-observability-section-head">
+                <div>
+                  <p class="eyebrow">Endpoints</p>
+                  <h3>Endpoint 统计</h3>
+                </div>
+                <span>{{ adminRequestEndpointRows.length }} 项</span>
+              </div>
+              <div v-if="!adminRequestEndpointRows.length" class="admin-observability-empty">
+                当前没有 endpoint 统计。
+              </div>
+              <div v-else class="admin-table-wrap admin-observability-table-wrap">
+                <table class="admin-table admin-observability-table">
+                  <thead>
+                    <tr><th>Endpoint</th><th>数量</th></tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="row in adminRequestEndpointRows" :key="row.label">
+                      <td>{{ row.label }}</td><td>{{ row.count }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          </div>
+          <section class="admin-observability-errors">
+            <div class="admin-observability-section-head">
+              <div>
+                <p class="eyebrow">Recent Errors</p>
+                <h3>最近错误摘要</h3>
+              </div>
+              <span>{{ adminRecentRequestErrors.length }} 条</span>
+            </div>
+            <div v-if="!adminRecentRequestErrors.length" class="admin-observability-empty">
+              当前没有最近错误摘要。
+            </div>
+            <div v-else class="admin-observability-error-list">
+              <article v-for="error in adminRecentRequestErrors" :key="error.request_id + error.created_at" class="admin-observability-error">
+                <div class="admin-observability-error-head">
+                  <strong>{{ error.method }} {{ error.endpoint }}</strong>
+                  <span>{{ error.status_code }} · {{ error.outcome }} · {{ error.duration_ms }}ms</span>
+                </div>
+                <div class="admin-observability-error-meta">
+                  <span>请求 ID {{ error.request_id }}</span>
+                  <span>{{ formatDate(error.created_at) }}</span>
+                </div>
+              </article>
+            </div>
+          </section>
+        </section>
+        <section class="panel admin-panel admin-audit-panel">
+          <div class="panel-title-row">
+            <div>
+              <p class="eyebrow">Admin Audit</p>
+              <h2 class="panel-title">管理员审计</h2>
+            </div>
+            <button class="ghost-button compact" type="button" @click="loadAdminAuditEvents">刷新</button>
+          </div>
+          <p class="admin-observability-lede">
+            记录账号状态变更、系统探针和管理员退出所有设备等低敏操作，便于后续排查和追责。
+          </p>
+          <div v-if="admin.loadingAuditEvents" class="admin-usage-notice" role="status">正在加载管理员审计...</div>
+          <div v-else-if="admin.auditLoadError" class="inline-error" role="alert">{{ admin.auditLoadError }}</div>
+          <div v-else-if="!adminAuditEvents.length" class="empty-state compact-empty">
+            <strong>暂无管理员审计事件</strong><span>发生账号状态变更或系统探针后会显示在这里。</span>
+          </div>
+          <div v-else class="admin-audit-list">
+            <article v-for="event in adminAuditEvents" :key="event.id" class="admin-audit-event">
+              <div class="admin-audit-event-main">
+                <div>
+                  <p class="eyebrow">{{ adminAuditActionLabel(event.action) }}</p>
+                  <h3>{{ event.summary }}</h3>
+                </div>
+                <span :data-state="event.outcome">{{ event.outcome }}</span>
+              </div>
+              <dl class="admin-audit-event-meta">
+                <dt>时间</dt><dd>{{ formatDate(event.created_at) }}</dd>
+                <dt>操作者</dt><dd>{{ adminAccountLabel(event.actor_account_id) }}</dd>
+                <dt>目标</dt><dd>{{ adminAuditTargetLabel(event) }}</dd>
+                <dt>请求 ID</dt><dd>{{ event.request_id || "-" }}</dd>
+              </dl>
+            </article>
+          </div>
+        </section>
         <section class="panel admin-panel admin-account-ledger">
           <div class="panel-title-row">
             <div><p class="eyebrow">Account Usage</p><h2 class="panel-title">账号与 Token 用量</h2></div>
@@ -1317,6 +1486,6 @@
     <!-- Vue 3 global build 已放入本地静态目录，避免本地页面依赖外部 CDN。 -->
     <script src="/static/vendor/vue.global.prod.js?v=20260731-auth-admin"></script>
     <script src="/static/china_cities.js?v=20260803-cities"></script>
-    <script src="/static/app.js?v=20260819-tool-audit-v2"></script>
+    <script src="/static/app.js?v=20260820-admin-audit-v1"></script>
   </body>
 </html>

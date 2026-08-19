@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import threading
 import time
@@ -83,6 +84,7 @@ from .job_screenshot import (
 from .llm import LLMClient, LLMRequestError
 from .models import (
     AccountRecord,
+    AdminAuditEventRecord,
     BackgroundTaskRecord,
     CandidateProfileInput,
     ResumeArtifactRecord,
@@ -109,6 +111,7 @@ from .web_hardening import (
 )
 
 STATIC_DIR = Path(__file__).with_name("web_static")
+logger = logging.getLogger(__name__)
 SESSION_COOKIE_NAME = "job_agent_session"
 SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 # Uvicorn 的重载子进程只能通过导入路径重新创建应用，因此启动参数通过这些
@@ -442,6 +445,18 @@ def create_web_app(
         count = backend.store.revoke_all_auth_sessions(account.id)
         response.delete_cookie(SESSION_COOKIE_NAME, path="/")
         delete_csrf_cookie(response)
+        if account.role == "admin":
+            record_admin_audit_event(
+                backend,
+                request,
+                account,
+                action="auth.logout_all_devices",
+                target_type="account",
+                target_id=str(account.id),
+                target_account_id=account.id,
+                summary=f"撤销账号 #{account.id} 的全部登录会话。",
+                details={"revoked_sessions": count},
+            )
         return {"ok": True, "revoked_sessions": count}
 
     @web_app.get("/")
@@ -1434,6 +1449,21 @@ def create_web_app(
         account = backend.store.update_account_status(account_id, payload.status)
         if payload.status != "active":
             backend.store.revoke_all_auth_sessions(account_id)
+        record_admin_audit_event(
+            backend,
+            request,
+            actor,
+            action="account.status_updated",
+            target_type="account",
+            target_id=str(target.id),
+            target_account_id=target.id,
+            summary=f"账号 #{target.id} 状态从 {target.status} 更新为 {account.status}。",
+            details={
+                "previous_status": target.status,
+                "next_status": account.status,
+                "target_role": target.role,
+            },
+        )
         return {"account": asdict(account)}
 
     @web_app.get("/api/admin/usage/summary")
@@ -1454,6 +1484,22 @@ def create_web_app(
         require_admin(request)
         return {"requests": web_app.state.request_metrics.snapshot()}
 
+    @web_app.get("/api/admin/audit/events")
+    def admin_audit_events(
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, object]:
+        """管理员查看最近的低敏管理操作审计事件。"""
+
+        require_admin(request)
+        events = backend.store.list_admin_audit_events(limit=limit, offset=offset)
+        return {
+            "events": [asdict(event) for event in events],
+            "limit": limit,
+            "offset": offset,
+        }
+
     @web_app.post("/api/admin/tasks/probe")
     def admin_task_queue_probe(request: Request) -> dict[str, object]:
         """管理员登记一个无业务数据的 Worker 探针，用于运维验证。"""
@@ -1463,6 +1509,16 @@ def create_web_app(
             task = backend.enqueue_system_probe(actor.id)
         except TaskQueueError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
+        record_admin_audit_event(
+            backend,
+            request,
+            actor,
+            action="system.probe_enqueued",
+            target_type="background_task",
+            target_id=task.task_key,
+            summary="投递系统探针任务。",
+            details={"task_type": task.task_type, "task_key": task.task_key},
+        )
         return {"task": serialize_background_task(task)}
 
     @web_app.get("/api/admin/usage/events")
@@ -2173,6 +2229,40 @@ def sse_event(event: str, data: dict[str, object]) -> str:
     """把事件编码成 Server-Sent Events 文本块。"""
 
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def record_admin_audit_event(
+    backend: JobHuntingApp,
+    request: Request,
+    actor: AccountRecord,
+    *,
+    action: str,
+    target_type: str,
+    target_id: str | None = None,
+    target_account_id: int | None = None,
+    summary: str,
+    details: dict[str, object] | None = None,
+    outcome: str = "succeeded",
+) -> None:
+    """追加管理员动作审计；失败时只写低敏警告，不影响已完成动作。"""
+
+    try:
+        backend.store.record_admin_audit_event(
+            AdminAuditEventRecord(
+                id=0,
+                actor_account_id=actor.id,
+                target_account_id=target_account_id,
+                action=action,
+                target_type=target_type,
+                target_id=target_id,
+                outcome=outcome,
+                summary=summary,
+                details=details or {},
+                request_id=getattr(request.state, "request_id", None),
+            )
+        )
+    except Exception as error:  # pragma: no cover - 仅在数据库异常时触发
+        logger.warning("管理员审计事件写入失败：%s", type(error).__name__)
 
 
 def serialize_resume_artifact(artifact: ResumeArtifactRecord) -> dict[str, object]:

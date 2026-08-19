@@ -297,7 +297,10 @@ def apply_request_headers(
     response.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; "
-        "script-src 'self'; "
+        # Vue global build compiles the in-page template at mount time. Until
+        # the frontend has a build step with precompiled templates, CSP must
+        # allow that runtime compiler.
+        "script-src 'self' 'unsafe-eval'; "
         "style-src 'self'; "
         "img-src 'self' data: blob:; "
         "connect-src 'self'; "

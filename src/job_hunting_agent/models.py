@@ -515,6 +515,23 @@ class ToolCallTraceRecord:
 
 
 @dataclass
+class AdminAuditEventRecord:
+    """一次管理员动作的追加式审计记录。"""
+
+    id: int
+    actor_account_id: int | None
+    target_account_id: int | None
+    action: str
+    target_type: str
+    target_id: str | None
+    outcome: str
+    summary: str
+    details: dict[str, object] = field(default_factory=dict)
+    request_id: str | None = None
+    created_at: str = ""
+
+
+@dataclass
 class BackgroundTaskRecord:
     """一条可跨 Web 重启恢复的后台任务状态。
 

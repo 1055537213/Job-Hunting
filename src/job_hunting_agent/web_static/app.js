@@ -102,6 +102,7 @@ if (!window.Vue) {
           accounts: [],
           events: [],
           toolTraces: [],
+          auditEvents: [],
           selectedToolTraceId: "",
           toolTraceDetail: null,
           summary: {},
@@ -111,13 +112,16 @@ if (!window.Vue) {
           loadingEvents: false,
           loadingToolTraces: false,
           loadingToolTraceDetail: false,
+          loadingAuditEvents: false,
           eventsError: "",
           toolTracesError: "",
           toolTraceDetailError: "",
+          auditLoadError: "",
           loadError: "",
           usageRequestVersion: 0,
           toolTraceRequestVersion: 0,
           toolTraceDetailRequestVersion: 0,
+          auditRequestVersion: 0,
           toolTraceTotal: 0,
         },
         profiles: [],
@@ -249,6 +253,31 @@ if (!window.Vue) {
       /** 当前选中的工具调用完整详情。 */
       selectedAdminToolTraceDetail() {
         return this.admin.toolTraceDetail || this.selectedAdminToolTrace;
+      },
+
+      /** 按管理员需要把请求指标对象转成低基数排序行。 */
+      adminRequestStatusRows() {
+        return this.sortedMetricRows(this.admin.requestMetrics.status_counts, 4);
+      },
+
+      /** 展示请求方法分布，便于判断是 GET/POST 哪类入口占主导。 */
+      adminRequestMethodRows() {
+        return this.sortedMetricRows(this.admin.requestMetrics.method_counts, 8);
+      },
+
+      /** 展示低基数 endpoint 统计，帮助管理员识别热点路由。 */
+      adminRequestEndpointRows() {
+        return this.sortedMetricRows(this.admin.requestMetrics.endpoint_counts, 12);
+      },
+
+      /** 最近错误按时间倒序展示。 */
+      adminRecentRequestErrors() {
+        return [...(this.admin.requestMetrics.recent_errors || [])];
+      },
+
+      /** 管理员审计事件按后端返回顺序展示，默认是最新在前。 */
+      adminAuditEvents() {
+        return [...(this.admin.auditEvents || [])];
       },
 
       /** 当前城市选择面板右侧展示的一级地区。 */
@@ -606,6 +635,7 @@ if (!window.Vue) {
           };
           this.admin.requestMetrics = requestMetrics.requests || {};
           this.admin.loadError = "";
+          await this.loadAdminAuditEvents();
 
           const selectedAccountId = Number(this.admin.selectedAccountId);
           const selectedAccountStillExists = this.admin.accounts.some(
@@ -618,6 +648,27 @@ if (!window.Vue) {
           await this.loadAdminActiveDetail(selectedAccountId);
         } catch (error) {
           this.admin.loadError = error.message || "后台数据加载失败，请稍后重试。";
+        }
+      },
+
+      /** 独立加载管理操作审计，避免审计接口异常影响账号和 Token 面板。 */
+      async loadAdminAuditEvents() {
+        const requestVersion = this.admin.auditRequestVersion + 1;
+        this.admin.auditRequestVersion = requestVersion;
+        this.admin.loadingAuditEvents = true;
+        this.admin.auditLoadError = "";
+        try {
+          const data = await this.requestJson("/api/admin/audit/events?limit=30");
+          if (requestVersion !== this.admin.auditRequestVersion) return;
+          this.admin.auditEvents = data.events || [];
+        } catch (error) {
+          if (requestVersion !== this.admin.auditRequestVersion) return;
+          this.admin.auditEvents = [];
+          this.admin.auditLoadError = error.message || "管理员审计记录加载失败。";
+        } finally {
+          if (requestVersion === this.admin.auditRequestVersion) {
+            this.admin.loadingAuditEvents = false;
+          }
         }
       },
 
@@ -850,6 +901,46 @@ if (!window.Vue) {
       /** 返回指定账号的工具调用失败次数。 */
       accountToolCallFailureCount(accountId) {
         return this.accountToolCallSummary(accountId)?.failed_trace_count || 0;
+      },
+
+      /** 管理端审计中把账号 ID 转成人能读的标签；账号已删除时保留 ID。 */
+      adminAccountLabel(accountId) {
+        const id = Number(accountId);
+        if (!Number.isInteger(id) || id <= 0) return "系统";
+        const account = this.admin.accounts.find((item) => Number(item.id) === id);
+        if (!account) return `账号 #${id}`;
+        return account.email || account.display_name || `账号 #${id}`;
+      },
+
+      /** 管理端审计目标展示，避免把原始 details JSON 塞进密集列表。 */
+      adminAuditTargetLabel(event) {
+        if (event.target_account_id) {
+          return this.adminAccountLabel(event.target_account_id);
+        }
+        const targetType = event.target_type || "system";
+        return event.target_id ? `${targetType} #${event.target_id}` : targetType;
+      },
+
+      /** 常见审计动作的中文标签；未知动作保留原始低基数字符串。 */
+      adminAuditActionLabel(action) {
+        const labels = {
+          "account.status_updated": "账号状态变更",
+          "auth.logout_all_devices": "退出所有设备",
+          "system.probe_enqueued": "系统探针",
+        };
+        return labels[action] || action || "管理员操作";
+      },
+
+      /** 把带 count 的对象行转换成按数量降序的可展示数组。 */
+      sortedMetricRows(source, limit = Infinity) {
+        return Object.entries(source || {})
+          .map(([label, count]) => ({
+            label,
+            count: Number(count) || 0,
+          }))
+          .filter((entry) => entry.count > 0)
+          .sort((left, right) => right.count - left.count || PINYIN_COLLATOR.compare(left.label, right.label))
+          .slice(0, limit);
       },
 
       /** 监听全局 Ctrl/Cmd+K 和 Esc，提供类似工作台的快速动作入口。 */
