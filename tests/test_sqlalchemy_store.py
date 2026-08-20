@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import datetime, timedelta
+
+import pytest
+
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.models import (
     AdminAuditEventRecord,
@@ -10,6 +15,7 @@ from job_hunting_agent.models import (
     UsageEventRecord,
 )
 from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
+from job_hunting_agent.tool_audit import tool_audit_retention_cutoff
 
 
 def test_sqlalchemy_store_runs_existing_profile_chat_and_usage_workflow(database_url):
@@ -100,6 +106,14 @@ def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(d
     store.initialize()
     account = store.create_account("tools@example.com", "hashed-password")
     other = store.create_account("other-tools@example.com", "hashed-password")
+    retention_cutoff = tool_audit_retention_cutoff()
+    cutoff_at = datetime.fromisoformat(retention_cutoff)
+    recent_started_at = (cutoff_at + timedelta(minutes=1)).isoformat()
+    recent_finished_at = (cutoff_at + timedelta(minutes=2)).isoformat()
+    other_started_at = (cutoff_at + timedelta(minutes=3)).isoformat()
+    other_finished_at = (cutoff_at + timedelta(minutes=4)).isoformat()
+    old_started_at = (cutoff_at - timedelta(seconds=1)).isoformat()
+    old_finished_at = (cutoff_at + timedelta(seconds=10)).isoformat()
 
     first = store.record_tool_call_trace(
         ToolCallTraceRecord(
@@ -125,10 +139,10 @@ def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(d
                     }
                 ]
             },
-            created_at="2026-08-18T16:01:00+00:00",
-            started_at="2026-08-18T16:01:00+00:00",
+            created_at=recent_started_at,
+            started_at=recent_started_at,
             finished_at=None,
-            updated_at="2026-08-18T16:01:00+00:00",
+            updated_at=recent_started_at,
         )
     )
     updated = store.record_tool_call_trace(
@@ -156,12 +170,25 @@ def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(d
                     }
                 ]
             },
-            created_at="2026-08-18T16:01:00+00:00",
-            started_at="2026-08-18T16:01:00+00:00",
-            finished_at="2026-08-18T16:02:00+00:00",
-            updated_at="2026-08-18T16:02:00+00:00",
+            created_at=recent_started_at,
+            started_at=recent_started_at,
+            finished_at=recent_finished_at,
+            updated_at=recent_finished_at,
         )
     )
+    with pytest.raises(ValueError, match="其他账号"):
+        store.record_tool_call_trace(
+            replace(
+                updated,
+                id=0,
+                account_id=other.id,
+                title="不应覆盖其他账号的任务",
+            )
+        )
+    assert store.get_tool_call_trace("root-1", account_id=account.id).account_id == account.id
+    with pytest.raises(KeyError):
+        store.get_tool_call_trace("root-1", account_id=other.id)
+
     store.record_tool_call_trace(
         ToolCallTraceRecord(
             id=0,
@@ -177,10 +204,10 @@ def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(d
             last_step_name="github_project_analysis",
             last_error_summary="GitHub 不可访问",
             trace={"steps": [{"id": "step-1", "name": "github_project_analysis", "status": "failed"}]},
-            created_at="2026-08-18T16:03:00+00:00",
-            started_at="2026-08-18T16:03:00+00:00",
-            finished_at="2026-08-18T16:04:00+00:00",
-            updated_at="2026-08-18T16:04:00+00:00",
+            created_at=other_started_at,
+            started_at=other_started_at,
+            finished_at=other_finished_at,
+            updated_at=other_finished_at,
         )
     )
     old = store.record_tool_call_trace(
@@ -198,25 +225,30 @@ def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(d
             last_step_name="ingest_candidate_message",
             last_error_summary=None,
             trace={"steps": [{"id": "step-1", "name": "ingest_candidate_message", "status": "completed"}]},
-            created_at="2026-08-17T15:59:59+00:00",
-            started_at="2026-08-17T15:59:59+00:00",
-            finished_at="2026-08-17T16:00:10+00:00",
-            updated_at="2026-08-17T16:00:10+00:00",
+            created_at=old_started_at,
+            started_at=old_started_at,
+            finished_at=old_finished_at,
+            updated_at=old_finished_at,
         )
     )
 
     assert updated.id == first.id
     assert store.get_tool_call_trace("root-1").status == "completed"
-    assert store.count_tool_call_traces(account.id) == 2
-    assert [trace.root_request_id for trace in store.list_tool_call_traces(account.id)] == ["root-1", "root-old"]
-    summary = store.summarize_tool_call_traces_by_account()
-    assert {"account_id": account.id, "trace_count": 2, "failed_trace_count": 0} in summary
+    assert store.count_tool_call_traces(account.id, cutoff_iso=retention_cutoff) == 1
+    assert [
+        trace.root_request_id
+        for trace in store.list_tool_call_traces(account.id, cutoff_iso=retention_cutoff)
+    ] == ["root-1"]
+    with pytest.raises(KeyError):
+        store.get_tool_call_trace(old.root_request_id, cutoff_iso=retention_cutoff)
+    summary = store.summarize_tool_call_traces_by_account(cutoff_iso=retention_cutoff)
+    assert {"account_id": account.id, "trace_count": 1, "failed_trace_count": 0} in summary
     assert {"account_id": other.id, "trace_count": 1, "failed_trace_count": 1} in summary
 
-    deleted = store.delete_tool_call_traces_before("2026-08-17T16:00:00+00:00")
+    deleted = store.delete_tool_call_traces_before(retention_cutoff)
 
     assert deleted == 1
-    assert store.count_tool_call_traces(account.id) == 1
+    assert store.count_tool_call_traces(account.id, cutoff_iso=retention_cutoff) == 1
     try:
         store.get_tool_call_trace(old.root_request_id)
     except KeyError:
@@ -272,4 +304,119 @@ def test_sqlalchemy_store_records_admin_audit_events(database_url):
     assert events[0].request_id == "audit-request-2"
     assert events[1].target_account_id == target.id
     assert events[1].details == {"previous_status": "active", "next_status": "disabled"}
+    store.close()
+
+
+def test_account_status_and_admin_audit_are_committed_atomically(database_url, monkeypatch):
+    """审计写入失败时，账号状态和 Session 撤销不能先行提交。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    actor = store.create_account("atomic-admin@example.com", "hashed-password", role="admin")
+    target = store.create_account("atomic-target@example.com", "hashed-password")
+    event = AdminAuditEventRecord(
+        id=0,
+        actor_account_id=actor.id,
+        target_account_id=target.id,
+        action="account.status_updated",
+        target_type="account",
+        target_id=str(target.id),
+        outcome="succeeded",
+        summary="账号状态已更新。",
+        details={"previous_status": "active", "next_status": "disabled"},
+        request_id="atomic-request-1",
+    )
+
+    def fail_audit_insert(*_args, **_kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(store, "_insert_admin_audit_event", fail_audit_insert)
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        store.update_account_status_with_audit(
+            target.id,
+            "disabled",
+            event,
+            revoke_sessions=True,
+        )
+
+    assert store.get_account(target.id).status == "active"
+    store.close()
+
+
+def test_revoke_all_auth_sessions_and_admin_audit_are_committed_atomically(
+    database_url,
+    monkeypatch,
+):
+    """撤销全部 Session 时，审计失败也不能留下半成品会话状态。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    actor = store.create_account("atomic-admin-logout@example.com", "hashed-password", role="admin")
+    target = store.create_account("atomic-target-logout@example.com", "hashed-password")
+    session = store.save_auth_session(
+        target.id,
+        "token-hash-logout",
+        "2026-08-20T01:00:00+00:00",
+        "2026-08-20T01:00:00+00:00",
+        "2026-08-21T01:00:00+00:00",
+        "2026-08-22T01:00:00+00:00",
+    )
+    event = AdminAuditEventRecord(
+        id=0,
+        actor_account_id=actor.id,
+        target_account_id=target.id,
+        action="auth.logout_all_devices",
+        target_type="account",
+        target_id=str(target.id),
+        outcome="succeeded",
+        summary="撤销账号全部登录会话。",
+        details={},
+        request_id="atomic-request-logout",
+    )
+
+    def fail_audit_insert(*_args, **_kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(store, "_insert_admin_audit_event", fail_audit_insert)
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        store.revoke_all_auth_sessions_with_audit(target.id, event)
+
+    assert store.get_auth_session(session.id).revoked_at is None
+    store.close()
+
+
+def test_background_task_and_admin_audit_are_committed_atomically(database_url, monkeypatch):
+    """后台任务登记和管理员审计必须同事务提交，否则不能留下孤立任务。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    actor = store.create_account("probe-admin@example.com", "hashed-password", role="admin")
+    event = AdminAuditEventRecord(
+        id=0,
+        actor_account_id=actor.id,
+        target_account_id=None,
+        action="system.probe_enqueued",
+        target_type="background_task",
+        target_id=None,
+        outcome="succeeded",
+        summary="投递系统探针任务。",
+        details={},
+        request_id="probe-request-1",
+    )
+
+    def fail_audit_insert(*_args, **_kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(store, "_insert_admin_audit_event", fail_audit_insert)
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        store.create_background_task(
+            account_id=actor.id,
+            task_type="system_probe",
+            payload={"purpose": "admin_runtime_probe"},
+            idempotency_key="probe-once",
+            max_attempts=1,
+            audit_event=event,
+        )
+
+    assert store.get_background_task_by_idempotency(actor.id, "probe-once") is None
     store.close()

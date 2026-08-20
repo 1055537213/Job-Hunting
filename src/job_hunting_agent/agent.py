@@ -977,12 +977,19 @@ def tool_message_to_output(message: ToolMessage) -> dict[str, object]:
     """把一次工具消息压平成可供 Web 摘要使用的结构。"""
 
     raw_content = stringify_tool_message_content(message.content)
+    status = str(getattr(message, "status", "success") or "success")
     item: dict[str, object] = {
         "tool_name": message.name or "unknown_tool",
         "raw_content": raw_content,
+        "status": status,
     }
     parsed = try_parse_json(raw_content)
-    if parsed is not None:
+    if status == "error":
+        if isinstance(parsed, dict) and parsed.get("error"):
+            item["data"] = parsed
+        else:
+            item["data"] = {"error": raw_content or "工具调用失败。"}
+    elif parsed is not None:
         item["data"] = parsed
     return item
 

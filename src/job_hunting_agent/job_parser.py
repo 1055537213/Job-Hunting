@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from .city_catalog import all_cities, cities_in_text, normalize_city_name
 from .llm import LLMClient
 from .models import ImportedJob, SkillRequirement
+from .skill_normalization import find_skill_mentions
 
 EDUCATION_ORDER = {
     # 学历等级来自决策地图 #7：学历是硬性条件，候选人学历不能低于职位要求。
@@ -560,18 +561,10 @@ def extract_skills(text: str) -> list[str]:
     `matcher.py` 结合候选人档案处理。
     """
 
-    found = []
-    lower_text = text.lower()
-    aliases = {
-        "向量检索": ["向量检索", "vector"],
-        "RAG": ["rag", "检索增强"],
-        "Agent": ["agent", "智能体"],
-    }
-    for skill in KNOWN_SKILLS:
-        terms = aliases.get(skill, [skill])
-        if any(term.lower() in lower_text for term in terms):
-            found.append(skill)
-    return sorted(set(found), key=found.index)
+    return [
+        skill
+        for skill, _matched_text, _start, _end in find_skill_mentions(text, KNOWN_SKILLS)
+    ]
 
 
 def now_iso() -> str:

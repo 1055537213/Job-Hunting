@@ -645,7 +645,7 @@ def load_web_security_settings(
         raise ValueError(
             "JOB_AGENT_ENVIRONMENT 只能是 development、test 或 production"
         )
-    return WebSecuritySettings(
+    settings = WebSecuritySettings(
         environment=runtime_environment,
         csrf_enabled=parse_bool(get("JOB_AGENT_CSRF_ENABLED", default="true")),
         security_headers_enabled=parse_bool(
@@ -665,6 +665,21 @@ def load_web_security_settings(
             "JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS",
         ),
     )
+    if settings.environment == "production":
+        disabled_controls = [
+            name
+            for name, enabled in (
+                ("CSRF", settings.csrf_enabled),
+                ("安全响应头", settings.security_headers_enabled),
+                ("请求限流", settings.rate_limit_enabled),
+            )
+            if not enabled
+        ]
+        if disabled_controls:
+            raise ValueError(
+                "生产环境不能关闭以下 Web 安全控制：" + "、".join(disabled_controls)
+            )
+    return settings
 
 
 def masked_web_security_settings(settings: WebSecuritySettings) -> dict[str, object]:
@@ -997,7 +1012,15 @@ def load_cookie_secure(
         "JOB_AGENT_COOKIE_SECURE",
         "false",
     )
-    return parse_bool(raw_value)
+    secure = parse_bool(raw_value)
+    runtime_environment = (
+        environment.get("JOB_AGENT_ENVIRONMENT")
+        or file_values.get("JOB_AGENT_ENVIRONMENT")
+        or "development"
+    ).strip().lower()
+    if runtime_environment == "production" and not secure:
+        raise ValueError("生产环境必须启用 Secure Session Cookie。")
+    return secure
 
 
 def load_semantic_matching_enabled(

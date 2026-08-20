@@ -19,7 +19,11 @@ from job_hunting_agent.github_project import (
     analyze_public_github_repository,
     normalize_public_github_repository_url,
 )
-from job_hunting_agent.models import CandidateProfileInput, ProjectExperienceCard
+from job_hunting_agent.models import (
+    CandidateProfileInput,
+    ProjectExperienceCard,
+    ToolCallTraceRecord,
+)
 from job_hunting_agent.resume_document import ResumeFileStore
 from job_hunting_agent.task_queue import CeleryTaskQueue
 from job_hunting_agent.web import create_web_app
@@ -326,6 +330,14 @@ def test_github_project_submission_rejects_duplicate_and_confirmation_stays_idem
         ),
         account_id=account_id,
     )
+    with pytest.raises(ValueError, match="至少确认"):
+        app.confirm_project_card_and_enqueue_rag(
+            card.id,
+            "   ",
+            account_id=account_id,
+        )
+    assert app.store.get_project_card(card.id, account_id=account_id).status == "待确认"
+
     confirmed, rag_task = app.confirm_project_card_and_enqueue_rag(
         card.id,
         "本人负责接口设计与实现。",
@@ -410,3 +422,94 @@ def test_web_queues_github_project_analysis_and_rejects_non_github_url() -> None
     assert duplicate.status_code == 409
     assert "GitHub 项目" in duplicate.json()["detail"]
     assert queue.task_keys == [payload["task"]["task_key"]]
+
+
+def test_project_confirmation_cannot_continue_another_accounts_tool_trace(database_url) -> None:
+    """客户端伪造其他账号的 root ID 时，后端必须新建自己的任务链路。"""
+
+    web_app = create_web_app(database_url=database_url)
+    owner_client = TestClient(web_app)
+    other_client = TestClient(web_app)
+    owner_client.post(
+        "/api/auth/register",
+        json={"email": "project-owner@example.com", "password": "password-123"},
+    )
+    other_client.post(
+        "/api/auth/register",
+        json={"email": "project-other@example.com", "password": "password-123"},
+    )
+    owner_login = owner_client.post(
+        "/api/auth/login",
+        json={"email": "project-owner@example.com", "password": "password-123"},
+    )
+    other_client.post(
+        "/api/auth/login",
+        json={"email": "project-other@example.com", "password": "password-123"},
+    )
+    owner_id = owner_client.get("/api/auth/me").json()["account"]["id"]
+    other_id = other_client.get("/api/auth/me").json()["account"]["id"]
+    profile = owner_client.post(
+        "/api/profiles",
+        headers={"X-CSRF-Token": owner_login.json()["csrf_token"]},
+        json={"name": "任务链路隔离测试"},
+    )
+    candidate_id = int(profile.json()["candidate_id"])
+
+    backend = JobHuntingApp(database_url=database_url)
+    backend.initialize()
+    card = backend.store.save_project_card(
+        candidate_id,
+        ProjectExperienceCard(
+            card_type="待确认项目经历卡片",
+            project_name="owner-project",
+            read_files=["README.md"],
+            skipped_summary={},
+            detected_tech_stack=["Python"],
+            detected_core_features=["接口/API 服务"],
+            responsibility_draft=["负责接口设计"],
+            highlight_draft=[],
+            resume_expression_draft=[],
+            questions_for_candidate=[],
+            source_type="github_public_repository",
+            source_url="https://github.com/example/owner-project",
+            source_ref="main",
+        ),
+        account_id=owner_id,
+    )
+    foreign_root = "a" * 32
+    backend.store.record_tool_call_trace(
+        ToolCallTraceRecord(
+            id=0,
+            account_id=other_id,
+            candidate_id=None,
+            session_id="foreign-session",
+            root_request_id=foreign_root,
+            title="其他账号任务",
+            status="completed",
+            source="chat",
+            step_count=1,
+            attempt_count=1,
+            last_step_name="ingest_candidate_message",
+            last_error_summary=None,
+            trace={"steps": [{"name": "ingest_candidate_message", "status": "completed"}]},
+            created_at="2026-08-21T01:00:00+00:00",
+            started_at="2026-08-21T01:00:00+00:00",
+            finished_at="2026-08-21T01:00:01+00:00",
+            updated_at="2026-08-21T01:00:01+00:00",
+        )
+    )
+
+    confirmed = owner_client.post(
+        f"/api/projects/{card.id}/confirm",
+        headers={"X-CSRF-Token": owner_login.json()["csrf_token"]},
+        json={
+            "confirmed_summary": "后端/API 技术栈：Python",
+            "root_request_id": foreign_root,
+        },
+    )
+
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["root_request_id"] != foreign_root
+    assert backend.store.get_tool_call_trace(foreign_root, account_id=other_id).title == "其他账号任务"
+    with pytest.raises(KeyError):
+        backend.store.get_tool_call_trace(foreign_root, account_id=owner_id)

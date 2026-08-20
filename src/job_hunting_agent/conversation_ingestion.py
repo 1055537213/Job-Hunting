@@ -25,6 +25,29 @@ from .models import (
     LongTextInput,
     sanitize_preference_weights,
 )
+from .skill_normalization import (
+    find_skill_mentions,
+    merge_skill_mappings,
+    normalize_skill_mapping,
+)
+
+SKILL_PROFICIENCY_LEVELS = (
+    "熟练掌握",
+    "项目中使用",
+    "项目使用",
+    "较熟悉",
+    "使用过",
+    "学习过",
+    "精通",
+    "熟练",
+    "熟悉",
+    "了解",
+    "入门",
+    "不会",
+    "不具备",
+    "缺失",
+    "没有",
+)
 
 
 def decide_conversation_ingestion(
@@ -60,13 +83,19 @@ def build_ingestion_prompt(candidate: CandidateProfile, message: str) -> str:
 5. 用户说“附近/邻近城市也可以”时，只填写能够明确识别的城市；不要猜测未知城市。
 6. 用户说“城市不限/任何城市都可以”时，将 clear_preferred_cities 和 clear_acceptable_cities 设为 true。
 7. 用户明确说更看重某个维度时，preference_weights 只能使用 1.0、1.5、2.0。
-8. 只返回 JSON，不要返回 Markdown。
+8. 记录技能前先与“当前已记录技能”核对：仅大小写、空格、全半角、连接符或常见别名不同
+   的名称视为同一技能，沿用已有标准名称；没有新的技能或熟练度变化时不要重复返回。
+9. 用户明确说“求职方向改为/改成/换成 X”时，target_directions 只填写 X，不保留旧方向；
+   只有“也考虑/同时考虑/增加”等补充表达才保留已有方向并追加新方向。
+10. 只返回 JSON，不要返回 Markdown。
 
 当前候选人 ID：{candidate.id}
 当前候选人姓名：{candidate.name}
+当前已记录技能：{candidate.skills}
 当前首选城市：{candidate.preferred_cities}
 当前其他可接受城市：{candidate.acceptable_cities}
 当前偏好权重：{candidate.preference_weights}
+当前求职方向：{candidate.target_directions}
 
 JSON 格式：
 {{
@@ -127,11 +156,32 @@ def decision_from_json(
         if key in preference_weights
         and preference_weights[key] != candidate.preference_weights.get(key, 1.0)
     }
+    replace_target_directions = has_target_direction_replacement_intent(original_message)
+    rule_target_directions = extract_target_directions(original_message)
+    llm_target_directions = clean_string_list(profile_data.get("target_directions") or [])
+    # 对“改为”这种明确替换，只接受从用户原话中提取的已知方向，避免模型把旧方向一并回填。
+    # 若本地规则尚不认识新方向，仍保留模型已解析出的目标方向，避免丢失有效更新。
+    target_directions = (
+        rule_target_directions or llm_target_directions
+        if replace_target_directions
+        else llm_target_directions
+    )
+    rule_skills = extract_skills_from_message(original_message)
+    llm_skills = clean_string_dict(profile_data.get("skills") or {})
+    # 模型负责补充语义理解，但用户原话中明确说出的熟练度优先级更高；
+    # 这样不会因为模型把“精通 Python”回传成“待确认”而覆盖真实陈述。
+    skills = merge_skill_mappings(rule_skills, llm_skills)
+    explicit_rule_skills = {
+        name: level
+        for name, level in rule_skills.items()
+        if level != "待确认"
+    }
+    skills = merge_skill_mappings(skills, explicit_rule_skills)
     patch = CandidateProfilePatch(
         status=empty_to_none(profile_data.get("status")),
         education=empty_to_none(profile_data.get("education")),
         experience_years=parse_float_or_none(profile_data.get("experience_years")),
-        skills=clean_string_dict(profile_data.get("skills") or {}),
+        skills=skills,
         preferred_cities=preferred_cities,
         acceptable_cities=acceptable_cities,
         replace_preferred_cities=bool(preferred_cities),
@@ -140,7 +190,8 @@ def decision_from_json(
         preference_weights=preference_updates,
         salary_floor_k=parse_int_or_none(profile_data.get("salary_floor_k")),
         expected_salary_k=parse_int_or_none(profile_data.get("expected_salary_k")),
-        target_directions=clean_string_list(profile_data.get("target_directions") or []),
+        target_directions=target_directions,
+        replace_target_directions=replace_target_directions,
         unacceptable=clean_string_list(profile_data.get("unacceptable") or []),
     )
     long_texts = [
@@ -202,6 +253,7 @@ def rule_based_decision(candidate: CandidateProfile, message: str) -> Conversati
         clear_acceptable_cities=clear_cities,
         preference_weights=preference_weights,
         target_directions=extract_target_directions(message),
+        replace_target_directions=has_target_direction_replacement_intent(message),
         unacceptable=extract_unacceptable(message),
     )
     fields = patch_field_names(patch)
@@ -245,20 +297,43 @@ def extract_experience_years(text: str) -> float | None:
 def extract_skills_from_message(text: str) -> dict[str, str]:
     """从消息中提取明确出现的技能词。"""
 
-    lower_text = text.lower()
     result: dict[str, str] = {}
-    for skill in KNOWN_SKILLS:
-        skill_text = re.escape(skill.lower())
-        if skill.lower() not in lower_text:
-            continue
+    for skill, matched_text, _start, _end in find_skill_mentions(text, KNOWN_SKILLS):
+        skill_text = re.escape(matched_text)
         negative_before = rf"(?:不会|没有|不具备|缺少|缺失)\s*{skill_text}"
         negative_after = rf"{skill_text}\s*(?:不会|没有|不具备|缺少|缺失)"
-        result[skill] = (
+        explicit_level = extract_explicit_skill_level(text, matched_text)
+        result[skill] = explicit_level or (
             "不会"
-            if re.search(negative_before, lower_text) or re.search(negative_after, lower_text)
+            if re.search(negative_before, text, re.IGNORECASE)
+            or re.search(negative_after, text, re.IGNORECASE)
             else "待确认"
         )
     return result
+
+
+def extract_explicit_skill_level(text: str, skill: str) -> str | None:
+    """从技能附近的明确表达中提取熟练度，不对普通“会某技能”做拔高推断。"""
+
+    skill_pattern = re.escape(skill)
+    level_pattern = "|".join(re.escape(level) for level in SKILL_PROFICIENCY_LEVELS)
+    patterns = (
+        (
+            rf"(?:我的|我对|对于|对)?\s*{skill_pattern}\s*(?:的\s*)?"
+            rf"(?:熟练度|熟练程度|掌握程度|水平)\s*(?:是|为|：|:)?\s*(?P<level>{level_pattern})"
+        ),
+        rf"(?P<level>{level_pattern})\s*(?:的\s*)?{skill_pattern}",
+        rf"{skill_pattern}\s*(?:很|比较|非常)?\s*(?P<level>{level_pattern})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        level = match.group("level")
+        if level in {"不具备", "缺失", "没有"}:
+            return "不会"
+        return level
+    return None
 
 
 def extract_city_preferences(
@@ -366,35 +441,52 @@ def extract_preference_weights(text: str) -> dict[str, float]:
     return {key: normalized[key] for key in result if key in normalized}
 
 
-def extract_cities(text: str) -> list[str]:
-    """兼容旧调用：只返回消息中明确作为首选表达的城市。"""
+TARGET_DIRECTION_REPLACEMENT_PATTERN = re.compile(
+    r"(?:求职|职业|岗位|工作|目标)?方向(?:\s*从[^，,。；;！？!?\n]*?)?\s*"
+    r"(?:改为|改成|换为|换成|调整为|调整成|变更为|变更成|转为|转成|变为|变成)\s*"
+    r"(?P<value>[^，,。；;！？!?\n]+)",
+    re.IGNORECASE,
+)
 
-    placeholder = CandidateProfile(
-        id=0,
-        name="",
-        status="",
-        education="",
-        experience_years=0,
-        skills={},
-        preferred_cities=[],
-        salary_floor_k=None,
-        expected_salary_k=None,
-        target_directions=[],
-        unacceptable=[],
-        acceptable_cities=[],
-    )
-    preferred, _, _ = extract_city_preferences(placeholder, text)
-    return preferred
+
+def has_target_direction_replacement_intent(text: str) -> bool:
+    """判断用户是否明确要求用新的求职方向替换已有方向。"""
+
+    return TARGET_DIRECTION_REPLACEMENT_PATTERN.search(text) is not None
 
 
 def extract_target_directions(text: str) -> list[str]:
     """提取常见求职方向。"""
 
-    directions = []
-    if "agent" in text.lower() or "智能体" in text:
-        directions.append("AI Agent 应用开发")
-    if "后端" in text:
-        directions.append("后端开发")
+    # 替换语句可能同时提到旧方向和新方向，例如“从 Agent 开发改为后端开发”。
+    # 此时只能从“改为”后的目标片段提取，不能把被替换的旧方向重新写回档案。
+    replacement_match = TARGET_DIRECTION_REPLACEMENT_PATTERN.search(text)
+    direction_text = replacement_match.group("value") if replacement_match else text
+    direction_aliases = (
+        ("AI Agent 应用开发", ("agent", "智能体")),
+        ("后端开发", ("后端", "服务端")),
+        ("前端开发", ("前端", "web前端", "web 前端")),
+        ("全栈开发", ("全栈",)),
+        ("算法工程", ("算法",)),
+        ("数据工程", ("数据工程", "大数据")),
+        ("数据分析", ("数据分析",)),
+        ("测试开发", ("测试开发", "测试工程")),
+        ("产品经理", ("产品经理", "产品岗")),
+    )
+    normalized_text = direction_text.lower()
+    directions = [
+        canonical
+        for canonical, aliases in direction_aliases
+        if any(alias in normalized_text for alias in aliases)
+    ]
+    if replacement_match and not directions:
+        fallback = re.sub(
+            r"^(?:做|从事|转向|转做)\s*|\s*(?:相关)?(?:岗位|职位|工作|方向)$",
+            "",
+            direction_text.strip(),
+        ).strip()
+        if fallback and len(fallback) <= 40:
+            directions.append(fallback)
     return directions
 
 
@@ -475,11 +567,11 @@ def clean_string_dict(value: Any) -> dict[str, str]:
 
     if not isinstance(value, dict):
         return {}
-    return {
+    return normalize_skill_mapping({
         str(key).strip(): str(item).strip() or "待确认"
         for key, item in value.items()
         if str(key).strip()
-    }
+    })
 
 
 def clean_number_dict(value: Any) -> dict[str, float]:

@@ -17,6 +17,11 @@ import re
 from .job_parser import KNOWN_SKILLS
 from .llm import LLMClient
 from .models import CandidateProfile, ImportedJob, ProjectExperienceRecord, ResumeDraft
+from .skill_normalization import (
+    contains_skill_mention,
+    skill_identity,
+    skill_level_is_available,
+)
 
 
 def build_resume_draft(
@@ -45,10 +50,24 @@ def build_resume_draft(
     contextual_evidence = list(semantic_evidence or [])
     evidence = [*factual_evidence, *contextual_evidence]
     factual_evidence_text = "\n".join(factual_evidence).lower()
+    candidate_skill_names = {
+        skill_identity(name)
+        for name, level in candidate.skills.items()
+        if skill_level_is_available(level)
+    }
+    unavailable_skill_names = {
+        skill_identity(name)
+        for name, level in candidate.skills.items()
+        if not skill_level_is_available(level)
+    }
     matched_skills = [
         skill
         for skill in job.skills
-        if skill in candidate.skills or skill.lower() in factual_evidence_text
+        if skill_identity(skill) in candidate_skill_names
+        or (
+            skill_identity(skill) not in unavailable_skill_names
+            and contains_skill_mention(factual_evidence_text, skill)
+        )
     ]
     missing_skills = [skill for skill in job.skills if skill not in matched_skills]
     risks = [
@@ -56,7 +75,7 @@ def build_resume_draft(
         for skill in missing_skills
     ]
     for skill in matched_skills:
-        if skill not in candidate.skills:
+        if skill_identity(skill) not in candidate_skill_names:
             risks.append(f"技能 {skill} 仅来自已提供材料，熟练度仍需候选人确认。")
     if allow_proficiency_upgrade:
         # 用户可以明确要求一次性提高草稿措辞，但该选择不会反向修改事实档案。
@@ -116,7 +135,10 @@ def collect_evidence(
         f"实际经验年限：{candidate.experience_years:g} 年",
     ]
     for skill, level in candidate.skills.items():
-        evidence.append(f"已确认技能：{skill}（{level}）")
+        if skill_level_is_available(level):
+            evidence.append(f"已确认技能：{skill}（{level}）")
+        else:
+            evidence.append(f"候选人明确不具备技能：{skill}")
     for record in confirmed_project_cards:
         if record.confirmed_summary:
             evidence.append(f"已确认项目：{record.card.project_name}：{record.confirmed_summary}")
@@ -183,8 +205,10 @@ def skill_phrase(skill: str, level: str) -> str:
 def matched_skill_phrase(skill: str, candidate: CandidateProfile) -> str:
     """为已匹配技能生成不会假设未知熟练度的简历措辞。"""
 
-    if skill in candidate.skills:
-        return skill_phrase(skill, candidate.skills[skill])
+    identity = skill_identity(skill)
+    for candidate_skill, level in candidate.skills.items():
+        if skill_identity(candidate_skill) == identity:
+            return skill_phrase(skill, level)
     return f"候选人材料中提及 {skill}（熟练度待确认）"
 
 
@@ -235,19 +259,34 @@ def validate_llm_output(
 
     violations: list[str] = []
     lower_text = text.lower()
+    candidate_skill_names = {
+        skill_identity(name)
+        for name, level in candidate.skills.items()
+        if skill_level_is_available(level)
+    }
+    unavailable_skill_names = {
+        skill_identity(name)
+        for name, level in candidate.skills.items()
+        if not skill_level_is_available(level)
+    }
     for skill in missing_skills:
-        if skill.lower() in lower_text:
+        if contains_skill_mention(lower_text, skill):
             violations.append(f"包含未确认技能：{skill}")
     evidence_text = "\n".join(evidence).lower()
     for skill in KNOWN_SKILLS:
-        if (
-            skill not in candidate.skills
-            and skill.lower() not in evidence_text
-            and skill.lower() in lower_text
+        identity = skill_identity(skill)
+        if identity in unavailable_skill_names and contains_skill_mention(lower_text, skill):
+            note = f"包含候选人明确不具备的技能：{skill}"
+        elif (
+            identity not in candidate_skill_names
+            and not contains_skill_mention(evidence_text, skill)
+            and contains_skill_mention(lower_text, skill)
         ):
             note = f"包含档案外技能：{skill}"
-            if note not in violations:
-                violations.append(note)
+        else:
+            continue
+        if note not in violations:
+            violations.append(note)
     if not allow_proficiency_upgrade:
         for skill, level in candidate.skills.items():
             if level.strip() in {"项目使用", "项目中使用", "使用过", "了解", "学习过", "入门"}:

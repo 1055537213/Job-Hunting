@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator, Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol, Self
 from uuid import uuid4
@@ -45,6 +45,8 @@ from .models import (
     UsageEventRecord,
     sanitize_preference_weights,
 )
+from .skill_normalization import merge_skill_mappings, normalize_skill_mapping
+from .tool_audit import tool_audit_retention_cutoff
 
 RESUME_ARTIFACT_STATUSES = {"ready", "processing", "failed"}
 
@@ -208,6 +210,42 @@ class RepositoryStore:
                 raise KeyError(f"Account not found: {account_id}")
         return self.get_account(account_id)
 
+    def update_account_status_with_audit(
+        self,
+        account_id: int,
+        status: str,
+        audit_event: AdminAuditEventRecord,
+        *,
+        revoke_sessions: bool = False,
+    ) -> AccountRecord:
+        """在同一事务中更新账号状态、撤销 Session 并写入管理员审计。"""
+
+        if status not in {"active", "disabled"}:
+            raise ValueError("账号状态只能是 active 或 disabled。")
+        if audit_event.target_account_id != account_id:
+            raise ValueError("账号状态审计的目标账号与写入目标不一致。")
+        if audit_event.actor_account_id is not None:
+            self.get_account(audit_event.actor_account_id)
+        self.get_account(account_id)
+        changed_at = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE accounts SET status = ?, updated_at = ? WHERE id = ?",
+                (status, changed_at, account_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Account not found: {account_id}")
+            if revoke_sessions:
+                conn.execute(
+                    """
+                    UPDATE auth_sessions SET revoked_at = ?
+                    WHERE account_id = ? AND revoked_at IS NULL
+                    """,
+                    (changed_at, account_id),
+                )
+            self._insert_admin_audit_event(conn, audit_event)
+        return self.get_account(account_id)
+
     def update_account_password(
         self,
         account_id: int,
@@ -320,6 +358,36 @@ class RepositoryStore:
                 """,
                 (now_iso(), account_id),
             )
+            return int(cursor.rowcount)
+
+    def revoke_all_auth_sessions_with_audit(
+        self,
+        account_id: int,
+        audit_event: AdminAuditEventRecord,
+    ) -> int:
+        """在同一事务中撤销全部 Session 并写入管理员审计。"""
+
+        if audit_event.target_account_id != account_id:
+            raise ValueError("登录会话审计的目标账号与撤销目标不一致。")
+        self._validate_admin_audit_event(audit_event)
+        self.get_account(account_id)
+        revoked_at = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE auth_sessions SET revoked_at = ?
+                WHERE account_id = ? AND revoked_at IS NULL
+                """,
+                (revoked_at, account_id),
+            )
+            event = replace(
+                audit_event,
+                details={
+                    **(audit_event.details or {}),
+                    "revoked_sessions": int(cursor.rowcount),
+                },
+            )
+            self._insert_admin_audit_event(conn, event)
             return int(cursor.rowcount)
 
     def create_chat_session(
@@ -593,6 +661,27 @@ class RepositoryStore:
         updated_at = trace.updated_at or now
         trace_payload = json.dumps(trace.trace or {}, ensure_ascii=False)
         with self.connect() as conn:
+            # Beat 可能尚未在午夜完成清理。若同一链路 ID 在保留窗口外再次出现，
+            # 先移除旧记录，避免 ON CONFLICT 保留过期 created_at 后被查询条件隐藏。
+            existing = conn.execute(
+                """
+                SELECT account_id, created_at FROM tool_call_traces
+                WHERE root_request_id = ?
+                """,
+                (root_request_id,),
+            ).fetchone()
+            if (
+                existing is not None
+                and int(existing["account_id"]) == trace.account_id
+                and str(existing["created_at"]) < tool_audit_retention_cutoff()
+            ):
+                conn.execute(
+                    """
+                    DELETE FROM tool_call_traces
+                    WHERE root_request_id = ? AND account_id = ?
+                    """,
+                    (root_request_id, trace.account_id),
+                )
             conn.execute(
                 """
                 INSERT INTO tool_call_traces (
@@ -602,7 +691,6 @@ class RepositoryStore:
                     created_at, started_at, finished_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (root_request_id) DO UPDATE SET
-                    account_id = EXCLUDED.account_id,
                     candidate_id = COALESCE(EXCLUDED.candidate_id, tool_call_traces.candidate_id),
                     session_id = COALESCE(EXCLUDED.session_id, tool_call_traces.session_id),
                     title = EXCLUDED.title,
@@ -616,6 +704,7 @@ class RepositoryStore:
                     started_at = COALESCE(tool_call_traces.started_at, EXCLUDED.started_at),
                     finished_at = EXCLUDED.finished_at,
                     updated_at = EXCLUDED.updated_at
+                WHERE tool_call_traces.account_id = EXCLUDED.account_id
                 """,
                 (
                     trace.account_id,
@@ -637,17 +726,22 @@ class RepositoryStore:
                 ),
             )
             row = conn.execute(
-                "SELECT * FROM tool_call_traces WHERE root_request_id = ?",
-                (root_request_id,),
+                """
+                SELECT * FROM tool_call_traces
+                WHERE root_request_id = ? AND account_id = ?
+                """,
+                (root_request_id, trace.account_id),
             ).fetchone()
-        if row is None:  # pragma: no cover - 仅在数据库异常时触发
-            raise RuntimeError(f"Tool call trace was not persisted: {root_request_id}")
+        if row is None:
+            raise ValueError("该 root_request_id 已属于其他账号，不能覆盖其工具轨迹。")
         return tool_call_trace_from_row(row)
 
     def get_tool_call_trace(
         self,
         root_request_id: str,
         account_id: int | None = None,
+        *,
+        cutoff_iso: str | None = None,
     ) -> ToolCallTraceRecord:
         """读取一条工具调用审计轨迹，并可按账号隔离。"""
 
@@ -656,6 +750,9 @@ class RepositoryStore:
         if account_id is not None:
             conditions.append("account_id = ?")
             parameters.append(account_id)
+        if cutoff_iso is not None:
+            conditions.append("created_at >= ?")
+            parameters.append(cutoff_iso)
         with self.connect() as conn:
             row = conn.execute(
                 f"""
@@ -674,11 +771,12 @@ class RepositoryStore:
         *,
         limit: int = 50,
         offset: int = 0,
+        cutoff_iso: str | None = None,
     ) -> list[ToolCallTraceRecord]:
         """分页列出最近工具调用任务，详情由单条读取接口按需加载。"""
 
-        conditions: list[str] = []
-        parameters: list[object] = []
+        conditions = ["created_at >= ?"]
+        parameters: list[object] = [cutoff_iso or tool_audit_retention_cutoff()]
         if account_id is not None:
             conditions.append("account_id = ?")
             parameters.append(account_id)
@@ -695,19 +793,32 @@ class RepositoryStore:
             ).fetchall()
         return [tool_call_trace_from_row(row) for row in rows]
 
-    def count_tool_call_traces(self, account_id: int | None = None) -> int:
+    def count_tool_call_traces(
+        self,
+        account_id: int | None = None,
+        *,
+        cutoff_iso: str | None = None,
+    ) -> int:
         """返回工具调用任务数量，供分页 UI 展示总数。"""
 
-        where = " WHERE account_id = ?" if account_id is not None else ""
-        parameters = (account_id,) if account_id is not None else ()
+        conditions = ["created_at >= ?"]
+        parameters: list[object] = [cutoff_iso or tool_audit_retention_cutoff()]
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            parameters.append(account_id)
+        where = f" WHERE {' AND '.join(conditions)}"
         with self.connect() as conn:
             row = conn.execute(
                 f"SELECT COUNT(*) AS count FROM tool_call_traces{where}",
-                parameters,
+                tuple(parameters),
             ).fetchone()
         return int(row["count"])
 
-    def summarize_tool_call_traces_by_account(self) -> list[dict[str, int]]:
+    def summarize_tool_call_traces_by_account(
+        self,
+        *,
+        cutoff_iso: str | None = None,
+    ) -> list[dict[str, int]]:
         """按账号聚合工具调用任务数量和失败数量。"""
 
         with self.connect() as conn:
@@ -719,9 +830,11 @@ class RepositoryStore:
                     COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
                         AS failed_trace_count
                 FROM tool_call_traces
+                WHERE created_at >= ?
                 GROUP BY account_id
                 ORDER BY account_id
-                """
+                """,
+                (cutoff_iso or tool_audit_retention_cutoff(),),
             ).fetchall()
         return [
             {
@@ -745,6 +858,20 @@ class RepositoryStore:
     def record_admin_audit_event(self, event: AdminAuditEventRecord) -> AdminAuditEventRecord:
         """追加记录一次管理员动作，不保存正文、查询参数或密钥。"""
 
+        self._validate_admin_audit_event(event)
+        with self.connect() as conn:
+            record_id = self._insert_admin_audit_event(conn, event)
+            row = conn.execute(
+                "SELECT * FROM admin_audit_events WHERE id = ?",
+                (record_id,),
+            ).fetchone()
+        if row is None:  # pragma: no cover - 仅在数据库异常时触发
+            raise RuntimeError("Admin audit event was not persisted.")
+        return admin_audit_event_from_row(row)
+
+    def _validate_admin_audit_event(self, event: AdminAuditEventRecord) -> None:
+        """校验审计事件关联的账号，供独立和复合事务共同使用。"""
+
         if event.actor_account_id is not None:
             if event.actor_account_id <= 0:
                 raise ValueError("管理员审计事件的操作者账号无效。")
@@ -753,6 +880,14 @@ class RepositoryStore:
             if event.target_account_id <= 0:
                 raise ValueError("管理员审计事件的目标账号无效。")
             self.get_account(event.target_account_id)
+
+    def _insert_admin_audit_event(
+        self,
+        conn: RepositoryConnection,
+        event: AdminAuditEventRecord,
+    ) -> int:
+        """在调用方现有事务中插入一条已脱敏的管理员审计事件。"""
+
         if event.outcome not in {"succeeded", "blocked", "failed"}:
             raise ValueError(f"Unsupported admin audit outcome: {event.outcome}")
         action = event.action.strip()[:96]
@@ -761,35 +896,27 @@ class RepositoryStore:
             raise ValueError("管理员审计事件缺少动作。")
         if not target_type:
             raise ValueError("管理员审计事件缺少目标类型。")
-        created_at = event.created_at or now_iso()
-        with self.connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO admin_audit_events (
-                    actor_account_id, target_account_id, action, target_type,
-                    target_id, outcome, summary, details_json, request_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event.actor_account_id,
-                    event.target_account_id,
-                    action,
-                    target_type,
-                    str(event.target_id)[:160] if event.target_id else None,
-                    event.outcome,
-                    trim_audit_text(event.summary) or "管理员操作已记录。",
-                    json.dumps(event.details or {}, ensure_ascii=False),
-                    str(event.request_id)[:128] if event.request_id else None,
-                    created_at,
-                ),
-            )
-            row = conn.execute(
-                "SELECT * FROM admin_audit_events WHERE id = ?",
-                (int(cursor.lastrowid),),
-            ).fetchone()
-        if row is None:  # pragma: no cover - 仅在数据库异常时触发
-            raise RuntimeError("Admin audit event was not persisted.")
-        return admin_audit_event_from_row(row)
+        cursor = conn.execute(
+            """
+            INSERT INTO admin_audit_events (
+                actor_account_id, target_account_id, action, target_type,
+                target_id, outcome, summary, details_json, request_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.actor_account_id,
+                event.target_account_id,
+                action,
+                target_type,
+                str(event.target_id)[:160] if event.target_id else None,
+                event.outcome,
+                trim_audit_text(event.summary) or "管理员操作已记录。",
+                json.dumps(event.details or {}, ensure_ascii=False),
+                str(event.request_id)[:128] if event.request_id else None,
+                event.created_at or now_iso(),
+            ),
+        )
+        return int(cursor.lastrowid)
 
     def list_admin_audit_events(
         self,
@@ -823,6 +950,7 @@ class RepositoryStore:
         session_id: str | None = None,
         idempotency_key: str | None = None,
         max_attempts: int = 3,
+        audit_event: AdminAuditEventRecord | None = None,
     ) -> BackgroundTaskRecord:
         """创建一条待执行任务；相同账号和幂等键重复提交会复用原任务。"""
 
@@ -836,6 +964,8 @@ class RepositoryStore:
         self.get_account(account_id)
         if candidate_id is not None:
             self.get_candidate_profile(candidate_id, account_id=account_id)
+        if audit_event is not None:
+            self._validate_admin_audit_event(audit_event)
 
         payload_json = json.dumps(dict(payload or {}), ensure_ascii=False)
         now = now_iso()
@@ -851,45 +981,66 @@ class RepositoryStore:
                     (account_id, idempotency_key),
                 ).fetchone()
                 if existing is not None:
-                    return background_task_from_row(existing)
-            conn.execute(
-                """
-                INSERT INTO background_tasks (
-                    task_key, account_id, candidate_id, session_id, task_type,
-                    status, progress, attempt, max_attempts, idempotency_key,
-                    payload_json, result_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (account_id, idempotency_key) DO NOTHING
-                """,
-                (
-                    task_key,
-                    account_id,
-                    candidate_id,
-                    session_id,
-                    normalized_type,
-                    max_attempts,
-                    idempotency_key,
-                    payload_json,
-                    json.dumps({}, ensure_ascii=False),
-                    now,
-                    now,
-                ),
-            )
-            row = conn.execute(
-                "SELECT * FROM background_tasks WHERE task_key = ?",
-                (task_key,),
-            ).fetchone()
-            if row is None and idempotency_key:
-                row = conn.execute(
+                    row = existing
+                else:
+                    row = None
+            else:
+                row = None
+            if row is None:
+                conn.execute(
                     """
-                    SELECT * FROM background_tasks
-                    WHERE account_id = ? AND idempotency_key = ?
+                    INSERT INTO background_tasks (
+                        task_key, account_id, candidate_id, session_id, task_type,
+                        status, progress, attempt, max_attempts, idempotency_key,
+                        payload_json, result_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (account_id, idempotency_key) DO NOTHING
                     """,
-                    (account_id, idempotency_key),
+                    (
+                        task_key,
+                        account_id,
+                        candidate_id,
+                        session_id,
+                        normalized_type,
+                        max_attempts,
+                        idempotency_key,
+                        payload_json,
+                        json.dumps({}, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM background_tasks WHERE task_key = ?",
+                    (task_key,),
                 ).fetchone()
-        if row is None:  # pragma: no cover - 仅在数据库异常时触发
-            raise RuntimeError("后台任务创建后无法读取任务记录。")
-        return background_task_from_row(row)
+                if row is None and idempotency_key:
+                    row = conn.execute(
+                        """
+                        SELECT * FROM background_tasks
+                        WHERE account_id = ? AND idempotency_key = ?
+                        """,
+                        (account_id, idempotency_key),
+                    ).fetchone()
+            if row is None:  # pragma: no cover - 仅在数据库异常时触发
+                raise RuntimeError("后台任务创建后无法读取任务记录。")
+            record = background_task_from_row(row)
+            if audit_event is not None:
+                if audit_event.target_type != "background_task":
+                    raise ValueError("后台任务审计的目标类型必须是 background_task。")
+                event = replace(
+                    audit_event,
+                    target_id=record.task_key,
+                    details={
+                        **(audit_event.details or {}),
+                        "task_key": record.task_key,
+                        "task_type": record.task_type,
+                    },
+                )
+                # 任务登记和审计写入必须随同一数据库事务提交；否则审计失败时会
+                # 留下一条已经可投递的孤立任务。
+                self._insert_admin_audit_event(conn, event)
+        return record
 
     def get_background_task(
         self,
@@ -1129,6 +1280,7 @@ class RepositoryStore:
     ) -> int:
         """保存候选人结构化档案，返回新建档案 ID。"""
 
+        skills = normalize_skill_mapping(profile.skills)
         preferred_cities = normalize_city_list(profile.preferred_cities)
         acceptable_cities = [
             city
@@ -1158,7 +1310,7 @@ class RepositoryStore:
                         profile.experience_years,
                         profile.salary_floor_k,
                         profile.expected_salary_k,
-                        json.dumps(profile.skills, ensure_ascii=False),
+                        json.dumps(skills, ensure_ascii=False),
                         json.dumps(preferred_cities, ensure_ascii=False),
                         json.dumps(acceptable_cities, ensure_ascii=False),
                         json.dumps(preference_weights, ensure_ascii=False),
@@ -1174,7 +1326,7 @@ class RepositoryStore:
                     "candidate_profile",
                     candidate_id,
                     "skills",
-                    " ".join(profile.skills),
+                    " ".join(skills),
                     account_id=account_id,
                     candidate_id=candidate_id,
                 )
@@ -1200,9 +1352,7 @@ class RepositoryStore:
                     "SELECT * FROM candidate_profiles WHERE content_fingerprint = ?",
                     (fingerprint,),
                 ).fetchone()
-                legacy_rows = conn.execute(
-                    "SELECT * FROM candidate_profiles WHERE content_fingerprint IS NULL"
-                ).fetchall()
+                candidate_rows = conn.execute("SELECT * FROM candidate_profiles").fetchall()
             else:
                 row = conn.execute(
                     """
@@ -1211,17 +1361,16 @@ class RepositoryStore:
                     """,
                     (account_id, fingerprint),
                 ).fetchone()
-                legacy_rows = conn.execute(
-                    """
-                    SELECT * FROM candidate_profiles
-                    WHERE account_id = ? AND content_fingerprint IS NULL
-                    """,
+                candidate_rows = conn.execute(
+                    "SELECT * FROM candidate_profiles WHERE account_id = ?",
                     (account_id,),
                 ).fetchall()
         if row is not None:
             return candidate_profile_from_row(row)
-        for legacy_row in legacy_rows:
-            profile = candidate_profile_from_row(legacy_row)
+        # 历史档案可能在启用规范化前写入；补做一次逻辑比较，保证 Python/python
+        # 之类的等价写法仍然会命中已有档案。
+        for candidate_row in candidate_rows:
+            profile = candidate_profile_from_row(candidate_row)
             if candidate_profile_content_fingerprint(profile) == fingerprint:
                 return profile
         return None
@@ -1269,8 +1418,8 @@ class RepositoryStore:
     ) -> list[str]:
         """按 patch 局部更新候选人档案，返回实际更新的字段名。
 
-        自动入库只处理消息中明确出现的字段：标量和首选城市覆盖，其他列表去重追加，
-        技能字段按技能名合并/更新熟练度。
+        自动入库只处理消息中明确出现的字段：标量、首选城市和明确替换的求职方向覆盖，
+        其他列表去重追加，技能字段按技能名合并/更新熟练度。
         """
 
         current = self.get_candidate_profile(candidate_id, account_id=account_id)
@@ -1281,7 +1430,7 @@ class RepositoryStore:
         experience_years = current.experience_years
         salary_floor_k = current.salary_floor_k
         expected_salary_k = current.expected_salary_k
-        skills = dict(current.skills)
+        skills = normalize_skill_mapping(current.skills)
         preferred_cities = list(current.preferred_cities)
         acceptable_cities = list(current.acceptable_cities)
         preference_weights = sanitize_preference_weights(current.preference_weights)
@@ -1304,8 +1453,10 @@ class RepositoryStore:
             expected_salary_k = patch.expected_salary_k
             updated_fields.append("expected_salary_k")
         if patch.skills:
-            skills.update(patch.skills)
-            updated_fields.append("skills")
+            merged_skills = merge_skill_mappings(skills, patch.skills)
+            if merged_skills != skills:
+                skills = merged_skills
+                updated_fields.append("skills")
         if patch.clear_preferred_cities:
             preferred_cities = []
             updated_fields.append("preferred_cities")
@@ -1334,8 +1485,15 @@ class RepositoryStore:
                     preference_weights[key] = sanitize_preference_weights({key: value})[key]
             updated_fields.append("preference_weights")
         if patch.target_directions:
-            target_directions = merge_unique(target_directions, patch.target_directions)
-            updated_fields.append("target_directions")
+            incoming_directions = merge_unique([], patch.target_directions)
+            next_target_directions = (
+                incoming_directions
+                if patch.replace_target_directions
+                else merge_unique(target_directions, incoming_directions)
+            )
+            if next_target_directions != target_directions:
+                target_directions = next_target_directions
+                updated_fields.append("target_directions")
         if patch.unacceptable:
             unacceptable = merge_unique(unacceptable, patch.unacceptable)
             updated_fields.append("unacceptable")
@@ -1995,7 +2153,13 @@ class RepositoryStore:
         if existing.status == "已确认":
             # 重复确认必须保持幂等，不能再次创建一份相同 long_texts 材料。
             return existing
-        summary = confirmed_summary if confirmed_summary is not None else existing.confirmed_summary
+        summary = str(
+            confirmed_summary
+            if confirmed_summary is not None
+            else existing.confirmed_summary or ""
+        ).strip()
+        if not summary:
+            raise ValueError("确认项目经历前至少确认一组属于候选人的内容。")
         confirmed_at = now_iso()
         with self.connect() as conn:
             cursor = conn.execute(
@@ -2010,15 +2174,12 @@ class RepositoryStore:
             if cursor.rowcount == 0:
                 # 另一个请求已经完成确认；不再登记第二份相同长文本。
                 return self.get_project_card(record_id, account_id=account_id)
-            # 如果候选人没有写确认摘要，就把卡片草稿作为可检索材料保存，
-            # 但界面仍然应该提示它来自候选人确认过的卡片而不是原始档案事实。
-            text_for_index = summary or project_card_index_text(existing.card)
             self._add_long_text(
                 conn,
                 "project_experience_card",
                 record_id,
                 "confirmed",
-                text_for_index,
+                summary,
                 account_id=account_id,
                 candidate_id=existing.candidate_id,
             )
@@ -3034,7 +3195,8 @@ def candidate_profile_from_row(row: RepositoryRow) -> CandidateProfile:
         experience_years=float(row["experience_years"]),
         salary_floor_k=row["salary_floor_k"],
         expected_salary_k=row["expected_salary_k"],
-        skills=json.loads(row["skills_json"]),
+        # 旧记录即使曾保留 Python/python 两个键，读取时也只向上层暴露一个技能。
+        skills=normalize_skill_mapping(json.loads(row["skills_json"])),
         preferred_cities=normalize_city_list(json.loads(row["preferred_cities_json"] or "[]")),
         target_directions=json.loads(row["target_directions_json"]),
         unacceptable=json.loads(row["unacceptable_json"]),

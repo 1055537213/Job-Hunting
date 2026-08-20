@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .worker import create_worker_app
 from .task_queue import TaskQueueError
+from .worker import create_worker_app
 
 
 def main(argv: list[str] | None = None) -> None:

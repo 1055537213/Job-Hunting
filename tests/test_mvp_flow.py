@@ -430,6 +430,8 @@ def test_confirmed_missing_core_skill_can_trigger_hard_elimination(tmp_path, acc
 
     assert result.eliminated
     assert any("确认不具备" in item for item in result.elimination_reasons)
+    assert not any("已确认技能：Python" in item for item in result.resume_suggestions)
+    assert any("缺失技能" in item and "Python" in item for item in result.resume_suggestions)
 
 
 def test_uncertain_skill_gap_is_not_scored_as_zero(tmp_path, account_id):

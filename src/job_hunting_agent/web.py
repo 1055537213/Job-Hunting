@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -43,8 +43,8 @@ from .app import JobHuntingApp
 from .auth import (
     AccountAlreadyExistsError,
     hash_password,
-    iso_utc,
     is_session_expired,
+    iso_utc,
     new_session_token,
     session_expiry,
     session_token_hash,
@@ -93,12 +93,13 @@ from .models import (
 )
 from .rag import RAGProviderRequestError
 from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
+from .skill_normalization import normalize_skill_mapping
 from .task_queue import BackgroundTaskQueue, TaskQueueError
 from .tool_audit import (
     background_task_tool_name,
     build_tool_trace_record,
     has_audited_steps,
-    tool_step_label as task_step_label,
+    tool_audit_retention_cutoff,
     tool_step_label,
     tool_trace_title,
 )
@@ -111,7 +112,6 @@ from .web_hardening import (
 )
 
 STATIC_DIR = Path(__file__).with_name("web_static")
-logger = logging.getLogger(__name__)
 SESSION_COOKIE_NAME = "job_agent_session"
 SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 # Uvicorn 的重载子进程只能通过导入路径重新创建应用，因此启动参数通过这些
@@ -257,8 +257,13 @@ class GitHubProjectPayload(BaseModel):
 class ProjectCardConfirmationPayload(BaseModel):
     """候选人确认项目卡片时可选提供的本人职责摘要。"""
 
-    confirmed_summary: str | None = None
-    root_request_id: str | None = None
+    confirmed_summary: str | None = Field(default=None, max_length=20_000)
+    root_request_id: str | None = Field(
+        default=None,
+        min_length=32,
+        max_length=32,
+        pattern=r"^[A-Fa-f0-9]{32}$",
+    )
 
 
 def create_web_app(
@@ -442,30 +447,54 @@ def create_web_app(
 
         account = current_account(request)
         assert account is not None
-        count = backend.store.revoke_all_auth_sessions(account.id)
-        response.delete_cookie(SESSION_COOKIE_NAME, path="/")
-        delete_csrf_cookie(response)
         if account.role == "admin":
-            record_admin_audit_event(
-                backend,
-                request,
-                account,
+            audit_event = AdminAuditEventRecord(
+                id=0,
+                actor_account_id=account.id,
+                target_account_id=account.id,
                 action="auth.logout_all_devices",
                 target_type="account",
                 target_id=str(account.id),
-                target_account_id=account.id,
+                outcome="succeeded",
                 summary=f"撤销账号 #{account.id} 的全部登录会话。",
-                details={"revoked_sessions": count},
+                details={},
+                request_id=getattr(request.state, "request_id", None),
             )
+            count = backend.store.revoke_all_auth_sessions_with_audit(account.id, audit_event)
+        else:
+            count = backend.store.revoke_all_auth_sessions(account.id)
+        response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+        delete_csrf_cookie(response)
         return {"ok": True, "revoked_sessions": count}
 
-    @web_app.get("/")
-    def home() -> FileResponse:
-        """返回单页 Web 前端。"""
-
+    def frontend_shell() -> FileResponse:
         response = FileResponse(STATIC_DIR / "index.html")
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
+
+    @web_app.get("/")
+    def home() -> FileResponse:
+        """返回 Web 前端入口；前端会按登录状态进入登录页或工作台。"""
+
+        return frontend_shell()
+
+    @web_app.get("/login")
+    def login_page() -> FileResponse:
+        """登录和注册页面。"""
+
+        return frontend_shell()
+
+    @web_app.get("/workspace")
+    def workspace_page() -> FileResponse:
+        """求职工作台页面。"""
+
+        return frontend_shell()
+
+    @web_app.get("/admin")
+    def admin_page() -> FileResponse:
+        """管理后台页面。"""
+
+        return frontend_shell()
 
     @web_app.get("/api/health")
     def health(request: Request) -> dict[str, object]:
@@ -727,7 +756,7 @@ def create_web_app(
             reconcile_task_trace(trace, tool_outputs)
             approval = approval_from_tool_outputs(tool_outputs)
             trace["approval"] = approval
-            trace["status"] = "waiting_confirmation" if approval else "completed"
+            trace["status"] = task_trace_completion_status(trace, approval)
             trace["duration_ms"] = max(0, round((time.monotonic() - trace_started_at) * 1000))
             trace["finished_at"] = iso_utc() if not approval else None
             trace["updated_at"] = iso_utc()
@@ -739,6 +768,7 @@ def create_web_app(
                 rule_based_result=None,
             )
             task_trace_metadata = trace if has_audited_steps(trace) else None
+            user_task_trace = serialize_user_task_trace(task_trace_metadata)
             save_successful_web_chat_turn(
                 backend,
                 payload.candidate_id,
@@ -747,9 +777,7 @@ def create_web_app(
                 display_reply,
                 {
                     "mode": result.mode,
-                    "used_tools": result.used_tools,
-                    "usage": result.usage,
-                    "task_trace": task_trace_metadata,
+                    "task_trace": user_task_trace,
                 },
                 account_id=account_id,
             )
@@ -764,12 +792,11 @@ def create_web_app(
             return {
                 "mode": result.mode,
                 "reply": result.reply,
-                "used_tools": result.used_tools,
-                "tool_outputs": tool_outputs,
-                "usage": result.usage,
                 "display_reply": display_reply,
+                "task_trace": user_task_trace,
+                "background_tasks": public_background_tasks_from_tool_outputs(tool_outputs),
                 "profile": asdict(backend.get_candidate_profile(payload.candidate_id, account_id=account_id)),
-        }
+            }
 
         try:
             result = backend.ingest_conversation_message(
@@ -784,6 +811,7 @@ def create_web_app(
         tool_outputs = [{"tool_name": "ingest_conversation_message", "data": asdict(result)}]
         trace = new_task_trace(root_request_id=root_request_id, source="chat")
         reconcile_task_trace(trace, tool_outputs)
+        trace["status"] = task_trace_completion_status(trace, None)
         trace["duration_ms"] = max(0, round((time.monotonic() - trace_started_at) * 1000))
         trace["finished_at"] = iso_utc()
         trace["updated_at"] = iso_utc()
@@ -802,8 +830,7 @@ def create_web_app(
             display_reply,
             {
                 "mode": "rule_based_ingestion",
-                "used_tools": ["ingest_conversation_message"],
-                "task_trace": trace,
+                "task_trace": serialize_user_task_trace(trace),
             },
             account_id=account_id,
         )
@@ -818,10 +845,9 @@ def create_web_app(
         return {
             "mode": "rule_based_ingestion",
             "reply": result.reply,
-            "used_tools": ["ingest_conversation_message"],
-            "tool_outputs": tool_outputs,
-            "result": asdict(result),
             "display_reply": display_reply,
+            "task_trace": serialize_user_task_trace(trace),
+            "background_tasks": [],
             "profile": asdict(backend.get_candidate_profile(payload.candidate_id, account_id=account_id)),
         }
 
@@ -887,8 +913,21 @@ def create_web_app(
             "candidate_id": candidate_id,
             "session_id": actual_session_id,
             "messages": [
-                asdict(message)
-                for message in backend.list_chat_messages(candidate_id, actual_session_id, limit, account_id=account_id)
+                {
+                    **asdict(message),
+                    "content": (
+                        sanitize_web_chat_reply(message.content)
+                        if message.role == "assistant"
+                        else message.content
+                    ),
+                    "metadata": serialize_user_chat_metadata(message.metadata),
+                }
+                for message in backend.list_chat_messages(
+                    candidate_id,
+                    actual_session_id,
+                    limit,
+                    account_id=account_id,
+                )
             ],
         }
 
@@ -1120,7 +1159,16 @@ def create_web_app(
 
         account = current_account(request)
         assert account is not None
-        request_id = payload.root_request_id.strip() if payload.root_request_id and payload.root_request_id.strip() else uuid.uuid4().hex
+        try:
+            pending_record = backend.store.get_project_card(record_id, account_id=account.id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="项目经历卡片不存在。") from error
+        request_id = owned_or_new_root_request_id(
+            backend,
+            account_id=account.id,
+            candidate_id=pending_record.candidate_id,
+            root_request_id=payload.root_request_id,
+        )
         try:
             record, rag_task = backend.confirm_project_card_and_enqueue_rag(
                 record_id,
@@ -1131,6 +1179,8 @@ def create_web_app(
             )
         except KeyError as error:
             raise HTTPException(status_code=404, detail="项目经历卡片不存在。") from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         except TaskQueueError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         update_confirmation_tool_trace(
@@ -1446,23 +1496,27 @@ def create_web_app(
             and backend.store.count_active_admins() <= 1
         ):
             raise HTTPException(status_code=400, detail="至少需要保留一个可用管理员账号。")
-        account = backend.store.update_account_status(account_id, payload.status)
-        if payload.status != "active":
-            backend.store.revoke_all_auth_sessions(account_id)
-        record_admin_audit_event(
-            backend,
-            request,
-            actor,
+        audit_event = AdminAuditEventRecord(
+            id=0,
+            actor_account_id=actor.id,
+            target_account_id=target.id,
             action="account.status_updated",
             target_type="account",
             target_id=str(target.id),
-            target_account_id=target.id,
-            summary=f"账号 #{target.id} 状态从 {target.status} 更新为 {account.status}。",
+            outcome="succeeded",
+            summary=f"账号 #{target.id} 状态从 {target.status} 更新为 {payload.status}。",
             details={
                 "previous_status": target.status,
-                "next_status": account.status,
+                "next_status": payload.status,
                 "target_role": target.role,
             },
+            request_id=getattr(request.state, "request_id", None),
+        )
+        account = backend.store.update_account_status_with_audit(
+            account_id,
+            payload.status,
+            audit_event,
+            revoke_sessions=payload.status != "active",
         )
         return {"account": asdict(account)}
 
@@ -1505,20 +1559,26 @@ def create_web_app(
         """管理员登记一个无业务数据的 Worker 探针，用于运维验证。"""
 
         actor = require_admin(request)
+        task: BackgroundTaskRecord | None = None
         try:
-            task = backend.enqueue_system_probe(actor.id)
+            task = backend.enqueue_system_probe(
+                actor.id,
+                audit_event=AdminAuditEventRecord(
+                    id=0,
+                    actor_account_id=actor.id,
+                    target_account_id=None,
+                    action="system.probe_enqueued",
+                    target_type="background_task",
+                    target_id=None,
+                    outcome="succeeded",
+                    summary="投递系统探针任务。",
+                    details={},
+                    request_id=getattr(request.state, "request_id", None),
+                ),
+            )
         except TaskQueueError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
-        record_admin_audit_event(
-            backend,
-            request,
-            actor,
-            action="system.probe_enqueued",
-            target_type="background_task",
-            target_id=task.task_key,
-            summary="投递系统探针任务。",
-            details={"task_type": task.task_type, "task_key": task.task_key},
-        )
+        assert task is not None
         return {"task": serialize_background_task(task)}
 
     @web_app.get("/api/admin/usage/events")
@@ -1564,7 +1624,10 @@ def create_web_app(
 
         require_admin(request)
         try:
-            trace = backend.store.get_tool_call_trace(root_request_id)
+            trace = backend.store.get_tool_call_trace(
+                root_request_id,
+                cutoff_iso=tool_audit_retention_cutoff(),
+            )
         except KeyError as error:
             raise HTTPException(status_code=404, detail="工具调用记录不存在。") from error
         return {"trace": serialize_tool_trace_detail(trace)}
@@ -1589,7 +1652,7 @@ def stream_web_chat_events(
     root_request_id = uuid.uuid4().hex
     trace = new_task_trace(root_request_id=root_request_id, source="chat")
     trace_started_at = time.monotonic()
-    yield sse_event("task_started", {"task_trace": trace})
+    yield sse_event("task_started", {"task_trace": serialize_user_task_trace(trace)})
 
     if payload.use_env_llm:
         assert chat_agent is not None
@@ -1612,20 +1675,20 @@ def stream_web_chat_events(
                     yield sse_event("token", {"content": event.get("content", "")})
                 elif event_type == "step_started":
                     step = start_task_step(trace, str(event.get("name") or "unknown_tool"))
-                    yield sse_event("step_started", {"step": step})
+                    yield sse_event("step_started", {"step": serialize_user_task_step(step)})
                 elif event_type == "step_completed":
                     step = complete_task_step(
                         trace,
                         str(event.get("name") or "unknown_tool"),
                         event.get("data"),
                     )
-                    yield sse_event("step_completed", {"step": step})
+                    yield sse_event("step_completed", {"step": serialize_user_task_step(step)})
                 elif event_type == "final":
                     result = event["result"]
                     reconcile_task_trace(trace, result.tool_outputs)
                     approval = approval_from_tool_outputs(result.tool_outputs)
                     trace["approval"] = approval
-                    trace["status"] = "waiting_confirmation" if approval else "completed"
+                    trace["status"] = task_trace_completion_status(trace, approval)
                     trace["duration_ms"] = max(0, round((time.monotonic() - trace_started_at) * 1000))
                     trace["finished_at"] = iso_utc() if not approval else None
                     trace["updated_at"] = iso_utc()
@@ -1640,6 +1703,7 @@ def stream_web_chat_events(
                         start_task_step(trace, "compose_reply")
                         complete_task_step(trace, "compose_reply", None)
                     task_trace_metadata = trace if has_audited_steps(trace) else None
+                    user_task_trace = serialize_user_task_trace(task_trace_metadata)
                     save_successful_web_chat_turn(
                         backend,
                         payload.candidate_id,
@@ -1648,9 +1712,7 @@ def stream_web_chat_events(
                         display_reply,
                         {
                             "mode": result.mode,
-                            "used_tools": result.used_tools,
-                            "usage": result.usage,
-                            "task_trace": task_trace_metadata,
+                            "task_trace": user_task_trace,
                         },
                         account_id=account_id,
                     )
@@ -1663,20 +1725,20 @@ def stream_web_chat_events(
                         source="chat",
                     )
                     if approval:
-                        yield sse_event("approval_required", {"task_trace": trace})
+                        yield sse_event("approval_required", {"task_trace": user_task_trace})
                     else:
-                        yield sse_event("task_completed", {"task_trace": trace})
+                        event_name = "task_failed" if trace["status"] == "failed" else "task_completed"
+                        yield sse_event(event_name, {"task_trace": user_task_trace})
                     yield sse_event(
                         "final",
                         {
                             "mode": result.mode,
                             "reply": result.reply,
-                            "used_tools": result.used_tools,
-                            "tool_outputs": result.tool_outputs,
-                            "usage": result.usage,
                             "display_reply": display_reply,
-                            "task_trace": trace,
-                            "root_request_id": root_request_id,
+                            "task_trace": user_task_trace,
+                            "background_tasks": public_background_tasks_from_tool_outputs(
+                                result.tool_outputs
+                            ),
                             "profile": asdict(backend.get_candidate_profile(payload.candidate_id, account_id=account_id)),
                         },
                     )
@@ -1690,7 +1752,7 @@ def stream_web_chat_events(
                 session_id=session_id,
                 source="chat",
             )
-            yield sse_event("task_failed", {"task_trace": trace})
+            yield sse_event("task_failed", {"task_trace": serialize_user_task_trace(trace)})
             yield sse_event("error", {"detail": str(error)})
         except Exception as error:  # noqa: BLE001 - SSE 内统一返回可读错误事件。
             fail_task_trace(trace, str(error), trace_started_at)
@@ -1702,13 +1764,13 @@ def stream_web_chat_events(
                 session_id=session_id,
                 source="chat",
             )
-            yield sse_event("task_failed", {"task_trace": trace})
+            yield sse_event("task_failed", {"task_trace": serialize_user_task_trace(trace)})
             yield sse_event("error", {"detail": str(error)})
         return
 
     try:
         step = start_task_step(trace, "ingest_candidate_message")
-        yield sse_event("step_started", {"step": step})
+        yield sse_event("step_started", {"step": serialize_user_task_step(step)})
         result = backend.ingest_conversation_message(
             payload.candidate_id,
             user_message,
@@ -1726,7 +1788,7 @@ def stream_web_chat_events(
             session_id=session_id,
             source="rule_based_chat",
         )
-        yield sse_event("task_failed", {"task_trace": trace})
+        yield sse_event("task_failed", {"task_trace": serialize_user_task_trace(trace)})
         yield sse_event("error", {"detail": str(error)})
         return
 
@@ -1745,6 +1807,7 @@ def stream_web_chat_events(
     trace["finished_at"] = iso_utc()
     trace["updated_at"] = iso_utc()
     task_trace_metadata = trace if has_audited_steps(trace) else None
+    user_task_trace = serialize_user_task_trace(task_trace_metadata)
     save_successful_web_chat_turn(
         backend,
         payload.candidate_id,
@@ -1753,8 +1816,7 @@ def stream_web_chat_events(
         display_reply,
         {
             "mode": "rule_based_ingestion",
-            "used_tools": ["ingest_conversation_message"],
-            "task_trace": task_trace_metadata,
+            "task_trace": user_task_trace,
         },
         account_id=account_id,
     )
@@ -1766,7 +1828,7 @@ def stream_web_chat_events(
         session_id=session_id,
         source="rule_based_chat",
     )
-    yield sse_event("task_completed", {"task_trace": trace})
+    yield sse_event("task_completed", {"task_trace": user_task_trace})
     # 规则兜底没有真实 token 流，这里发送一次完整文本，保持前端路径统一。
     yield sse_event("token", {"content": display_reply})
     yield sse_event(
@@ -1774,12 +1836,9 @@ def stream_web_chat_events(
         {
             "mode": "rule_based_ingestion",
             "reply": result.reply,
-            "used_tools": ["ingest_conversation_message"],
-            "tool_outputs": tool_outputs,
-            "result": result_dict,
             "display_reply": display_reply,
-            "task_trace": trace,
-            "root_request_id": root_request_id,
+            "task_trace": user_task_trace,
+            "background_tasks": [],
             "profile": asdict(backend.get_candidate_profile(payload.candidate_id, account_id=account_id)),
         },
     )
@@ -1805,6 +1864,94 @@ def new_task_trace(root_request_id: str | None = None, source: str = "chat") -> 
     }
 
 
+def serialize_user_task_step(step: object) -> dict[str, object] | None:
+    """返回折叠任务过程所需字段，不暴露内部工具名、参数或结果对象。"""
+
+    if not isinstance(step, dict):
+        return None
+    return {
+        "id": str(step.get("id") or ""),
+        "label": str(step.get("label") or "执行任务"),
+        "status": str(step.get("status") or "running"),
+        "summary": str(step.get("summary") or ""),
+    }
+
+
+def serialize_user_task_trace(trace: object) -> dict[str, object] | None:
+    """把内部审计轨迹投影成前端可展示的低敏任务过程。"""
+
+    if not isinstance(trace, dict):
+        return None
+    steps = [
+        serialized
+        for step in trace.get("steps", [])
+        if (serialized := serialize_user_task_step(step)) is not None
+    ]
+    approval = trace.get("approval")
+    user_approval: dict[str, object] | None = None
+    if isinstance(approval, dict):
+        items = [
+            {
+                "label": str(item.get("label") or ""),
+                "value": str(item.get("value") or ""),
+            }
+            for item in approval.get("items", [])
+            if isinstance(item, dict)
+        ]
+        user_approval = {
+            "kind": str(approval.get("kind") or ""),
+            "record_id": approval.get("record_id"),
+            "title": str(approval.get("title") or ""),
+            "message": str(approval.get("message") or ""),
+            "items": items,
+            "confirm_label": str(approval.get("confirm_label") or "确认"),
+            "cancel_label": str(approval.get("cancel_label") or "取消"),
+            "status": str(approval.get("status") or "waiting"),
+        }
+    return {
+        "version": int(trace.get("version") or 1),
+        "root_request_id": str(trace.get("root_request_id") or ""),
+        "title": str(trace.get("title") or "本次任务"),
+        "status": str(trace.get("status") or "running"),
+        "duration_ms": trace.get("duration_ms"),
+        "steps": steps,
+        "approval": user_approval,
+    }
+
+
+def serialize_user_chat_metadata(metadata: object) -> dict[str, object]:
+    """历史消息只返回恢复任务折叠区所需的安全元数据。"""
+
+    if not isinstance(metadata, dict):
+        return {}
+    task_trace = serialize_user_task_trace(metadata.get("task_trace"))
+    return {"task_trace": task_trace} if task_trace is not None else {}
+
+
+def public_background_tasks_from_tool_outputs(
+    tool_outputs: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """只返回前端恢复 GitHub 项目轮询需要的任务标识和状态。"""
+
+    tasks: list[dict[str, object]] = []
+    for item in tool_outputs:
+        if item.get("tool_name") != "analyze_github_project_for_candidate":
+            continue
+        data = item.get("data")
+        task = data.get("task") if isinstance(data, dict) else None
+        if not isinstance(task, dict) or not task.get("task_key"):
+            continue
+        tasks.append(
+            {
+                "task_key": str(task["task_key"]),
+                "task_type": str(task.get("task_type") or "github_project_analysis"),
+                "status": str(task.get("status") or "queued"),
+                "progress": int(task.get("progress") or 0),
+            }
+        )
+    return tasks
+
+
 def start_task_step(trace: dict[str, object], tool_name: str) -> dict[str, object]:
     """登记一个正在执行的任务步骤。"""
 
@@ -1814,7 +1961,7 @@ def start_task_step(trace: dict[str, object], tool_name: str) -> dict[str, objec
     step = {
         "id": f"step-{len(steps) + 1}",
         "name": tool_name,
-        "label": task_step_label(tool_name),
+        "label": tool_step_label(tool_name),
         "status": "running",
         "summary": None,
         "started_at": now,
@@ -1934,7 +2081,7 @@ def summarize_tool_result(tool_name: str, data: object) -> dict[str, object] | N
             "job_id": draft.get("job_id"),
             "version": draft.get("version"),
         }
-    return {"ok": True, "result_keys": sorted(str(key) for key in data.keys())[:12]}
+    return {"ok": True, "result_keys": sorted(str(key) for key in data)[:12]}
 
 
 def summarize_task_step(tool_name: str, data: object) -> str | None:
@@ -2016,14 +2163,25 @@ def reconcile_task_trace(trace: dict[str, object], tool_outputs: list[dict[str, 
                     attempt["summary"] = summary
                     attempt["result"] = result
         matched_step_ids.add(str(existing.get("id")))
-    trace["title"] = task_trace_title(tool_names)
+    trace["title"] = tool_trace_title(tool_names)
     trace["updated_at"] = iso_utc()
 
 
-def task_trace_title(tool_names: list[str]) -> str:
-    """根据本轮真实工具选择比“本次任务”更具体的摘要标题。"""
+def task_trace_completion_status(
+    trace: dict[str, object],
+    approval: dict[str, object] | None,
+) -> str:
+    """根据确认状态和真实步骤结果确定任务最终状态。"""
 
-    return tool_trace_title(tool_names)
+    if approval is not None:
+        return "waiting_confirmation"
+    steps = trace.get("steps")
+    if isinstance(steps, list) and any(
+        isinstance(step, dict) and step.get("status") == "failed"
+        for step in steps
+    ):
+        return "failed"
+    return "completed"
 
 
 def fail_task_trace(trace: dict[str, object], detail: str, started_at: float) -> None:
@@ -2114,14 +2272,46 @@ def load_or_new_tool_trace(
     backend: JobHuntingApp,
     *,
     root_request_id: str,
+    account_id: int,
     source: str,
 ) -> dict[str, object]:
     """读取既有审计轨迹；不存在时创建一条新的非 SSE 轨迹。"""
 
     try:
-        return dict(backend.store.get_tool_call_trace(root_request_id).trace)
+        return dict(
+            backend.store.get_tool_call_trace(
+                root_request_id,
+                account_id=account_id,
+                cutoff_iso=tool_audit_retention_cutoff(),
+            ).trace
+        )
     except KeyError:
         return new_task_trace(root_request_id=root_request_id, source=source)
+
+
+def owned_or_new_root_request_id(
+    backend: JobHuntingApp,
+    *,
+    account_id: int,
+    candidate_id: int,
+    root_request_id: str | None,
+) -> str:
+    """只续接当前账号和候选人已有轨迹，否则生成新的不可猜测 ID。"""
+
+    value = str(root_request_id or "").strip()
+    if not value:
+        return uuid.uuid4().hex
+    try:
+        existing = backend.store.get_tool_call_trace(
+            value,
+            account_id=account_id,
+            cutoff_iso=tool_audit_retention_cutoff(),
+        )
+    except KeyError:
+        return uuid.uuid4().hex
+    if existing.candidate_id not in {None, candidate_id}:
+        return uuid.uuid4().hex
+    return value
 
 
 def update_confirmation_tool_trace(
@@ -2139,6 +2329,7 @@ def update_confirmation_tool_trace(
     trace = load_or_new_tool_trace(
         backend,
         root_request_id=root_request_id,
+        account_id=account_id,
         source="project_confirmation",
     )
     trace["source"] = trace.get("source") or "project_confirmation"
@@ -2164,7 +2355,7 @@ def update_confirmation_tool_trace(
             "task": rag_task,
         },
     )
-    trace["title"] = task_trace_title(
+    trace["title"] = tool_trace_title(
         [str(item.get("name") or "") for item in trace.get("steps", []) if isinstance(item, dict)]
     )
     trace["status"] = "running" if rag_task is not None else "completed"
@@ -2192,10 +2383,11 @@ def record_background_task_enqueue_trace(
     trace = load_or_new_tool_trace(
         backend,
         root_request_id=root_request_id,
+        account_id=task.account_id,
         source=source,
     )
     tool_name = background_task_tool_name(task.task_type)
-    trace["title"] = trace.get("title") or task_trace_title([tool_name])
+    trace["title"] = trace.get("title") or tool_trace_title([tool_name])
     trace["source"] = source
     step = start_task_step(trace, tool_name)
     queued_result = {
@@ -2229,40 +2421,6 @@ def sse_event(event: str, data: dict[str, object]) -> str:
     """把事件编码成 Server-Sent Events 文本块。"""
 
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-
-def record_admin_audit_event(
-    backend: JobHuntingApp,
-    request: Request,
-    actor: AccountRecord,
-    *,
-    action: str,
-    target_type: str,
-    target_id: str | None = None,
-    target_account_id: int | None = None,
-    summary: str,
-    details: dict[str, object] | None = None,
-    outcome: str = "succeeded",
-) -> None:
-    """追加管理员动作审计；失败时只写低敏警告，不影响已完成动作。"""
-
-    try:
-        backend.store.record_admin_audit_event(
-            AdminAuditEventRecord(
-                id=0,
-                actor_account_id=actor.id,
-                target_account_id=target_account_id,
-                action=action,
-                target_type=target_type,
-                target_id=target_id,
-                outcome=outcome,
-                summary=summary,
-                details=details or {},
-                request_id=getattr(request.state, "request_id", None),
-            )
-        )
-    except Exception as error:  # pragma: no cover - 仅在数据库异常时触发
-        logger.warning("管理员审计事件写入失败：%s", type(error).__name__)
 
 
 def serialize_resume_artifact(artifact: ResumeArtifactRecord) -> dict[str, object]:
@@ -2395,62 +2553,50 @@ def format_web_chat_reply(
     这样刷新页面恢复历史时，用户看到的内容和当时聊天窗口里的内容一致。
     """
 
-    if mode == "langchain_agent":
-        tool_line = f"工具：{'、'.join(used_tools)}" if used_tools else "工具：本轮未调用工具"
-        tool_summary = summarize_tool_outputs_for_display(tool_outputs)
-        return "\n\n".join(part for part in [reply, tool_line, tool_summary] if part)
-
-    result = rule_based_result or {}
-    saved_fields = result.get("saved_structured_fields") or []
-    saved_fields_text = "、".join(str(item) for item in saved_fields) or "无结构化字段"
-    saved_long_text_ids = result.get("saved_long_text_ids") or []
-    long_text_ids_text = "、".join(str(item) for item in saved_long_text_ids) or "无"
-    rag_line = (
-        "RAG：已增量索引本次长文本"
-        if result.get("rag_update_mode") == "incremental"
-        else "RAG：本次未更新索引"
-    )
-    return f"{reply}\n\n保存字段：{saved_fields_text}\n长文本 ID：{long_text_ids_text}\n{rag_line}"
+    # 工具调用、保存字段和 RAG 状态只进入任务追踪与管理员审计，不进入聊天气泡。
+    # 保留参数是为了兼容已有调用方，但展示文本唯一来源是 Agent 自然语言回复。
+    return sanitize_web_chat_reply(reply)
 
 
-def summarize_tool_outputs_for_display(tool_outputs: list[dict[str, object]]) -> str:
-    """把 Agent 工具输出压缩成网页可读摘要。
+def sanitize_web_chat_reply(value: object) -> str:
+    """移除旧版本已经拼入聊天消息的内部执行元数据。
 
-    这里只生成展示文本，不把工具输出当成新的前端事实源；事实仍以后端 PostgreSQL 为准。
+    新消息由 `format_web_chat_reply` 直接阻止元数据进入；这里同时用于历史读取，
+    让旧数据库记录在用户界面恢复时也不会暴露工具名、字段名、内部 ID 或 RAG 状态。
     """
 
-    lines: list[str] = []
-    for item in tool_outputs:
-        data = item.get("data") if isinstance(item, dict) else None
-        if not isinstance(data, dict):
+    text = str(value or "").replace("\r\n", "\n").strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not is_legacy_chat_metadata_line(line):
             continue
-        if data.get("error"):
-            lines.append(f"工具错误：{data['error']}")
-        saved_fields = data.get("saved_structured_fields")
-        if isinstance(saved_fields, list):
-            fields_text = "、".join(str(field) for field in saved_fields) or "无结构化字段"
-            lines.append(f"保存字段：{fields_text}")
-        saved_long_text_ids = data.get("saved_long_text_ids")
-        if isinstance(saved_long_text_ids, list):
-            ids_text = "、".join(str(item_id) for item_id in saved_long_text_ids) or "无"
-            lines.append(f"长文本 ID：{ids_text}")
-        rag_update_mode = data.get("rag_update_mode")
-        if rag_update_mode:
-            lines.append(
-                "RAG：已增量索引本次长文本"
-                if rag_update_mode == "incremental"
-                else f"RAG：{rag_update_mode}"
-            )
-        job = data.get("job")
-        if isinstance(job, dict) and job.get("title"):
-            lines.append(f"导入职位：{job['title']}")
-        matches = data.get("matches")
-        if isinstance(matches, list) and matches:
-            lines.append(f"匹配结果：共 {len(matches)} 个职位，已按推荐顺序返回。")
-        task = data.get("task")
-        if isinstance(task, dict) and task.get("task_type") == "github_project_analysis":
-            lines.append("GitHub 项目分析：任务已排队，完成后会生成待确认项目卡片。")
-    return "\n".join(lines)
+        if all(
+            not remaining.strip() or is_legacy_chat_metadata_line(remaining)
+            for remaining in lines[index:]
+        ):
+            return "\n".join(lines[:index]).rstrip()
+    return text
+
+
+def is_legacy_chat_metadata_line(value: str) -> bool:
+    """只识别旧版确切生成过的尾部元数据行。"""
+
+    line = value.strip()
+    return any(
+        re.fullmatch(pattern, line)
+        for pattern in (
+            r"工具：.+",
+            r"工具错误：.+",
+            r"保存字段：.+",
+            r"长文本 ID：(?:无|\d+(?:[、,，]\s*\d+)*)",
+            r"RAG：.+",
+            r"导入职位：.+",
+            r"匹配结果：共 \d+ 个职位，已按推荐顺序返回。",
+            r"GitHub 项目分析：任务已排队，完成后会生成待确认项目卡片。",
+        )
+    )
 
 
 def get_profile_or_404(backend: JobHuntingApp, candidate_id: int, account_id: int | None = None):
@@ -2471,11 +2617,11 @@ def clean_string_list(values: list[str]) -> list[str]:
 def clean_string_dict(values: dict[str, str]) -> dict[str, str]:
     """清理网页表单中的技能字典。"""
 
-    return {
+    return normalize_skill_mapping({
         str(key).strip(): str(value).strip() or "待确认"
         for key, value in values.items()
         if str(key).strip()
-    }
+    })
 
 
 def create_reloadable_web_app() -> FastAPI:

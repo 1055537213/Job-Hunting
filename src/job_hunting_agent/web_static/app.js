@@ -20,6 +20,31 @@ if (!window.Vue) {
   // 认证错误不会永久占据登录表单；用户输入新内容时会更早清除。
   const AUTH_ERROR_DISMISS_MS = 6000;
   const PINYIN_COLLATOR = new Intl.Collator("zh-CN-u-co-pinyin");
+  const FRONTEND_ROUTES = {
+    auth: "/login",
+    workspace: "/workspace",
+    admin: "/admin",
+  };
+
+  /** 根据当前 URL 识别前端入口，避免继续依赖单页内部 activeView 跳转。 */
+  function currentFrontendPage() {
+    const pathname = window.location?.pathname || "/";
+    const normalized = pathname.replace(/\/+$/, "") || "/";
+    if (normalized === FRONTEND_ROUTES.admin) return "admin";
+    if (normalized === FRONTEND_ROUTES.auth || normalized === "/register") return "auth";
+    return "workspace";
+  }
+
+  /** 只允许登录后的 next 参数跳回本项目的前端页面，避免开放重定向。 */
+  function safeFrontendNextRoute(value) {
+    const next = String(value || "").trim();
+    if (!next || !next.startsWith("/") || next.startsWith("//")) return "";
+    const pathname = next.split(/[?#]/, 1)[0].replace(/\/+$/, "") || "/";
+    if ([FRONTEND_ROUTES.workspace, FRONTEND_ROUTES.admin, "/"].includes(pathname)) {
+      return pathname === "/" ? FRONTEND_ROUTES.workspace : next;
+    }
+    return "";
+  }
 
   /** 克隆并按拼音排列省份和城市，避免改变静态数据源。 */
   function buildSortedCityGroups() {
@@ -64,7 +89,10 @@ if (!window.Vue) {
 
   createApp({
     data() {
+      const page = currentFrontendPage();
       return {
+        page,
+        authChecked: false,
         auth: {
           authenticated: false,
           account: null,
@@ -92,7 +120,7 @@ if (!window.Vue) {
           message: "",
         },
         jobImportNoticeReturnTarget: null,
-        activeView: "workspace",
+        activeView: page === "admin" ? "admin" : "workspace",
         workspaceRailOpen: false,
         activeWorkspacePanel: "",
         sessions: [],
@@ -103,6 +131,7 @@ if (!window.Vue) {
           events: [],
           toolTraces: [],
           auditEvents: [],
+          activeSection: "usage",
           selectedToolTraceId: "",
           toolTraceDetail: null,
           summary: {},
@@ -130,6 +159,7 @@ if (!window.Vue) {
         resumeArtifacts: [],
         resumeJobSelections: {},
         projectCards: [],
+        projectReviewSelections: {},
         githubProjectUrl: "",
         messages: [],
         currentProfileId: Number(localStorage.getItem("currentProfileId") || 0),
@@ -192,6 +222,26 @@ if (!window.Vue) {
     },
 
     computed: {
+      /** 当前入口是否应该展示登录/注册表单。 */
+      showAuthSurface() {
+        return this.page === "auth" && !this.auth.authenticated;
+      },
+
+      /** 工作台只在工作台 URL 展示；后台和登录页不再靠 activeView 混在一起。 */
+      showWorkspaceSurface() {
+        return this.page === "workspace" && this.auth.authenticated && this.activeView === "workspace";
+      },
+
+      /** 后台只在 /admin 展示，权限由启动时的 Session 检查负责兜底。 */
+      showAdminSurface() {
+        return this.page === "admin" && this.auth.authenticated && this.activeView === "admin";
+      },
+
+      /** 直接打开工作台或后台时，先等一次 Session 探测完成再决定跳转或展示。 */
+      showRouteLoading() {
+        return this.page !== "auth" && !this.authChecked;
+      },
+
       /** 返回当前选中的候选人档案。 */
       currentProfile() {
         return this.profiles.find((profile) => profile.id === this.currentProfileId) || null;
@@ -278,6 +328,107 @@ if (!window.Vue) {
       /** 管理员审计事件按后端返回顺序展示，默认是最新在前。 */
       adminAuditEvents() {
         return [...(this.admin.auditEvents || [])];
+      },
+
+      /** 管理员审计动作聚合，用于侧边栏和概览卡片展示。 */
+      adminAuditActionCounts() {
+        const counts = {
+          total: 0,
+          status_updated: 0,
+          system_probe_enqueued: 0,
+          auth_logout_all_devices: 0,
+        };
+        for (const event of this.admin.auditEvents || []) {
+          counts.total += 1;
+          if (event.action === "account.status_updated") counts.status_updated += 1;
+          if (event.action === "system.probe_enqueued") counts.system_probe_enqueued += 1;
+          if (event.action === "auth.logout_all_devices") counts.auth_logout_all_devices += 1;
+        }
+        return counts;
+      },
+
+      /** 侧边栏展示的后台模块；数值用于快速识别当前模块的数据量。 */
+      adminNavigationItems() {
+        return [
+          {
+            key: "usage",
+            short: "用量",
+            title: "用量与账号",
+            description: "账号与 Token 用量",
+            count: this.admin.accounts.length,
+            badge: `${this.admin.summary.billable_tokens || 0} Token`,
+          },
+          {
+            key: "observability",
+            short: "观测",
+            title: "请求观测",
+            description: "请求与错误概览",
+            count: this.admin.requestMetrics.total_requests || 0,
+            badge: `${this.adminRecentRequestErrors.length} 条错误`,
+          },
+          {
+            key: "audit",
+            short: "审计",
+            title: "管理员审计",
+            description: "状态变更与系统操作",
+            count: this.adminAuditActionCounts.total,
+            badge: `${this.adminAuditActionCounts.status_updated} 次变更`,
+          },
+        ];
+      },
+
+      /** 当前后台模块的标题，和侧边栏保持一致。 */
+      adminSectionTitle() {
+        return {
+          usage: "用量与账号",
+          observability: "请求观测",
+          audit: "管理员审计",
+        }[this.admin.activeSection] || "用量与账号";
+      },
+
+      /** 当前后台模块的简短说明。 */
+      adminSectionDescription() {
+        return {
+          usage: "先看账号，再看 Token 明细和后台任务入口。",
+          observability: "看请求量、错误分布、限流与 CSRF 拦截。",
+          audit: "记录状态变更、会话操作和系统探针。",
+        }[this.admin.activeSection] || "后台管理";
+      },
+
+      /** 当前模块顶部的 KPI 卡片。 */
+      adminSectionKpis() {
+        if (this.admin.activeSection === "observability") {
+          return [
+            { label: "HTTP 请求", value: this.admin.requestMetrics.total_requests || 0, hint: "进程内累计" },
+            { label: "错误请求", value: this.admin.requestMetrics.error_requests || 0, hint: "4xx / 5xx" },
+            { label: "平均耗时", value: `${this.admin.requestMetrics.average_duration_ms || 0}ms`, hint: "单机快照" },
+            {
+              label: "安全拦截",
+              value:
+                (this.admin.requestMetrics.rate_limited_requests || 0) +
+                (this.admin.requestMetrics.csrf_rejected_requests || 0),
+              hint: "限流 + CSRF",
+            },
+          ];
+        }
+        if (this.admin.activeSection === "audit") {
+          return [
+            { label: "审计事件", value: this.adminAuditActionCounts.total, hint: "最近两天" },
+            { label: "账号状态变更", value: this.adminAuditActionCounts.status_updated, hint: "禁用 / 恢复" },
+            { label: "系统探针", value: this.adminAuditActionCounts.system_probe_enqueued, hint: "运维验证" },
+            {
+              label: "退出所有设备",
+              value: this.adminAuditActionCounts.auth_logout_all_devices,
+              hint: "会话撤销",
+            },
+          ];
+        }
+        return [
+          { label: "账号数", value: this.admin.accounts.length, hint: "后台可见" },
+          { label: "请求事件", value: this.admin.summary.event_count || 0, hint: "Token 流水" },
+          { label: "总 Token", value: this.admin.summary.total_tokens || 0, hint: "全部用量" },
+          { label: "可计费 Token", value: this.admin.summary.billable_tokens || 0, hint: "确认后结算" },
+        ];
       },
 
       /** 当前城市选择面板右侧展示的一级地区。 */
@@ -431,7 +582,52 @@ if (!window.Vue) {
     methods: {
       /** 给 Vue 挂载容器切换登录页全宽布局；工作台恢复原有边距和最大宽度。 */
       syncAuthPageClass(authenticated) {
-        document.getElementById("app")?.classList.toggle("auth-page", !authenticated);
+        const app = document.getElementById("app");
+        if (!app) return;
+        app.classList.toggle("auth-page", this.page === "auth" && !authenticated);
+        app.classList.toggle("workspace-page", this.page === "workspace");
+        app.classList.toggle("admin-page", this.page === "admin");
+      },
+
+      /** 统一前端页面跳转；当前页面相同时使用 replace 避免重复历史记录。 */
+      navigateTo(route, replace = false) {
+        const target = safeFrontendNextRoute(route) || FRONTEND_ROUTES.workspace;
+        if (window.location.pathname === target) return;
+        if (replace) {
+          window.location.replace(target);
+        } else {
+          window.location.assign(target);
+        }
+      },
+
+      /** 登录页地址会带上 next，登录后回到用户原本想访问的前端页面。 */
+      navigateToAuth(replace = false) {
+        const current = window.location.pathname || FRONTEND_ROUTES.workspace;
+        const next = safeFrontendNextRoute(current);
+        const suffix = next ? `?next=${encodeURIComponent(next)}` : "";
+        if (replace) {
+          window.location.replace(`${FRONTEND_ROUTES.auth}${suffix}`);
+        } else {
+          window.location.assign(`${FRONTEND_ROUTES.auth}${suffix}`);
+        }
+      },
+
+      /** 登录成功后的落点：优先尊重安全的 next 参数，否则进入工作台。 */
+      navigateAfterAuth(replace = false) {
+        const params = new URLSearchParams(window.location.search || "");
+        const next = safeFrontendNextRoute(params.get("next")) || FRONTEND_ROUTES.workspace;
+        this.navigateTo(next, replace);
+      },
+
+      /** 从管理后台回到工作台。 */
+      goWorkspace() {
+        this.navigateTo(FRONTEND_ROUTES.workspace);
+      },
+
+      /** 返回当前账号档案列表中的展示序号，不替代后端真实候选人 ID。 */
+      profileDisplayNumber(profileId) {
+        const index = this.profiles.findIndex((profile) => profile.id === profileId);
+        return index >= 0 ? index + 1 : "";
       },
 
       /** 先读取服务端 Session；未登录时不请求任何候选人或职位数据。 */
@@ -440,14 +636,35 @@ if (!window.Vue) {
           const data = await this.requestJson("/api/auth/me");
           this.auth.authenticated = Boolean(data.authenticated);
           this.auth.account = data.account || null;
-          if (this.auth.authenticated) {
-            await this.initialize();
-          }
         } catch (error) {
           this.auth.authenticated = false;
           this.auth.account = null;
           // 初始化探测失败不等同于登录失败，避免刷新页面时提前显示错误框。
         }
+        this.authChecked = true;
+        if (!this.auth.authenticated) {
+          if (this.page !== "auth") {
+            this.navigateToAuth(true);
+          }
+          return;
+        }
+        if (this.page === "auth") {
+          this.navigateAfterAuth(true);
+          return;
+        }
+        if (this.page === "admin") {
+          if (this.auth.account?.role !== "admin") {
+            this.navigateTo(FRONTEND_ROUTES.workspace, true);
+            return;
+          }
+          this.activeView = "admin";
+          this.admin.activeSection = "usage";
+          this.admin.activeDetailTab = "tokens";
+          await this.loadAdminData();
+          return;
+        }
+        this.activeView = "workspace";
+        await this.initialize();
       },
 
       /** 切换登录与注册表单。 */
@@ -559,6 +776,10 @@ if (!window.Vue) {
           this.activeView = "workspace";
           this.authForm.password = "";
           this.authPasswordVisible = false;
+          if (this.page === "auth") {
+            this.navigateAfterAuth(true);
+            return;
+          }
           await this.initialize();
           await nextTick();
           document.querySelector("#chatPanel")?.focus?.();
@@ -588,6 +809,9 @@ if (!window.Vue) {
         this.matches = [];
         this.resumeArtifacts = [];
         this.resumeJobSelections = {};
+        this.sessions = [];
+        this.activeSessionId = "";
+        this.navigateToAuth(true);
       },
 
       /** 撤销当前账号在所有设备上的 Session，并回到登录页。 */
@@ -608,6 +832,7 @@ if (!window.Vue) {
         this.resumeJobSelections = {};
         this.sessions = [];
         this.activeSessionId = "";
+        this.navigateToAuth(true);
       },
 
       /** 打开管理员用量页面并刷新脱敏后台数据。 */
@@ -615,7 +840,25 @@ if (!window.Vue) {
         if (this.auth.account?.role !== "admin") {
           return;
         }
-        this.activeView = "admin";
+        this.admin.activeSection = "usage";
+        this.admin.activeDetailTab = "tokens";
+        this.navigateTo(FRONTEND_ROUTES.admin);
+      },
+
+      /** 切换后台左侧菜单，不重新洗牌数据，只改变主内容区。 */
+      selectAdminSection(section) {
+        if (!["usage", "observability", "audit"].includes(section)) {
+          return;
+        }
+        this.admin.activeSection = section;
+      },
+
+      /** 按当前后台模块刷新对应数据，默认先保住“用量与账号”的首屏体验。 */
+      async refreshAdminSection() {
+        if (this.admin.activeSection === "audit") {
+          await this.loadAdminAuditEvents();
+          return;
+        }
         await this.loadAdminData();
       },
 
@@ -1215,6 +1458,7 @@ if (!window.Vue) {
             this.matches = [];
             this.resumeArtifacts = [];
             this.projectCards = [];
+            this.projectReviewSelections = {};
             return;
           }
 
@@ -1242,6 +1486,7 @@ if (!window.Vue) {
           this.matches = [];
           this.resumeArtifacts = [];
           this.projectCards = [];
+          this.projectReviewSelections = {};
           this.resumeJobSelections = {};
           return;
         }
@@ -1466,13 +1711,20 @@ if (!window.Vue) {
           this.setWelcomeMessage();
           return;
         }
-        this.messages = messages.map((message) => ({
-          ...message,
-          isError: false,
-          isStreaming: false,
-          renderedHtml: this.renderMarkdown(message.content),
-          taskTrace: this.normalizeTaskTrace(message.metadata?.task_trace, { fromHistory: true }),
-        }));
+        this.messages = messages.map((message) => {
+          const content =
+            message.role === "assistant"
+              ? this.sanitizeUserVisibleChatContent(message.content)
+              : message.content;
+          return {
+            ...message,
+            content,
+            isError: false,
+            isStreaming: false,
+            renderedHtml: this.renderMarkdown(content),
+            taskTrace: this.normalizeTaskTrace(message.metadata?.task_trace, { fromHistory: true }),
+          };
+        });
         this.reconcileTaskApprovals();
       },
 
@@ -1529,7 +1781,7 @@ if (!window.Vue) {
           if (data.task_trace) {
             this.setMessageTaskTrace(assistantMessage, data.task_trace, { autoCollapse: true });
           }
-          this.captureProjectTasksFromChat(data.tool_outputs || []);
+          this.captureProjectTasksFromChat(data.background_tasks || []);
           if (data.profile) {
             this.updateProfileInState(data.profile);
           }
@@ -1579,6 +1831,7 @@ if (!window.Vue) {
           this.resumeArtifacts = [];
           this.resumeJobSelections = {};
           this.projectCards = [];
+          this.projectReviewSelections = {};
           await this.loadProfiles();
         } catch (error) {
           this.appendAssistant(`删除档案失败：${error.message || "未知错误"}`, true);
@@ -1864,6 +2117,7 @@ if (!window.Vue) {
             : Boolean(trace.expanded ?? shouldStayOpen);
         return {
           version: Number(trace.version || 1),
+          root_request_id: String(trace.root_request_id || ""),
           title: String(trace.title || "本次任务"),
           status,
           duration_ms: Number.isFinite(Number(trace.duration_ms)) ? Number(trace.duration_ms) : null,
@@ -1959,7 +2213,11 @@ if (!window.Vue) {
         const trace = message?.taskTrace;
         const approval = trace?.approval;
         if (!approval || approval.status !== "waiting" || this.confirmingTaskApprovalId) return;
-        if (approval.kind !== "project_card_confirmation" || !approval.record_id) return;
+        if (approval.kind === "project_card_confirmation") {
+          this.viewTaskApproval(message);
+          return;
+        }
+        if (!approval.record_id) return;
 
         this.confirmingTaskApprovalId = Number(approval.record_id);
         try {
@@ -2020,57 +2278,36 @@ if (!window.Vue) {
 
       /** 生成 Agent 模式下的后备展示文本。 */
       buildChatReply(payload) {
-        if (payload.mode === "langchain_agent") {
-          const toolLine = payload.used_tools?.length
-            ? `工具：${payload.used_tools.join("、")}`
-            : "工具：本轮未调用工具";
-          const toolSummary = this.summarizeToolOutputs(payload.tool_outputs || []);
-          return [payload.reply, toolLine, toolSummary].filter(Boolean).join("\n\n");
-        }
-
-        const result = payload.result || {};
-        const savedFields = result.saved_structured_fields?.length
-          ? result.saved_structured_fields.join("、")
-          : "无结构化字段";
-        const ragLine =
-          result.rag_update_mode === "incremental"
-            ? "RAG：已增量索引本次长文本"
-            : "RAG：本次未更新索引";
-        return `${payload.reply}\n\n保存字段：${savedFields}\n长文本 ID：${result.saved_long_text_ids?.join("、") || "无"}\n${ragLine}`;
+        return this.sanitizeUserVisibleChatContent(payload.reply || "本轮处理已完成。");
       },
 
-      /** 把工具结果压缩成适合聊天窗口展示的摘要。 */
-      summarizeToolOutputs(toolOutputs) {
-        const lines = [];
-        for (const item of toolOutputs) {
-          const data = item.data || {};
-          if (data.error) {
-            lines.push(`工具错误：${data.error}`);
-          }
-          if (Array.isArray(data.saved_structured_fields)) {
-            lines.push(`保存字段：${data.saved_structured_fields.join("、") || "无结构化字段"}`);
-          }
-          if (Array.isArray(data.saved_long_text_ids)) {
-            lines.push(`长文本 ID：${data.saved_long_text_ids.join("、") || "无"}`);
-          }
-          if (data.rag_update_mode) {
-            lines.push(
-              data.rag_update_mode === "incremental"
-                ? "RAG：已增量索引本次长文本"
-                : `RAG：${data.rag_update_mode}`
-            );
-          }
-          if (data.job?.title) {
-            lines.push(`导入职位：${data.job.title}`);
-          }
-          if (Array.isArray(data.matches) && data.matches.length) {
-            lines.push(`匹配结果：共 ${data.matches.length} 个职位，已按推荐顺序返回。`);
-          }
-          if (data.task?.task_type === "github_project_analysis") {
-            lines.push("GitHub 项目分析：任务已排队，完成后会生成待确认项目卡片。");
+      /** 防止旧历史或接口兼容字段把内部执行元数据重新带进聊天气泡。 */
+      sanitizeUserVisibleChatContent(value) {
+        const text = String(value || "").replace(/\r\n/g, "\n").trim();
+        if (!text) {
+          return "";
+        }
+        const legacyMetadataLine = (line) => [
+          /^工具：.+$/,
+          /^工具错误：.+$/,
+          /^保存字段：.+$/,
+          /^长文本 ID：(?:无|\d+(?:[、,，]\s*\d+)*)$/,
+          /^RAG：.+$/,
+          /^导入职位：.+$/,
+          /^匹配结果：共 \d+ 个职位，已按推荐顺序返回。$/,
+          /^GitHub 项目分析：任务已排队，完成后会生成待确认项目卡片。$/,
+        ].some((pattern) => pattern.test(String(line || "").trim()));
+        const lines = text.split("\n");
+        for (let index = 0; index < lines.length; index += 1) {
+          if (!legacyMetadataLine(lines[index])) continue;
+          const isMetadataTail = lines
+            .slice(index)
+            .every((line) => !line.trim() || legacyMetadataLine(line));
+          if (isMetadataTail) {
+            return lines.slice(0, index).join("\n").trimEnd();
           }
         }
-        return lines.join("\n");
+        return text;
       },
 
       /** 上传当前选择的 DOCX/PDF，并跟踪后端安排的 OCR 或 RAG 任务。 */
@@ -2306,10 +2543,233 @@ if (!window.Vue) {
         else localStorage.removeItem(key);
       },
 
+      /** 把项目分析中的线索按协作边界整理成确认组，避免把同一工作流拆成多项。 */
+      projectReviewItems(record) {
+        const card = record?.card || {};
+        const items = [];
+        const techGroups = [
+          {
+            key: "frontend",
+            label: "前端技术栈",
+            aliases: new Set([
+              "html",
+              "css",
+              "scss",
+              "sass",
+              "less",
+              "javascript",
+              "js",
+              "ecmascript",
+              "typescript",
+              "ts",
+              "vue",
+              "react",
+              "angular",
+              "svelte",
+              "jquery",
+              "nuxt",
+              "nextjs",
+              "vite",
+              "webpack",
+              "tailwindcss",
+              "bootstrap",
+            ]),
+          },
+          {
+            key: "backend",
+            label: "后端/API 技术栈",
+            aliases: new Set([
+              "python",
+              "py",
+              "java",
+              "go",
+              "golang",
+              "rust",
+              "kotlin",
+              "php",
+              "ruby",
+              "c#",
+              "c#net",
+              "c++",
+              "net",
+              "dotnet",
+              "aspnet",
+              "nodejs",
+              "node",
+              "express",
+              "fastapi",
+              "django",
+              "flask",
+              "spring",
+            ]),
+          },
+          {
+            key: "data",
+            label: "数据与存储技术栈",
+            aliases: new Set([
+              "sql",
+              "postgresql",
+              "postgres",
+              "pgsql",
+              "mysql",
+              "sqlite",
+              "mongodb",
+              "redis",
+              "elasticsearch",
+              "pgvector",
+              "database",
+              "数据库",
+            ]),
+          },
+          {
+            key: "ai",
+            label: "AI/Agent 技术栈",
+            aliases: new Set([
+              "agent",
+              "aiagent",
+              "langchain",
+              "langgraph",
+              "rag",
+              "llm",
+              "embedding",
+              "transformers",
+              "openai",
+              "向量检索",
+              "检索增强",
+              "检索增强生成",
+            ]),
+          },
+          {
+            key: "infra",
+            label: "部署与基础设施",
+            aliases: new Set([
+              "docker",
+              "dockercompose",
+              "kubernetes",
+              "k8s",
+              "nginx",
+              "linux",
+              "cicd",
+              "githubactions",
+              "deployment",
+              "部署",
+              "容器化",
+            ]),
+          },
+        ];
+        const normalizeTechName = (value) =>
+          String(value || "")
+            .trim()
+            .toLowerCase()
+            .replace(/[.\s/_-]+/g, "");
+        const techGroupFor = (value) => {
+          const normalized = normalizeTechName(value);
+          return techGroups.find((group) => group.aliases.has(normalized)) || null;
+        };
+        const groupedTechItems = new Map();
+        const appendItems = (label, values, prefix) => {
+          (Array.isArray(values) ? values : []).forEach((value, index) => {
+            const text = String(value || "").trim();
+            if (!text) return;
+            items.push({ key: `${prefix}-${index}`, label, value: text });
+          });
+        };
+        (Array.isArray(card.detected_tech_stack) ? card.detected_tech_stack : []).forEach((value, index) => {
+          const text = String(value || "").trim();
+          if (!text) return;
+          const group = techGroupFor(text);
+          if (!group) {
+            items.push({ key: `tech-${index}`, label: "技术栈", value: text });
+            return;
+          }
+          let item = groupedTechItems.get(group.key);
+          if (!item) {
+            item = { key: `tech-group-${group.key}`, label: group.label, value: "", values: [] };
+            groupedTechItems.set(group.key, item);
+            items.push(item);
+          }
+          item.values.push(text);
+          item.value = item.values.join("、");
+        });
+        appendItems("核心功能", card.detected_core_features, "feature");
+        appendItems("可能负责", card.responsibility_draft, "responsibility");
+        appendItems("项目亮点", card.highlight_draft, "highlight");
+        return items;
+      },
+
+      /** 让项目卡片加载后保留当前页面内已经做出的分组选择。 */
+      syncProjectReviewSelections(records) {
+        const next = {};
+        for (const record of Array.isArray(records) ? records : []) {
+          if (record?.status !== "待确认") continue;
+          const recordKey = String(record.id);
+          const previous = this.projectReviewSelections[recordKey] || {};
+          next[recordKey] = {};
+          for (const item of this.projectReviewItems(record)) {
+            next[recordKey][item.key] = ["accepted", "rejected"].includes(previous[item.key])
+              ? previous[item.key]
+              : "pending";
+          }
+        }
+        this.projectReviewSelections = next;
+      },
+
+      /** 返回某一确认组当前的审核状态。 */
+      projectReviewStatus(record, item) {
+        return this.projectReviewSelections[String(record?.id)]?.[item?.key] || "pending";
+      },
+
+      /** 设置一个项目确认组的确认或排除状态。 */
+      setProjectReviewDecision(record, item, status) {
+        if (!record || record.status !== "待确认" || !item || !["accepted", "rejected"].includes(status)) {
+          return;
+        }
+        const recordKey = String(record.id);
+        this.projectReviewSelections = {
+          ...this.projectReviewSelections,
+          [recordKey]: {
+            ...(this.projectReviewSelections[recordKey] || {}),
+            [item.key]: status,
+          },
+        };
+      },
+
+      /** 返回已经确认的组数量，并把待处理数量显示在折叠标题中。 */
+      projectReviewAcceptedCount(record) {
+        return this.projectReviewItems(record).filter(
+          (item) => this.projectReviewStatus(record, item) === "accepted"
+        ).length;
+      },
+
+      /** 返回折叠标题中的已确认组和待处理组数量。 */
+      projectReviewSummary(record) {
+        if (record?.status === "已确认") return "已保存";
+        const items = this.projectReviewItems(record);
+        const accepted = this.projectReviewAcceptedCount(record);
+        const pending = items.filter((item) => this.projectReviewStatus(record, item) === "pending").length;
+        return `${accepted} 组已确认 · ${pending} 组待处理`;
+      },
+
+      /** 把用户确认的项目线索拼成后端可检索的本人贡献摘要。 */
+      projectConfirmedSummary(record) {
+        const groups = new Map();
+        for (const item of this.projectReviewItems(record)) {
+          if (this.projectReviewStatus(record, item) !== "accepted") continue;
+          if (!groups.has(item.label)) groups.set(item.label, []);
+          groups.get(item.label).push(item.value);
+        }
+        if (!groups.size) return "";
+        return [
+          `项目：${record?.card?.project_name || "未命名项目"}`,
+          ...Array.from(groups, ([label, values]) => `${label}：${values.join("；")}`),
+        ].join("\n");
+      },
+
       /** 读取当前候选人的待确认与已确认项目经历卡片。 */
       async loadProjectCards(signal = null) {
         if (!this.currentProfileId) {
           this.projectCards = [];
+          this.projectReviewSelections = {};
           return;
         }
         try {
@@ -2318,6 +2778,7 @@ if (!window.Vue) {
             signal ? { signal } : {}
           );
           this.projectCards = data.project_cards || [];
+          this.syncProjectReviewSelections(this.projectCards);
           this.reconcileTaskApprovals();
         } catch (error) {
           this.projectCards = [];
@@ -2353,7 +2814,9 @@ if (!window.Vue) {
             this.pollGitHubProjectTask(data.task.task_key, this.currentProfileId);
           } else {
             await this.loadProjectCards();
-            this.appendAssistant("GitHub 项目分析已完成，已生成待确认项目经历卡片。");
+            this.appendAssistant(
+              "GitHub 项目分析已完成，已生成待确认项目经历卡片。请在左侧按组确认：属于你的内容点“确认”，不是你开发或不确定的内容点“排除”。"
+            );
           }
         } catch (error) {
           if (this.showDuplicateNotice(error, "项目已存在")) {
@@ -2383,7 +2846,9 @@ if (!window.Vue) {
                   this.projectTaskNotified[taskKey] = true;
                   if (task.status === "succeeded") {
                     const projectName = task.result?.project_name || "GitHub 项目";
-                    this.appendAssistant(`**${projectName}** 已分析完成，请在左侧确认你的实际职责。`);
+                    this.appendAssistant(
+                      `**${projectName}** 已分析完成。我发现了一些可能的技术栈、功能和职责，请在左侧按组确认：属于你的内容点“确认”，不是你开发或不确定的内容点“排除”。`
+                    );
                   } else {
                     this.githubProjectError = task.error_summary || "GitHub 项目分析失败，请稍后重试。";
                     this.appendAssistant(this.githubProjectError, true);
@@ -2420,23 +2885,42 @@ if (!window.Vue) {
       /** 由候选人明确确认项目卡片，才把其摘要作为后续可检索证据。 */
       async confirmProjectCard(record) {
         if (!record || record.status !== "待确认" || this.confirmingProjectCardId) return;
+        const confirmedSummary = this.projectConfirmedSummary(record);
+        if (!confirmedSummary) {
+          this.githubProjectError = "请先按组确认至少一组属于你的技术、功能或职责。";
+          this.openWorkspacePanel("github");
+          return;
+        }
         this.confirmingProjectCardId = record.id;
         this.githubProjectError = "";
+        const approvalMessage = this.messages.find((message) => {
+          const approval = message?.taskTrace?.approval;
+          return approval?.kind === "project_card_confirmation"
+            && Number(approval.record_id) === Number(record.id);
+        });
+        const rootRequestId = approvalMessage?.taskTrace?.root_request_id || null;
         try {
           const data = await this.requestJson(`/api/projects/${encodeURIComponent(record.id)}/confirm`, {
             method: "POST",
-            body: JSON.stringify({ confirmed_summary: null }),
+            body: JSON.stringify({
+              confirmed_summary: confirmedSummary,
+              root_request_id: rootRequestId,
+            }),
           });
           const index = this.projectCards.findIndex((item) => item.id === record.id);
           if (index >= 0) this.projectCards[index] = data.project_card;
+          const nextSelections = { ...this.projectReviewSelections };
+          delete nextSelections[String(record.id)];
+          this.projectReviewSelections = nextSelections;
+          this.reconcileTaskApprovals();
           const projectName = data.project_card?.card?.project_name || "项目";
           if (data.task?.task_key) {
             this.backgroundTasks[data.task.task_key] = data.task;
             this.rememberRagTask(data.task.task_key, 0);
             this.pollBackgroundTask(data.task.task_key, projectName, this.currentProfileId);
-            this.appendAssistant(`已确认项目经历：**${projectName}**。RAG 增量索引已自动开始。`);
+            this.appendAssistant(`已保存项目经历：**${projectName}**。只有你确认的内容会用于后续简历和匹配。`);
           } else {
-            this.appendAssistant(`已确认项目经历：**${projectName}**。`);
+            this.appendAssistant(`已保存项目经历：**${projectName}**。只有你确认的内容会用于后续简历和匹配。`);
           }
         } catch (error) {
           this.githubProjectError = error.message || "确认项目经历失败。";
@@ -2446,11 +2930,9 @@ if (!window.Vue) {
         }
       },
 
-      /** 从 Agent 工具输出中接管 GitHub 分析任务，支持“把链接发给 Agent”这一入口。 */
-      captureProjectTasksFromChat(toolOutputs) {
-        for (const item of toolOutputs || []) {
-          if (item?.tool_name !== "analyze_github_project_for_candidate") continue;
-          const task = item.data?.task;
+      /** 从聊天响应的低敏任务摘要中接管 GitHub 分析轮询。 */
+      captureProjectTasksFromChat(tasks) {
+        for (const task of tasks || []) {
           if (!task?.task_key) continue;
           this.backgroundTasks[task.task_key] = task;
           this.rememberProjectTask(task.task_key);

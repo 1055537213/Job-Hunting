@@ -340,6 +340,8 @@ class CandidateProfilePatch:
     salary_floor_k: int | None = None
     expected_salary_k: int | None = None
     target_directions: list[str] = field(default_factory=list)
+    # 用户明确说“方向改为 X”时，用 X 替换旧方向；普通补充仍按列表追加。
+    replace_target_directions: bool = False
     unacceptable: list[str] = field(default_factory=list)
     # 对话中明确表示“也可以”的城市，不会覆盖首选城市。
     acceptable_cities: list[str] = field(default_factory=list)

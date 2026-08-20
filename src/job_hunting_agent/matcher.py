@@ -18,6 +18,7 @@ from .models import (
     SkillRequirement,
     sanitize_preference_weights,
 )
+from .skill_normalization import skill_identity, skill_level_is_available
 
 SKILL_PROFICIENCY_SCORE = {
     "精通": 100.0,
@@ -33,9 +34,6 @@ SKILL_PROFICIENCY_SCORE = {
     "入门": 40.0,
     "待确认": 30.0,
 }
-CONFIRMED_MISSING_LEVELS = {"明确不会", "不会", "不具备", "缺失", "没有", "无"}
-
-
 DirectionScorer = Callable[[CandidateProfile, ImportedJob], float | None]
 
 
@@ -84,15 +82,15 @@ def match_job(
 
     # 候选人在档案里显式确认“不会”的核心技能，可以触发更强淘汰。
     core_skill_names = {
-        requirement.name.lower()
+        skill_identity(requirement.name)
         for requirement in (job.skill_requirements or [])
         if requirement.category == "core"
     }
     confirmed_missing_core = [
         name
         for name, level in candidate.skills.items()
-        if str(level).strip().lower() in CONFIRMED_MISSING_LEVELS
-        and name.lower() in core_skill_names
+        if not skill_level_is_available(level)
+        and skill_identity(name) in core_skill_names
     ]
     if confirmed_missing_core:
         elimination_reasons.append("职位明确必须且候选人确认不具备：" + "、".join(confirmed_missing_core))
@@ -139,9 +137,13 @@ def match_job(
     if direction_score is not None:
         dimension_scores["direction"] = direction_score
 
-    candidate_skill_names = {name.lower() for name in candidate.skills}
-    matched_skills = [skill for skill in job.skills if skill.lower() in candidate_skill_names]
-    missing_skills = [skill for skill in job.skills if skill.lower() not in candidate_skill_names]
+    candidate_skill_names = {
+        skill_identity(name)
+        for name, level in candidate.skills.items()
+        if skill_level_is_available(level)
+    }
+    matched_skills = [skill for skill in job.skills if skill_identity(skill) in candidate_skill_names]
+    missing_skills = [skill for skill in job.skills if skill_identity(skill) not in candidate_skill_names]
 
     eliminated = bool(elimination_reasons)
     if eliminated:
@@ -318,7 +320,7 @@ def skill_score(
     if not requirements:
         risks.append("职位未明确技能要求，技能匹配信息不完整")
         return 50.0
-    candidate_skills = {name.lower(): level for name, level in candidate.skills.items()}
+    candidate_skills = {skill_identity(name): level for name, level in candidate.skills.items()}
     grouped: dict[str, list[tuple[SkillRequirement, float]]] = {
         "core": [],
         "general": [],
@@ -332,8 +334,8 @@ def skill_score(
         # 旧数据库或人工编辑数据可能含有未知分类；按不确定技能处理，
         # 避免异常数据直接中断整批职位匹配。
         category = requirement.category if requirement.category in grouped else "uncertain"
-        level = candidate_skills.get(requirement.name.lower())
-        is_confirmed_missing = level is None or str(level).strip().lower() in CONFIRMED_MISSING_LEVELS
+        level = candidate_skills.get(skill_identity(requirement.name))
+        is_confirmed_missing = level is None or not skill_level_is_available(level)
         if is_confirmed_missing:
             if category == "uncertain":
                 # 不确定技能只提示或少扣分：完全不参与分数计算，保留不确定风险即可。

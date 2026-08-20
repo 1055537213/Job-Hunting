@@ -15,10 +15,11 @@ import pytest
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.background_tasks import run_registered_task
 from job_hunting_agent.config import TaskQueueSettings, load_task_queue_settings
-from job_hunting_agent.models import CandidateProfileInput, RAGIndexStats
+from job_hunting_agent.models import CandidateProfileInput, RAGIndexStats, ToolCallTraceRecord
 from job_hunting_agent.resume_document import ResumeFileStore
 from job_hunting_agent.task_queue import CeleryTaskQueue, TaskQueueError
 from job_hunting_agent.tool_audit import tool_audit_retention_cutoff
+from job_hunting_agent.web import load_or_new_tool_trace, new_task_trace, owned_or_new_root_request_id
 
 
 class FakeCeleryProducer:
@@ -272,6 +273,148 @@ def test_tool_audit_retention_cutoff_keeps_two_shanghai_natural_days() -> None:
     """保留窗口应从上海时区的昨日 0 点开始，而不是按 UTC 自然日误删。"""
 
     assert tool_audit_retention_cutoff(datetime(2026, 8, 19, 1, 0, tzinfo=UTC)) == "2026-08-17T16:00:00+00:00"
+
+
+def test_tool_trace_helpers_respect_account_isolation_and_retention_window(
+    database_url: str,
+    tmp_path: Path,
+) -> None:
+    """工具轨迹续接必须受账号和两天保留期约束。"""
+
+    backend = JobHuntingApp(
+        database_url=database_url,
+        object_storage=ResumeFileStore(tmp_path / "resumes"),
+        semantic_matching=False,
+    )
+    backend.initialize()
+    owner = backend.store.create_account("trace-owner@example.com", "hashed-password")
+    foreign = backend.store.create_account("trace-foreign@example.com", "hashed-password")
+    candidate_id = backend.save_candidate_profile(
+        CandidateProfileInput(
+            name="轨迹候选人",
+            status="待补充",
+            education="本科",
+            experience_years=1.0,
+            skills={},
+            preferred_cities=[],
+            acceptable_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        ),
+        account_id=owner.id,
+    )
+
+    recent_root_id = "0123456789abcdef0123456789abcdef"
+    recent_trace = new_task_trace(root_request_id=recent_root_id, source="chat")
+    recent_trace["title"] = "最近任务"
+    recent_trace["steps"] = [
+        {
+            "id": "step-1",
+            "name": "ingest_candidate_message",
+            "label": "记录候选人消息",
+            "status": "completed",
+            "summary": "已记录",
+            "started_at": "2026-08-20T00:00:00+00:00",
+            "finished_at": "2026-08-20T00:00:01+00:00",
+            "attempts": [],
+        }
+    ]
+    backend.store.record_tool_call_trace(
+        ToolCallTraceRecord(
+            id=0,
+            account_id=owner.id,
+            candidate_id=candidate_id,
+            session_id="session-owner",
+            root_request_id=recent_root_id,
+            title="最近任务",
+            status="completed",
+            source="chat",
+            step_count=1,
+            attempt_count=1,
+            last_step_name="ingest_candidate_message",
+            last_error_summary=None,
+            trace=recent_trace,
+            created_at="2026-08-20T00:00:00+00:00",
+            started_at="2026-08-20T00:00:00+00:00",
+            finished_at="2026-08-20T00:00:01+00:00",
+            updated_at="2026-08-20T00:00:01+00:00",
+        )
+    )
+
+    old_root_id = "fedcba9876543210fedcba9876543210"
+    old_trace = new_task_trace(root_request_id=old_root_id, source="project_confirmation")
+    old_trace["title"] = "旧任务"
+    old_trace["steps"] = [
+        {
+            "id": "step-1",
+            "name": "confirm_project_card",
+            "label": "确认项目",
+            "status": "completed",
+            "summary": "已确认",
+            "started_at": "2000-01-01T00:00:00+00:00",
+            "finished_at": "2000-01-01T00:00:01+00:00",
+            "attempts": [],
+        }
+    ]
+    backend.store.record_tool_call_trace(
+        ToolCallTraceRecord(
+            id=0,
+            account_id=owner.id,
+            candidate_id=candidate_id,
+            session_id="session-owner",
+            root_request_id=old_root_id,
+            title="旧任务",
+            status="completed",
+            source="project_confirmation",
+            step_count=1,
+            attempt_count=1,
+            last_step_name="confirm_project_card",
+            last_error_summary=None,
+            trace=old_trace,
+            created_at="2000-01-01T00:00:00+00:00",
+            started_at="2000-01-01T00:00:00+00:00",
+            finished_at="2000-01-01T00:00:01+00:00",
+            updated_at="2000-01-01T00:00:01+00:00",
+        )
+    )
+
+    assert (
+        owned_or_new_root_request_id(
+            backend,
+            account_id=owner.id,
+            candidate_id=candidate_id,
+            root_request_id=recent_root_id,
+        )
+        == recent_root_id
+    )
+    foreign_request_id = owned_or_new_root_request_id(
+        backend,
+        account_id=foreign.id,
+        candidate_id=candidate_id,
+        root_request_id=recent_root_id,
+    )
+    assert foreign_request_id != recent_root_id
+    assert len(foreign_request_id) == 32
+
+    recent_loaded = load_or_new_tool_trace(
+        backend,
+        root_request_id=recent_root_id,
+        account_id=owner.id,
+        source="chat",
+    )
+    expired_loaded = load_or_new_tool_trace(
+        backend,
+        root_request_id=old_root_id,
+        account_id=owner.id,
+        source="project_confirmation",
+    )
+
+    assert recent_loaded["title"] == "最近任务"
+    assert recent_loaded["steps"][0]["name"] == "ingest_candidate_message"
+    assert expired_loaded["title"] == "本次任务"
+    assert expired_loaded["steps"] == []
 
 
 def test_resume_ocr_task_creates_follow_up_rag_task(

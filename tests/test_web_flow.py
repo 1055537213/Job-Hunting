@@ -9,6 +9,7 @@ import json
 import logging
 import re
 
+import pytest
 from fastapi.testclient import TestClient
 from langchain_core.language_models.fake_chat_models import (
     FakeListChatModel,
@@ -19,7 +20,12 @@ from langchain_core.messages import AIMessage
 from job_hunting_agent.agent import JobHuntingAgent
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.models import CandidateProfileInput, CandidateProfilePatch
-from job_hunting_agent.web import ChatPayload, create_web_app
+from job_hunting_agent.web import (
+    ChatPayload,
+    create_web_app,
+    format_web_chat_reply,
+    sanitize_web_chat_reply,
+)
 
 
 class ToolCallingFakeChatModel(FakeMessagesListChatModel):
@@ -100,6 +106,42 @@ def test_secure_cookie_setting_is_loaded_from_project_env(tmp_path, monkeypatch)
     assert "; secure" in response.headers["set-cookie"].lower()
 
 
+@pytest.mark.parametrize(
+    "disabled_setting",
+    [
+        "JOB_AGENT_COOKIE_SECURE",
+        "JOB_AGENT_CSRF_ENABLED",
+        "JOB_AGENT_SECURITY_HEADERS_ENABLED",
+        "JOB_AGENT_RATE_LIMIT_ENABLED",
+    ],
+)
+def test_production_rejects_disabled_web_security_controls(
+    tmp_path,
+    monkeypatch,
+    disabled_setting,
+) -> None:
+    """生产环境不能通过配置关闭已承诺的 Web 安全边界。"""
+
+    settings = {
+        "JOB_AGENT_ENVIRONMENT": "production",
+        "JOB_AGENT_COOKIE_SECURE": "true",
+        "JOB_AGENT_CSRF_ENABLED": "true",
+        "JOB_AGENT_SECURITY_HEADERS_ENABLED": "true",
+        "JOB_AGENT_RATE_LIMIT_ENABLED": "true",
+    }
+    settings[disabled_setting] = "false"
+    for key in settings:
+        monkeypatch.delenv(key, raising=False)
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(f"{key}={value}" for key, value in settings.items()),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="生产环境"):
+        create_web_app(env_file=env_path)
+
+
 def test_web_hardening_adds_request_id_security_headers_and_access_log(caplog) -> None:
     """所有 Web 响应都应带请求 ID、安全响应头，并输出不含正文的结构化访问日志。"""
 
@@ -128,6 +170,26 @@ def test_web_hardening_adds_request_id_security_headers_and_access_log(caplog) -
         "status_code": 200,
     }.items() <= records[-1].items()
     assert "body" not in records[-1]
+
+
+def test_web_hardening_keeps_request_id_and_security_headers_on_unhandled_500() -> None:
+    """未处理异常生成的 500 响应也必须保留统一追踪与安全响应头。"""
+
+    app = create_web_app()
+
+    @app.get("/api/test/unhandled-error")
+    def unhandled_error():
+        raise RuntimeError("test failure")
+
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/api/test/unhandled-error",
+        headers={"X-Request-ID": "request-error-123"},
+    )
+
+    assert response.status_code == 500
+    assert response.headers["x-request-id"] == "request-error-123"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
 
 
 def test_csrf_header_is_required_for_authenticated_mutations(monkeypatch) -> None:
@@ -329,16 +391,29 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     client = legacy_client()
 
     home = client.get("/")
+    login_page = client.get("/login")
+    workspace_page = client.get("/workspace")
+    admin_page = client.get("/admin")
     script = client.get("/static/app.js")
     styles = client.get("/static/styles.css")
     tokens = client.get("/static/tokens.css")
     vue = client.get("/static/vendor/vue.global.prod.js")
 
     assert home.status_code == 200
+    for page in (login_page, workspace_page, admin_page):
+        assert page.status_code == 200
+        assert page.headers["cache-control"] == "no-store, max-age=0"
+        assert "/static/app.js?v=20260820-admin-shell-v4" in page.text
     assert "Job Hunting Agent" in home.text
     assert "syncAuthPageClass" in script.text
-    assert '/static/app.js?v=20260820-admin-audit-v1' in home.text
-    assert '/static/styles.css?v=20260820-admin-audit-v1' in home.text
+    assert "FRONTEND_ROUTES" in script.text
+    assert "safeFrontendNextRoute" in script.text
+    assert 'v-if="showAuthSurface"' in home.text
+    assert 'v-if="showWorkspaceSurface"' in home.text
+    assert 'v-if="showAdminSurface"' in home.text
+    assert 'v-if="showRouteLoading"' in home.text
+    assert '/static/app.js?v=20260820-admin-shell-v4' in home.text
+    assert '/static/styles.css?v=20260820-admin-shell-v4' in home.text
     assert "本地运行 · 用户复制职位文本" not in home.text
     assert "Conversation Workspace" not in home.text
     assert "整理求职证据" not in home.text
@@ -358,6 +433,7 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert styles.status_code == 200
     assert styles.headers["cache-control"] == "no-store, max-age=0"
     assert "#app.auth-page" in styles.text
+    assert ".route-loading" in styles.text
     assert "max-width: none" in styles.text
     assert tokens.status_code == 200
     assert "Hallmark · tokens" in tokens.text
@@ -457,8 +533,8 @@ def test_web_profile_form_uses_city_picker_and_auth_copy(tmp_path):
     assert "省份及直辖市" in home
     assert '<optgroup' not in home
     assert '/static/china_cities.js?v=20260803-cities' in home
-    assert '/static/styles.css?v=20260820-admin-audit-v1' in home
-    assert '/static/app.js?v=20260820-admin-audit-v1' in home
+    assert '/static/styles.css?v=20260820-admin-shell-v4' in home
+    assert '/static/app.js?v=20260820-admin-shell-v4' in home
     assert "cityGroups: buildSortedCityGroups()" in script
     assert "HOT_CITY_NAMES" in script
     assert "cityPickerOpen: false" in script
@@ -510,7 +586,8 @@ def test_web_can_create_profile_and_ingest_chat_message_incrementally(tmp_path):
     rag = client.get("/api/rag/search", params={"query": "FastAPI 求职助手"}).json()
 
     assert chat.status_code == 200, chat.text
-    assert chat.json()["result"]["rag_update_mode"] == "incremental"
+    assert chat.json()["task_trace"]["status"] == "completed"
+    assert {"used_tools", "tool_outputs", "usage", "result"}.isdisjoint(chat.json())
     assert profile["education"] == "本科"
     assert profile["skills"]["Python"] == "待确认"
     assert any("FastAPI" in item["content"] for item in rag["results"])
@@ -965,7 +1042,142 @@ def test_web_chat_history_survives_page_reopen(tmp_path):
     messages = history.json()["messages"]
     assert [message["role"] for message in messages] == ["user", "assistant"]
     assert messages[0]["content"] == "我是本科，1年经验，会 Python。"
-    assert "保存字段" in messages[1]["content"]
+    assert "保存字段" not in messages[1]["content"]
+    assert "工具：" not in messages[1]["content"]
+
+
+def test_web_chat_reply_does_not_expose_internal_execution_metadata(tmp_path):
+    """新消息的聊天气泡不能包含工具名、保存字段、ID 或 RAG 状态。"""
+
+    rendered = format_web_chat_reply(
+        mode="rule_based_ingestion",
+        reply="已为你更新档案。",
+        used_tools=["ingest_candidate_message"],
+        tool_outputs=[
+            {
+                "tool_name": "ingest_candidate_message",
+                "data": {
+                    "saved_structured_fields": ["skills"],
+                    "saved_long_text_ids": [28],
+                    "rag_update_mode": "incremental",
+                },
+            }
+        ],
+        rule_based_result={
+            "saved_structured_fields": ["skills"],
+            "saved_long_text_ids": [28],
+            "rag_update_mode": "incremental",
+        },
+    )
+
+    assert rendered == "已为你更新档案。"
+    assert "ingest_candidate_message" not in rendered
+    assert "保存字段" not in rendered
+    assert "长文本 ID" not in rendered
+    assert "RAG" not in rendered
+
+
+def test_web_chat_history_hides_legacy_internal_execution_metadata(tmp_path):
+    """刷新历史消息时也要隐藏旧版本已经持久化的内部字段。"""
+
+    client = login_test_account(
+        TestClient(create_web_app()),
+        email="legacy-chat-metadata@example.com",
+    )
+    candidate_id = client.post(
+        "/api/profiles",
+        json={
+            "name": "历史消息清理测试",
+            "status": "待补充",
+            "education": "本科",
+            "experience_years": 1,
+            "skills": {},
+            "preferred_cities": [],
+            "expected_salary_k": None,
+            "salary_floor_k": None,
+            "target_directions": [],
+            "unacceptable": [],
+        },
+    ).json()["candidate_id"]
+    account_id = client.get("/api/auth/me").json()["account"]["id"]
+    backend = JobHuntingApp()
+    backend.initialize()
+    session_id = f"legacy-metadata-{candidate_id}"
+    backend.store.create_chat_session(
+        session_id=session_id,
+        account_id=account_id,
+        candidate_id=candidate_id,
+        title="历史消息清理测试",
+    )
+    backend.save_chat_message(
+        candidate_id,
+        session_id,
+        "assistant",
+        "已为你更新档案。\n\n工具：ingest_candidate_message\n\n保存字段：skills\n长文本 ID：28\nRAG：已增量索引本次长文本",
+        {"source": "legacy-test"},
+        account_id=account_id,
+    )
+
+    history = client.get(
+        "/api/chat/history",
+        params={"candidate_id": candidate_id, "session_id": session_id},
+    )
+
+    assert history.status_code == 200
+    assert history.json()["messages"][0]["content"] == "已为你更新档案。"
+    assert history.json()["messages"][0]["metadata"] == {}
+
+
+def test_chat_metadata_sanitizer_only_removes_exact_legacy_tail_blocks() -> None:
+    """正常回答中的同名小标题不能因为旧版清理规则被截断。"""
+
+    normal_reply = "分析如下：\n匹配结果：该岗位与候选人的经历整体相关，但仍需核对项目证据。"
+    legacy_only = "工具：ingest_candidate_message\n保存字段：skills\n长文本 ID：28"
+
+    assert sanitize_web_chat_reply(normal_reply) == normal_reply
+    assert sanitize_web_chat_reply(legacy_only) == ""
+
+
+def test_web_chat_stream_returns_updated_profile_skill_proficiency(tmp_path):
+    """网页对话中的明确技能熟练度必须同步到 SSE final 的档案摘要。"""
+
+    client = legacy_client()
+    candidate_id = client.post(
+        "/api/profiles",
+        json={
+            "name": "技能熟练度网页测试",
+            "status": "待补充",
+            "education": "本科",
+            "experience_years": 1,
+            "skills": {"Python": "待确认"},
+            "preferred_cities": [],
+            "salary_floor_k": None,
+            "expected_salary_k": None,
+            "target_directions": [],
+            "unacceptable": [],
+        },
+    ).json()["candidate_id"]
+
+    response = client.post(
+        "/api/chat/stream",
+        json={
+            "candidate_id": candidate_id,
+            "message": "我的python熟练度是精通",
+            "auto_rag": False,
+            "use_env_llm": False,
+            "session_id": f"web-skill-proficiency-{candidate_id}",
+        },
+    )
+
+    assert response.status_code == 200
+    final_match = re.search(r"event: final\r?\ndata: (.+)", response.text)
+    assert final_match is not None
+    final_payload = json.loads(final_match.group(1))
+    assert final_payload["profile"]["skills"]["Python"] == "精通"
+    assert (
+        client.get(f"/api/profiles/{candidate_id}").json()["profile"]["skills"]["Python"]
+        == "精通"
+    )
 
 
 def test_web_chat_can_use_langchain_agent_mode(tmp_path):
@@ -1028,7 +1240,8 @@ def test_web_chat_can_use_langchain_agent_mode(tmp_path):
 
     assert chat.status_code == 200, chat.text
     assert chat.json()["mode"] == "langchain_agent"
-    assert "ingest_candidate_message" in chat.json()["used_tools"]
+    assert chat.json()["display_reply"] == "我已经通过 Agent 工具保存了你的资料。"
+    assert {"used_tools", "tool_outputs", "usage", "result"}.isdisjoint(chat.json())
 
 
 def test_web_chat_stream_returns_sse_and_saves_history(tmp_path):
@@ -1080,6 +1293,12 @@ def test_web_chat_stream_returns_sse_and_saves_history(tmp_path):
     assert "event: token" in response.text
     assert "event: final" in response.text
     assert "这是流式回复。" in response.text
+    final_match = re.search(r"event: final\r?\ndata: (.+)", response.text)
+    assert final_match is not None
+    final_payload = json.loads(final_match.group(1))
+    assert {"used_tools", "tool_outputs", "usage", "result", "root_request_id"}.isdisjoint(
+        final_payload
+    )
     assert [message["role"] for message in history] == ["user", "assistant"]
     assert history[1]["content"].startswith("这是流式回复。")
 

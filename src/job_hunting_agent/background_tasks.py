@@ -65,7 +65,11 @@ def _record_background_task_trace(
     root_request_id = _background_task_root_request_id(record)
     now = iso_utc()
     try:
-        existing = backend.store.get_tool_call_trace(root_request_id)
+        existing = backend.store.get_tool_call_trace(
+            root_request_id,
+            account_id=record.account_id,
+            cutoff_iso=tool_audit_retention_cutoff(),
+        )
         trace = dict(existing.trace)
         steps = trace.setdefault("steps", [])
         if not isinstance(steps, list):

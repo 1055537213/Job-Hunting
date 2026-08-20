@@ -13,6 +13,7 @@ from .models import (
     ProjectExperienceCard,
     sanitize_preference_weights,
 )
+from .skill_normalization import normalize_skill_mapping
 
 
 class DuplicateResourceError(ValueError):
@@ -71,11 +72,8 @@ def candidate_profile_content_fingerprint(profile: CandidateProfileInput) -> str
         "experience_years": float(profile.experience_years),
         "salary_floor_k": profile.salary_floor_k,
         "expected_salary_k": profile.expected_salary_k,
-        "skills": {
-            _normalize_scalar(name): _normalize_scalar(level)
-            for name, level in profile.skills.items()
-            if _normalize_scalar(name)
-        },
+        # 技能的大小写和常见别名不应让同一档案绕过内容去重。
+        "skills": normalize_skill_mapping(profile.skills),
         # 多选城市和方向在表单中没有先后语义；排序后避免仅因点击顺序不同而重复创建。
         "preferred_cities": _normalized_values(preferred_cities),
         "acceptable_cities": _normalized_values(acceptable_cities),

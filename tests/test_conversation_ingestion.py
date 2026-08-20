@@ -5,7 +5,10 @@ PostgreSQL 结构化事实、哪些内容进入 RAG 长文本知识库”。这�
 自动入库链路。
 """
 
+import json
+
 from job_hunting_agent.app import JobHuntingApp
+from job_hunting_agent.conversation_ingestion import decision_from_json
 from job_hunting_agent.models import CandidateProfileInput, sanitize_preference_weights
 
 
@@ -193,6 +196,147 @@ def test_conversation_persists_only_explicit_preference_weight_updates(tmp_path,
     assert profile.acceptable_cities == []
 
 
+def test_conversation_direction_replacement_overwrites_previous_direction(tmp_path, account_id):
+    """“求职方向改为 X”必须替换旧方向，不能把 X 追加到旧列表。"""
+
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="方向替换测试",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=["AI Agent 应用开发"],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+
+    result = app.ingest_conversation_message(
+        candidate_id,
+        "我想把求职方向改为后端开发。",
+        account_id=account_id,
+    )
+    profile = app.get_candidate_profile(candidate_id, account_id=account_id)
+
+    assert "target_directions" in result.saved_structured_fields
+    assert profile.target_directions == ["后端开发"]
+
+
+def test_conversation_direction_replacement_accepts_other_common_directions(tmp_path, account_id):
+    """替换方向不能只对 Agent 和后端两个硬编码值生效。"""
+
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="前端方向替换测试",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=["AI Agent 应用开发"],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+
+    app.ingest_conversation_message(
+        candidate_id,
+        "请把我的求职方向改成前端开发。",
+        account_id=account_id,
+    )
+
+    profile = app.get_candidate_profile(candidate_id, account_id=account_id)
+    assert profile.target_directions == ["前端开发"]
+
+
+def test_conversation_direction_addition_keeps_previous_direction(tmp_path, account_id):
+    """“也考虑 X”是补充方向，必须保留既有方向。"""
+
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="方向追加测试",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=["AI Agent 应用开发"],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+
+    app.ingest_conversation_message(
+        candidate_id,
+        "我也考虑后端开发。",
+        account_id=account_id,
+    )
+
+    profile = app.get_candidate_profile(candidate_id, account_id=account_id)
+    assert profile.target_directions == ["AI Agent 应用开发", "后端开发"]
+
+
+class DirectionReplacementFakeLLM:
+    """故意返回旧方向，验证本地替换意图能够约束模型决策。"""
+
+    def complete(self, prompt: str) -> str:
+        return """
+        {
+          "reply": "已更新求职方向。",
+          "profile_updates": {
+            "target_directions": ["AI Agent 应用开发", "后端开发"]
+          },
+          "long_texts": []
+        }
+        """
+
+
+def test_llm_ingestion_direction_replacement_does_not_restore_old_direction(tmp_path, account_id):
+    """模型即使错误回传旧方向，明确替换意图也必须以用户原话为准。"""
+
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="模型方向替换测试",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=["AI Agent 应用开发"],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+
+    app.ingest_conversation_message(
+        candidate_id,
+        "我想把求职方向改为后端开发。",
+        llm_client=DirectionReplacementFakeLLM(),
+        account_id=account_id,
+    )
+
+    profile = app.get_candidate_profile(candidate_id, account_id=account_id)
+    assert profile.target_directions == ["后端开发"]
+
+
 def test_preference_weights_are_limited_to_discrete_levels():
     """外部或旧数据中的任意小数权重会被归一化到三个支持等级。"""
 
@@ -232,3 +376,78 @@ def test_rule_based_ingestion_preserves_explicit_missing_skill(tmp_path, account
     profile = app.get_candidate_profile(candidate_id, account_id=account_id)
     assert profile.skills["Docker"] == "不会"
     assert profile.skills["Python"] == "待确认"
+
+
+def test_rule_based_ingestion_saves_explicit_skill_proficiency(tmp_path, account_id):
+    """明确说明技能熟练度时，档案摘要应保存用户说出的等级。"""
+
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="技能熟练度测试",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={"Python": "待确认"},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+
+    app.ingest_conversation_message(
+        candidate_id,
+        "我的python熟练度是精通。",
+        account_id=account_id,
+    )
+
+    profile = app.get_candidate_profile(candidate_id, account_id=account_id)
+    assert profile.skills["Python"] == "精通"
+
+
+def test_llm_ingestion_uses_original_message_for_explicit_skill_proficiency(tmp_path, account_id):
+    """LLM 即使把明确熟练度回传成待确认，也不能覆盖用户原话。"""
+
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="LLM 技能熟练度测试",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={"Python": "待确认"},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+    candidate = app.get_candidate_profile(candidate_id, account_id=account_id)
+    decision = decision_from_json(
+        candidate,
+        "我的python熟练度是精通。",
+        json.dumps(
+            {
+                "reply": "已记录。",
+                "profile_updates": {"skills": {"Python": "待确认"}},
+                "long_texts": [],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    app.store.update_candidate_profile(
+        candidate_id,
+        decision.profile_updates,
+        account_id=account_id,
+    )
+
+    profile = app.get_candidate_profile(candidate_id, account_id=account_id)
+    assert profile.skills["Python"] == "精通"

@@ -215,3 +215,46 @@ def test_proficiency_override_requires_explicit_flag_and_keeps_risk(tmp_path, ac
     assert not explicit_override.llm_discarded
     assert any("明确要求放宽熟练度" in risk for risk in explicit_override.authenticity_risks)
     assert candidate.skills == {"Python": "了解"}
+
+
+def test_confirmed_missing_skill_never_becomes_resume_evidence(tmp_path, account_id):
+    """“不会 Python”是负向事实，不能被写成简历中的候选人能力。"""
+
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="负向技能简历测试",
+            status="离职",
+            education="本科",
+            experience_years=1,
+            skills={"Python": "不会"},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+    job = app.import_job_text(
+        """
+        Python 开发工程师
+        10-15K
+        杭州
+        经验不限
+        本科
+        职位描述：负责 Python 服务开发。
+        """,
+        account_id=account_id,
+    )
+
+    draft = build_resume_draft(
+        app.get_candidate_profile(candidate_id, account_id=account_id),
+        job,
+        [],
+    )
+
+    assert "Python（不会）" not in draft.content
+    assert "已确认技能：Python" not in "\n".join(draft.evidence_items)
+    assert any("未确认技能：Python" in risk for risk in draft.authenticity_risks)

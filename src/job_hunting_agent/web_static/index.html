@@ -4,12 +4,16 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>求职助手 Agent</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260820-admin-audit-v1" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260820-admin-shell-v4" />
   </head>
   <body>
     <!-- Vue 还没有挂载完成时隐藏模板，避免用户短暂看到未编译的 {{ }}。 -->
     <div id="app" class="app-shell" v-cloak @click="closeSessionMenu(); closeCityPicker()">
-      <main v-if="!auth.authenticated" class="auth-shell" aria-labelledby="authTitle">
+      <main v-if="showRouteLoading" class="route-loading" role="status" aria-live="polite">
+        正在进入...
+      </main>
+
+      <main v-if="showAuthSurface" class="auth-shell" aria-labelledby="authTitle">
         <section class="auth-frame">
           <div class="auth-intro">
             <p class="auth-kicker">求职助手 Agent</p>
@@ -104,7 +108,7 @@
         </section>
       </main>
 
-      <header v-if="auth.authenticated && activeView === 'workspace'" class="topbar">
+      <header v-if="showWorkspaceSurface" class="topbar">
         <a class="brand" href="#chatPanel" aria-label="回到聊天工作区">
           <span class="brand-mark">JA</span>
           <span class="brand-copy">
@@ -138,7 +142,7 @@
         </div>
       </header>
 
-      <div v-if="auth.authenticated && activeView === 'workspace'" class="workspace-grid">
+      <div v-if="showWorkspaceSurface" class="workspace-grid">
         <aside
           id="profilePanel"
           class="sidebar"
@@ -178,7 +182,7 @@
               >
                 <option :value="0">暂无档案，请先创建</option>
                 <option v-for="profile in profiles" :key="profile.id" :value="profile.id">
-                  #{{ profile.id }} {{ profile.name }}
+                  #{{ profileDisplayNumber(profile.id) }} {{ profile.name }}
                 </option>
               </select>
             </label>
@@ -560,23 +564,64 @@
                 <div v-if="record.card.detected_core_features?.length" class="project-card-meta">
                   {{ record.card.detected_core_features.join(" · ") }}
                 </div>
-                <details class="project-card-details">
-                  <summary>查看待确认内容</summary>
-                  <ul>
-                    <li v-for="item in record.card.responsibility_draft" :key="item">{{ item }}</li>
-                    <li v-for="item in record.card.questions_for_candidate" :key="item">{{ item }}</li>
-                  </ul>
+                <details class="project-card-details" open>
+                  <summary>
+                    <span>按组确认内容</span>
+                    <span class="project-review-count">{{ projectReviewSummary(record) }}</span>
+                  </summary>
+                  <div class="project-review-list">
+                    <article
+                      v-for="item in projectReviewItems(record)"
+                      :key="item.key"
+                      class="project-review-item"
+                      :class="`is-${projectReviewStatus(record, item)}`"
+                    >
+                      <div class="project-review-item-copy">
+                        <span class="project-review-item-label">{{ item.label }}</span>
+                        <p>{{ item.value }}</p>
+                      </div>
+                      <div class="project-review-actions" role="group" :aria-label="`确认 ${item.value}`">
+                        <button
+                          class="project-review-choice is-accept"
+                          :class="{ 'is-selected': projectReviewStatus(record, item) === 'accepted' }"
+                          type="button"
+                          :aria-pressed="String(projectReviewStatus(record, item) === 'accepted')"
+                          @click="setProjectReviewDecision(record, item, 'accepted')"
+                        >
+                          确认
+                        </button>
+                        <button
+                          class="project-review-choice is-reject"
+                          :class="{ 'is-selected': projectReviewStatus(record, item) === 'rejected' }"
+                          type="button"
+                          :aria-pressed="String(projectReviewStatus(record, item) === 'rejected')"
+                          @click="setProjectReviewDecision(record, item, 'rejected')"
+                        >
+                          排除
+                        </button>
+                      </div>
+                    </article>
+                  </div>
+                  <div v-if="record.card.questions_for_candidate?.length" class="project-review-questions">
+                    <strong>还需要你补充</strong>
+                    <ul>
+                      <li v-for="question in record.card.questions_for_candidate" :key="question">{{ question }}</li>
+                    </ul>
+                  </div>
+                  <p v-if="record.status === '待确认' && !projectReviewAcceptedCount(record)" class="project-review-hint">
+                    请先确认至少一组属于你的技术、功能或职责，再保存项目经历。
+                  </p>
+                  <button
+                    v-if="record.status === '待确认'"
+                    class="primary-button compact project-review-submit"
+                    type="button"
+                    :disabled="!projectReviewAcceptedCount(record) || confirmingProjectCardId === record.id"
+                    :data-state="confirmingProjectCardId === record.id ? 'loading' : 'idle'"
+                    @click="confirmProjectCard(record)"
+                  >
+                    {{ confirmingProjectCardId === record.id ? "保存中" : `保存已确认内容（${projectReviewAcceptedCount(record)} 组）` }}
+                  </button>
                 </details>
-                <button
-                  v-if="record.status === '待确认'"
-                  class="ghost-button compact"
-                  type="button"
-                  :disabled="confirmingProjectCardId === record.id"
-                  :data-state="confirmingProjectCardId === record.id ? 'loading' : 'idle'"
-                  @click="confirmProjectCard(record)"
-                >
-                  {{ confirmingProjectCardId === record.id ? "确认中" : "确认项目经历" }}
-                </button>
               </article>
             </div>
             </div>
@@ -945,9 +990,10 @@
                       </dl>
                       <div class="task-approval-actions">
                         <button class="ghost-button compact" type="button" @click="viewTaskApproval(message)">
-                          查看内容
+                          {{ message.taskTrace.approval.kind === 'project_card_confirmation' ? "按组确认内容" : "查看内容" }}
                         </button>
                         <button
+                          v-if="message.taskTrace.approval.kind !== 'project_card_confirmation'"
                           class="primary-button compact"
                           type="button"
                           :disabled="message.taskTrace.approval.status !== 'waiting' || confirmingTaskApprovalId"
@@ -1001,367 +1047,421 @@
 
       </div>
 
-      <section v-if="auth.authenticated && activeView === 'admin'" class="admin-shell" aria-labelledby="adminTitle">
-        <header class="admin-head">
-          <div>
-            <p class="eyebrow">Account Operations</p>
-            <h1 id="adminTitle">用量与账号</h1>
-            <p class="admin-lede">只显示账号、系统和 Token 流水；候选人正文与对话内容默认不进入后台。</p>
+      <section v-if="showAdminSurface" class="admin-shell" aria-labelledby="adminTopTitle">
+        <header class="admin-topbar">
+          <div class="admin-topbar-brand">
+            <button class="admin-topbar-mark" type="button" @click="goWorkspace" aria-label="返回工作台">
+              JA
+            </button>
+            <div class="admin-topbar-copy">
+              <p class="eyebrow">Job Hunting Agent</p>
+              <h1 id="adminTopTitle">求职助手管理后台</h1>
+            </div>
           </div>
-          <div class="admin-actions">
-            <button class="ghost-button" type="button" @click="activeView = 'workspace'">回到工作台</button>
-            <button class="ghost-button" type="button" @click="logout">退出登录</button>
-            <button class="ghost-button" type="button" @click="logoutAll">退出所有设备</button>
+          <div class="admin-topbar-user">
+            <span class="admin-topbar-account">{{ auth.account?.display_name || auth.account?.email || "账号" }}</span>
+            <span class="admin-topbar-role">{{ auth.account?.role === 'admin' ? '管理员' : '账号' }}</span>
+          </div>
+          <div class="admin-topbar-actions">
+            <button class="ghost-button compact" type="button" @click="goWorkspace">回到工作台</button>
+            <button class="ghost-button compact" type="button" @click="refreshAdminSection">刷新当前页</button>
+            <button class="ghost-button compact" type="button" @click="logout">退出登录</button>
+            <button class="ghost-button compact" type="button" @click="logoutAll">退出所有设备</button>
           </div>
         </header>
-        <div class="admin-metrics" aria-live="polite">
-          <div class="admin-metric"><span>账号数</span><strong>{{ admin.accounts.length }}</strong></div>
-          <div class="admin-metric"><span>请求事件</span><strong>{{ admin.summary.event_count || 0 }}</strong></div>
-          <div class="admin-metric"><span>总 Token</span><strong>{{ admin.summary.total_tokens || 0 }}</strong></div>
-          <div class="admin-metric"><span>可计费 Token</span><strong>{{ admin.summary.billable_tokens || 0 }}</strong></div>
-          <div class="admin-metric"><span>HTTP 请求</span><strong>{{ admin.requestMetrics.total_requests || 0 }}</strong></div>
-          <div class="admin-metric"><span>错误请求</span><strong>{{ admin.requestMetrics.error_requests || 0 }}</strong></div>
-          <div class="admin-metric"><span>平均耗时</span><strong>{{ admin.requestMetrics.average_duration_ms || 0 }}ms</strong></div>
-          <div class="admin-metric">
-            <span>安全拦截</span>
-            <strong>{{ (admin.requestMetrics.rate_limited_requests || 0) + (admin.requestMetrics.csrf_rejected_requests || 0) }}</strong>
-          </div>
-        </div>
-        <section class="panel admin-panel admin-observability">
-          <div class="panel-title-row">
-            <div>
-              <p class="eyebrow">Request Observability</p>
-              <h2 class="panel-title">请求观测</h2>
+        <div class="admin-dashboard">
+          <aside class="admin-sidebar" aria-label="后台模块导航">
+            <div class="admin-sidebar-head">
+              <p class="eyebrow">Menu</p>
+              <strong>后台目录</strong>
+              <p class="admin-sidebar-lede">默认进入用量与账号。</p>
             </div>
-            <button class="ghost-button compact" type="button" @click="loadAdminData">刷新</button>
-          </div>
-          <p class="admin-observability-lede">
-            仅显示进程内低基数统计、最近错误摘要和路由热度，不包含正文、查询参数或密钥。
-          </p>
-          <div class="admin-observability-summary" aria-label="请求观测摘要">
-            <div class="admin-observability-stat">
-              <span>当前处理中</span>
-              <strong>{{ admin.requestMetrics.in_flight_requests || 0 }}</strong>
+            <nav class="admin-nav" aria-label="后台模块">
+              <button
+                v-for="item in adminNavigationItems"
+                :key="item.key"
+                class="admin-nav-item"
+                :class="{ 'is-selected': admin.activeSection === item.key }"
+                type="button"
+                :aria-pressed="String(admin.activeSection === item.key)"
+                @click="selectAdminSection(item.key)"
+              >
+                <span class="admin-nav-icon" aria-hidden="true">{{ item.short }}</span>
+                <span class="admin-nav-copy">
+                  <strong>{{ item.title }}</strong>
+                  <span>{{ item.description }}</span>
+                </span>
+                <span class="admin-nav-meta">
+                  <span class="admin-nav-count">{{ item.count }}</span>
+                  <span class="admin-nav-badge">{{ item.badge }}</span>
+                </span>
+                <span class="admin-nav-chevron" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" focusable="false"><path d="m6 9 6 6 6-6"></path></svg>
+                </span>
+              </button>
+            </nav>
+            <div class="admin-sidebar-foot">
+              <span>当前模块</span>
+              <strong>{{ adminSectionTitle }}</strong>
             </div>
-            <div class="admin-observability-stat">
-              <span>最大耗时</span>
-              <strong>{{ admin.requestMetrics.max_duration_ms || 0 }}ms</strong>
-            </div>
-            <div class="admin-observability-stat">
-              <span>限流次数</span>
-              <strong>{{ admin.requestMetrics.rate_limited_requests || 0 }}</strong>
-            </div>
-            <div class="admin-observability-stat">
-              <span>CSRF 拦截</span>
-              <strong>{{ admin.requestMetrics.csrf_rejected_requests || 0 }}</strong>
-            </div>
-            <div class="admin-observability-stat">
-              <span>异常请求</span>
-              <strong>{{ admin.requestMetrics.exception_requests || 0 }}</strong>
-            </div>
-            <div class="admin-observability-stat">
-              <span>最近错误</span>
-              <strong>{{ adminRecentRequestErrors.length }}</strong>
-            </div>
-          </div>
-          <div class="admin-observability-grid">
-            <section class="admin-observability-section">
-              <div class="admin-observability-section-head">
-                <div>
-                  <p class="eyebrow">Status Families</p>
-                  <h3>状态分布</h3>
-                </div>
-                <span>{{ adminRequestStatusRows.length }} 项</span>
-              </div>
-              <div v-if="!adminRequestStatusRows.length" class="admin-observability-empty">
-                当前没有状态分布数据。
-              </div>
-              <div v-else class="admin-table-wrap admin-observability-table-wrap">
-                <table class="admin-table admin-observability-table">
-                  <thead>
-                    <tr><th>状态族</th><th>数量</th></tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="row in adminRequestStatusRows" :key="row.label">
-                      <td>{{ row.label }}</td><td>{{ row.count }}</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-              <div class="admin-observability-divider"></div>
-              <div class="admin-observability-section-head">
-                <div>
-                  <p class="eyebrow">Methods</p>
-                  <h3>请求方法</h3>
-                </div>
-                <span>{{ adminRequestMethodRows.length }} 项</span>
-              </div>
-              <div v-if="!adminRequestMethodRows.length" class="admin-observability-empty">
-                当前没有请求方法统计。
-              </div>
-              <div v-else class="admin-table-wrap admin-observability-table-wrap">
-                <table class="admin-table admin-observability-table">
-                  <thead>
-                    <tr><th>方法</th><th>数量</th></tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="row in adminRequestMethodRows" :key="row.label">
-                      <td>{{ row.label }}</td><td>{{ row.count }}</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </section>
-            <section class="admin-observability-section">
-              <div class="admin-observability-section-head">
-                <div>
-                  <p class="eyebrow">Endpoints</p>
-                  <h3>Endpoint 统计</h3>
-                </div>
-                <span>{{ adminRequestEndpointRows.length }} 项</span>
-              </div>
-              <div v-if="!adminRequestEndpointRows.length" class="admin-observability-empty">
-                当前没有 endpoint 统计。
-              </div>
-              <div v-else class="admin-table-wrap admin-observability-table-wrap">
-                <table class="admin-table admin-observability-table">
-                  <thead>
-                    <tr><th>Endpoint</th><th>数量</th></tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="row in adminRequestEndpointRows" :key="row.label">
-                      <td>{{ row.label }}</td><td>{{ row.count }}</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </section>
-          </div>
-          <section class="admin-observability-errors">
-            <div class="admin-observability-section-head">
+          </aside>
+          <main class="admin-main">
+            <header class="admin-main-head">
               <div>
-                <p class="eyebrow">Recent Errors</p>
-                <h3>最近错误摘要</h3>
+                <p class="eyebrow">Dashboard</p>
+                <h2 class="admin-main-title">{{ adminSectionTitle }}</h2>
+                <p class="admin-main-lede">{{ adminSectionDescription }}</p>
               </div>
-              <span>{{ adminRecentRequestErrors.length }} 条</span>
-            </div>
-            <div v-if="!adminRecentRequestErrors.length" class="admin-observability-empty">
-              当前没有最近错误摘要。
-            </div>
-            <div v-else class="admin-observability-error-list">
-              <article v-for="error in adminRecentRequestErrors" :key="error.request_id + error.created_at" class="admin-observability-error">
-                <div class="admin-observability-error-head">
-                  <strong>{{ error.method }} {{ error.endpoint }}</strong>
-                  <span>{{ error.status_code }} · {{ error.outcome }} · {{ error.duration_ms }}ms</span>
-                </div>
-                <div class="admin-observability-error-meta">
-                  <span>请求 ID {{ error.request_id }}</span>
-                  <span>{{ formatDate(error.created_at) }}</span>
-                </div>
+              <button class="ghost-button compact" type="button" @click="refreshAdminSection">刷新</button>
+            </header>
+
+            <section class="admin-kpi-grid" aria-label="当前模块概览">
+              <article v-for="card in adminSectionKpis" :key="card.label" class="admin-kpi-card">
+                <span>{{ card.label }}</span>
+                <strong>{{ card.value }}</strong>
+                <small>{{ card.hint }}</small>
               </article>
-            </div>
-          </section>
-        </section>
-        <section class="panel admin-panel admin-audit-panel">
-          <div class="panel-title-row">
-            <div>
-              <p class="eyebrow">Admin Audit</p>
-              <h2 class="panel-title">管理员审计</h2>
-            </div>
-            <button class="ghost-button compact" type="button" @click="loadAdminAuditEvents">刷新</button>
-          </div>
-          <p class="admin-observability-lede">
-            记录账号状态变更、系统探针和管理员退出所有设备等低敏操作，便于后续排查和追责。
-          </p>
-          <div v-if="admin.loadingAuditEvents" class="admin-usage-notice" role="status">正在加载管理员审计...</div>
-          <div v-else-if="admin.auditLoadError" class="inline-error" role="alert">{{ admin.auditLoadError }}</div>
-          <div v-else-if="!adminAuditEvents.length" class="empty-state compact-empty">
-            <strong>暂无管理员审计事件</strong><span>发生账号状态变更或系统探针后会显示在这里。</span>
-          </div>
-          <div v-else class="admin-audit-list">
-            <article v-for="event in adminAuditEvents" :key="event.id" class="admin-audit-event">
-              <div class="admin-audit-event-main">
+            </section>
+
+            <section v-if="admin.activeSection === 'usage'" class="panel admin-panel admin-account-ledger">
+              <div class="panel-title-row">
                 <div>
-                  <p class="eyebrow">{{ adminAuditActionLabel(event.action) }}</p>
-                  <h3>{{ event.summary }}</h3>
+                  <p class="eyebrow">Account Usage</p>
+                  <h2 class="panel-title">账号与 Token 用量</h2>
                 </div>
-                <span :data-state="event.outcome">{{ event.outcome }}</span>
               </div>
-              <dl class="admin-audit-event-meta">
-                <dt>时间</dt><dd>{{ formatDate(event.created_at) }}</dd>
-                <dt>操作者</dt><dd>{{ adminAccountLabel(event.actor_account_id) }}</dd>
-                <dt>目标</dt><dd>{{ adminAuditTargetLabel(event) }}</dd>
-                <dt>请求 ID</dt><dd>{{ event.request_id || "-" }}</dd>
-              </dl>
-            </article>
-          </div>
-        </section>
-        <section class="panel admin-panel admin-account-ledger">
-          <div class="panel-title-row">
-            <div><p class="eyebrow">Account Usage</p><h2 class="panel-title">账号与 Token 用量</h2></div>
-            <button class="ghost-button compact" type="button" @click="loadAdminData">刷新</button>
-          </div>
-          <div v-if="admin.loadError" class="inline-error" role="alert">{{ admin.loadError }}</div>
-          <div v-if="!admin.accounts.length" class="empty-state">
-            <strong>还没有账号</strong><span>普通用户可以从登录页自行注册。</span>
-          </div>
-          <div v-else class="admin-account-workspace">
-            <section class="admin-account-directory" aria-labelledby="adminAccountListTitle">
-              <div class="admin-account-directory-head">
-                <p class="eyebrow">Accounts</p><h3 id="adminAccountListTitle">账号列表</h3>
+              <div v-if="admin.loadError" class="inline-error" role="alert">{{ admin.loadError }}</div>
+              <div v-if="!admin.accounts.length" class="empty-state">
+                <strong>还没有账号</strong><span>普通用户可以从登录页自行注册。</span>
               </div>
-              <div class="admin-account-list" role="list">
-                <article
-                  v-for="account in admin.accounts"
-                  :key="account.id"
-                  class="admin-account-entry"
-                  :class="{ 'is-selected': isAdminAccountSelected(account.id) }"
-                  role="listitem"
-                >
-                  <div class="admin-account-row">
-                    <button
-                      class="admin-account-select"
-                      type="button"
-                      :aria-pressed="String(isAdminAccountSelected(account.id))"
-                      aria-controls="adminUsageDetail"
-                      @click="selectAdminAccount(account.id)"
-                    >
-                      <span class="admin-account-summary">
-                        <strong>{{ account.email }}</strong>
-                        <span>{{ account.role }} · {{ account.status }} · {{ accountUsage(account.id) }} 可计费 Token · {{ accountToolCallCount(account.id) }} 个工具任务</span>
-                      </span>
-                      <span class="admin-account-event-count">{{ accountUsageEventCount(account.id) }} 条</span>
-                      <span class="admin-account-chevron" aria-hidden="true">
-                        <svg viewBox="0 0 24 24" focusable="false"><path d="m6 9 6 6 6-6"></path></svg>
-                      </span>
-                    </button>
-                    <button class="ghost-button compact admin-account-status-action" type="button" @click.stop="toggleAccountStatus(account)">
-                      {{ account.status === 'active' ? '禁用' : '恢复' }}
-                    </button>
+              <div v-else class="admin-account-workspace">
+                <section class="admin-account-directory" aria-labelledby="adminAccountListTitle">
+                  <div class="admin-account-directory-head">
+                    <p class="eyebrow">Accounts</p><h3 id="adminAccountListTitle">账号列表</h3>
                   </div>
+                  <div class="admin-account-list" role="list">
+                    <article
+                      v-for="account in admin.accounts"
+                      :key="account.id"
+                      class="admin-account-entry"
+                      :class="{ 'is-selected': isAdminAccountSelected(account.id) }"
+                      role="listitem"
+                    >
+                      <div class="admin-account-row">
+                        <button
+                          class="admin-account-select"
+                          type="button"
+                          :aria-pressed="String(isAdminAccountSelected(account.id))"
+                          aria-controls="adminUsageDetail"
+                          @click="selectAdminAccount(account.id)"
+                        >
+                          <span class="admin-account-summary">
+                            <strong>{{ account.email }}</strong>
+                            <span>{{ account.role }} · {{ account.status }} · {{ accountUsage(account.id) }} 可计费 Token · {{ accountToolCallCount(account.id) }} 个工具任务</span>
+                          </span>
+                          <span class="admin-account-event-count">{{ accountUsageEventCount(account.id) }} 条</span>
+                          <span class="admin-account-chevron" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" focusable="false"><path d="m6 9 6 6 6-6"></path></svg>
+                          </span>
+                        </button>
+                        <button class="ghost-button compact admin-account-status-action" type="button" @click.stop="toggleAccountStatus(account)">
+                          {{ account.status === 'active' ? '禁用' : '恢复' }}
+                        </button>
+                      </div>
+                    </article>
+                  </div>
+                </section>
+                <section
+                  id="adminUsageDetail"
+                  class="admin-account-usage"
+                  :aria-label="selectedAdminAccount ? `${selectedAdminAccount.email} 的 Token 使用明细` : 'Token 使用明细'"
+                >
+                  <template v-if="selectedAdminAccount">
+                    <div class="admin-account-usage-head">
+                      <div>
+                        <p class="eyebrow">Usage Ledger</p>
+                        <h3>{{ selectedAdminAccount.email }} 的后台明细</h3>
+                      </div>
+                      <span>{{ accountUsageEventCount(selectedAdminAccount.id) }} Token · {{ accountToolCallCount(selectedAdminAccount.id) }} 工具</span>
+                    </div>
+                    <div class="admin-detail-tabs" role="tablist" aria-label="后台明细切换">
+                      <button
+                        class="tab-button"
+                        type="button"
+                        role="tab"
+                        :aria-selected="String(admin.activeDetailTab === 'tokens')"
+                        @click="setAdminDetailTab('tokens')"
+                      >
+                        Token 明细
+                      </button>
+                      <button
+                        class="tab-button"
+                        type="button"
+                        role="tab"
+                        :aria-selected="String(admin.activeDetailTab === 'tools')"
+                        @click="setAdminDetailTab('tools')"
+                      >
+                        工具调用
+                      </button>
+                    </div>
+
+                    <template v-if="admin.activeDetailTab === 'tokens'">
+                      <div v-if="admin.loadingEvents" class="admin-usage-notice" role="status">正在加载 Token 明细...</div>
+                      <div v-else-if="admin.eventsError" class="inline-error" role="alert">{{ admin.eventsError }}</div>
+                      <div v-else-if="!admin.events.length" class="empty-state compact-empty">
+                        <strong>暂无用量流水</strong><span>该账号尚未产生可展示的 Token 使用记录。</span>
+                      </div>
+                      <div v-else class="admin-table-wrap">
+                        <table class="admin-table">
+                          <thead><tr><th>时间</th><th>操作</th><th>模型</th><th>Token</th><th>来源</th><th>状态</th></tr></thead>
+                          <tbody><tr v-for="event in admin.events" :key="event.id"><td>{{ formatDate(event.created_at) }}</td><td>{{ event.operation }}</td><td>{{ event.model }}</td><td>{{ event.total_tokens }}</td><td>{{ event.usage_source }}</td><td>{{ event.status }}</td></tr></tbody>
+                        </table>
+                      </div>
+                    </template>
+
+                    <template v-else>
+                      <div v-if="admin.loadingToolTraces" class="admin-usage-notice" role="status">正在加载工具调用记录...</div>
+                      <div v-else-if="admin.toolTracesError" class="inline-error" role="alert">{{ admin.toolTracesError }}</div>
+                      <div v-else-if="!admin.toolTraces.length" class="empty-state compact-empty">
+                        <strong>暂无工具调用任务</strong><span>最近两天内没有需要记录的工具调用。</span>
+                      </div>
+                      <div v-else class="admin-tool-workspace">
+                        <div class="admin-tool-list">
+                          <button
+                            v-for="trace in admin.toolTraces"
+                            :key="trace.root_request_id"
+                            type="button"
+                            class="admin-tool-row"
+                            :class="{ 'is-selected': String(trace.root_request_id) === String(admin.selectedToolTraceId) }"
+                            @click="selectAdminToolTrace(trace.root_request_id)"
+                          >
+                            <span class="admin-tool-row-main">
+                              <strong>{{ trace.title }}</strong>
+                              <span>{{ formatDate(trace.created_at) }} · {{ trace.step_count }} 步 · {{ trace.status }}</span>
+                            </span>
+                            <span class="admin-tool-row-meta">
+                              <span>{{ trace.attempt_count }} 次尝试</span>
+                              <span v-if="trace.last_error_summary" class="admin-tool-error">{{ trace.last_error_summary }}</span>
+                            </span>
+                          </button>
+                        </div>
+                        <div class="admin-tool-detail">
+                          <div v-if="admin.loadingToolTraceDetail" class="admin-usage-notice" role="status">正在加载任务详情...</div>
+                          <div v-else-if="admin.toolTraceDetailError" class="inline-error" role="alert">{{ admin.toolTraceDetailError }}</div>
+                          <div v-else-if="selectedAdminToolTraceDetail" class="admin-tool-detail-card">
+                            <div class="admin-tool-detail-head">
+                              <div>
+                                <p class="eyebrow">Tool Trace</p>
+                                <h4>{{ selectedAdminToolTraceDetail.title }}</h4>
+                              </div>
+                              <span>{{ selectedAdminToolTraceDetail.status }}</span>
+                            </div>
+                            <dl class="admin-tool-detail-meta">
+                              <dt>链路 ID</dt><dd>{{ selectedAdminToolTraceDetail.root_request_id }}</dd>
+                              <dt>来源</dt><dd>{{ selectedAdminToolTraceDetail.source }}</dd>
+                              <dt>步骤</dt><dd>{{ selectedAdminToolTraceDetail.step_count }}</dd>
+                              <dt>尝试</dt><dd>{{ selectedAdminToolTraceDetail.attempt_count }}</dd>
+                              <dt>开始</dt><dd>{{ formatDate(selectedAdminToolTraceDetail.started_at) }}</dd>
+                              <dt>结束</dt><dd>{{ formatDate(selectedAdminToolTraceDetail.finished_at) }}</dd>
+                            </dl>
+                            <ol class="admin-tool-step-list">
+                              <li v-for="step in selectedAdminToolTraceDetail.trace?.steps || []" :key="step.id" class="admin-tool-step" :class="`is-${step.status}`">
+                                <span class="admin-tool-step-mark" aria-hidden="true"></span>
+                                <div class="admin-tool-step-copy">
+                                  <strong>{{ step.label }}</strong>
+                                  <span v-if="step.summary">{{ step.summary }}</span>
+                                  <pre v-if="step.result" class="admin-tool-step-result">{{ JSON.stringify(step.result, null, 2) }}</pre>
+                                </div>
+                              </li>
+                            </ol>
+                          </div>
+                          <div v-else class="admin-usage-prompt">
+                            <strong>选择一条工具调用</strong><span>点击左侧任务后查看步骤和结果摘要。</span>
+                          </div>
+                        </div>
+                      </div>
+                    </template>
+                  </template>
+                  <div v-else class="admin-usage-prompt">
+                    <strong>选择一个账号</strong><span>点击左侧账号后查看其 Token 使用明细。</span>
+                  </div>
+                </section>
+              </div>
+            </section>
+
+            <section v-else-if="admin.activeSection === 'observability'" class="panel admin-panel admin-observability">
+              <div class="panel-title-row">
+                <div>
+                  <p class="eyebrow">Request Observability</p>
+                  <h2 class="panel-title">请求观测</h2>
+                </div>
+              </div>
+              <p class="admin-observability-lede">
+                仅显示进程内低基数统计、最近错误摘要和路由热度，不包含正文、查询参数或密钥。
+              </p>
+              <div class="admin-observability-summary" aria-label="请求观测摘要">
+                <div class="admin-observability-stat">
+                  <span>当前处理中</span>
+                  <strong>{{ admin.requestMetrics.in_flight_requests || 0 }}</strong>
+                </div>
+                <div class="admin-observability-stat">
+                  <span>最大耗时</span>
+                  <strong>{{ admin.requestMetrics.max_duration_ms || 0 }}ms</strong>
+                </div>
+                <div class="admin-observability-stat">
+                  <span>限流次数</span>
+                  <strong>{{ admin.requestMetrics.rate_limited_requests || 0 }}</strong>
+                </div>
+                <div class="admin-observability-stat">
+                  <span>CSRF 拦截</span>
+                  <strong>{{ admin.requestMetrics.csrf_rejected_requests || 0 }}</strong>
+                </div>
+                <div class="admin-observability-stat">
+                  <span>异常请求</span>
+                  <strong>{{ admin.requestMetrics.exception_requests || 0 }}</strong>
+                </div>
+                <div class="admin-observability-stat">
+                  <span>最近错误</span>
+                  <strong>{{ adminRecentRequestErrors.length }}</strong>
+                </div>
+              </div>
+              <div class="admin-observability-grid">
+                <section class="admin-observability-section">
+                  <div class="admin-observability-section-head">
+                    <div>
+                      <p class="eyebrow">Status Families</p>
+                      <h3>状态分布</h3>
+                    </div>
+                    <span>{{ adminRequestStatusRows.length }} 项</span>
+                  </div>
+                  <div v-if="!adminRequestStatusRows.length" class="admin-observability-empty">
+                    当前没有状态分布数据。
+                  </div>
+                  <div v-else class="admin-table-wrap admin-observability-table-wrap">
+                    <table class="admin-table admin-observability-table">
+                      <thead>
+                        <tr><th>状态族</th><th>数量</th></tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="row in adminRequestStatusRows" :key="row.label">
+                          <td>{{ row.label }}</td><td>{{ row.count }}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <div class="admin-observability-divider"></div>
+                  <div class="admin-observability-section-head">
+                    <div>
+                      <p class="eyebrow">Methods</p>
+                      <h3>请求方法</h3>
+                    </div>
+                    <span>{{ adminRequestMethodRows.length }} 项</span>
+                  </div>
+                  <div v-if="!adminRequestMethodRows.length" class="admin-observability-empty">
+                    当前没有请求方法统计。
+                  </div>
+                  <div v-else class="admin-table-wrap admin-observability-table-wrap">
+                    <table class="admin-table admin-observability-table">
+                      <thead>
+                        <tr><th>方法</th><th>数量</th></tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="row in adminRequestMethodRows" :key="row.label">
+                          <td>{{ row.label }}</td><td>{{ row.count }}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+                <section class="admin-observability-section">
+                  <div class="admin-observability-section-head">
+                    <div>
+                      <p class="eyebrow">Endpoints</p>
+                      <h3>Endpoint 统计</h3>
+                    </div>
+                    <span>{{ adminRequestEndpointRows.length }} 项</span>
+                  </div>
+                  <div v-if="!adminRequestEndpointRows.length" class="admin-observability-empty">
+                    当前没有 endpoint 统计。
+                  </div>
+                  <div v-else class="admin-table-wrap admin-observability-table-wrap">
+                    <table class="admin-table admin-observability-table">
+                      <thead>
+                        <tr><th>Endpoint</th><th>数量</th></tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="row in adminRequestEndpointRows" :key="row.label">
+                          <td>{{ row.label }}</td><td>{{ row.count }}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+              </div>
+              <section class="admin-observability-errors">
+                <div class="admin-observability-section-head">
+                  <div>
+                    <p class="eyebrow">Recent Errors</p>
+                    <h3>最近错误摘要</h3>
+                  </div>
+                  <span>{{ adminRecentRequestErrors.length }} 条</span>
+                </div>
+                <div v-if="!adminRecentRequestErrors.length" class="admin-observability-empty">
+                  当前没有最近错误摘要。
+                </div>
+                <div v-else class="admin-observability-error-list">
+                  <article v-for="error in adminRecentRequestErrors" :key="error.request_id + error.created_at" class="admin-observability-error">
+                    <div class="admin-observability-error-head">
+                      <strong>{{ error.method }} {{ error.endpoint }}</strong>
+                      <span>{{ error.status_code }} · {{ error.outcome }} · {{ error.duration_ms }}ms</span>
+                    </div>
+                    <div class="admin-observability-error-meta">
+                      <span>请求 ID {{ error.request_id }}</span>
+                      <span>{{ formatDate(error.created_at) }}</span>
+                    </div>
+                  </article>
+                </div>
+              </section>
+            </section>
+
+            <section v-else class="panel admin-panel admin-audit-panel">
+              <div class="panel-title-row">
+                <div>
+                  <p class="eyebrow">Admin Audit</p>
+                  <h2 class="panel-title">管理员审计</h2>
+                </div>
+              </div>
+              <p class="admin-observability-lede">
+                记录账号状态变更、系统探针和管理员会话撤销等低敏操作，便于后续排查和追责。
+              </p>
+              <div v-if="admin.loadingAuditEvents" class="admin-usage-notice" role="status">正在加载管理员审计...</div>
+              <div v-else-if="admin.auditLoadError" class="inline-error" role="alert">{{ admin.auditLoadError }}</div>
+              <div v-else-if="!adminAuditEvents.length" class="empty-state compact-empty">
+                <strong>暂无管理员审计事件</strong><span>发生账号状态变更或系统探针后会显示在这里。</span>
+              </div>
+              <div v-else class="admin-audit-list">
+                <article v-for="event in adminAuditEvents" :key="event.id" class="admin-audit-event">
+                  <div class="admin-audit-event-main">
+                    <div>
+                      <p class="eyebrow">{{ adminAuditActionLabel(event.action) }}</p>
+                      <h3>{{ event.summary }}</h3>
+                    </div>
+                    <span :data-state="event.outcome">{{ event.outcome }}</span>
+                  </div>
+                  <dl class="admin-audit-event-meta">
+                    <dt>时间</dt><dd>{{ formatDate(event.created_at) }}</dd>
+                    <dt>操作者</dt><dd>{{ adminAccountLabel(event.actor_account_id) }}</dd>
+                    <dt>目标</dt><dd>{{ adminAuditTargetLabel(event) }}</dd>
+                    <dt>请求 ID</dt><dd>{{ event.request_id || "-" }}</dd>
+                  </dl>
                 </article>
               </div>
             </section>
-            <section
-              id="adminUsageDetail"
-              class="admin-account-usage"
-              :aria-label="selectedAdminAccount ? `${selectedAdminAccount.email} 的 Token 使用明细` : 'Token 使用明细'"
-            >
-              <template v-if="selectedAdminAccount">
-                <div class="admin-account-usage-head">
-                  <div>
-                    <p class="eyebrow">Usage Ledger</p>
-                    <h3>{{ selectedAdminAccount.email }} 的后台明细</h3>
-                  </div>
-                  <span>{{ accountUsageEventCount(selectedAdminAccount.id) }} Token · {{ accountToolCallCount(selectedAdminAccount.id) }} 工具</span>
-                </div>
-                <div class="admin-detail-tabs" role="tablist" aria-label="后台明细切换">
-                  <button
-                    class="tab-button"
-                    type="button"
-                    role="tab"
-                    :aria-selected="String(admin.activeDetailTab === 'tokens')"
-                    @click="setAdminDetailTab('tokens')"
-                  >
-                    Token 明细
-                  </button>
-                  <button
-                    class="tab-button"
-                    type="button"
-                    role="tab"
-                    :aria-selected="String(admin.activeDetailTab === 'tools')"
-                    @click="setAdminDetailTab('tools')"
-                  >
-                    工具调用
-                  </button>
-                </div>
-
-                <template v-if="admin.activeDetailTab === 'tokens'">
-                  <div v-if="admin.loadingEvents" class="admin-usage-notice" role="status">正在加载 Token 明细...</div>
-                  <div v-else-if="admin.eventsError" class="inline-error" role="alert">{{ admin.eventsError }}</div>
-                  <div v-else-if="!admin.events.length" class="empty-state compact-empty">
-                    <strong>暂无用量流水</strong><span>该账号尚未产生可展示的 Token 使用记录。</span>
-                  </div>
-                  <div v-else class="admin-table-wrap">
-                    <table class="admin-table">
-                      <thead><tr><th>时间</th><th>操作</th><th>模型</th><th>Token</th><th>来源</th><th>状态</th></tr></thead>
-                      <tbody><tr v-for="event in admin.events" :key="event.id"><td>{{ formatDate(event.created_at) }}</td><td>{{ event.operation }}</td><td>{{ event.model }}</td><td>{{ event.total_tokens }}</td><td>{{ event.usage_source }}</td><td>{{ event.status }}</td></tr></tbody>
-                    </table>
-                  </div>
-                </template>
-
-                <template v-else>
-                  <div v-if="admin.loadingToolTraces" class="admin-usage-notice" role="status">正在加载工具调用记录...</div>
-                  <div v-else-if="admin.toolTracesError" class="inline-error" role="alert">{{ admin.toolTracesError }}</div>
-                  <div v-else-if="!admin.toolTraces.length" class="empty-state compact-empty">
-                    <strong>暂无工具调用任务</strong><span>最近两天内没有需要记录的工具调用。</span>
-                  </div>
-                  <div v-else class="admin-tool-workspace">
-                    <div class="admin-tool-list">
-                      <button
-                        v-for="trace in admin.toolTraces"
-                        :key="trace.root_request_id"
-                        type="button"
-                        class="admin-tool-row"
-                        :class="{ 'is-selected': String(trace.root_request_id) === String(admin.selectedToolTraceId) }"
-                        @click="selectAdminToolTrace(trace.root_request_id)"
-                      >
-                        <span class="admin-tool-row-main">
-                          <strong>{{ trace.title }}</strong>
-                          <span>{{ formatDate(trace.created_at) }} · {{ trace.step_count }} 步 · {{ trace.status }}</span>
-                        </span>
-                        <span class="admin-tool-row-meta">
-                          <span>{{ trace.attempt_count }} 次尝试</span>
-                          <span v-if="trace.last_error_summary" class="admin-tool-error">{{ trace.last_error_summary }}</span>
-                        </span>
-                      </button>
-                    </div>
-                    <div class="admin-tool-detail">
-                      <div v-if="admin.loadingToolTraceDetail" class="admin-usage-notice" role="status">正在加载任务详情...</div>
-                      <div v-else-if="admin.toolTraceDetailError" class="inline-error" role="alert">{{ admin.toolTraceDetailError }}</div>
-                      <div v-else-if="selectedAdminToolTraceDetail" class="admin-tool-detail-card">
-                        <div class="admin-tool-detail-head">
-                          <div>
-                            <p class="eyebrow">Tool Trace</p>
-                            <h4>{{ selectedAdminToolTraceDetail.title }}</h4>
-                          </div>
-                          <span>{{ selectedAdminToolTraceDetail.status }}</span>
-                        </div>
-                        <dl class="admin-tool-detail-meta">
-                          <dt>链路 ID</dt><dd>{{ selectedAdminToolTraceDetail.root_request_id }}</dd>
-                          <dt>来源</dt><dd>{{ selectedAdminToolTraceDetail.source }}</dd>
-                          <dt>步骤</dt><dd>{{ selectedAdminToolTraceDetail.step_count }}</dd>
-                          <dt>尝试</dt><dd>{{ selectedAdminToolTraceDetail.attempt_count }}</dd>
-                          <dt>开始</dt><dd>{{ formatDate(selectedAdminToolTraceDetail.started_at) }}</dd>
-                          <dt>结束</dt><dd>{{ formatDate(selectedAdminToolTraceDetail.finished_at) }}</dd>
-                        </dl>
-                        <ol class="admin-tool-step-list">
-                          <li v-for="step in selectedAdminToolTraceDetail.trace?.steps || []" :key="step.id" class="admin-tool-step" :class="`is-${step.status}`">
-                            <span class="admin-tool-step-mark" aria-hidden="true"></span>
-                            <div class="admin-tool-step-copy">
-                              <strong>{{ step.label }}</strong>
-                              <span v-if="step.summary">{{ step.summary }}</span>
-                              <pre v-if="step.result" class="admin-tool-step-result">{{ JSON.stringify(step.result, null, 2) }}</pre>
-                            </div>
-                          </li>
-                        </ol>
-                      </div>
-                      <div v-else class="admin-usage-prompt">
-                        <strong>选择一条工具调用</strong><span>点击左侧任务后查看步骤和结果摘要。</span>
-                      </div>
-                    </div>
-                  </div>
-                </template>
-              </template>
-              <div v-else class="admin-usage-prompt">
-                <strong>选择一个账号</strong><span>点击左侧账号后查看其 Token 使用明细。</span>
-              </div>
-            </section>
-          </div>
-        </section>
+          </main>
+        </div>
       </section>
 
-      <div v-if="auth.authenticated && activeView === 'workspace'" class="cmdk" :class="{ 'is-open': commandPaletteOpen }" :aria-hidden="String(!commandPaletteOpen)">
+      <div v-if="showWorkspaceSurface" class="cmdk" :class="{ 'is-open': commandPaletteOpen }" :aria-hidden="String(!commandPaletteOpen)">
         <div class="cmdk-backdrop" @click="closeCommandPalette"></div>
         <section
           class="cmdk-panel"
@@ -1486,6 +1586,6 @@
     <!-- Vue 3 global build 已放入本地静态目录，避免本地页面依赖外部 CDN。 -->
     <script src="/static/vendor/vue.global.prod.js?v=20260731-auth-admin"></script>
     <script src="/static/china_cities.js?v=20260803-cities"></script>
-    <script src="/static/app.js?v=20260820-admin-audit-v1"></script>
+    <script src="/static/app.js?v=20260820-admin-shell-v4"></script>
   </body>
 </html>

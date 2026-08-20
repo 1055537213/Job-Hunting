@@ -15,13 +15,29 @@ from langchain_core.language_models.fake_chat_models import (
     FakeListChatModel,
     FakeMessagesListChatModel,
 )
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from pydantic import Field
 
-from job_hunting_agent.agent import JobHuntingAgent
+from job_hunting_agent.agent import JobHuntingAgent, tool_message_to_output
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.config import AgentMemorySettings
 from job_hunting_agent.models import CandidateProfileInput
+
+
+def test_tool_message_error_status_is_preserved_for_task_audit() -> None:
+    """非 JSON 工具失败也必须保留失败状态，不能在 Web 轨迹中变成成功。"""
+
+    output = tool_message_to_output(
+        ToolMessage(
+            content="上游服务暂时不可用",
+            tool_call_id="call-error-1",
+            name="import_job_from_text",
+            status="error",
+        )
+    )
+
+    assert output["status"] == "error"
+    assert output["data"] == {"error": "上游服务暂时不可用"}
 
 
 def build_resume_docx_bytes(*paragraphs: str) -> bytes:

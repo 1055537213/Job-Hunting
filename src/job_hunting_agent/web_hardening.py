@@ -98,10 +98,14 @@ def install_web_hardening(
                 response = await call_next(request)
             status_code = response.status_code
             return response
-        except Exception:
+        except Exception:  # noqa: BLE001 - 统一生成不泄露异常正文的 500 响应。
             status_code = 500
             outcome = "exception"
-            raise
+            response = JSONResponse(
+                {"detail": "服务器内部错误。", "request_id": request_id},
+                status_code=500,
+            )
+            return response
         finally:
             duration_ms = max(0, round((time.monotonic() - started_at) * 1000))
             if response is not None:
@@ -145,7 +149,7 @@ class InMemoryRateLimiter:
             while bucket and bucket[0] <= cutoff:
                 bucket.popleft()
             if len(bucket) >= limit:
-                retry_after = max(1, int(round(window - (now - bucket[0]))))
+                retry_after = max(1, round(window - (now - bucket[0])))
                 return retry_after
             bucket.append(now)
         return None

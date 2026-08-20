@@ -36,6 +36,7 @@ from .llm import LLMClient
 from .matcher import match_job, semantic_direction_score
 from .model_gateway import ModelGateway
 from .models import (
+    AdminAuditEventRecord,
     BackgroundTaskRecord,
     CandidateProfile,
     CandidateProfileInput,
@@ -175,6 +176,7 @@ class JobHuntingApp:
         session_id: str | None = None,
         idempotency_key: str | None = None,
         max_attempts: int = 3,
+        audit_event: AdminAuditEventRecord | None = None,
     ) -> BackgroundTaskRecord:
         """先写 PostgreSQL 任务记录，再投递 task_key；失败时留下可审计状态。"""
 
@@ -201,6 +203,7 @@ class JobHuntingApp:
                     session_id=session_id,
                     idempotency_key=idempotency_key,
                     max_attempts=max_attempts,
+                    audit_event=audit_event,
                 )
         else:
             record = self.store.create_background_task(
@@ -211,6 +214,7 @@ class JobHuntingApp:
                 session_id=session_id,
                 idempotency_key=idempotency_key,
                 max_attempts=max_attempts,
+                audit_event=audit_event,
             )
         # 幂等复用的已完成任务无需再次投递；queued 任务才需要向 Redis 发送消息。
         if record.status != "queued":
@@ -231,7 +235,12 @@ class JobHuntingApp:
 
         return self.store.get_background_task(task_key, account_id=account_id)
 
-    def enqueue_system_probe(self, account_id: int) -> BackgroundTaskRecord:
+    def enqueue_system_probe(
+        self,
+        account_id: int,
+        *,
+        audit_event: AdminAuditEventRecord | None = None,
+    ) -> BackgroundTaskRecord:
         """登记一个不读取用户数据的 Worker 连通性探针，供管理员受控验证。"""
 
         return self.enqueue_background_task(
@@ -239,6 +248,7 @@ class JobHuntingApp:
             task_type="system_probe",
             payload={"purpose": "admin_runtime_probe"},
             max_attempts=1,
+            audit_event=audit_event,
         )
 
     def enqueue_rag_index_task(
