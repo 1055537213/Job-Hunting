@@ -2547,6 +2547,7 @@ if (!window.Vue) {
       projectReviewItems(record) {
         const card = record?.card || {};
         const items = [];
+        const reviewSignatures = [];
         const techGroups = [
           {
             key: "frontend",
@@ -2667,10 +2668,146 @@ if (!window.Vue) {
           return techGroups.find((group) => group.aliases.has(normalized)) || null;
         };
         const groupedTechItems = new Map();
+        const normalizeReviewText = (value) =>
+          String(value || "")
+            .trim()
+            .toLowerCase()
+            .replace(/[.\s/_\-·|、，,；;:：()[\]{}<>?!！？'"“”‘’]+/g, "");
+        const reviewConceptRules = [
+          {
+            key: "candidate-profile",
+            aliases: [
+              "候选人档案/资料管理",
+              "候选人档案",
+              "简历资料",
+              "资料管理",
+              "candidate profile",
+              "candidate",
+              "resume",
+            ],
+          },
+          {
+            key: "job-parsing",
+            aliases: [
+              "职位解析/标准化",
+              "职位文本解析",
+              "字段标准化",
+              "职位解析",
+              "导入流程",
+              "标准化",
+            ],
+          },
+          {
+            key: "matching-ranking",
+            aliases: [
+              "匹配排序/评分",
+              "职位匹配",
+              "推荐解释",
+              "匹配",
+              "排序",
+              "评分",
+              "recommend",
+              "rank",
+              "score",
+            ],
+          },
+          {
+            key: "vector-retrieval",
+            aliases: [
+              "向量检索/rag",
+              "向量检索",
+              "长文本语义检索",
+              "检索增强",
+              "retriever",
+              "embedding",
+              "vector",
+              "rag",
+            ],
+          },
+          {
+            key: "agent-tools",
+            aliases: [
+              "agent流程/工具调用",
+              "agent流程",
+              "工具调用设计",
+              "工具调用",
+              "智能体",
+              "tool_call",
+              "toolcall",
+              "tools",
+              "agent",
+            ],
+          },
+          {
+            key: "api-service",
+            aliases: [
+              "接口/api服务",
+              "接口设计",
+              "api服务",
+              "endpoint",
+              "router",
+              "route",
+              "api",
+            ],
+          },
+          {
+            key: "testing-quality",
+            aliases: [
+              "测试/质量验证",
+              "质量验证",
+              "测试",
+              "pytest",
+              "unittest",
+              "test",
+            ],
+          },
+          {
+            key: "deployment-infrastructure",
+            aliases: [
+              "部署/容器化",
+              "部署",
+              "容器化",
+              "deployment",
+              "docker",
+              "compose",
+              "kubernetes",
+              "k8s",
+            ],
+          },
+        ];
+        const reviewConceptsFor = (value) => {
+          const normalized = normalizeReviewText(value);
+          if (!normalized) return [];
+          return reviewConceptRules
+            .filter((rule) => rule.aliases.some((alias) => normalized.includes(normalizeReviewText(alias))))
+            .map((rule) => rule.key);
+        };
+        const reviewSignature = (value) =>
+          normalizeReviewText(value)
+            .replace(/^(可能负责|主要负责|负责|承担|参与|实现|项目包含|项目中包含|包含|涉及|围绕|聚焦|侧重于|用于)+/, "")
+            .replace(/(相关线索|相关实现线索|相关流程|相关设计|相关方向|相关功能|相关职责|线索|流程|设计|实现|方向|功能|职责)+$/, "");
+        const reviewConceptsSeen = new Set();
+        const reviewSignatureOverlaps = (signature) =>
+          reviewSignatures.some((existing) => {
+            if (!existing || !signature) return false;
+            if (existing === signature) return true;
+            if (existing.length < 3 || signature.length < 3) return false;
+            return existing.includes(signature) || signature.includes(existing);
+          });
         const appendItems = (label, values, prefix) => {
           (Array.isArray(values) ? values : []).forEach((value, index) => {
             const text = String(value || "").trim();
             if (!text) return;
+            const signature = reviewSignature(text);
+            const concepts = reviewConceptsFor(text);
+            if (
+              concepts.some((concept) => reviewConceptsSeen.has(concept))
+              || (signature && reviewSignatureOverlaps(signature))
+            ) {
+              return;
+            }
+            concepts.forEach((concept) => reviewConceptsSeen.add(concept));
+            if (signature) reviewSignatures.push(signature);
             items.push({ key: `${prefix}-${index}`, label, value: text });
           });
         };

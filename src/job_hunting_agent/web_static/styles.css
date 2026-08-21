@@ -1931,13 +1931,44 @@ textarea:focus-visible,
 }
 
 .project-card-details summary {
+  min-height: var(--size-hit);
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-sm);
-  cursor: pointer;
+  padding: var(--space-2xs) var(--space-sm);
   color: var(--color-ink-2);
+  background: var(--color-paper-raised);
+  border: var(--rule-thin) solid var(--color-rule);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
   font-weight: 700;
+  list-style: none;
+  transition:
+    transform var(--dur-micro) var(--ease-out),
+    background-color var(--dur-micro) var(--ease-out),
+    border-color var(--dur-micro) var(--ease-out),
+    color var(--dur-micro) var(--ease-out);
+}
+
+.project-card-details summary::-webkit-details-marker,
+.project-card-details summary::marker {
+  display: none;
+}
+
+.project-card-details summary:hover {
+  color: var(--color-ink);
+  background: var(--color-paper-2);
+  border-color: var(--color-rule-strong);
+}
+
+.project-card-details summary:focus-visible {
+  outline: calc(var(--rule-thin) * 2) solid var(--color-focus);
+  outline-offset: var(--space-2xs);
+}
+
+.project-card-details summary:active {
+  transform: translateY(var(--rule-thin));
 }
 
 .project-review-count {

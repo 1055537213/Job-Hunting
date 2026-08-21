@@ -403,7 +403,7 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     for page in (login_page, workspace_page, admin_page):
         assert page.status_code == 200
         assert page.headers["cache-control"] == "no-store, max-age=0"
-        assert "/static/app.js?v=20260820-admin-shell-v4" in page.text
+        assert "/static/app.js?v=20260821-project-review-dedupe-v2" in page.text
     assert "Job Hunting Agent" in home.text
     assert "syncAuthPageClass" in script.text
     assert "FRONTEND_ROUTES" in script.text
@@ -412,8 +412,8 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert 'v-if="showWorkspaceSurface"' in home.text
     assert 'v-if="showAdminSurface"' in home.text
     assert 'v-if="showRouteLoading"' in home.text
-    assert '/static/app.js?v=20260820-admin-shell-v4' in home.text
-    assert '/static/styles.css?v=20260820-admin-shell-v4' in home.text
+    assert '/static/app.js?v=20260821-project-review-dedupe-v2' in home.text
+    assert '/static/styles.css?v=20260821-project-review-dedupe-v2' in home.text
     assert "本地运行 · 用户复制职位文本" not in home.text
     assert "Conversation Workspace" not in home.text
     assert "整理求职证据" not in home.text
@@ -533,8 +533,8 @@ def test_web_profile_form_uses_city_picker_and_auth_copy(tmp_path):
     assert "省份及直辖市" in home
     assert '<optgroup' not in home
     assert '/static/china_cities.js?v=20260803-cities' in home
-    assert '/static/styles.css?v=20260820-admin-shell-v4' in home
-    assert '/static/app.js?v=20260820-admin-shell-v4' in home
+    assert '/static/styles.css?v=20260821-project-review-dedupe-v2' in home
+    assert '/static/app.js?v=20260821-project-review-dedupe-v2' in home
     assert "cityGroups: buildSortedCityGroups()" in script
     assert "HOT_CITY_NAMES" in script
     assert "cityPickerOpen: false" in script

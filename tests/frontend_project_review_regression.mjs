@@ -32,9 +32,11 @@ function extractMethod(signature, functionSignature) {
 }
 
 assert.match(page, /class="project-review-choice is-accept"/);
+assert.match(page, /href="\/static\/styles\.css\?v=20260821-project-review-dedupe-v2"/);
 assert.match(page, /@click="setProjectReviewDecision\(record, item, 'accepted'\)"/);
 assert.match(page, /@click="setProjectReviewDecision\(record, item, 'rejected'\)"/);
 assert.match(page, /按组确认内容/);
+assert.match(page, /<summary>\s*<span>按组确认内容<\/span>/);
 assert.match(page, /保存已确认内容/);
 assert.match(page, /message\.taskTrace\.approval\.kind !== 'project_card_confirmation'/);
 assert.match(source, /captureProjectTasksFromChat\(data\.background_tasks \|\| \[\]\)/);
@@ -44,6 +46,8 @@ assert.doesNotMatch(
   /class="ghost-button compact"[\s\S]{0,500}@click="confirmProjectCard\(record\)"/,
 );
 assert.match(styles, /\.project-source-link\s*\{[^}]*color: var\(--color-accent\);/);
+assert.match(styles, /\.project-card-details summary\s*\{[^}]*border: var\(--rule-thin\) solid var\(--color-rule\);/s);
+assert.match(styles, /\.project-card-details summary\s*\{[^}]*background: var\(--color-paper-raised\);/s);
 assert.doesNotMatch(
   styles,
   /\.project-source-link\s*\{[^}]*color: var\(--color-accent-ink\);/,
@@ -147,6 +151,73 @@ const selectedSummary = projectConfirmedSummary.call(context, record);
 assert.match(selectedSummary, /后端\/API 技术栈：Python、FastAPI/);
 assert.match(selectedSummary, /项目亮点：完成后端服务拆分/);
 assert.doesNotMatch(selectedSummary, /前端技术栈：JavaScript、Vue/);
+
+const duplicateRecord = {
+  id: 13,
+  status: "待确认",
+  card: {
+    project_name: "candidate-agent",
+    detected_tech_stack: ["Python", "FastAPI"],
+    detected_core_features: ["接口/API 服务", "向量检索/RAG"],
+    responsibility_draft: [
+      "可能负责接口/API 服务设计",
+      "可能负责向量检索、RAG 或长文本语义检索流程",
+      "负责接口设计",
+    ],
+    highlight_draft: [
+      "项目包含向量检索/RAG 相关线索",
+      "完成后端服务拆分",
+    ],
+    questions_for_candidate: ["项目中你负责的模块是什么？"],
+  },
+};
+
+const duplicateItems = projectReviewItems.call(context, duplicateRecord);
+assert.equal(duplicateItems.length, 4);
+assert.deepEqual(
+  duplicateItems.map((item) => `${item.label}:${item.value}`),
+  [
+    "后端/API 技术栈:Python、FastAPI",
+    "核心功能:接口/API 服务",
+    "核心功能:向量检索/RAG",
+    "项目亮点:完成后端服务拆分",
+  ],
+);
+
+const crossFieldDuplicateRecord = {
+  id: 14,
+  status: "待确认",
+  card: {
+    project_name: "cross-field-duplicates",
+    detected_tech_stack: ["SQL", "Agent", "Docker"],
+    detected_core_features: [
+      "候选人档案/资料管理",
+      "匹配排序/评分",
+      "Agent 流程/工具调用",
+      "部署/容器化",
+    ],
+    responsibility_draft: [
+      "可能负责候选人档案或简历资料建模",
+      "可能负责职位匹配、排序或推荐解释逻辑",
+      "可能负责 Agent 流程或工具调用设计",
+      "可能负责部署与容器化方案设计",
+    ],
+    highlight_draft: [
+      "项目包含 Agent 或 LangChain 相关实现线索",
+      "项目包含部署/容器化相关线索",
+      "完成团队协作流程梳理",
+    ],
+    questions_for_candidate: [],
+  },
+};
+
+const crossFieldItems = projectReviewItems.call(context, crossFieldDuplicateRecord);
+assert.deepEqual(
+  crossFieldItems
+    .filter((item) => item.label === "可能负责" || item.label === "项目亮点")
+    .map((item) => `${item.label}:${item.value}`),
+  ["项目亮点:完成团队协作流程梳理"],
+);
 
 let requestOptions = null;
 const savedMessages = [];
