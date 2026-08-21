@@ -1882,6 +1882,19 @@ textarea:focus-visible,
   overflow-wrap: anywhere;
 }
 
+.project-card-head-actions {
+  min-width: 0;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2xs);
+}
+
+.project-card-delete {
+  flex: 0 0 auto;
+}
+
 .project-source-link,
 .project-card-meta {
   min-width: 0;

@@ -652,6 +652,16 @@ class JobHuntingApp:
 
         return self.store.confirm_project_card(record_id, confirmed_summary, account_id=account_id)
 
+    def delete_project_card(
+        self,
+        record_id: int,
+        account_id: int | None = None,
+    ) -> dict[str, object]:
+        """删除一张项目经历卡片及其确认摘要，并同步回收 RAG 证据。"""
+
+        result = self.store.delete_project_card(record_id, account_id=account_id)
+        return self._finish_deletion_cleanup(result)
+
     def confirm_project_card_and_enqueue_rag(
         self,
         record_id: int,

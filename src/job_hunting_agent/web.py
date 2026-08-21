@@ -305,6 +305,7 @@ def create_web_app(
             agent_error = str(error)
 
     web_app = FastAPI(title="Job Hunting Agent Web", version="0.1.0")
+    web_app.state.backend = backend
     install_web_hardening(
         web_app,
         settings=web_security_settings,
@@ -1097,6 +1098,21 @@ def create_web_app(
                 for record in backend.list_project_cards(candidate_id, account_id=account.id)
             ]
         }
+
+    @web_app.delete("/api/projects/{record_id}")
+    def delete_project_card(
+        record_id: int,
+        request: Request,
+    ) -> dict[str, object]:
+        """删除当前账号的一张项目经历卡片及其摘要证据。"""
+
+        account = current_account(request)
+        assert account is not None
+        try:
+            result = backend.delete_project_card(record_id, account_id=account.id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="项目经历卡片不存在。") from error
+        return {"deleted": True, **result}
 
     @web_app.post("/api/projects/github")
     def analyze_github_project(

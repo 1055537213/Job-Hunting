@@ -200,6 +200,7 @@ if (!window.Vue) {
         resumeError: "",
         submittingGitHubProject: false,
         confirmingProjectCardId: 0,
+        deletingProjectCardId: 0,
         confirmingTaskApprovalId: 0,
         githubProjectError: "",
         // 当前页面正在跟踪的后台 RAG 任务；任务事实仍以 PostgreSQL API 返回值为准。
@@ -1459,6 +1460,7 @@ if (!window.Vue) {
             this.resumeArtifacts = [];
             this.projectCards = [];
             this.projectReviewSelections = {};
+            this.deletingProjectCardId = 0;
             return;
           }
 
@@ -1488,6 +1490,7 @@ if (!window.Vue) {
           this.projectCards = [];
           this.projectReviewSelections = {};
           this.resumeJobSelections = {};
+          this.deletingProjectCardId = 0;
           return;
         }
         await this.refreshCurrentProfile();
@@ -1832,6 +1835,7 @@ if (!window.Vue) {
           this.resumeJobSelections = {};
           this.projectCards = [];
           this.projectReviewSelections = {};
+          this.deletingProjectCardId = 0;
           await this.loadProfiles();
         } catch (error) {
           this.appendAssistant(`删除档案失败：${error.message || "未知错误"}`, true);
@@ -3064,6 +3068,53 @@ if (!window.Vue) {
           this.appendAssistant(this.githubProjectError, true);
         } finally {
           this.confirmingProjectCardId = 0;
+        }
+      },
+
+      /** 删除一张已导入项目卡片，并同步清理本地的确认状态。 */
+      async deleteProjectCard(record) {
+        if (!record || this.deletingProjectCardId || !window.confirm(
+          `确定删除项目“${record.card?.project_name || "未命名项目"}”吗？\n删除后该项目卡片和对应的检索证据都会永久移除。`
+        )) {
+          return;
+        }
+        this.deletingProjectCardId = record.id;
+        this.githubProjectError = "";
+        try {
+          await this.requestJson(`/api/projects/${encodeURIComponent(record.id)}`, {
+            method: "DELETE",
+          });
+          this.projectCards = this.projectCards.filter(
+            (item) => Number(item.id) !== Number(record.id)
+          );
+          const recordKey = String(record.id);
+          const nextSelections = { ...this.projectReviewSelections };
+          delete nextSelections[recordKey];
+          this.projectReviewSelections = nextSelections;
+          for (const message of this.messages) {
+            const trace = message?.taskTrace;
+            const approval = trace?.approval;
+            if (
+              approval?.kind === "project_card_confirmation" &&
+              Number(approval.record_id) === Number(record.id) &&
+              approval.status === "waiting"
+            ) {
+              approval.status = "cancelled";
+              approval.message = "对应项目已删除，本次待确认内容已移除。";
+              trace.status = "cancelled";
+              trace.expanded = false;
+            }
+          }
+          this.reconcileTaskApprovals();
+          this.appendAssistant(`已删除项目经历：**${record.card?.project_name || "未命名项目"}**。`);
+          if (this.currentProfileId) {
+            await this.loadProjectCards();
+          }
+        } catch (error) {
+          this.githubProjectError = error.message || "删除项目经历失败。";
+          this.appendAssistant(this.githubProjectError, true);
+        } finally {
+          this.deletingProjectCardId = 0;
         }
       },
 

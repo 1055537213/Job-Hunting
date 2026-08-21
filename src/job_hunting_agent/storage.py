@@ -2185,6 +2185,48 @@ class RepositoryStore:
             )
         return self.get_project_card(record_id, account_id=account_id)
 
+    def delete_project_card(
+        self,
+        record_id: int,
+        account_id: int | None = None,
+    ) -> dict[str, object]:
+        """删除一张项目经历卡片及其确认摘要对应的长文本。"""
+
+        existing = self.get_project_card(record_id, account_id=account_id)
+        owner_clause = ""
+        owner_parameters: tuple[object, ...] = ()
+        if account_id is not None:
+            owner_clause = " AND account_id = ?"
+            owner_parameters = (account_id,)
+
+        with self.connect() as conn:
+            long_text_rows = conn.execute(
+                f"""
+                SELECT id FROM long_texts
+                WHERE entity_type = 'project_experience_card' AND entity_id = ?{owner_clause}
+                """,
+                (record_id, *owner_parameters),
+            ).fetchall()
+            conn.execute(
+                f"""
+                DELETE FROM long_texts
+                WHERE entity_type = 'project_experience_card' AND entity_id = ?{owner_clause}
+                """,
+                (record_id, *owner_parameters),
+            )
+            cursor = conn.execute(
+                f"DELETE FROM project_experience_cards WHERE id = ?{owner_clause}",
+                (record_id, *owner_parameters),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Project experience card not found: {record_id}")
+
+        return {
+            "project_card_id": record_id,
+            "candidate_id": existing.candidate_id,
+            "long_text_ids": [int(row["id"]) for row in long_text_rows],
+        }
+
     def get_long_text_for_entity(
         self,
         entity_type: str,

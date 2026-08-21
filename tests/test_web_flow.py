@@ -19,7 +19,7 @@ from langchain_core.messages import AIMessage
 
 from job_hunting_agent.agent import JobHuntingAgent
 from job_hunting_agent.app import JobHuntingApp
-from job_hunting_agent.models import CandidateProfileInput, CandidateProfilePatch
+from job_hunting_agent.models import CandidateProfileInput, CandidateProfilePatch, ProjectExperienceCard
 from job_hunting_agent.web import (
     ChatPayload,
     create_web_app,
@@ -403,7 +403,7 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     for page in (login_page, workspace_page, admin_page):
         assert page.status_code == 200
         assert page.headers["cache-control"] == "no-store, max-age=0"
-        assert "/static/app.js?v=20260821-project-review-dedupe-v2" in page.text
+        assert "/static/app.js?v=20260821-project-delete-v1" in page.text
     assert "Job Hunting Agent" in home.text
     assert "syncAuthPageClass" in script.text
     assert "FRONTEND_ROUTES" in script.text
@@ -412,8 +412,8 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert 'v-if="showWorkspaceSurface"' in home.text
     assert 'v-if="showAdminSurface"' in home.text
     assert 'v-if="showRouteLoading"' in home.text
-    assert '/static/app.js?v=20260821-project-review-dedupe-v2' in home.text
-    assert '/static/styles.css?v=20260821-project-review-dedupe-v2' in home.text
+    assert '/static/app.js?v=20260821-project-delete-v1' in home.text
+    assert '/static/styles.css?v=20260821-project-delete-v1' in home.text
     assert "本地运行 · 用户复制职位文本" not in home.text
     assert "Conversation Workspace" not in home.text
     assert "整理求职证据" not in home.text
@@ -533,8 +533,8 @@ def test_web_profile_form_uses_city_picker_and_auth_copy(tmp_path):
     assert "省份及直辖市" in home
     assert '<optgroup' not in home
     assert '/static/china_cities.js?v=20260803-cities' in home
-    assert '/static/styles.css?v=20260821-project-review-dedupe-v2' in home
-    assert '/static/app.js?v=20260821-project-review-dedupe-v2' in home
+    assert '/static/styles.css?v=20260821-project-delete-v1' in home
+    assert '/static/app.js?v=20260821-project-delete-v1' in home
     assert "cityGroups: buildSortedCityGroups()" in script
     assert "HOT_CITY_NAMES" in script
     assert "cityPickerOpen: false" in script
@@ -818,8 +818,60 @@ def test_web_can_delete_profiles_sessions_and_jobs_with_account_scoping(tmp_path
     assert chat.status_code == 200, chat.text
     assert client_a.get("/api/chat/history", params={"candidate_id": candidate_id, "session_id": session_id}).json()["messages"]
 
+    backend = client_a.app.state.backend
+    account = backend.store.get_account_by_email("delete-a@example.com")[0]
+    project_card = backend.store.save_project_card(
+        candidate_id,
+        ProjectExperienceCard(
+            card_type="待确认项目经历卡片",
+            project_name="待删除项目",
+            read_files=["README.md"],
+            skipped_summary={},
+            detected_tech_stack=["Python", "FastAPI"],
+            detected_core_features=["接口/API 服务"],
+            responsibility_draft=["负责接口设计"],
+            highlight_draft=["完成后端服务拆分"],
+            resume_expression_draft=["使用 Python 和 FastAPI 开发接口"],
+            questions_for_candidate=[],
+            source_type="github_public_repository",
+            source_url="https://github.com/example/delete-project",
+            source_ref="main",
+        ),
+        account_id=account.id,
+    )
+    confirmed_project, _ = backend.confirm_project_card_and_enqueue_rag(
+        project_card.id,
+        "本人负责接口设计与实现。",
+        account_id=account.id,
+    )
+    project_long_texts = backend.store.list_long_texts(
+        ["project_experience_card"],
+        candidate_id=candidate_id,
+        account_id=account.id,
+    )
+    assert confirmed_project.status == "已确认"
+    assert len(project_long_texts) == 1
+    backend.index_rag_long_texts([project_long_texts[0].id], account_id=account.id)
+    assert client_a.get("/api/projects", params={"candidate_id": candidate_id}).json()["project_cards"]
+    assert backend.search_rag("接口设计", account_id=account.id)
+
     assert client_b.delete(f"/api/profiles/{candidate_id}").status_code == 404
     assert client_b.delete(f"/api/jobs/{job['id']}").status_code == 404
+    assert client_b.delete(f"/api/projects/{project_card.id}").status_code == 404
+
+    deleted_project = client_a.delete(f"/api/projects/{project_card.id}")
+    assert deleted_project.status_code == 200, deleted_project.text
+    deleted_project_payload = deleted_project.json()
+    assert deleted_project_payload["deleted"] is True
+    assert deleted_project_payload["rag_cleanup"] == "database_cascade"
+    assert deleted_project_payload["long_text_ids"] == [project_long_texts[0].id]
+    assert client_a.get("/api/projects", params={"candidate_id": candidate_id}).json()["project_cards"] == []
+    assert backend.store.list_long_texts(
+        ["project_experience_card"],
+        candidate_id=candidate_id,
+        account_id=account.id,
+    ) == []
+    assert backend.search_rag("接口设计", account_id=account.id) == []
 
     deleted_session = client_a.delete(f"/api/chat/sessions/{session_id}")
     assert deleted_session.status_code == 200, deleted_session.text

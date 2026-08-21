@@ -32,7 +32,11 @@ function extractMethod(signature, functionSignature) {
 }
 
 assert.match(page, /class="project-review-choice is-accept"/);
-assert.match(page, /href="\/static\/styles\.css\?v=20260821-project-review-dedupe-v2"/);
+assert.match(page, /href="\/static\/styles\.css\?v=20260821-project-delete-v1"/);
+assert.match(page, /src="\/static\/app\.js\?v=20260821-project-delete-v1"/);
+assert.match(page, /@click="deleteProjectCard\(record\)"/);
+assert.match(page, /class="danger-button compact project-card-delete"/);
+assert.match(source, /async deleteProjectCard\(record\) \{/);
 assert.match(page, /@click="setProjectReviewDecision\(record, item, 'accepted'\)"/);
 assert.match(page, /@click="setProjectReviewDecision\(record, item, 'rejected'\)"/);
 assert.match(page, /按组确认内容/);

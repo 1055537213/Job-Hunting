@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>求职助手 Agent</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260821-project-review-dedupe-v2" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260821-project-delete-v1" />
   </head>
   <body>
     <!-- Vue 还没有挂载完成时隐藏模板，避免用户短暂看到未编译的 {{ }}。 -->
@@ -547,7 +547,18 @@
               <article v-for="record in projectCards" :key="record.id" class="project-card-row">
                 <div class="project-card-head">
                   <strong>{{ record.card.project_name }}</strong>
-                  <span class="file-kind">{{ record.status }}</span>
+                  <div class="project-card-head-actions">
+                    <span class="file-kind">{{ record.status }}</span>
+                    <button
+                      class="danger-button compact project-card-delete"
+                      type="button"
+                      :aria-label="`删除 ${record.card.project_name || '未命名项目'}`"
+                      :disabled="deletingProjectCardId === record.id || confirmingProjectCardId === record.id"
+                      @click="deleteProjectCard(record)"
+                    >
+                      {{ deletingProjectCardId === record.id ? "删除中" : "删除" }}
+                    </button>
+                  </div>
                 </div>
                 <a
                   v-if="record.card.source_url"
@@ -615,7 +626,7 @@
                     v-if="record.status === '待确认'"
                     class="primary-button compact project-review-submit"
                     type="button"
-                    :disabled="!projectReviewAcceptedCount(record) || confirmingProjectCardId === record.id"
+                    :disabled="!projectReviewAcceptedCount(record) || confirmingProjectCardId === record.id || deletingProjectCardId === record.id"
                     :data-state="confirmingProjectCardId === record.id ? 'loading' : 'idle'"
                     @click="confirmProjectCard(record)"
                   >
@@ -1586,6 +1597,6 @@
     <!-- Vue 3 global build 已放入本地静态目录，避免本地页面依赖外部 CDN。 -->
     <script src="/static/vendor/vue.global.prod.js?v=20260731-auth-admin"></script>
     <script src="/static/china_cities.js?v=20260803-cities"></script>
-    <script src="/static/app.js?v=20260821-project-review-dedupe-v2"></script>
+    <script src="/static/app.js?v=20260821-project-delete-v1"></script>
   </body>
 </html>
