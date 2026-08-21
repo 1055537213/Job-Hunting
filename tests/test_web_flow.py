@@ -8,7 +8,6 @@
 import json
 import logging
 import re
-from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -26,7 +25,6 @@ from job_hunting_agent.models import (
     ProjectExperienceCard,
     UsageEventRecord,
 )
-from job_hunting_agent.tool_audit import tool_audit_retention_cutoff
 from job_hunting_agent.web import (
     ChatPayload,
     create_web_app,
@@ -1473,8 +1471,8 @@ def test_web_chat_stream_without_tools_does_not_create_admin_tool_trace(tmp_path
     assert client.get("/api/admin/tools/traces").json()["traces"] == []
 
 
-def test_admin_usage_events_keep_two_day_window_and_prune_old_rows(tmp_path):
-    """后台 Token 明细只返回最近两天记录，并会删除窗口外旧流水。"""
+def test_admin_usage_events_keep_five_page_window_and_prune_old_rows(tmp_path):
+    """后台 Token 明细只保留最近 5 页，并会删除更早流水。"""
 
     env_path = tmp_path / ".env"
     env_path.write_text(
@@ -1495,10 +1493,10 @@ def test_admin_usage_events_keep_two_day_window_and_prune_old_rows(tmp_path):
     )
     store = web_app.state.backend.store
     account = store.get_account_by_email("admin@example.com")[0]
-    retention_cutoff = tool_audit_retention_cutoff()
-    cutoff_at = datetime.fromisoformat(retention_cutoff)
-    old_at = (cutoff_at - timedelta(seconds=1)).isoformat()
-    recent_at = (cutoff_at + timedelta(minutes=1)).isoformat()
+
+    def ledger_timestamp(index: int) -> str:
+        minute, second = divmod(index, 60)
+        return f"2026-08-21T00:{minute:02d}:{second:02d}+00:00"
 
     def usage_event(call_id: str, total_tokens: int, created_at: str) -> UsageEventRecord:
         return UsageEventRecord(
@@ -1524,29 +1522,44 @@ def test_admin_usage_events_keep_two_day_window_and_prune_old_rows(tmp_path):
             pricing_version="test-v1",
         )
 
-    store.record_usage_event(usage_event("usage-old", 900, old_at))
-    store.record_usage_event(usage_event("usage-recent", 42, recent_at))
+    for index in range(1, 502):
+        store.record_usage_event(
+            usage_event(f"usage-{index:03d}", 1, ledger_timestamp(index))
+        )
 
-    response = client.get(f"/api/admin/usage/events?account_id={account.id}&limit=200")
-
+    response = client.get(f"/api/admin/usage/events?account_id={account.id}&limit=100&offset=0")
     assert response.status_code == 200
-    assert [event["call_id"] for event in response.json()["events"]] == ["usage-recent"]
-    assert [event.call_id for event in store.list_usage_events(account_id=account.id)] == [
-        "usage-recent"
+    assert response.json()["total"] == 500
+    assert response.json()["page_size"] == 100
+    assert response.json()["max_pages"] == 5
+    assert [event["call_id"] for event in response.json()["events"]] == [
+        f"usage-{index:03d}" for index in range(501, 401, -1)
+    ]
+
+    response_page5 = client.get(f"/api/admin/usage/events?account_id={account.id}&limit=100&offset=400")
+    assert response_page5.status_code == 200
+    assert [event["call_id"] for event in response_page5.json()["events"]] == [
+        f"usage-{index:03d}" for index in range(101, 1, -1)
+    ]
+
+    assert store.count_usage_events(account.id) == 500
+    assert [event.call_id for event in store.list_usage_events(account_id=account.id, limit=100, offset=0)] == [
+        f"usage-{index:03d}" for index in range(501, 401, -1)
     ]
     summary = client.get("/api/admin/usage/summary").json()
-    assert summary["summary"]["total_tokens"] == 42
+    assert summary["summary"]["total_tokens"] == 500
+    assert summary["summary"]["event_count"] == 500
     assert summary["by_account"] == [
         {
             "account_id": account.id,
-            "input_tokens": 42,
+            "input_tokens": 500,
             "output_tokens": 0,
-            "total_tokens": 42,
-            "billable_tokens": 42,
-            "event_count": 1,
+            "total_tokens": 500,
+            "billable_tokens": 500,
+            "event_count": 500,
         }
     ]
-
+    assert summary["tool_calls_by_account"] == []
 
 def test_web_chat_stream_records_admin_tool_trace_detail(tmp_path):
     """真实工具调用的流式消息应能在管理端看到同一条任务链路与步骤结果。"""

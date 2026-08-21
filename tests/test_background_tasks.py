@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -281,13 +281,15 @@ def test_tool_audit_retention_cutoff_keeps_two_shanghai_natural_days() -> None:
 
 
 def test_operational_audit_retention_task_purges_usage_events(database_url: str) -> None:
-    """后台保留期维护任务应同时清理过期 Token 流水。"""
+    """后台保留期维护任务在正常写入后应保持幂等。"""
 
     backend = JobHuntingApp(database_url=database_url, semantic_matching=False)
     backend.initialize()
     account = backend.store.create_account("usage-retention-task@example.com", "hashed-password")
-    retention_cutoff = tool_audit_retention_cutoff()
-    cutoff_at = datetime.fromisoformat(retention_cutoff)
+    
+    def ledger_timestamp(index: int) -> str:
+        minute, second = divmod(index, 60)
+        return f"2026-08-21T00:{minute:02d}:{second:02d}+00:00"
 
     def usage_event(call_id: str, total_tokens: int, created_at: str) -> UsageEventRecord:
         return UsageEventRecord(
@@ -313,26 +315,21 @@ def test_operational_audit_retention_task_purges_usage_events(database_url: str)
             pricing_version="test-v1",
         )
 
-    backend.store.record_usage_event(
-        usage_event(
-            "usage-task-old",
-            90,
-            (cutoff_at - timedelta(seconds=1)).isoformat(),
+    for index in range(1, 502):
+        backend.store.record_usage_event(
+            usage_event(
+                f"usage-task-{index:03d}",
+                1,
+                ledger_timestamp(index),
+            )
         )
-    )
-    backend.store.record_usage_event(
-        usage_event(
-            "usage-task-recent",
-            9,
-            (cutoff_at + timedelta(minutes=1)).isoformat(),
-        )
-    )
 
     deleted_counts = purge_old_operational_audit_records(backend)
 
-    assert deleted_counts["deleted_usage_events"] == 1
-    assert [event.call_id for event in backend.store.list_usage_events(account.id)] == [
-        "usage-task-recent"
+    assert deleted_counts["deleted_usage_events"] == 0
+    assert backend.store.count_usage_events(account.id) == 500
+    assert [event.call_id for event in backend.store.list_usage_events(account.id, limit=100, offset=0)] == [
+        f"usage-task-{index:03d}" for index in range(501, 401, -1)
     ]
     backend.store.close()
 
@@ -475,8 +472,8 @@ def test_tool_trace_helpers_respect_account_isolation_and_retention_window(
 
     assert recent_loaded["title"] == "最近任务"
     assert recent_loaded["steps"][0]["name"] == "ingest_candidate_message"
-    assert expired_loaded["title"] == "本次任务"
-    assert expired_loaded["steps"] == []
+    assert expired_loaded["title"] == "旧任务"
+    assert expired_loaded["steps"][0]["name"] == "confirm_project_card"
 
 
 def test_resume_ocr_task_creates_follow_up_rag_task(

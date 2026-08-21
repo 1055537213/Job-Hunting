@@ -45,8 +45,8 @@ from .models import (
     UsageEventRecord,
     sanitize_preference_weights,
 )
+from .admin_ledger import ADMIN_LEDGER_MAX_RECORDS
 from .skill_normalization import merge_skill_mappings, normalize_skill_mapping
-from .tool_audit import tool_audit_retention_cutoff
 
 RESUME_ARTIFACT_STATUSES = {"ready", "processing", "failed"}
 
@@ -562,6 +562,11 @@ class RepositoryStore:
                     event.pricing_version,
                 ),
             )
+            self._prune_usage_events_for_account(
+                conn,
+                event.account_id,
+                max_records=ADMIN_LEDGER_MAX_RECORDS,
+            )
             row = conn.execute(
                 "SELECT * FROM usage_events WHERE call_id = ?", (event.call_id,)
             ).fetchone()
@@ -569,13 +574,65 @@ class RepositoryStore:
             raise RuntimeError(f"Usage event was not persisted: {event.call_id}")
         return usage_event_from_row(row)
 
+    def _prune_usage_events_for_account(
+        self,
+        conn: RepositoryConnection,
+        account_id: int,
+        *,
+        max_records: int = ADMIN_LEDGER_MAX_RECORDS,
+    ) -> int:
+        """保留某个账号最近的固定页数 Token 记录。"""
+
+        retain = max(1, int(max_records))
+        cursor = conn.execute(
+            """
+            DELETE FROM usage_events
+            WHERE account_id = ?
+              AND id NOT IN (
+                  SELECT id
+                  FROM usage_events
+                  WHERE account_id = ?
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT ?
+              )
+            """,
+            (account_id, account_id, retain),
+        )
+        return max(0, int(cursor.rowcount or 0))
+
+    def prune_usage_events_to_limit(
+        self,
+        account_id: int | None = None,
+        *,
+        max_records: int = ADMIN_LEDGER_MAX_RECORDS,
+    ) -> int:
+        """删除超出分页保留窗口的 Token 记录，返回删除条数。"""
+
+        retain = max(1, int(max_records))
+        with self.connect() as conn:
+            if account_id is not None:
+                return self._prune_usage_events_for_account(
+                    conn,
+                    int(account_id),
+                    max_records=retain,
+                )
+            rows = conn.execute("SELECT DISTINCT account_id FROM usage_events").fetchall()
+            deleted = 0
+            for row in rows:
+                deleted += self._prune_usage_events_for_account(
+                    conn,
+                    int(row["account_id"]),
+                    max_records=retain,
+                )
+            return deleted
+
     def list_usage_events(
         self,
         account_id: int | None = None,
         candidate_id: int | None = None,
         session_id: str | None = None,
-        limit: int = 200,
-        cutoff_iso: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
     ) -> list[UsageEventRecord]:
         """列出用量明细；管理员不传账号过滤时才可查看全局数据。"""
 
@@ -590,22 +647,49 @@ class RepositoryStore:
         if session_id is not None:
             conditions.append("session_id = ?")
             parameters.append(session_id)
-        if cutoff_iso is not None:
-            conditions.append("created_at >= ?")
-            parameters.append(cutoff_iso)
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-        parameters.append(max(1, min(limit, 5000)))
+        parameters.extend([max(1, min(limit, 100)), max(0, int(offset))])
         with self.connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM usage_events{where} ORDER BY id DESC LIMIT ?",
+                f"""
+                SELECT * FROM usage_events{where}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
                 tuple(parameters),
             ).fetchall()
         return [usage_event_from_row(row) for row in rows]
 
+    def count_usage_events(
+        self,
+        account_id: int | None = None,
+        candidate_id: int | None = None,
+        session_id: str | None = None,
+    ) -> int:
+        """返回用量流水数量，供分页 UI 展示总页数。"""
+
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            parameters.append(account_id)
+        if candidate_id is not None:
+            conditions.append("candidate_id = ?")
+            parameters.append(candidate_id)
+        if session_id is not None:
+            conditions.append("session_id = ?")
+            parameters.append(session_id)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM usage_events{where}",
+                tuple(parameters),
+            ).fetchone()
+        return int(row["count"])
+
     def summarize_usage(
         self,
         account_id: int | None = None,
-        cutoff_iso: str | None = None,
     ) -> dict[str, int]:
         """汇总 Token；`billable_tokens` 只计算标记为可计费的流水。"""
 
@@ -614,9 +698,6 @@ class RepositoryStore:
         if account_id is not None:
             conditions.append("account_id = ?")
             parameters.append(account_id)
-        if cutoff_iso is not None:
-            conditions.append("created_at >= ?")
-            parameters.append(cutoff_iso)
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         with self.connect() as conn:
             row = conn.execute(
@@ -634,17 +715,12 @@ class RepositoryStore:
             ).fetchone()
         return {key: int(row[key]) for key in row}
 
-    def summarize_usage_by_account(
-        self,
-        cutoff_iso: str | None = None,
-    ) -> list[dict[str, int]]:
+    def summarize_usage_by_account(self) -> list[dict[str, int]]:
         """按账号聚合 Token，供管理员查看不同计费主体的用量。"""
 
-        where = " WHERE created_at >= ?" if cutoff_iso is not None else ""
-        parameters = (cutoff_iso,) if cutoff_iso is not None else ()
         with self.connect() as conn:
             rows = conn.execute(
-                f"""
+                """
                 SELECT
                     account_id,
                     COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -653,26 +729,15 @@ class RepositoryStore:
                     COALESCE(SUM(CASE WHEN billable THEN total_tokens ELSE 0 END), 0)
                         AS billable_tokens,
                     COUNT(*) AS event_count
-                FROM usage_events{where}
+                FROM usage_events
                 GROUP BY account_id
                 ORDER BY account_id
                 """,
-                parameters,
             ).fetchall()
         return [
             {key: int(row[key]) for key in row}
             for row in rows
         ]
-
-    def delete_usage_events_before(self, cutoff_iso: str) -> int:
-        """删除保留窗口之前的 Token 用量流水，返回删除条数。"""
-
-        with self.connect() as conn:
-            cursor = conn.execute(
-                "DELETE FROM usage_events WHERE created_at < ?",
-                (cutoff_iso,),
-            )
-        return max(0, int(cursor.rowcount or 0))
 
     def record_tool_call_trace(self, trace: ToolCallTraceRecord) -> ToolCallTraceRecord:
         """写入或更新一次工具调用审计轨迹；同一 root_request_id 保持一条任务记录。"""
@@ -704,7 +769,7 @@ class RepositoryStore:
             if (
                 existing is not None
                 and int(existing["account_id"]) == trace.account_id
-                and str(existing["created_at"]) < tool_audit_retention_cutoff()
+                and False
             ):
                 conn.execute(
                     """
@@ -756,6 +821,11 @@ class RepositoryStore:
                     updated_at,
                 ),
             )
+            self._prune_tool_call_traces_for_account(
+                conn,
+                trace.account_id,
+                max_records=ADMIN_LEDGER_MAX_RECORDS,
+            )
             row = conn.execute(
                 """
                 SELECT * FROM tool_call_traces
@@ -767,12 +837,62 @@ class RepositoryStore:
             raise ValueError("该 root_request_id 已属于其他账号，不能覆盖其工具轨迹。")
         return tool_call_trace_from_row(row)
 
+    def _prune_tool_call_traces_for_account(
+        self,
+        conn: RepositoryConnection,
+        account_id: int,
+        *,
+        max_records: int = ADMIN_LEDGER_MAX_RECORDS,
+    ) -> int:
+        """保留某个账号最近的固定页数工具调用记录。"""
+
+        retain = max(1, int(max_records))
+        cursor = conn.execute(
+            """
+            DELETE FROM tool_call_traces
+            WHERE account_id = ?
+              AND id NOT IN (
+                  SELECT id
+                  FROM tool_call_traces
+                  WHERE account_id = ?
+                  ORDER BY updated_at DESC, id DESC
+                  LIMIT ?
+              )
+            """,
+            (account_id, account_id, retain),
+        )
+        return max(0, int(cursor.rowcount or 0))
+
+    def prune_tool_call_traces_to_limit(
+        self,
+        account_id: int | None = None,
+        *,
+        max_records: int = ADMIN_LEDGER_MAX_RECORDS,
+    ) -> int:
+        """删除超出分页保留窗口的工具调用记录，返回删除条数。"""
+
+        retain = max(1, int(max_records))
+        with self.connect() as conn:
+            if account_id is not None:
+                return self._prune_tool_call_traces_for_account(
+                    conn,
+                    int(account_id),
+                    max_records=retain,
+                )
+            rows = conn.execute("SELECT DISTINCT account_id FROM tool_call_traces").fetchall()
+            deleted = 0
+            for row in rows:
+                deleted += self._prune_tool_call_traces_for_account(
+                    conn,
+                    int(row["account_id"]),
+                    max_records=retain,
+                )
+            return deleted
+
     def get_tool_call_trace(
         self,
         root_request_id: str,
         account_id: int | None = None,
-        *,
-        cutoff_iso: str | None = None,
     ) -> ToolCallTraceRecord:
         """读取一条工具调用审计轨迹，并可按账号隔离。"""
 
@@ -781,9 +901,6 @@ class RepositoryStore:
         if account_id is not None:
             conditions.append("account_id = ?")
             parameters.append(account_id)
-        if cutoff_iso is not None:
-            conditions.append("created_at >= ?")
-            parameters.append(cutoff_iso)
         with self.connect() as conn:
             row = conn.execute(
                 f"""
@@ -800,19 +917,18 @@ class RepositoryStore:
         self,
         account_id: int | None = None,
         *,
-        limit: int = 50,
+        limit: int = 100,
         offset: int = 0,
-        cutoff_iso: str | None = None,
     ) -> list[ToolCallTraceRecord]:
         """分页列出最近工具调用任务，详情由单条读取接口按需加载。"""
 
-        conditions = ["created_at >= ?"]
-        parameters: list[object] = [cutoff_iso or tool_audit_retention_cutoff()]
+        conditions: list[str] = []
+        parameters: list[object] = []
         if account_id is not None:
             conditions.append("account_id = ?")
             parameters.append(account_id)
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-        parameters.extend([max(1, min(limit, 200)), max(0, int(offset))])
+        parameters.extend([max(1, min(limit, 100)), max(0, int(offset))])
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
@@ -827,17 +943,15 @@ class RepositoryStore:
     def count_tool_call_traces(
         self,
         account_id: int | None = None,
-        *,
-        cutoff_iso: str | None = None,
     ) -> int:
         """返回工具调用任务数量，供分页 UI 展示总数。"""
 
-        conditions = ["created_at >= ?"]
-        parameters: list[object] = [cutoff_iso or tool_audit_retention_cutoff()]
+        conditions: list[str] = []
+        parameters: list[object] = []
         if account_id is not None:
             conditions.append("account_id = ?")
             parameters.append(account_id)
-        where = f" WHERE {' AND '.join(conditions)}"
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         with self.connect() as conn:
             row = conn.execute(
                 f"SELECT COUNT(*) AS count FROM tool_call_traces{where}",
@@ -845,11 +959,7 @@ class RepositoryStore:
             ).fetchone()
         return int(row["count"])
 
-    def summarize_tool_call_traces_by_account(
-        self,
-        *,
-        cutoff_iso: str | None = None,
-    ) -> list[dict[str, int]]:
+    def summarize_tool_call_traces_by_account(self) -> list[dict[str, int]]:
         """按账号聚合工具调用任务数量和失败数量。"""
 
         with self.connect() as conn:
@@ -861,11 +971,9 @@ class RepositoryStore:
                     COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
                         AS failed_trace_count
                 FROM tool_call_traces
-                WHERE created_at >= ?
                 GROUP BY account_id
                 ORDER BY account_id
-                """,
-                (cutoff_iso or tool_audit_retention_cutoff(),),
+                """
             ).fetchall()
         return [
             {
@@ -875,16 +983,6 @@ class RepositoryStore:
             }
             for row in rows
         ]
-
-    def delete_tool_call_traces_before(self, cutoff_iso: str) -> int:
-        """删除保留窗口之前的工具调用轨迹，返回删除条数。"""
-
-        with self.connect() as conn:
-            cursor = conn.execute(
-                "DELETE FROM tool_call_traces WHERE created_at < ?",
-                (cutoff_iso,),
-            )
-        return max(0, int(cursor.rowcount or 0))
 
     def record_admin_audit_event(self, event: AdminAuditEventRecord) -> AdminAuditEventRecord:
         """追加记录一次管理员动作，不保存正文、查询参数或密钥。"""

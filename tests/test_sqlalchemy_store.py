@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timedelta
 
 import pytest
 
@@ -15,7 +14,13 @@ from job_hunting_agent.models import (
     UsageEventRecord,
 )
 from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
-from job_hunting_agent.tool_audit import tool_audit_retention_cutoff
+
+
+def ledger_timestamp(index: int) -> str:
+    """生成稳定、按字典序递增的 ISO 时间，方便分页/排序测试。"""
+
+    minute, second = divmod(index, 60)
+    return f"2026-08-21T00:{minute:02d}:{second:02d}+00:00"
 
 
 def test_sqlalchemy_store_runs_existing_profile_chat_and_usage_workflow(database_url):
@@ -100,20 +105,12 @@ def test_app_uses_sqlalchemy_store_when_a_database_url_is_explicit(database_url)
 
 
 def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(database_url):
-    """工具调用审计表按任务 upsert，并支持管理端列表、详情、聚合和保留清理。"""
+    """工具调用审计表按任务 upsert，并支持 5 页固定分页保留。"""
 
     store = SQLAlchemyStore(database_url)
     store.initialize()
     account = store.create_account("tools@example.com", "hashed-password")
     other = store.create_account("other-tools@example.com", "hashed-password")
-    retention_cutoff = tool_audit_retention_cutoff()
-    cutoff_at = datetime.fromisoformat(retention_cutoff)
-    recent_started_at = (cutoff_at + timedelta(minutes=1)).isoformat()
-    recent_finished_at = (cutoff_at + timedelta(minutes=2)).isoformat()
-    other_started_at = (cutoff_at + timedelta(minutes=3)).isoformat()
-    other_finished_at = (cutoff_at + timedelta(minutes=4)).isoformat()
-    old_started_at = (cutoff_at - timedelta(seconds=1)).isoformat()
-    old_finished_at = (cutoff_at + timedelta(seconds=10)).isoformat()
 
     first = store.record_tool_call_trace(
         ToolCallTraceRecord(
@@ -121,7 +118,7 @@ def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(d
             account_id=account.id,
             candidate_id=None,
             session_id="session-1",
-            root_request_id="root-1",
+            root_request_id="root-001",
             title="导入职位信息",
             status="running",
             source="chat",
@@ -139,10 +136,10 @@ def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(d
                     }
                 ]
             },
-            created_at=recent_started_at,
-            started_at=recent_started_at,
+            created_at=ledger_timestamp(1),
+            started_at=ledger_timestamp(1),
             finished_at=None,
-            updated_at=recent_started_at,
+            updated_at=ledger_timestamp(1),
         )
     )
     updated = store.record_tool_call_trace(
@@ -151,7 +148,7 @@ def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(d
             account_id=account.id,
             candidate_id=None,
             session_id=None,
-            root_request_id="root-1",
+            root_request_id="root-001",
             title="导入职位信息",
             status="completed",
             source="chat",
@@ -170,10 +167,10 @@ def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(d
                     }
                 ]
             },
-            created_at=recent_started_at,
-            started_at=recent_started_at,
-            finished_at=recent_finished_at,
-            updated_at=recent_finished_at,
+            created_at=ledger_timestamp(2),
+            started_at=ledger_timestamp(1),
+            finished_at=ledger_timestamp(2),
+            updated_at=ledger_timestamp(2),
         )
     )
     with pytest.raises(ValueError, match="其他账号"):
@@ -185,9 +182,38 @@ def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(d
                 title="不应覆盖其他账号的任务",
             )
         )
-    assert store.get_tool_call_trace("root-1", account_id=account.id).account_id == account.id
-    with pytest.raises(KeyError):
-        store.get_tool_call_trace("root-1", account_id=other.id)
+    assert store.get_tool_call_trace("root-001").status == "completed"
+
+    for index in range(2, 502):
+        store.record_tool_call_trace(
+            ToolCallTraceRecord(
+                id=0,
+                account_id=account.id,
+                candidate_id=None,
+                session_id=None,
+                root_request_id=f"root-{index:03d}",
+                title=f"任务 {index}",
+                status="completed",
+                source="chat",
+                step_count=1,
+                attempt_count=1,
+                last_step_name="import_job_from_text",
+                last_error_summary=None,
+                trace={
+                    "steps": [
+                        {
+                            "id": "step-1",
+                            "name": "import_job_from_text",
+                            "status": "completed",
+                        }
+                    ]
+                },
+                created_at=ledger_timestamp(index),
+                started_at=ledger_timestamp(index),
+                finished_at=ledger_timestamp(index),
+                updated_at=ledger_timestamp(index),
+            )
+        )
 
     store.record_tool_call_trace(
         ToolCallTraceRecord(
@@ -204,72 +230,38 @@ def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(d
             last_step_name="github_project_analysis",
             last_error_summary="GitHub 不可访问",
             trace={"steps": [{"id": "step-1", "name": "github_project_analysis", "status": "failed"}]},
-            created_at=other_started_at,
-            started_at=other_started_at,
-            finished_at=other_finished_at,
-            updated_at=other_finished_at,
-        )
-    )
-    old = store.record_tool_call_trace(
-        ToolCallTraceRecord(
-            id=0,
-            account_id=account.id,
-            candidate_id=None,
-            session_id=None,
-            root_request_id="root-old",
-            title="旧任务",
-            status="completed",
-            source="chat",
-            step_count=1,
-            attempt_count=1,
-            last_step_name="ingest_candidate_message",
-            last_error_summary=None,
-            trace={"steps": [{"id": "step-1", "name": "ingest_candidate_message", "status": "completed"}]},
-            created_at=old_started_at,
-            started_at=old_started_at,
-            finished_at=old_finished_at,
-            updated_at=old_finished_at,
+            created_at=ledger_timestamp(503),
+            started_at=ledger_timestamp(503),
+            finished_at=ledger_timestamp(503),
+            updated_at=ledger_timestamp(503),
         )
     )
 
     assert updated.id == first.id
-    assert store.get_tool_call_trace("root-1").status == "completed"
-    assert store.count_tool_call_traces(account.id, cutoff_iso=retention_cutoff) == 1
+    assert store.count_tool_call_traces(account.id) == 500
+    assert store.count_tool_call_traces(other.id) == 1
     assert [
         trace.root_request_id
-        for trace in store.list_tool_call_traces(account.id, cutoff_iso=retention_cutoff)
-    ] == ["root-1"]
+        for trace in store.list_tool_call_traces(account.id, limit=100, offset=0)
+    ] == [f"root-{index:03d}" for index in range(501, 401, -1)]
+    assert [
+        trace.root_request_id
+        for trace in store.list_tool_call_traces(account.id, limit=100, offset=400)
+    ] == [f"root-{index:03d}" for index in range(101, 1, -1)]
     with pytest.raises(KeyError):
-        store.get_tool_call_trace(old.root_request_id, cutoff_iso=retention_cutoff)
-    summary = store.summarize_tool_call_traces_by_account(cutoff_iso=retention_cutoff)
-    assert {"account_id": account.id, "trace_count": 1, "failed_trace_count": 0} in summary
+        store.get_tool_call_trace("root-001", account_id=account.id)
+
+    summary = store.summarize_tool_call_traces_by_account()
+    assert {"account_id": account.id, "trace_count": 500, "failed_trace_count": 0} in summary
     assert {"account_id": other.id, "trace_count": 1, "failed_trace_count": 1} in summary
-
-    deleted = store.delete_tool_call_traces_before(retention_cutoff)
-
-    assert deleted == 1
-    assert store.count_tool_call_traces(account.id, cutoff_iso=retention_cutoff) == 1
-    try:
-        store.get_tool_call_trace(old.root_request_id)
-    except KeyError:
-        pass
-    else:  # pragma: no cover
-        raise AssertionError("旧工具调用记录没有被清理")
     store.close()
-
-
 def test_sqlalchemy_store_filters_and_purges_usage_events_by_retention_window(database_url):
-    """Token 流水支持和工具调用相同的最近两天保留窗口。"""
+    """Token 流水支持和工具调用相同的 5 页固定保留窗口。"""
 
     store = SQLAlchemyStore(database_url)
     store.initialize()
     account = store.create_account("usage-retention@example.com", "hashed-password")
     other = store.create_account("usage-retention-other@example.com", "hashed-password")
-    retention_cutoff = tool_audit_retention_cutoff()
-    cutoff_at = datetime.fromisoformat(retention_cutoff)
-    old_at = (cutoff_at - timedelta(seconds=1)).isoformat()
-    recent_at = (cutoff_at + timedelta(minutes=1)).isoformat()
-    other_recent_at = (cutoff_at + timedelta(minutes=2)).isoformat()
 
     def usage_event(
         *,
@@ -301,51 +293,53 @@ def test_sqlalchemy_store_filters_and_purges_usage_events_by_retention_window(da
             pricing_version="test-v1",
         )
 
-    store.record_usage_event(
-        usage_event(
-            owner_id=account.id,
-            call_id="usage-old",
-            total_tokens=900,
-            created_at=old_at,
+    for index in range(1, 502):
+        store.record_usage_event(
+            usage_event(
+                owner_id=account.id,
+                call_id=f"usage-{index:03d}",
+                total_tokens=1,
+                created_at=ledger_timestamp(index),
+            )
         )
-    )
-    store.record_usage_event(
-        usage_event(
-            owner_id=account.id,
-            call_id="usage-recent",
-            total_tokens=30,
-            created_at=recent_at,
-        )
-    )
     store.record_usage_event(
         usage_event(
             owner_id=other.id,
             call_id="usage-other-recent",
             total_tokens=5,
-            created_at=other_recent_at,
+            created_at=ledger_timestamp(503),
         )
     )
 
+    assert store.count_usage_events(account.id) == 500
+    assert store.count_usage_events(other.id) == 1
     assert [
         event.call_id
-        for event in store.list_usage_events(account.id, cutoff_iso=retention_cutoff)
-    ] == ["usage-recent"]
-    assert store.summarize_usage(account.id, cutoff_iso=retention_cutoff)["total_tokens"] == 30
-    assert store.summarize_usage(cutoff_iso=retention_cutoff)["total_tokens"] == 35
-    by_account = store.summarize_usage_by_account(cutoff_iso=retention_cutoff)
+        for event in store.list_usage_events(account.id, limit=100, offset=0)
+    ] == [f"usage-{index:03d}" for index in range(501, 401, -1)]
+    assert [
+        event.call_id
+        for event in store.list_usage_events(account.id, limit=100, offset=400)
+    ] == [f"usage-{index:03d}" for index in range(101, 1, -1)]
+    assert store.summarize_usage(account.id)["total_tokens"] == 500
+    assert store.summarize_usage()["total_tokens"] == 505
+    by_account = store.summarize_usage_by_account()
     assert {
         "account_id": account.id,
-        "input_tokens": 30,
+        "input_tokens": 500,
         "output_tokens": 0,
-        "total_tokens": 30,
-        "billable_tokens": 30,
+        "total_tokens": 500,
+        "billable_tokens": 500,
+        "event_count": 500,
+    } in by_account
+    assert {
+        "account_id": other.id,
+        "input_tokens": 5,
+        "output_tokens": 0,
+        "total_tokens": 5,
+        "billable_tokens": 5,
         "event_count": 1,
     } in by_account
-
-    deleted = store.delete_usage_events_before(retention_cutoff)
-
-    assert deleted == 1
-    assert [event.call_id for event in store.list_usage_events(account.id)] == ["usage-recent"]
     store.close()
 
 

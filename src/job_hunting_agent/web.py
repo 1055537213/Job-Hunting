@@ -95,11 +95,11 @@ from .rag import RAGProviderRequestError
 from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
 from .skill_normalization import normalize_skill_mapping
 from .task_queue import BackgroundTaskQueue, TaskQueueError
+from .admin_ledger import ADMIN_LEDGER_MAX_PAGES, ADMIN_LEDGER_PAGE_SIZE
 from .tool_audit import (
     background_task_tool_name,
     build_tool_trace_record,
     has_audited_steps,
-    tool_audit_retention_cutoff,
     tool_step_label,
     tool_trace_title,
 )
@@ -355,13 +355,11 @@ def create_web_app(
             raise HTTPException(status_code=403, detail="需要管理员权限。")
         return account
 
-    def prune_admin_retention_window() -> str:
-        """后台运维数据只保留最近两天自然日，并在管理员读取时补清旧数据。"""
+    def prune_admin_retention_window() -> None:
+        """后台运维数据只保留固定分页窗口，并在管理员读取时补清旧数据。"""
 
-        cutoff_iso = tool_audit_retention_cutoff()
-        backend.store.delete_usage_events_before(cutoff_iso)
-        backend.store.delete_tool_call_traces_before(cutoff_iso)
-        return cutoff_iso
+        backend.store.prune_usage_events_to_limit()
+        backend.store.prune_tool_call_traces_to_limit()
 
     @web_app.post("/api/auth/register")
     def register(payload: RegisterPayload) -> dict[str, object]:
@@ -1549,13 +1547,13 @@ def create_web_app(
         """管理员查看全局 Token 和工具调用汇总。"""
 
         require_admin(request)
-        cutoff_iso = prune_admin_retention_window()
+        prune_admin_retention_window()
         return {
-            "summary": backend.store.summarize_usage(cutoff_iso=cutoff_iso),
-            "by_account": backend.store.summarize_usage_by_account(cutoff_iso=cutoff_iso),
-            "tool_calls_by_account": backend.store.summarize_tool_call_traces_by_account(
-                cutoff_iso=cutoff_iso,
-            ),
+            "summary": backend.store.summarize_usage(),
+            "by_account": backend.store.summarize_usage_by_account(),
+            "tool_calls_by_account": backend.store.summarize_tool_call_traces_by_account(),
+            "page_size": ADMIN_LEDGER_PAGE_SIZE,
+            "max_pages": ADMIN_LEDGER_MAX_PAGES,
         }
 
     @web_app.get("/api/admin/observability/requests")
@@ -1614,44 +1612,54 @@ def create_web_app(
         account_id: int | None = Query(default=None),
         candidate_id: int | None = Query(default=None),
         session_id: str | None = Query(default=None),
-        limit: int = Query(default=200, ge=1, le=5000),
+        limit: int = Query(default=ADMIN_LEDGER_PAGE_SIZE, ge=1, le=ADMIN_LEDGER_PAGE_SIZE),
+        offset: int = Query(default=0, ge=0),
     ) -> dict[str, object]:
         """管理员查看用量流水，保留来源、操作类型和是否可计费状态。"""
 
         require_admin(request)
-        cutoff_iso = prune_admin_retention_window()
+        prune_admin_retention_window()
         events = backend.store.list_usage_events(
             account_id,
             candidate_id,
             session_id,
             limit,
-            cutoff_iso=cutoff_iso,
+            offset,
         )
-        return {"events": [asdict(event) for event in events]}
+        total = backend.store.count_usage_events(account_id, candidate_id, session_id)
+        return {
+            "events": [asdict(event) for event in events],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "page_size": ADMIN_LEDGER_PAGE_SIZE,
+            "max_pages": ADMIN_LEDGER_MAX_PAGES,
+        }
 
     @web_app.get("/api/admin/tools/traces")
     def admin_tool_traces(
         request: Request,
         account_id: int | None = Query(default=None),
-        limit: int = Query(default=50, ge=1, le=200),
+        limit: int = Query(default=ADMIN_LEDGER_PAGE_SIZE, ge=1, le=ADMIN_LEDGER_PAGE_SIZE),
         offset: int = Query(default=0, ge=0),
     ) -> dict[str, object]:
-        """管理员分页查看最近两天内的工具调用任务摘要。"""
+        """管理员分页查看最近固定窗口内的工具调用任务摘要。"""
 
         require_admin(request)
-        cutoff_iso = prune_admin_retention_window()
+        prune_admin_retention_window()
         traces = backend.store.list_tool_call_traces(
             account_id,
             limit=limit,
             offset=offset,
-            cutoff_iso=cutoff_iso,
         )
-        total = backend.store.count_tool_call_traces(account_id, cutoff_iso=cutoff_iso)
+        total = backend.store.count_tool_call_traces(account_id)
         return {
             "traces": [serialize_tool_trace_summary(trace) for trace in traces],
             "total": total,
             "limit": limit,
             "offset": offset,
+            "page_size": ADMIN_LEDGER_PAGE_SIZE,
+            "max_pages": ADMIN_LEDGER_MAX_PAGES,
         }
 
     @web_app.get("/api/admin/tools/traces/{root_request_id}")
@@ -1659,11 +1667,10 @@ def create_web_app(
         """管理员按需查看某次任务的工具调用流程和安全结果摘要。"""
 
         require_admin(request)
-        cutoff_iso = prune_admin_retention_window()
+        prune_admin_retention_window()
         try:
             trace = backend.store.get_tool_call_trace(
                 root_request_id,
-                cutoff_iso=cutoff_iso,
             )
         except KeyError as error:
             raise HTTPException(status_code=404, detail="工具调用记录不存在。") from error
@@ -2319,7 +2326,6 @@ def load_or_new_tool_trace(
             backend.store.get_tool_call_trace(
                 root_request_id,
                 account_id=account_id,
-                cutoff_iso=tool_audit_retention_cutoff(),
             ).trace
         )
     except KeyError:
@@ -2342,7 +2348,6 @@ def owned_or_new_root_request_id(
         existing = backend.store.get_tool_call_trace(
             value,
             account_id=account_id,
-            cutoff_iso=tool_audit_retention_cutoff(),
         )
     except KeyError:
         return uuid.uuid4().hex

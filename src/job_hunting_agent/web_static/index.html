@@ -1228,6 +1228,23 @@
                           <tbody><tr v-for="event in admin.events" :key="event.id"><td>{{ formatDate(event.created_at) }}</td><td>{{ event.operation }}</td><td>{{ event.model }}</td><td>{{ event.total_tokens }}</td><td>{{ event.usage_source }}</td><td>{{ event.status }}</td></tr></tbody>
                         </table>
                       </div>
+                      <div class="admin-ledger-pagination" role="navigation" aria-label="Token 明细分页">
+                        <span class="admin-ledger-page-info">{{ adminLedgerPageInfo(admin.usageTotal) }}</span>
+                        <div class="admin-ledger-page-nav">
+                          <button class="admin-ledger-page-button" type="button" :disabled="admin.usagePage <= 1" @click="loadAdminUsageEvents(selectedAdminAccount.id, admin.usagePage - 1)">上一页</button>
+                          <button
+                            v-for="page in adminLedgerPageNumbers(admin.usageTotal)"
+                            :key="`usage-page-${page}`"
+                            class="admin-ledger-page-button"
+                            type="button"
+                            :aria-selected="String(admin.usagePage === page)"
+                            @click="loadAdminUsageEvents(selectedAdminAccount.id, page)"
+                          >
+                            {{ page }}
+                          </button>
+                          <button class="admin-ledger-page-button" type="button" :disabled="admin.usagePage >= adminLedgerPageCount(admin.usageTotal)" @click="loadAdminUsageEvents(selectedAdminAccount.id, admin.usagePage + 1)">下一页</button>
+                        </div>
+                      </div>
                     </template>
 
                     <template v-else>
@@ -1289,6 +1306,23 @@
                           <div v-else class="admin-usage-prompt">
                             <strong>选择一条工具调用</strong><span>点击左侧任务后查看步骤和结果摘要。</span>
                           </div>
+                        </div>
+                      </div>
+                      <div class="admin-ledger-pagination" role="navigation" aria-label="工具调用分页">
+                        <span class="admin-ledger-page-info">{{ adminLedgerPageInfo(admin.toolTraceTotal) }}</span>
+                        <div class="admin-ledger-page-nav">
+                          <button class="admin-ledger-page-button" type="button" :disabled="admin.toolTracePage <= 1" @click="loadAdminToolTraces(selectedAdminAccount.id, admin.toolTracePage - 1)">上一页</button>
+                          <button
+                            v-for="page in adminLedgerPageNumbers(admin.toolTraceTotal)"
+                            :key="`tool-page-${page}`"
+                            class="admin-ledger-page-button"
+                            type="button"
+                            :aria-selected="String(admin.toolTracePage === page)"
+                            @click="loadAdminToolTraces(selectedAdminAccount.id, page)"
+                          >
+                            {{ page }}
+                          </button>
+                          <button class="admin-ledger-page-button" type="button" :disabled="admin.toolTracePage >= adminLedgerPageCount(admin.toolTraceTotal)" @click="loadAdminToolTraces(selectedAdminAccount.id, admin.toolTracePage + 1)">下一页</button>
                         </div>
                       </div>
                     </template>

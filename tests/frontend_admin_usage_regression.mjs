@@ -17,6 +17,10 @@ const source = readFileSync(appPath, "utf8");
 const template = readFileSync(indexPath, "utf8");
 const styles = readFileSync(stylesPath, "utf8");
 
+globalThis.PINYIN_COLLATOR = new Intl.Collator("zh-CN-u-co-pinyin");
+globalThis.ADMIN_LEDGER_PAGE_SIZE = 100;
+globalThis.ADMIN_LEDGER_MAX_PAGES = 5;
+
 function extractMethod(signature, functionSignature) {
   const start = source.indexOf(signature);
   const end = source.indexOf("      /**", start + 1);
@@ -60,6 +64,13 @@ assert.match(template, /adminAuditTargetLabel\(event\)/);
 assert.match(template, /class="admin-tool-workspace"/);
 assert.match(template, /class="admin-tool-list"/);
 assert.match(template, /class="admin-tool-detail"/);
+assert.match(template, /class="admin-ledger-pagination"/);
+assert.match(template, /aria-label="Token 明细分页"/);
+assert.match(template, /aria-label="工具调用分页"/);
+assert.match(template, /adminLedgerPageInfo\(admin\.usageTotal\)/);
+assert.match(template, /adminLedgerPageInfo\(admin\.toolTraceTotal\)/);
+assert.match(template, /adminLedgerPageNumbers\(admin\.usageTotal\)/);
+assert.match(template, /adminLedgerPageNumbers\(admin\.toolTraceTotal\)/);
 assert.match(template, /v-for="trace in admin\.toolTraces"/);
 assert.match(template, /@click="selectAdminToolTrace\(trace\.root_request_id\)"/);
 assert.match(template, /selectedAdminToolTraceDetail\.trace\?\.steps/);
@@ -71,18 +82,26 @@ assert.match(source, /toolTraces:\s*\[\]/);
 assert.match(source, /auditEvents:\s*\[\]/);
 assert.match(source, /requestMetrics:\s*\{\}/);
 assert.match(source, /selectedToolTraceId:\s*""/);
+assert.match(source, /usageTotal:\s*0/);
+assert.match(source, /usagePage:\s*1/);
+assert.match(source, /ledgerPageSize:\s*ADMIN_LEDGER_PAGE_SIZE/);
+assert.match(source, /ledgerMaxPages:\s*ADMIN_LEDGER_MAX_PAGES/);
+assert.match(source, /toolTracePage:\s*1/);
 assert.match(source, /short:\s*"用量"/);
 assert.match(source, /short:\s*"观测"/);
 assert.match(source, /short:\s*"审计"/);
 assert.match(source, /selectAdminAccount\(accountId\)/);
-assert.match(source, /loadAdminUsageEvents\(accountId = this\.admin\.selectedAccountId\)/);
-assert.match(source, /loadAdminToolTraces\(accountId = this\.admin\.selectedAccountId, offset = 0\)/);
+assert.match(source, /loadAdminUsageEvents\(accountId = this\.admin\.selectedAccountId, page = this\.admin\.usagePage\)/);
+assert.match(source, /loadAdminToolTraces\(accountId = this\.admin\.selectedAccountId, page = this\.admin\.toolTracePage\)/);
 assert.match(source, /selectAdminToolTrace\(rootRequestId\)/);
 assert.match(source, /adminRequestStatusRows\(\)/);
 assert.match(source, /adminRequestMethodRows\(\)/);
 assert.match(source, /adminRequestEndpointRows\(\)/);
 assert.match(source, /adminRecentRequestErrors\(\)/);
 assert.match(source, /adminAuditEvents\(\)/);
+assert.match(source, /adminLedgerPageCount\(total\)/);
+assert.match(source, /adminLedgerPageNumbers\(total\)/);
+assert.match(source, /adminLedgerPageInfo\(total\)/);
 assert.match(source, /label:\s*"HTTP 请求"/);
 assert.match(source, /label:\s*"错误请求"/);
 assert.match(source, /label:\s*"平均耗时"/);
@@ -92,10 +111,10 @@ assert.match(source, /adminAccountLabel\(accountId\)/);
 assert.match(source, /adminAuditTargetLabel\(event\)/);
 assert.match(source, /adminAuditActionLabel\(action\)/);
 assert.match(source, /sortedMetricRows\(source, limit = Infinity\)/);
-assert.match(source, /\/api\/admin\/usage\/events\?account_id=\$\{encodeURIComponent\(selectedAccountId\)\}&limit=200/);
+assert.match(source, /\/api\/admin\/usage\/events\?account_id=\$\{encodeURIComponent\(selectedAccountId\)\}&limit=\$\{encodeURIComponent\(pageSize\)\}&offset=\$\{encodeURIComponent\(\(requestedPage - 1\) \* pageSize\)\}/);
 assert.match(source, /\/api\/admin\/observability\/requests/);
 assert.match(source, /\/api\/admin\/audit\/events\?limit=30/);
-assert.match(source, /\/api\/admin\/tools\/traces\?account_id=\$\{encodeURIComponent\(selectedAccountId\)\}&limit=50&offset=\$\{encodeURIComponent\(offset\)\}/);
+assert.match(source, /\/api\/admin\/tools\/traces\?account_id=\$\{encodeURIComponent\(selectedAccountId\)\}&limit=\$\{encodeURIComponent\(pageSize\)\}&offset=\$\{encodeURIComponent\(\(requestedPage - 1\) \* pageSize\)\}/);
 assert.match(source, /\/api\/admin\/tools\/traces\/\$\{encodeURIComponent\(traceId\)\}/);
 assert.match(source, /usageRequestVersion/);
 assert.match(source, /toolTraceRequestVersion/);
@@ -157,16 +176,16 @@ const clearAdminUsageSelection = extractMethod(
   "function clearAdminUsageSelection() {",
 );
 const loadAdminUsageEvents = extractMethod(
-  "async loadAdminUsageEvents(accountId = this.admin.selectedAccountId) {",
-  "async function loadAdminUsageEvents(accountId = this.admin.selectedAccountId) {",
+  "async loadAdminUsageEvents(accountId = this.admin.selectedAccountId, page = this.admin.usagePage) {",
+  "async function loadAdminUsageEvents(accountId = this.admin.selectedAccountId, page = this.admin.usagePage) {",
 );
 const loadAdminActiveDetail = extractMethod(
   "async loadAdminActiveDetail(accountId = this.admin.selectedAccountId) {",
   "async function loadAdminActiveDetail(accountId = this.admin.selectedAccountId) {",
 );
 const loadAdminToolTraces = extractMethod(
-  "async loadAdminToolTraces(accountId = this.admin.selectedAccountId, offset = 0) {",
-  "async function loadAdminToolTraces(accountId = this.admin.selectedAccountId, offset = 0) {",
+  "async loadAdminToolTraces(accountId = this.admin.selectedAccountId, page = this.admin.toolTracePage) {",
+  "async function loadAdminToolTraces(accountId = this.admin.selectedAccountId, page = this.admin.toolTracePage) {",
 );
 const selectAdminToolTrace = extractMethod(
   "async selectAdminToolTrace(rootRequestId) {",
@@ -179,6 +198,18 @@ const setAdminDetailTab = extractMethod(
 const sortedMetricRows = extractMethod(
   "sortedMetricRows(source, limit = Infinity) {",
   "function sortedMetricRows(source, limit = Infinity) {",
+);
+const adminLedgerPageCount = extractMethod(
+  "adminLedgerPageCount(total) {",
+  "function adminLedgerPageCount(total) {",
+);
+const adminLedgerPageNumbers = extractMethod(
+  "adminLedgerPageNumbers(total) {",
+  "function adminLedgerPageNumbers(total) {",
+);
+const adminLedgerPageInfo = extractMethod(
+  "adminLedgerPageInfo(total) {",
+  "function adminLedgerPageInfo(total) {",
 );
 const adminAccountLabel = extractMethod(
   "adminAccountLabel(accountId) {",
@@ -193,13 +224,15 @@ const adminAuditActionLabel = extractMethod(
   "function adminAuditActionLabel(action) {",
 );
 
-globalThis.PINYIN_COLLATOR = new Intl.Collator("zh-CN-u-co-pinyin");
-
 const requestUrls = [];
 const selectionContext = {
   admin: {
     accounts: [],
     events: [],
+    usageTotal: 0,
+    usagePage: 1,
+    ledgerPageSize: ADMIN_LEDGER_PAGE_SIZE,
+    ledgerMaxPages: ADMIN_LEDGER_MAX_PAGES,
     summary: {},
     selectedAccountId: 0,
     loadingEvents: false,
@@ -221,11 +254,22 @@ const selectionContext = {
     auditLoadError: "",
     auditRequestVersion: 0,
     toolTraceTotal: 0,
+    toolTracePage: 1,
   },
   requestJson: async (url) => {
     requestUrls.push(url);
-    return { events: [{ id: 11, account_id: 7, total_tokens: 42 }] };
+    return {
+      events: [{ id: 11, account_id: 7, total_tokens: 42 }],
+      total: 1,
+      limit: ADMIN_LEDGER_PAGE_SIZE,
+      offset: 0,
+      page_size: ADMIN_LEDGER_PAGE_SIZE,
+      max_pages: ADMIN_LEDGER_MAX_PAGES,
+    };
   },
+  adminLedgerPageCount,
+  adminLedgerPageNumbers,
+  adminLedgerPageInfo,
   isAdminAccountSelected,
   clearAdminUsageSelection,
   loadAdminActiveDetail,
@@ -236,11 +280,11 @@ const selectionContext = {
 await selectAdminAccount.call(selectionContext, 7);
 assert.equal(selectionContext.admin.selectedAccountId, 7);
 assert.deepEqual(selectionContext.admin.events, [{ id: 11, account_id: 7, total_tokens: 42 }]);
-assert.deepEqual(requestUrls, ["/api/admin/usage/events?account_id=7&limit=200"]);
+assert.deepEqual(requestUrls, ["/api/admin/usage/events?account_id=7&limit=100&offset=0"]);
 
 await selectAdminAccount.call(selectionContext, 7);
 assert.equal(selectionContext.admin.selectedAccountId, 7);
-assert.deepEqual(requestUrls, ["/api/admin/usage/events?account_id=7&limit=200"]);
+assert.deepEqual(requestUrls, ["/api/admin/usage/events?account_id=7&limit=100&offset=0"]);
 
 const adminLoadUrls = [];
 let adminAuditLoaded = false;
@@ -248,6 +292,10 @@ const adminLoadContext = {
   admin: {
     accounts: [],
     events: [{ id: 99 }],
+    usageTotal: 0,
+    usagePage: 1,
+    ledgerPageSize: ADMIN_LEDGER_PAGE_SIZE,
+    ledgerMaxPages: ADMIN_LEDGER_MAX_PAGES,
     summary: {},
     requestMetrics: {},
     activeDetailTab: "tokens",
@@ -270,12 +318,19 @@ const adminLoadContext = {
     toolTraceDetailRequestVersion: 0,
     auditRequestVersion: 0,
     toolTraceTotal: 0,
+    toolTracePage: 1,
   },
   requestJson: async (url) => {
     adminLoadUrls.push(url);
     if (url === "/api/admin/accounts") return { accounts: [{ id: 7, email: "admin@example.com" }] };
     if (url === "/api/admin/usage/summary") {
-      return { summary: { event_count: 1 }, by_account: [], tool_calls_by_account: [] };
+      return {
+        summary: { event_count: 1 },
+        by_account: [],
+        tool_calls_by_account: [],
+        page_size: ADMIN_LEDGER_PAGE_SIZE,
+        max_pages: ADMIN_LEDGER_MAX_PAGES,
+      };
     }
     if (url === "/api/admin/observability/requests") {
       return { requests: { total_requests: 12, error_requests: 1, average_duration_ms: 8.5 } };
@@ -287,6 +342,7 @@ const adminLoadContext = {
     adminAuditLoaded = true;
     this.admin.auditEvents = [{ id: 17, action: "account.status_updated" }];
   },
+  adminLedgerPageCount,
   loadAdminActiveDetail,
   loadAdminUsageEvents: async () => {
     throw new Error("details should not load before an account is selected");
@@ -301,6 +357,8 @@ assert.deepEqual(adminLoadUrls.sort(), [
 ]);
 assert.equal(adminLoadContext.admin.selectedAccountId, 0);
 assert.deepEqual(adminLoadContext.admin.events, []);
+assert.equal(adminLoadContext.admin.ledgerPageSize, ADMIN_LEDGER_PAGE_SIZE);
+assert.equal(adminLoadContext.admin.ledgerMaxPages, ADMIN_LEDGER_MAX_PAGES);
 assert.equal(adminAuditLoaded, true);
 assert.deepEqual(adminLoadContext.admin.auditEvents, [{ id: 17, action: "account.status_updated" }]);
 assert.deepEqual(adminLoadContext.admin.requestMetrics, {
@@ -362,6 +420,11 @@ const toolContext = {
     toolTraceRequestVersion: 0,
     toolTraceDetailRequestVersion: 0,
     toolTraceTotal: 0,
+    toolTracePage: 1,
+    usagePage: 1,
+    usageTotal: 0,
+    ledgerPageSize: ADMIN_LEDGER_PAGE_SIZE,
+    ledgerMaxPages: ADMIN_LEDGER_MAX_PAGES,
   },
   requestJson: async (url) => {
     toolUrls.push(url);
@@ -383,6 +446,7 @@ const toolContext = {
     throw new Error(`unexpected URL ${url}`);
   },
   isAdminAccountSelected,
+  adminLedgerPageCount,
   loadAdminActiveDetail,
   loadAdminUsageEvents: async () => {
     throw new Error("token detail should not load while tools tab is active");
@@ -400,7 +464,7 @@ assert.deepEqual(toolContext.admin.toolTraceDetail.trace.steps, [
   { id: "step-1", label: "解析职位信息", status: "completed" },
 ]);
 assert.deepEqual(toolUrls, [
-  "/api/admin/tools/traces?account_id=7&limit=50&offset=0",
+  "/api/admin/tools/traces?account_id=7&limit=100&offset=0",
   "/api/admin/tools/traces/root-1",
 ]);
 

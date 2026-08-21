@@ -19,6 +19,8 @@ if (!window.Vue) {
   const CHAT_STREAM_TIMEOUT_MS = 180000;
   // 认证错误不会永久占据登录表单；用户输入新内容时会更早清除。
   const AUTH_ERROR_DISMISS_MS = 6000;
+  const ADMIN_LEDGER_PAGE_SIZE = 100;
+  const ADMIN_LEDGER_MAX_PAGES = 5;
   const PINYIN_COLLATOR = new Intl.Collator("zh-CN-u-co-pinyin");
   const FRONTEND_ROUTES = {
     auth: "/login",
@@ -129,6 +131,8 @@ if (!window.Vue) {
         admin: {
           accounts: [],
           events: [],
+          usageTotal: 0,
+          usagePage: 1,
           toolTraces: [],
           auditEvents: [],
           activeSection: "usage",
@@ -148,6 +152,9 @@ if (!window.Vue) {
           auditLoadError: "",
           loadError: "",
           usageRequestVersion: 0,
+          ledgerPageSize: ADMIN_LEDGER_PAGE_SIZE,
+          ledgerMaxPages: ADMIN_LEDGER_MAX_PAGES,
+          toolTracePage: 1,
           toolTraceRequestVersion: 0,
           toolTraceDetailRequestVersion: 0,
           auditRequestVersion: 0,
@@ -304,6 +311,30 @@ if (!window.Vue) {
       /** 当前选中的工具调用完整详情。 */
       selectedAdminToolTraceDetail() {
         return this.admin.toolTraceDetail || this.selectedAdminToolTrace;
+      },
+
+      /** 按后台固定页大小计算总页数，最多 5 页。 */
+      adminLedgerPageCount(total) {
+        const pageSize = Math.max(1, Number(this.admin.ledgerPageSize || ADMIN_LEDGER_PAGE_SIZE));
+        const maxPages = Math.max(1, Number(this.admin.ledgerMaxPages || ADMIN_LEDGER_MAX_PAGES));
+        const pageCount = Math.ceil(Math.max(0, Number(total || 0)) / pageSize);
+        return pageCount > 0 ? Math.min(maxPages, pageCount) : 0;
+      },
+
+      /** 生成页码按钮数组。 */
+      adminLedgerPageNumbers(total) {
+        const pageCount = this.adminLedgerPageCount(total);
+        return Array.from({ length: pageCount }, (_, index) => index + 1);
+      },
+
+      /** 生成页脚分页说明。 */
+      adminLedgerPageInfo(total) {
+        const pageCount = this.adminLedgerPageCount(total);
+        if (!pageCount) {
+          return "暂无记录";
+        }
+        const pageSize = Math.max(1, Number(this.admin.ledgerPageSize || ADMIN_LEDGER_PAGE_SIZE));
+        return `每页 ${pageSize} 条 · 共 ${pageCount} 页`;
       },
 
       /** 按管理员需要把请求指标对象转成低基数排序行。 */
@@ -877,6 +908,8 @@ if (!window.Vue) {
             by_account: summary.by_account || [],
             tool_calls_by_account: summary.tool_calls_by_account || [],
           };
+          this.admin.ledgerPageSize = Number(summary.page_size || ADMIN_LEDGER_PAGE_SIZE);
+          this.admin.ledgerMaxPages = Number(summary.max_pages || ADMIN_LEDGER_MAX_PAGES);
           this.admin.requestMetrics = requestMetrics.requests || {};
           this.admin.loadError = "";
           await this.loadAdminAuditEvents();
@@ -928,6 +961,8 @@ if (!window.Vue) {
         this.admin.toolTraces = [];
         this.admin.selectedToolTraceId = "";
         this.admin.toolTraceDetail = null;
+        this.admin.usagePage = 1;
+        this.admin.toolTracePage = 1;
         this.admin.eventsError = "";
         this.admin.toolTracesError = "";
         this.admin.toolTraceDetailError = "";
@@ -946,9 +981,12 @@ if (!window.Vue) {
         this.admin.toolTraceDetailRequestVersion += 1;
         this.admin.selectedAccountId = 0;
         this.admin.events = [];
+        this.admin.usageTotal = 0;
+        this.admin.usagePage = 1;
         this.admin.toolTraces = [];
         this.admin.selectedToolTraceId = "";
         this.admin.toolTraceDetail = null;
+        this.admin.toolTracePage = 1;
         this.admin.eventsError = "";
         this.admin.toolTracesError = "";
         this.admin.toolTraceDetailError = "";
@@ -961,9 +999,9 @@ if (!window.Vue) {
       /** 根据当前标签加载账号右侧明细。 */
       async loadAdminActiveDetail(accountId = this.admin.selectedAccountId) {
         if (this.admin.activeDetailTab === "tools") {
-          await this.loadAdminToolTraces(accountId);
+          await this.loadAdminToolTraces(accountId, this.admin.toolTracePage);
         } else {
-          await this.loadAdminUsageEvents(accountId);
+          await this.loadAdminUsageEvents(accountId, this.admin.usagePage);
         }
       },
 
@@ -975,18 +1013,21 @@ if (!window.Vue) {
         await this.loadAdminActiveDetail();
       },
 
-      /** 使用已有 account_id 查询参数读取单个账号的最多 200 条最新流水。 */
-      async loadAdminUsageEvents(accountId = this.admin.selectedAccountId) {
+      /** 使用已有 account_id 查询参数按页读取单个账号的 Token 流水。 */
+      async loadAdminUsageEvents(accountId = this.admin.selectedAccountId, page = this.admin.usagePage) {
         const selectedAccountId = Number(accountId);
         if (!Number.isInteger(selectedAccountId) || selectedAccountId <= 0) return;
+        const requestedPage = Math.max(1, Math.floor(Number(page) || 1));
+        const pageSize = Math.max(1, Number(this.admin.ledgerPageSize || ADMIN_LEDGER_PAGE_SIZE));
 
         const requestVersion = this.admin.usageRequestVersion + 1;
         this.admin.usageRequestVersion = requestVersion;
         this.admin.loadingEvents = true;
         this.admin.eventsError = "";
+        this.admin.usagePage = requestedPage;
         try {
           const data = await this.requestJson(
-            `/api/admin/usage/events?account_id=${encodeURIComponent(selectedAccountId)}&limit=200`
+            `/api/admin/usage/events?account_id=${encodeURIComponent(selectedAccountId)}&limit=${encodeURIComponent(pageSize)}&offset=${encodeURIComponent((requestedPage - 1) * pageSize)}`
           );
           if (
             requestVersion !== this.admin.usageRequestVersion ||
@@ -994,7 +1035,15 @@ if (!window.Vue) {
           ) {
             return;
           }
+          const total = Number(data.total || 0);
+          const pageCount = this.adminLedgerPageCount(total);
+          if (pageCount > 0 && requestedPage > pageCount) {
+            await this.loadAdminUsageEvents(selectedAccountId, pageCount);
+            return;
+          }
           this.admin.events = data.events || [];
+          this.admin.usageTotal = total;
+          this.admin.usagePage = pageCount > 0 ? requestedPage : 1;
         } catch (error) {
           if (
             requestVersion !== this.admin.usageRequestVersion ||
@@ -1011,18 +1060,21 @@ if (!window.Vue) {
         }
       },
 
-      /** 按账号分页读取最近两天内的工具调用任务摘要。 */
-      async loadAdminToolTraces(accountId = this.admin.selectedAccountId, offset = 0) {
+      /** 按账号分页读取工具调用任务摘要。 */
+      async loadAdminToolTraces(accountId = this.admin.selectedAccountId, page = this.admin.toolTracePage) {
         const selectedAccountId = Number(accountId);
         if (!Number.isInteger(selectedAccountId) || selectedAccountId <= 0) return;
+        const requestedPage = Math.max(1, Math.floor(Number(page) || 1));
+        const pageSize = Math.max(1, Number(this.admin.ledgerPageSize || ADMIN_LEDGER_PAGE_SIZE));
 
         const requestVersion = this.admin.toolTraceRequestVersion + 1;
         this.admin.toolTraceRequestVersion = requestVersion;
         this.admin.loadingToolTraces = true;
         this.admin.toolTracesError = "";
+        this.admin.toolTracePage = requestedPage;
         try {
           const data = await this.requestJson(
-            `/api/admin/tools/traces?account_id=${encodeURIComponent(selectedAccountId)}&limit=50&offset=${encodeURIComponent(offset)}`
+            `/api/admin/tools/traces?account_id=${encodeURIComponent(selectedAccountId)}&limit=${encodeURIComponent(pageSize)}&offset=${encodeURIComponent((requestedPage - 1) * pageSize)}`
           );
           if (
             requestVersion !== this.admin.toolTraceRequestVersion ||
@@ -1030,8 +1082,15 @@ if (!window.Vue) {
           ) {
             return;
           }
+          const total = Number(data.total || 0);
+          const pageCount = this.adminLedgerPageCount(total);
+          if (pageCount > 0 && requestedPage > pageCount) {
+            await this.loadAdminToolTraces(selectedAccountId, pageCount);
+            return;
+          }
           this.admin.toolTraces = data.traces || [];
-          this.admin.toolTraceTotal = Number(data.total || 0);
+          this.admin.toolTraceTotal = total;
+          this.admin.toolTracePage = pageCount > 0 ? requestedPage : 1;
           const selectedStillExists = this.admin.toolTraces.some(
             (trace) => String(trace.root_request_id || "") === String(this.admin.selectedToolTraceId || "")
           );

@@ -33,7 +33,6 @@ from .task_queue import (
 from .tool_audit import (
     background_task_tool_name,
     build_tool_trace_record,
-    tool_audit_retention_cutoff,
     tool_step_label,
 )
 
@@ -68,7 +67,6 @@ def _record_background_task_trace(
         existing = backend.store.get_tool_call_trace(
             root_request_id,
             account_id=record.account_id,
-            cutoff_iso=tool_audit_retention_cutoff(),
         )
         trace = dict(existing.trace)
         steps = trace.setdefault("steps", [])
@@ -189,18 +187,16 @@ def _record_background_task_trace(
 
 
 def purge_old_tool_call_traces(backend: JobHuntingApp) -> int:
-    """删除保留窗口之前的工具调用审计记录。"""
+    """删除超出分页保留窗口的工具调用审计记录。"""
 
-    cutoff = tool_audit_retention_cutoff()
-    return backend.store.delete_tool_call_traces_before(cutoff)
+    return backend.store.prune_tool_call_traces_to_limit()
 
 
 def purge_old_operational_audit_records(backend: JobHuntingApp) -> dict[str, int]:
-    """删除保留窗口之前的后台运维记录。"""
+    """删除超出分页保留窗口的后台运维记录。"""
 
-    cutoff = tool_audit_retention_cutoff()
-    deleted_tool_call_traces = backend.store.delete_tool_call_traces_before(cutoff)
-    deleted_usage_events = backend.store.delete_usage_events_before(cutoff)
+    deleted_tool_call_traces = backend.store.prune_tool_call_traces_to_limit()
+    deleted_usage_events = backend.store.prune_usage_events_to_limit()
     return {
         "deleted_tool_call_traces": deleted_tool_call_traces,
         "deleted_usage_events": deleted_usage_events,
