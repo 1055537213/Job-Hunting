@@ -355,6 +355,14 @@ def create_web_app(
             raise HTTPException(status_code=403, detail="需要管理员权限。")
         return account
 
+    def prune_admin_retention_window() -> str:
+        """后台运维数据只保留最近两天自然日，并在管理员读取时补清旧数据。"""
+
+        cutoff_iso = tool_audit_retention_cutoff()
+        backend.store.delete_usage_events_before(cutoff_iso)
+        backend.store.delete_tool_call_traces_before(cutoff_iso)
+        return cutoff_iso
+
     @web_app.post("/api/auth/register")
     def register(payload: RegisterPayload) -> dict[str, object]:
         """开放普通用户注册；管理员账号不通过此接口创建。"""
@@ -1541,10 +1549,13 @@ def create_web_app(
         """管理员查看全局 Token 和工具调用汇总。"""
 
         require_admin(request)
+        cutoff_iso = prune_admin_retention_window()
         return {
-            "summary": backend.store.summarize_usage(),
-            "by_account": backend.store.summarize_usage_by_account(),
-            "tool_calls_by_account": backend.store.summarize_tool_call_traces_by_account(),
+            "summary": backend.store.summarize_usage(cutoff_iso=cutoff_iso),
+            "by_account": backend.store.summarize_usage_by_account(cutoff_iso=cutoff_iso),
+            "tool_calls_by_account": backend.store.summarize_tool_call_traces_by_account(
+                cutoff_iso=cutoff_iso,
+            ),
         }
 
     @web_app.get("/api/admin/observability/requests")
@@ -1608,7 +1619,14 @@ def create_web_app(
         """管理员查看用量流水，保留来源、操作类型和是否可计费状态。"""
 
         require_admin(request)
-        events = backend.store.list_usage_events(account_id, candidate_id, session_id, limit)
+        cutoff_iso = prune_admin_retention_window()
+        events = backend.store.list_usage_events(
+            account_id,
+            candidate_id,
+            session_id,
+            limit,
+            cutoff_iso=cutoff_iso,
+        )
         return {"events": [asdict(event) for event in events]}
 
     @web_app.get("/api/admin/tools/traces")
@@ -1621,12 +1639,14 @@ def create_web_app(
         """管理员分页查看最近两天内的工具调用任务摘要。"""
 
         require_admin(request)
+        cutoff_iso = prune_admin_retention_window()
         traces = backend.store.list_tool_call_traces(
             account_id,
             limit=limit,
             offset=offset,
+            cutoff_iso=cutoff_iso,
         )
-        total = backend.store.count_tool_call_traces(account_id)
+        total = backend.store.count_tool_call_traces(account_id, cutoff_iso=cutoff_iso)
         return {
             "traces": [serialize_tool_trace_summary(trace) for trace in traces],
             "total": total,
@@ -1639,10 +1659,11 @@ def create_web_app(
         """管理员按需查看某次任务的工具调用流程和安全结果摘要。"""
 
         require_admin(request)
+        cutoff_iso = prune_admin_retention_window()
         try:
             trace = backend.store.get_tool_call_trace(
                 root_request_id,
-                cutoff_iso=tool_audit_retention_cutoff(),
+                cutoff_iso=cutoff_iso,
             )
         except KeyError as error:
             raise HTTPException(status_code=404, detail="工具调用记录不存在。") from error

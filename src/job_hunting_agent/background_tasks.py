@@ -195,6 +195,18 @@ def purge_old_tool_call_traces(backend: JobHuntingApp) -> int:
     return backend.store.delete_tool_call_traces_before(cutoff)
 
 
+def purge_old_operational_audit_records(backend: JobHuntingApp) -> dict[str, int]:
+    """删除保留窗口之前的后台运维记录。"""
+
+    cutoff = tool_audit_retention_cutoff()
+    deleted_tool_call_traces = backend.store.delete_tool_call_traces_before(cutoff)
+    deleted_usage_events = backend.store.delete_usage_events_before(cutoff)
+    return {
+        "deleted_tool_call_traces": deleted_tool_call_traces,
+        "deleted_usage_events": deleted_usage_events,
+    }
+
+
 class NonRetryableTaskError(RuntimeError):
     """任务类型或参数不可恢复，不应浪费队列重试次数。"""
 
@@ -530,13 +542,17 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
         ignore_result=True,
     )
     def purge_tool_call_traces(self: Any) -> dict[str, object]:
-        """按上海自然日清理过期工具调用审计记录。"""
+        """按上海自然日清理过期工具调用审计和 Token 用量记录。"""
 
         backend = JobHuntingApp(env_path=env_path)
         try:
             backend.initialize()
-            deleted_count = purge_old_tool_call_traces(backend)
-            return {"status": "succeeded", "deleted_count": deleted_count}
+            deleted_counts = purge_old_operational_audit_records(backend)
+            return {
+                "status": "succeeded",
+                "deleted_count": sum(deleted_counts.values()),
+                **deleted_counts,
+            }
         finally:
             backend.store.close()
 

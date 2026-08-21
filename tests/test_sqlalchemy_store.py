@@ -258,6 +258,97 @@ def test_sqlalchemy_store_records_lists_summarizes_and_purges_tool_call_traces(d
     store.close()
 
 
+def test_sqlalchemy_store_filters_and_purges_usage_events_by_retention_window(database_url):
+    """Token 流水支持和工具调用相同的最近两天保留窗口。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    account = store.create_account("usage-retention@example.com", "hashed-password")
+    other = store.create_account("usage-retention-other@example.com", "hashed-password")
+    retention_cutoff = tool_audit_retention_cutoff()
+    cutoff_at = datetime.fromisoformat(retention_cutoff)
+    old_at = (cutoff_at - timedelta(seconds=1)).isoformat()
+    recent_at = (cutoff_at + timedelta(minutes=1)).isoformat()
+    other_recent_at = (cutoff_at + timedelta(minutes=2)).isoformat()
+
+    def usage_event(
+        *,
+        owner_id: int,
+        call_id: str,
+        total_tokens: int,
+        created_at: str,
+    ) -> UsageEventRecord:
+        return UsageEventRecord(
+            id=0,
+            account_id=owner_id,
+            candidate_id=None,
+            session_id=None,
+            root_request_id=f"request-{call_id}",
+            call_id=call_id,
+            provider="test-provider",
+            model="test-model",
+            operation="agent_chat",
+            input_tokens=total_tokens,
+            output_tokens=0,
+            total_tokens=total_tokens,
+            usage_source="provider",
+            status="succeeded",
+            attempt=1,
+            provider_request_id=None,
+            raw_usage={"total_tokens": total_tokens},
+            created_at=created_at,
+            billable=True,
+            pricing_version="test-v1",
+        )
+
+    store.record_usage_event(
+        usage_event(
+            owner_id=account.id,
+            call_id="usage-old",
+            total_tokens=900,
+            created_at=old_at,
+        )
+    )
+    store.record_usage_event(
+        usage_event(
+            owner_id=account.id,
+            call_id="usage-recent",
+            total_tokens=30,
+            created_at=recent_at,
+        )
+    )
+    store.record_usage_event(
+        usage_event(
+            owner_id=other.id,
+            call_id="usage-other-recent",
+            total_tokens=5,
+            created_at=other_recent_at,
+        )
+    )
+
+    assert [
+        event.call_id
+        for event in store.list_usage_events(account.id, cutoff_iso=retention_cutoff)
+    ] == ["usage-recent"]
+    assert store.summarize_usage(account.id, cutoff_iso=retention_cutoff)["total_tokens"] == 30
+    assert store.summarize_usage(cutoff_iso=retention_cutoff)["total_tokens"] == 35
+    by_account = store.summarize_usage_by_account(cutoff_iso=retention_cutoff)
+    assert {
+        "account_id": account.id,
+        "input_tokens": 30,
+        "output_tokens": 0,
+        "total_tokens": 30,
+        "billable_tokens": 30,
+        "event_count": 1,
+    } in by_account
+
+    deleted = store.delete_usage_events_before(retention_cutoff)
+
+    assert deleted == 1
+    assert [event.call_id for event in store.list_usage_events(account.id)] == ["usage-recent"]
+    store.close()
+
+
 def test_sqlalchemy_store_records_admin_audit_events(database_url):
     """管理员审计表以追加方式保存低敏动作和 request_id。"""
 

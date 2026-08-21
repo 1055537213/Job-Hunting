@@ -7,15 +7,20 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from job_hunting_agent.app import JobHuntingApp
-from job_hunting_agent.background_tasks import run_registered_task
+from job_hunting_agent.background_tasks import purge_old_operational_audit_records, run_registered_task
 from job_hunting_agent.config import TaskQueueSettings, load_task_queue_settings
-from job_hunting_agent.models import CandidateProfileInput, RAGIndexStats, ToolCallTraceRecord
+from job_hunting_agent.models import (
+    CandidateProfileInput,
+    RAGIndexStats,
+    ToolCallTraceRecord,
+    UsageEventRecord,
+)
 from job_hunting_agent.resume_document import ResumeFileStore
 from job_hunting_agent.task_queue import CeleryTaskQueue, TaskQueueError
 from job_hunting_agent.tool_audit import tool_audit_retention_cutoff
@@ -273,6 +278,63 @@ def test_tool_audit_retention_cutoff_keeps_two_shanghai_natural_days() -> None:
     """保留窗口应从上海时区的昨日 0 点开始，而不是按 UTC 自然日误删。"""
 
     assert tool_audit_retention_cutoff(datetime(2026, 8, 19, 1, 0, tzinfo=UTC)) == "2026-08-17T16:00:00+00:00"
+
+
+def test_operational_audit_retention_task_purges_usage_events(database_url: str) -> None:
+    """后台保留期维护任务应同时清理过期 Token 流水。"""
+
+    backend = JobHuntingApp(database_url=database_url, semantic_matching=False)
+    backend.initialize()
+    account = backend.store.create_account("usage-retention-task@example.com", "hashed-password")
+    retention_cutoff = tool_audit_retention_cutoff()
+    cutoff_at = datetime.fromisoformat(retention_cutoff)
+
+    def usage_event(call_id: str, total_tokens: int, created_at: str) -> UsageEventRecord:
+        return UsageEventRecord(
+            id=0,
+            account_id=account.id,
+            candidate_id=None,
+            session_id=None,
+            root_request_id=f"request-{call_id}",
+            call_id=call_id,
+            provider="test-provider",
+            model="test-model",
+            operation="agent_chat",
+            input_tokens=total_tokens,
+            output_tokens=0,
+            total_tokens=total_tokens,
+            usage_source="provider",
+            status="succeeded",
+            attempt=1,
+            provider_request_id=None,
+            raw_usage={"total_tokens": total_tokens},
+            created_at=created_at,
+            billable=True,
+            pricing_version="test-v1",
+        )
+
+    backend.store.record_usage_event(
+        usage_event(
+            "usage-task-old",
+            90,
+            (cutoff_at - timedelta(seconds=1)).isoformat(),
+        )
+    )
+    backend.store.record_usage_event(
+        usage_event(
+            "usage-task-recent",
+            9,
+            (cutoff_at + timedelta(minutes=1)).isoformat(),
+        )
+    )
+
+    deleted_counts = purge_old_operational_audit_records(backend)
+
+    assert deleted_counts["deleted_usage_events"] == 1
+    assert [event.call_id for event in backend.store.list_usage_events(account.id)] == [
+        "usage-task-recent"
+    ]
+    backend.store.close()
 
 
 def test_tool_trace_helpers_respect_account_isolation_and_retention_window(

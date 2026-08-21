@@ -8,6 +8,7 @@
 import json
 import logging
 import re
+from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -19,7 +20,13 @@ from langchain_core.messages import AIMessage
 
 from job_hunting_agent.agent import JobHuntingAgent
 from job_hunting_agent.app import JobHuntingApp
-from job_hunting_agent.models import CandidateProfileInput, CandidateProfilePatch, ProjectExperienceCard
+from job_hunting_agent.models import (
+    CandidateProfileInput,
+    CandidateProfilePatch,
+    ProjectExperienceCard,
+    UsageEventRecord,
+)
+from job_hunting_agent.tool_audit import tool_audit_retention_cutoff
 from job_hunting_agent.web import (
     ChatPayload,
     create_web_app,
@@ -1464,6 +1471,81 @@ def test_web_chat_stream_without_tools_does_not_create_admin_tool_trace(tmp_path
     assert "event: step_started" not in response.text
     assert client.get("/api/admin/usage/summary").json()["tool_calls_by_account"] == []
     assert client.get("/api/admin/tools/traces").json()["traces"] == []
+
+
+def test_admin_usage_events_keep_two_day_window_and_prune_old_rows(tmp_path):
+    """后台 Token 明细只返回最近两天记录，并会删除窗口外旧流水。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_BOOTSTRAP_ADMIN_EMAIL=admin@example.com",
+                "JOB_AGENT_BOOTSTRAP_ADMIN_PASSWORD=strong-password-123",
+                "JOB_AGENT_BOOTSTRAP_ADMIN_DISPLAY_NAME=初始管理员",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    web_app = create_web_app(env_file=env_path)
+    client = login_test_account(
+        TestClient(web_app),
+        email="admin@example.com",
+        password="strong-password-123",
+    )
+    store = web_app.state.backend.store
+    account = store.get_account_by_email("admin@example.com")[0]
+    retention_cutoff = tool_audit_retention_cutoff()
+    cutoff_at = datetime.fromisoformat(retention_cutoff)
+    old_at = (cutoff_at - timedelta(seconds=1)).isoformat()
+    recent_at = (cutoff_at + timedelta(minutes=1)).isoformat()
+
+    def usage_event(call_id: str, total_tokens: int, created_at: str) -> UsageEventRecord:
+        return UsageEventRecord(
+            id=0,
+            account_id=account.id,
+            candidate_id=None,
+            session_id=None,
+            root_request_id=f"request-{call_id}",
+            call_id=call_id,
+            provider="test-provider",
+            model="test-model",
+            operation="agent_chat",
+            input_tokens=total_tokens,
+            output_tokens=0,
+            total_tokens=total_tokens,
+            usage_source="provider",
+            status="succeeded",
+            attempt=1,
+            provider_request_id=None,
+            raw_usage={"total_tokens": total_tokens},
+            created_at=created_at,
+            billable=True,
+            pricing_version="test-v1",
+        )
+
+    store.record_usage_event(usage_event("usage-old", 900, old_at))
+    store.record_usage_event(usage_event("usage-recent", 42, recent_at))
+
+    response = client.get(f"/api/admin/usage/events?account_id={account.id}&limit=200")
+
+    assert response.status_code == 200
+    assert [event["call_id"] for event in response.json()["events"]] == ["usage-recent"]
+    assert [event.call_id for event in store.list_usage_events(account_id=account.id)] == [
+        "usage-recent"
+    ]
+    summary = client.get("/api/admin/usage/summary").json()
+    assert summary["summary"]["total_tokens"] == 42
+    assert summary["by_account"] == [
+        {
+            "account_id": account.id,
+            "input_tokens": 42,
+            "output_tokens": 0,
+            "total_tokens": 42,
+            "billable_tokens": 42,
+            "event_count": 1,
+        }
+    ]
 
 
 def test_web_chat_stream_records_admin_tool_trace_detail(tmp_path):

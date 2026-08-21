@@ -575,6 +575,7 @@ class RepositoryStore:
         candidate_id: int | None = None,
         session_id: str | None = None,
         limit: int = 200,
+        cutoff_iso: str | None = None,
     ) -> list[UsageEventRecord]:
         """列出用量明细；管理员不传账号过滤时才可查看全局数据。"""
 
@@ -589,6 +590,9 @@ class RepositoryStore:
         if session_id is not None:
             conditions.append("session_id = ?")
             parameters.append(session_id)
+        if cutoff_iso is not None:
+            conditions.append("created_at >= ?")
+            parameters.append(cutoff_iso)
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         parameters.append(max(1, min(limit, 5000)))
         with self.connect() as conn:
@@ -598,11 +602,22 @@ class RepositoryStore:
             ).fetchall()
         return [usage_event_from_row(row) for row in rows]
 
-    def summarize_usage(self, account_id: int | None = None) -> dict[str, int]:
+    def summarize_usage(
+        self,
+        account_id: int | None = None,
+        cutoff_iso: str | None = None,
+    ) -> dict[str, int]:
         """汇总 Token；`billable_tokens` 只计算标记为可计费的流水。"""
 
-        where = " WHERE account_id = ?" if account_id is not None else ""
-        parameters = (account_id,) if account_id is not None else ()
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            parameters.append(account_id)
+        if cutoff_iso is not None:
+            conditions.append("created_at >= ?")
+            parameters.append(cutoff_iso)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         with self.connect() as conn:
             row = conn.execute(
                 f"""
@@ -615,16 +630,21 @@ class RepositoryStore:
                     COUNT(*) AS event_count
                 FROM usage_events{where}
                 """,
-                parameters,
+                tuple(parameters),
             ).fetchone()
         return {key: int(row[key]) for key in row}
 
-    def summarize_usage_by_account(self) -> list[dict[str, int]]:
+    def summarize_usage_by_account(
+        self,
+        cutoff_iso: str | None = None,
+    ) -> list[dict[str, int]]:
         """按账号聚合 Token，供管理员查看不同计费主体的用量。"""
 
+        where = " WHERE created_at >= ?" if cutoff_iso is not None else ""
+        parameters = (cutoff_iso,) if cutoff_iso is not None else ()
         with self.connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT
                     account_id,
                     COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -633,15 +653,26 @@ class RepositoryStore:
                     COALESCE(SUM(CASE WHEN billable THEN total_tokens ELSE 0 END), 0)
                         AS billable_tokens,
                     COUNT(*) AS event_count
-                FROM usage_events
+                FROM usage_events{where}
                 GROUP BY account_id
                 ORDER BY account_id
-                """
+                """,
+                parameters,
             ).fetchall()
         return [
             {key: int(row[key]) for key in row}
             for row in rows
         ]
+
+    def delete_usage_events_before(self, cutoff_iso: str) -> int:
+        """删除保留窗口之前的 Token 用量流水，返回删除条数。"""
+
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM usage_events WHERE created_at < ?",
+                (cutoff_iso,),
+            )
+        return max(0, int(cursor.rowcount or 0))
 
     def record_tool_call_trace(self, trace: ToolCallTraceRecord) -> ToolCallTraceRecord:
         """写入或更新一次工具调用审计轨迹；同一 root_request_id 保持一条任务记录。"""
