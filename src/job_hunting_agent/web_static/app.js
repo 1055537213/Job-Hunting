@@ -313,30 +313,6 @@ if (!window.Vue) {
         return this.admin.toolTraceDetail || this.selectedAdminToolTrace;
       },
 
-      /** 按后台固定页大小计算总页数，最多 5 页。 */
-      adminLedgerPageCount(total) {
-        const pageSize = Math.max(1, Number(this.admin.ledgerPageSize || ADMIN_LEDGER_PAGE_SIZE));
-        const maxPages = Math.max(1, Number(this.admin.ledgerMaxPages || ADMIN_LEDGER_MAX_PAGES));
-        const pageCount = Math.ceil(Math.max(0, Number(total || 0)) / pageSize);
-        return pageCount > 0 ? Math.min(maxPages, pageCount) : 0;
-      },
-
-      /** 生成页码按钮数组。 */
-      adminLedgerPageNumbers(total) {
-        const pageCount = this.adminLedgerPageCount(total);
-        return Array.from({ length: pageCount }, (_, index) => index + 1);
-      },
-
-      /** 生成页脚分页说明。 */
-      adminLedgerPageInfo(total) {
-        const pageCount = this.adminLedgerPageCount(total);
-        if (!pageCount) {
-          return "暂无记录";
-        }
-        const pageSize = Math.max(1, Number(this.admin.ledgerPageSize || ADMIN_LEDGER_PAGE_SIZE));
-        return `每页 ${pageSize} 条 · 共 ${pageCount} 页`;
-      },
-
       /** 按管理员需要把请求指标对象转成低基数排序行。 */
       adminRequestStatusRows() {
         return this.sortedMetricRows(this.admin.requestMetrics.status_counts, 4);
@@ -1232,6 +1208,30 @@ if (!window.Vue) {
           "system.probe_enqueued": "系统探针",
         };
         return labels[action] || action || "管理员操作";
+      },
+
+      /** 按后台固定页大小计算总页数，最多 5 页。 */
+      adminLedgerPageCount(total) {
+        const pageSize = Math.max(1, Number(this.admin.ledgerPageSize || ADMIN_LEDGER_PAGE_SIZE));
+        const maxPages = Math.max(1, Number(this.admin.ledgerMaxPages || ADMIN_LEDGER_MAX_PAGES));
+        const pageCount = Math.ceil(Math.max(0, Number(total || 0)) / pageSize);
+        return pageCount > 0 ? Math.min(maxPages, pageCount) : 0;
+      },
+
+      /** 生成页码按钮数组。 */
+      adminLedgerPageNumbers(total) {
+        const pageCount = this.adminLedgerPageCount(total);
+        return Array.from({ length: pageCount }, (_, index) => index + 1);
+      },
+
+      /** 生成页脚分页说明。 */
+      adminLedgerPageInfo(total) {
+        const pageCount = this.adminLedgerPageCount(total);
+        if (!pageCount) {
+          return "暂无记录";
+        }
+        const pageSize = Math.max(1, Number(this.admin.ledgerPageSize || ADMIN_LEDGER_PAGE_SIZE));
+        return `每页 ${pageSize} 条 · 共 ${pageCount} 页`;
       },
 
       /** 把带 count 的对象行转换成按数量降序的可展示数组。 */
