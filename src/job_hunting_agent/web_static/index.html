@@ -1168,7 +1168,7 @@
                         >
                           <span class="admin-account-summary">
                             <strong>{{ account.email }}</strong>
-                            <span>{{ account.role }} · {{ account.status }} · {{ accountUsage(account.id) }} 可计费 Token · {{ accountToolCallCount(account.id) }} 个工具任务</span>
+                            <span>{{ account.role }} · {{ account.status }} · {{ accountBillingStateLabel(account.id) }} · {{ accountUsage(account.id) }} 可计费 Token · {{ accountBillingRemainingLabel(account.id) }} · {{ accountToolCallCount(account.id) }} 个工具任务</span>
                           </span>
                           <span class="admin-account-event-count">{{ accountUsageEventCount(account.id) }} 条</span>
                           <span class="admin-account-chevron" aria-hidden="true">
@@ -1193,7 +1193,7 @@
                         <p class="eyebrow">Usage Ledger</p>
                         <h3>{{ selectedAdminAccount.email }} 的后台明细</h3>
                       </div>
-                      <span>{{ accountUsageEventCount(selectedAdminAccount.id) }} Token · {{ accountToolCallCount(selectedAdminAccount.id) }} 工具</span>
+                      <span>{{ accountBillingStateLabel(selectedAdminAccount.id) }} · {{ accountUsageEventCount(selectedAdminAccount.id) }} Token · {{ accountToolCallCount(selectedAdminAccount.id) }} 工具</span>
                     </div>
                     <div class="admin-detail-tabs" role="tablist" aria-label="后台明细切换">
                       <button

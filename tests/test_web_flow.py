@@ -474,6 +474,8 @@ def test_web_health_reports_enabled_memory_as_configured(tmp_path):
 
     assert health.status_code == 200
     assert health.json()["memory"]["configured"] is True
+    assert "billing" in health.json()
+    assert isinstance(health.json()["billing"]["configured"], bool)
 
 
 def test_web_auth_bootstrap_does_not_surface_probe_errors_in_login_form(tmp_path):
@@ -1560,6 +1562,9 @@ def test_admin_usage_events_keep_five_page_window_and_prune_old_rows(tmp_path):
         }
     ]
     assert summary["tool_calls_by_account"] == []
+    assert summary["billing"]["summary"]["configured"] is False
+    assert summary["billing"]["summary"]["account_count"] == 1
+    assert summary["billing"]["by_account"][0]["state"] == "unlimited"
 
 def test_web_chat_stream_records_admin_tool_trace_detail(tmp_path):
     """真实工具调用的流式消息应能在管理端看到同一条任务链路与步骤结果。"""

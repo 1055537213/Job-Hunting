@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
 from starlette.concurrency import run_in_threadpool
 
+from .admin_ledger import ADMIN_LEDGER_MAX_PAGES, ADMIN_LEDGER_PAGE_SIZE
 from .agent import JobHuntingAgent
 from .app import JobHuntingApp
 from .auth import (
@@ -51,8 +52,14 @@ from .auth import (
     utc_now,
     verify_password,
 )
+from .billing_projection import (
+    billing_projection_to_dict,
+    billing_summary_to_dict,
+    project_account_billing,
+)
 from .config import (
     load_agent_memory_settings,
+    load_billing_settings,
     load_bootstrap_admin_settings,
     load_cookie_secure,
     load_database_settings,
@@ -63,6 +70,7 @@ from .config import (
     load_task_queue_settings,
     load_web_security_settings,
     masked_agent_memory_settings,
+    masked_billing_settings,
     masked_embedding_settings,
     masked_llm_settings,
     masked_object_storage_settings,
@@ -95,7 +103,6 @@ from .rag import RAGProviderRequestError
 from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
 from .skill_normalization import normalize_skill_mapping
 from .task_queue import BackgroundTaskQueue, TaskQueueError
-from .admin_ledger import ADMIN_LEDGER_MAX_PAGES, ADMIN_LEDGER_PAGE_SIZE
 from .tool_audit import (
     background_task_tool_name,
     build_tool_trace_record,
@@ -545,6 +552,10 @@ def create_web_app(
             web_security_config = masked_web_security_settings(load_web_security_settings(env_path))
         except ValueError as error:
             web_security_config = {"configured": False, "error": str(error)}
+        try:
+            billing_config = masked_billing_settings(load_billing_settings(env_path))
+        except ValueError as error:
+            billing_config = {"configured": False, "error": str(error)}
         if account is None or account.role != "admin":
             return {
                 "status": "ok",
@@ -561,6 +572,7 @@ def create_web_app(
                     ),
                     "rate_limit_enabled": bool(web_security_config.get("rate_limit_enabled")),
                 },
+                "billing": {"configured": bool(billing_config.get("configured"))},
             }
         return {
             "status": "ok",
@@ -574,6 +586,7 @@ def create_web_app(
             "memory": memory_config,
             "task_queue": task_queue_config,
             "web_security": web_security_config,
+            "billing": billing_config,
             "agent": {
                 "configured": chat_agent is not None,
                 "error": agent_error,
@@ -1548,10 +1561,25 @@ def create_web_app(
 
         require_admin(request)
         prune_admin_retention_window()
+        billing_settings = load_billing_settings(env_path)
+        billing_projections, billing_summary = project_account_billing(
+            backend.store.list_accounts(),
+            backend.store.summarize_usage_by_account(),
+            quota_tokens=billing_settings.quota_tokens,
+            warning_ratio=billing_settings.warning_ratio,
+        )
         return {
             "summary": backend.store.summarize_usage(),
             "by_account": backend.store.summarize_usage_by_account(),
             "tool_calls_by_account": backend.store.summarize_tool_call_traces_by_account(),
+            "billing": {
+                "settings": masked_billing_settings(billing_settings),
+                "summary": billing_summary_to_dict(billing_summary),
+                "by_account": [
+                    billing_projection_to_dict(projection)
+                    for projection in billing_projections
+                ],
+            },
             "page_size": ADMIN_LEDGER_PAGE_SIZE,
             "max_pages": ADMIN_LEDGER_MAX_PAGES,
         }

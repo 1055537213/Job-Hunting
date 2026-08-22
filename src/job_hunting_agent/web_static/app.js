@@ -139,6 +139,11 @@ if (!window.Vue) {
           selectedToolTraceId: "",
           toolTraceDetail: null,
           summary: {},
+          billing: {
+            settings: {},
+            summary: {},
+            by_account: [],
+          },
           requestMetrics: {},
           activeDetailTab: "tokens",
           selectedAccountId: 0,
@@ -364,7 +369,7 @@ if (!window.Vue) {
             title: "用量与账号",
             description: "账号与 Token 用量",
             count: this.admin.accounts.length,
-            badge: `${this.admin.summary.billable_tokens || 0} Token`,
+            badge: `${(this.admin.billing?.summary?.total_billable_tokens ?? this.admin.summary.billable_tokens) || 0} Token`,
           },
           {
             key: "observability",
@@ -397,7 +402,7 @@ if (!window.Vue) {
       /** 当前后台模块的简短说明。 */
       adminSectionDescription() {
         return {
-          usage: "先看账号，再看 Token 明细和后台任务入口。",
+          usage: "先看账号，再看配额状态、Token 明细和后台任务入口。",
           observability: "看请求量、错误分布、限流与 CSRF 拦截。",
           audit: "记录状态变更、会话操作和系统探针。",
         }[this.admin.activeSection] || "后台管理";
@@ -431,11 +436,16 @@ if (!window.Vue) {
             },
           ];
         }
+        const billingSummary = this.admin.billing?.summary || {};
         return [
           { label: "账号数", value: this.admin.accounts.length, hint: "后台可见" },
-          { label: "请求事件", value: this.admin.summary.event_count || 0, hint: "Token 流水" },
-          { label: "总 Token", value: this.admin.summary.total_tokens || 0, hint: "全部用量" },
-          { label: "可计费 Token", value: this.admin.summary.billable_tokens || 0, hint: "确认后结算" },
+          {
+            label: "可计费 Token",
+            value: (billingSummary.total_billable_tokens ?? this.admin.summary.billable_tokens) || 0,
+            hint: "账单投影",
+          },
+          { label: "预警账号", value: billingSummary.warning_account_count || 0, hint: "接近配额" },
+          { label: "超额账号", value: billingSummary.over_quota_account_count || 0, hint: "需要处理" },
         ];
       },
 
@@ -884,6 +894,11 @@ if (!window.Vue) {
             by_account: summary.by_account || [],
             tool_calls_by_account: summary.tool_calls_by_account || [],
           };
+          this.admin.billing = {
+            settings: summary.billing?.settings || {},
+            summary: summary.billing?.summary || {},
+            by_account: summary.billing?.by_account || [],
+          };
           this.admin.ledgerPageSize = Number(summary.page_size || ADMIN_LEDGER_PAGE_SIZE);
           this.admin.ledgerMaxPages = Number(summary.max_pages || ADMIN_LEDGER_MAX_PAGES);
           this.admin.requestMetrics = requestMetrics.requests || {};
@@ -1180,6 +1195,35 @@ if (!window.Vue) {
       /** 返回指定账号的工具调用失败次数。 */
       accountToolCallFailureCount(accountId) {
         return this.accountToolCallSummary(accountId)?.failed_trace_count || 0;
+      },
+
+      /** 返回指定账号的账单投影行。 */
+      accountBillingSummary(accountId) {
+        return (this.admin.billing?.by_account || []).find(
+          (entry) => Number(entry.account_id) === Number(accountId)
+        ) || null;
+      },
+
+      /** 返回指定账号的账单状态标签。 */
+      accountBillingStateLabel(accountId) {
+        return this.accountBillingSummary(accountId)?.state_label || "未配置配额";
+      },
+
+      /** 返回指定账号的账单状态 class。 */
+      accountBillingStateClass(accountId) {
+        return {
+          healthy: "is-healthy",
+          warning: "is-warning",
+          over_quota: "is-over-quota",
+          unlimited: "is-unlimited",
+        }[this.accountBillingSummary(accountId)?.state || "unlimited"] || "is-unlimited";
+      },
+
+      /** 返回指定账号的剩余额度文本。 */
+      accountBillingRemainingLabel(accountId) {
+        const item = this.accountBillingSummary(accountId);
+        if (!item || item.quota_tokens === null) return "未配置配额";
+        return `剩余 ${item.remaining_tokens || 0} Token`;
       },
 
       /** 管理端审计中把账号 ID 转成人能读的标签；账号已删除时保留 ID。 */

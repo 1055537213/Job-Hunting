@@ -133,6 +133,18 @@ class WebSecuritySettings:
 
 
 @dataclass(frozen=True)
+class BillingSettings:
+    """后台账单投影配置。
+
+    这里先保存统一的每账号 Token 配额和预警比例，不把真实账单周期或价格版本
+    硬塞进配置层。账单快照仍然由 usage ledger 和后续账期逻辑生成。
+    """
+
+    quota_tokens: int | None = None
+    warning_ratio: float = 0.8
+
+
+@dataclass(frozen=True)
 class BootstrapAdminSettings:
     """首次启动时创建管理员账号的一次性配置。
 
@@ -696,6 +708,47 @@ def masked_web_security_settings(settings: WebSecuritySettings) -> dict[str, obj
     }
 
 
+def load_billing_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> BillingSettings:
+    """读取后台账单投影配置。"""
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(*keys: str, default: str | None = None) -> str | None:
+        for key in keys:
+            if environment.get(key):
+                return environment[key]
+            if file_values.get(key):
+                return file_values[key]
+        return default
+
+    quota_value = get("JOB_AGENT_BILLING_QUOTA_TOKENS", default="")
+    quota_tokens = None
+    if quota_value:
+        quota_tokens = parse_positive_int(quota_value, "JOB_AGENT_BILLING_QUOTA_TOKENS")
+    settings = BillingSettings(
+        quota_tokens=quota_tokens,
+        warning_ratio=parse_unit_interval(
+            get("JOB_AGENT_BILLING_WARNING_RATIO", default="0.8"),
+            "JOB_AGENT_BILLING_WARNING_RATIO",
+        ),
+    )
+    return settings
+
+
+def masked_billing_settings(settings: BillingSettings) -> dict[str, object]:
+    """返回适合健康检查和管理页展示的账单配置。"""
+
+    return {
+        "configured": settings.quota_tokens is not None,
+        "quota_tokens": settings.quota_tokens,
+        "warning_ratio": settings.warning_ratio,
+    }
+
+
 def normalize_embedding_api_style(value: str | None) -> str:
     """把 Embedding 协议别名归一化为内部适配器名称。"""
 
@@ -1091,4 +1144,16 @@ def parse_non_negative_int(value: str | None, field_name: str) -> int:
         raise ValueError(f"{field_name} 必须是非负整数") from error
     if parsed < 0:
         raise ValueError(f"{field_name} 不能小于 0")
+    return parsed
+
+
+def parse_unit_interval(value: str | None, field_name: str) -> float:
+    """解析 0 到 1 之间的浮点比例。"""
+
+    try:
+        parsed = float(value or "")
+    except ValueError as error:
+        raise ValueError(f"{field_name} 必须是 0 到 1 之间的小数") from error
+    if not 0 < parsed <= 1:
+        raise ValueError(f"{field_name} 必须位于 0 到 1 之间")
     return parsed

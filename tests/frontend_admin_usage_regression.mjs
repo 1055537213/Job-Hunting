@@ -328,6 +328,40 @@ const adminLoadContext = {
         summary: { event_count: 1 },
         by_account: [],
         tool_calls_by_account: [],
+        billing: {
+          settings: { configured: false, quota_tokens: null, warning_ratio: 0.8 },
+          summary: {
+            configured: false,
+            quota_tokens: null,
+            warning_ratio: 0.8,
+            account_count: 1,
+            billable_account_count: 0,
+            unlimited_account_count: 1,
+            warning_account_count: 0,
+            over_quota_account_count: 0,
+            total_billable_tokens: 0,
+            total_tokens: 0,
+            total_quota_tokens: null,
+            total_remaining_tokens: null,
+          },
+          by_account: [
+            {
+              account_id: 7,
+              email: "admin@example.com",
+              role: "admin",
+              status: "active",
+              billable_tokens: 0,
+              total_tokens: 0,
+              quota_tokens: null,
+              warning_ratio: 0.8,
+              warning_threshold_tokens: null,
+              remaining_tokens: null,
+              usage_ratio: null,
+              state: "unlimited",
+              state_label: "未配置配额",
+            },
+          ],
+        },
         page_size: ADMIN_LEDGER_PAGE_SIZE,
         max_pages: ADMIN_LEDGER_MAX_PAGES,
       };
@@ -366,6 +400,8 @@ assert.deepEqual(adminLoadContext.admin.requestMetrics, {
   error_requests: 1,
   average_duration_ms: 8.5,
 });
+assert.equal(adminLoadContext.admin.billing.summary.account_count, 1);
+assert.equal(adminLoadContext.admin.billing.by_account[0].state_label, "未配置配额");
 
 const auditUrls = [];
 const auditContext = {
