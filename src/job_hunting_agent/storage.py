@@ -1,4 +1,4 @@
-﻿"""数据库无关的领域仓储方法。
+"""数据库无关的领域仓储方法。
 
 本模块只保存候选人、职位、对话、简历和用量的领域读写逻辑，不创建数据库连接，
 也不负责 schema 初始化。具体连接和事务由 `SQLAlchemyStore` 提供，因此 Web、
@@ -45,8 +45,9 @@ from .models import (
     UsageEventRecord,
     sanitize_preference_weights,
 )
+from .profile_mutation import apply_candidate_profile_patch
 from .admin_ledger import ADMIN_LEDGER_MAX_RECORDS
-from .skill_normalization import merge_skill_mappings, normalize_skill_mapping
+from .skill_normalization import normalize_skill_mapping
 
 RESUME_ARTIFACT_STATUSES = {"ready", "processing", "failed"}
 
@@ -1552,98 +1553,10 @@ class RepositoryStore:
         """
 
         current = self.get_candidate_profile(candidate_id, account_id=account_id)
-        updated_fields: list[str] = []
-
-        status = current.status
-        education = current.education
-        experience_years = current.experience_years
-        salary_floor_k = current.salary_floor_k
-        expected_salary_k = current.expected_salary_k
-        skills = normalize_skill_mapping(current.skills)
-        preferred_cities = list(current.preferred_cities)
-        acceptable_cities = list(current.acceptable_cities)
-        preference_weights = sanitize_preference_weights(current.preference_weights)
-        target_directions = list(current.target_directions)
-        unacceptable = list(current.unacceptable)
-
-        if patch.status:
-            status = patch.status
-            updated_fields.append("status")
-        if patch.education:
-            education = patch.education
-            updated_fields.append("education")
-        if patch.experience_years is not None:
-            experience_years = patch.experience_years
-            updated_fields.append("experience_years")
-        if patch.salary_floor_k is not None:
-            salary_floor_k = patch.salary_floor_k
-            updated_fields.append("salary_floor_k")
-        if patch.expected_salary_k is not None:
-            expected_salary_k = patch.expected_salary_k
-            updated_fields.append("expected_salary_k")
-        if patch.skills:
-            merged_skills = merge_skill_mappings(skills, patch.skills)
-            if merged_skills != skills:
-                skills = merged_skills
-                updated_fields.append("skills")
-        if patch.clear_preferred_cities:
-            preferred_cities = []
-            updated_fields.append("preferred_cities")
-        elif patch.replace_preferred_cities or patch.preferred_cities:
-            # 最新一次明确的首选城市意向覆盖旧值，而不是无限追加。
-            preferred_cities = normalize_city_list(patch.preferred_cities)
-            updated_fields.append("preferred_cities")
-        if patch.clear_acceptable_cities:
-            acceptable_cities = []
-            updated_fields.append("acceptable_cities")
-        if patch.acceptable_cities:
-            acceptable_cities = merge_unique(
-                acceptable_cities,
-                normalize_city_list(patch.acceptable_cities),
-            )
-            updated_fields.append("acceptable_cities")
-        # 同一城市不能同时属于首选和其他可接受集合；首选级别始终优先。
-        disjoint_acceptable = [city for city in acceptable_cities if city not in preferred_cities]
-        if disjoint_acceptable != acceptable_cities:
-            acceptable_cities = disjoint_acceptable
-            if "acceptable_cities" not in updated_fields:
-                updated_fields.append("acceptable_cities")
-        if patch.preference_weights:
-            for key, value in patch.preference_weights.items():
-                if key in preference_weights:
-                    preference_weights[key] = sanitize_preference_weights({key: value})[key]
-            updated_fields.append("preference_weights")
-        if patch.target_directions:
-            incoming_directions = merge_unique([], patch.target_directions)
-            next_target_directions = (
-                incoming_directions
-                if patch.replace_target_directions
-                else merge_unique(target_directions, incoming_directions)
-            )
-            if next_target_directions != target_directions:
-                target_directions = next_target_directions
-                updated_fields.append("target_directions")
-        if patch.unacceptable:
-            unacceptable = merge_unique(unacceptable, patch.unacceptable)
-            updated_fields.append("unacceptable")
+        updated_profile, updated_fields = apply_candidate_profile_patch(current, patch)
 
         if not updated_fields:
             return []
-
-        updated_profile = CandidateProfileInput(
-            name=current.name,
-            status=status,
-            education=education,
-            experience_years=experience_years,
-            skills=skills,
-            preferred_cities=preferred_cities,
-            acceptable_cities=acceptable_cities,
-            salary_floor_k=salary_floor_k,
-            expected_salary_k=expected_salary_k,
-            target_directions=target_directions,
-            unacceptable=unacceptable,
-            preference_weights=preference_weights,
-        )
         fingerprint = candidate_profile_content_fingerprint(updated_profile)
 
         try:
@@ -1660,17 +1573,17 @@ class RepositoryStore:
                   AND COALESCE(account_id, -1) = COALESCE(?, COALESCE(account_id, -1))
                 """,
                 (
-                    status,
-                    education,
-                    experience_years,
-                    salary_floor_k,
-                    expected_salary_k,
-                    json.dumps(skills, ensure_ascii=False),
-                    json.dumps(preferred_cities, ensure_ascii=False),
-                    json.dumps(acceptable_cities, ensure_ascii=False),
-                    json.dumps(preference_weights, ensure_ascii=False),
-                    json.dumps(target_directions, ensure_ascii=False),
-                    json.dumps(unacceptable, ensure_ascii=False),
+                    updated_profile.status,
+                    updated_profile.education,
+                    updated_profile.experience_years,
+                    updated_profile.salary_floor_k,
+                    updated_profile.expected_salary_k,
+                    json.dumps(updated_profile.skills, ensure_ascii=False),
+                    json.dumps(updated_profile.preferred_cities, ensure_ascii=False),
+                    json.dumps(updated_profile.acceptable_cities, ensure_ascii=False),
+                    json.dumps(updated_profile.preference_weights, ensure_ascii=False),
+                    json.dumps(updated_profile.target_directions, ensure_ascii=False),
+                    json.dumps(updated_profile.unacceptable, ensure_ascii=False),
                     fingerprint,
                     candidate_id,
                     account_id,
@@ -3411,13 +3324,3 @@ def project_card_index_text(card: ProjectExperienceCard) -> str:
     ]
     # 过滤空段落，避免向长文本表写入一堆无意义的空字段。
     return "\n".join(part for part in parts if part.strip())
-
-
-def merge_unique(existing: list[str], incoming: list[str]) -> list[str]:
-    """按原顺序合并列表并去重。"""
-
-    merged = list(existing)
-    for item in incoming:
-        if item and item not in merged:
-            merged.append(item)
-    return merged

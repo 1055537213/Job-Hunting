@@ -169,9 +169,50 @@ Job-hunting Agent/
 
 - `src/job_hunting_agent/model_gateway.py`、`llm.py`：统一聊天、Embedding、Rerank 的供应商配置、有限重试、调用 ID 和 Token usage 记录；兼容通用 OpenAI-compatible 模型与旧版 DeepSeek 思考参数。
 - `src/job_hunting_agent/rag.py`、`pgvector_rag.py`：负责文本切分、Embedding 协议、可选 Rerank、向量写入和来源可追溯检索。
+- `src/job_hunting_agent/evals/rag_eval.py`：执行 RAG 黄金用例评测，输出 Recall@K、MRR 和禁止召回命中率，用于换模型、改切片或上线前验收。
+- `src/job_hunting_agent/evals/conversation_eval.py`：执行候选人档案变更回归，验证方向替换、技能熟练度、城市覆盖等固定语义规则。
 - `src/job_hunting_agent/object_storage.py`：通过 S3-compatible 接口读写 MinIO，数据库只保存对象键、哈希、版本和归属。
 - `src/job_hunting_agent/task_queue.py`：封装 Celery 投递，队列消息只包含安全的 `task_key`。
 - `src/job_hunting_agent/background_tasks.py`：原子认领任务并处理进度、重试、失败恢复、OCR、RAG 和 GitHub 分析。
 - `src/job_hunting_agent/resume_document.py`：校验文件类型和大小，解析 DOCX、文字 PDF，并为扫描 PDF 提供 OCR 流程。
 - `src/job_hunting_agent/web_static/index.html`、`app.js`、`styles.css`：实现登录、工作台、Markdown、SSE、任务轮询和响应式界面。
 - `tests/`：覆盖数据库迁移、认证隔离、职位匹配、Agent、RAG、对象存储、后台任务、简历和网页回归行为。
+
+## 6. 企业级质量验收
+
+RAG 召回评测使用固定黄金用例校验检索结果。先生成可编辑模板：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -m job_hunting_agent.evals.rag_eval --write-example data\runtime\rag_eval_cases.example.json
+```
+
+把模板里的 `expected_long_text_ids`、`expected_source_labels` 和 `forbidden_source_labels` 改成当前数据库中真实材料的 ID 或来源标签后运行：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -m job_hunting_agent.evals.rag_eval --cases data\runtime\rag_eval_cases.example.json --account-id 8 --top-k 5
+```
+
+退出码为 0 表示所有用例通过；失败时报告会显示具体用例的 Recall@K、MRR 和禁止召回命中数。上线前建议同时执行：
+
+```powershell
+.\scripts\enterprise_acceptance.ps1
+```
+
+如果已经维护了真实 RAG 黄金用例，可以把它接入同一套验收：
+
+```powershell
+.\scripts\enterprise_acceptance.ps1 -RagCases data\runtime\rag_eval_cases.example.json -AccountId 8 -TopK 5
+```
+
+候选人档案变更回归不依赖知识库规模，适合在改动“求职方向替换、城市覆盖、技能熟练度、偏好权重”等规则后快速跑：
+
+```powershell
+E:\Anaconda\envs\langchain1.2\python.exe -m job_hunting_agent.evals.conversation_eval --write-example data\runtime\conversation_eval_cases.example.json
+E:\Anaconda\envs\langchain1.2\python.exe -m job_hunting_agent.evals.conversation_eval --cases data\runtime\conversation_eval_cases.example.json
+```
+
+如果希望把它一起纳入统一验收，可以这样执行：
+
+```powershell
+.\scripts\enterprise_acceptance.ps1 -ConversationCases data\runtime\conversation_eval_cases.example.json
+```
