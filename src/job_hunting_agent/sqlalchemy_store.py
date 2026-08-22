@@ -141,6 +141,7 @@ class SQLAlchemyStore(RepositoryStore):
     """
 
     def __init__(self, database_url: str):
+        super().__init__()
         self.database_url = normalize_database_url(database_url)
         self.engine = sa.create_engine(self.database_url, pool_pre_ping=True)
 

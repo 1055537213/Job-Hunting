@@ -138,3 +138,7 @@ def test_account_filters_profiles_jobs_and_usage_events(database_url):
     assert store.record_usage_event(event).id == stored.id
     assert store.summarize_usage(account_a.id)["billable_tokens"] == 14
     assert store.summarize_usage(account_b.id)["event_count"] == 0
+    balance = store.get_account_balance_summary(account_a.id)
+    assert balance.balance_micro_yuan == 100_000_000 - (14 * 25)
+    assert balance.total_consumed_micro_yuan == 14 * 25
+    assert balance.ledger_entry_count == 2

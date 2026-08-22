@@ -427,6 +427,38 @@ class AccountRecord:
 
 
 @dataclass
+class AccountBalanceSummary:
+    """一个账号的余额与消费汇总。"""
+
+    account_id: int
+    balance_micro_yuan: int
+    total_recharge_micro_yuan: int
+    total_consumed_micro_yuan: int
+    ledger_entry_count: int
+    low_balance_threshold_micro_yuan: int
+    state: str = "balance"
+    state_label: str = "余额"
+
+
+@dataclass
+class BalanceLedgerRecord:
+    """一条余额或消费流水。"""
+
+    id: int
+    account_id: int
+    entry_kind: str
+    amount_micro_yuan: int
+    balance_before_micro_yuan: int
+    balance_after_micro_yuan: int
+    token_count: int | None
+    price_per_million_tokens_yuan: float | None
+    source_reference: str | None
+    summary: str
+    details: dict[str, object] = field(default_factory=dict)
+    created_at: str = ""
+
+
+@dataclass
 class AuthSessionRecord:
     """服务端登录 Session 记录。
 

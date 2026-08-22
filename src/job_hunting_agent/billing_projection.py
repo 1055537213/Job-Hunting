@@ -1,156 +1,151 @@
-"""账户级账单投影。
-
-这层只做读取已有 usage ledger 后的投影，不修改账本本身。
-它把“每账号配额、预警比例、当前可计费 Token、状态标签”整理成前端和管理
-员都能直接消费的结构。
-"""
+"""账号级余额投影。"""
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from math import ceil
 
 from .models import AccountRecord
 
 
 @dataclass(frozen=True)
-class AccountBillingProjection:
-    """单个账号的账单投影。"""
+class AccountBalanceProjection:
+    """单个账号的余额投影。"""
 
     account_id: int
     email: str
     role: str
     status: str
-    billable_tokens: int
-    total_tokens: int
-    quota_tokens: int | None
-    warning_ratio: float
-    warning_threshold_tokens: int | None
-    remaining_tokens: int | None
-    usage_ratio: float | None
+    balance_micro_yuan: int
+    total_recharge_micro_yuan: int
+    total_consumed_micro_yuan: int
+    ledger_entry_count: int
+    low_balance_threshold_micro_yuan: int
     state: str
     state_label: str
 
 
 @dataclass(frozen=True)
-class BillingSummary:
-    """管理端账单总览。"""
+class BalanceSummary:
+    """管理端余额总览。"""
 
     configured: bool
-    quota_tokens: int | None
-    warning_ratio: float
+    price_per_million_tokens_yuan: float
+    starting_balance_yuan: float
+    low_balance_threshold_yuan: float
     account_count: int
-    billable_account_count: int
-    unlimited_account_count: int
-    warning_account_count: int
-    over_quota_account_count: int
-    total_billable_tokens: int
-    total_tokens: int
-    total_quota_tokens: int | None
-    total_remaining_tokens: int | None
+    healthy_account_count: int
+    low_balance_account_count: int
+    suspended_account_count: int
+    total_balance_micro_yuan: int
+    total_recharge_micro_yuan: int
+    total_consumed_micro_yuan: int
+    total_ledger_entry_count: int
 
 
-def project_account_billing(
+def project_account_balances(
     accounts: Sequence[AccountRecord],
-    usage_by_account: Sequence[Mapping[str, object]],
+    balance_by_account: Sequence[Mapping[str, object]],
     *,
-    quota_tokens: int | None,
-    warning_ratio: float,
-) -> tuple[list[AccountBillingProjection], BillingSummary]:
-    """把 usage ledger 投影成账户级账单状态。"""
+    price_per_million_tokens_yuan: float,
+    starting_balance_yuan: float,
+    low_balance_threshold_yuan: float,
+) -> tuple[list[AccountBalanceProjection], BalanceSummary]:
+    """把余额流水与账号列表投影成前端需要的结构。"""
 
-    usage_map = {
+    balance_map = {
         int(row["account_id"]): row
-        for row in usage_by_account
+        for row in balance_by_account
         if row.get("account_id") is not None
     }
-    projections: list[AccountBillingProjection] = []
-    total_billable_tokens = 0
-    total_tokens = 0
-    warning_account_count = 0
-    over_quota_account_count = 0
-    unlimited_account_count = 0
+    projections: list[AccountBalanceProjection] = []
+    healthy_account_count = 0
+    low_balance_account_count = 0
+    suspended_account_count = 0
+    total_balance_micro_yuan = 0
+    total_recharge_micro_yuan = 0
+    total_consumed_micro_yuan = 0
+    total_ledger_entry_count = 0
+    threshold_micro_yuan = round(low_balance_threshold_yuan * 1_000_000)
 
     for account in accounts:
-        usage_row = usage_map.get(account.id, {})
-        billable_tokens = int(usage_row.get("billable_tokens", 0) or 0)
-        account_total_tokens = int(usage_row.get("total_tokens", 0) or 0)
-        total_billable_tokens += billable_tokens
-        total_tokens += account_total_tokens
-
-        if quota_tokens is None:
-            state = "unlimited"
-            state_label = "未配置配额"
-            remaining_tokens = None
-            usage_ratio = None
-            warning_threshold_tokens = None
-            unlimited_account_count += 1
+        row = balance_map.get(account.id, {})
+        balance_micro_yuan = int(row.get("balance_micro_yuan", 0) or 0)
+        recharge_micro_yuan = int(row.get("total_recharge_micro_yuan", 0) or 0)
+        consumed_micro_yuan = int(row.get("total_consumed_micro_yuan", 0) or 0)
+        ledger_entry_count = int(row.get("ledger_entry_count", 0) or 0)
+        row_threshold_micro_yuan = int(
+            row.get("low_balance_threshold_micro_yuan", threshold_micro_yuan) or threshold_micro_yuan
+        )
+        state = _balance_state(balance_micro_yuan, row_threshold_micro_yuan, account.status)
+        state_label = _balance_state_label(state)
+        total_balance_micro_yuan += balance_micro_yuan
+        total_recharge_micro_yuan += recharge_micro_yuan
+        total_consumed_micro_yuan += consumed_micro_yuan
+        total_ledger_entry_count += ledger_entry_count
+        if state == "balance":
+            healthy_account_count += 1
+        elif state == "low_balance":
+            low_balance_account_count += 1
         else:
-            warning_threshold_tokens = max(1, ceil(quota_tokens * warning_ratio))
-            usage_ratio = billable_tokens / quota_tokens if quota_tokens > 0 else None
-            remaining_tokens = max(quota_tokens - billable_tokens, 0)
-            if billable_tokens >= quota_tokens:
-                state = "over_quota"
-                state_label = "已超额"
-                over_quota_account_count += 1
-            elif billable_tokens >= warning_threshold_tokens:
-                state = "warning"
-                state_label = "接近配额"
-                warning_account_count += 1
-            else:
-                state = "healthy"
-                state_label = "正常"
+            suspended_account_count += 1
 
         projections.append(
-            AccountBillingProjection(
+            AccountBalanceProjection(
                 account_id=account.id,
                 email=account.email,
                 role=account.role,
                 status=account.status,
-                billable_tokens=billable_tokens,
-                total_tokens=account_total_tokens,
-                quota_tokens=quota_tokens,
-                warning_ratio=warning_ratio,
-                warning_threshold_tokens=warning_threshold_tokens,
-                remaining_tokens=remaining_tokens,
-                usage_ratio=usage_ratio,
+                balance_micro_yuan=balance_micro_yuan,
+                total_recharge_micro_yuan=recharge_micro_yuan,
+                total_consumed_micro_yuan=consumed_micro_yuan,
+                ledger_entry_count=ledger_entry_count,
+                low_balance_threshold_micro_yuan=row_threshold_micro_yuan,
                 state=state,
                 state_label=state_label,
             )
         )
 
-    if quota_tokens is None:
-        total_quota_tokens = None
-        total_remaining_tokens = None
-    else:
-        total_quota_tokens = quota_tokens * len(accounts)
-        total_remaining_tokens = max(total_quota_tokens - total_billable_tokens, 0)
-
-    summary = BillingSummary(
-        configured=quota_tokens is not None,
-        quota_tokens=quota_tokens,
-        warning_ratio=warning_ratio,
+    summary = BalanceSummary(
+        configured=True,
+        price_per_million_tokens_yuan=price_per_million_tokens_yuan,
+        starting_balance_yuan=starting_balance_yuan,
+        low_balance_threshold_yuan=low_balance_threshold_yuan,
         account_count=len(accounts),
-        billable_account_count=len(accounts) - unlimited_account_count,
-        unlimited_account_count=unlimited_account_count,
-        warning_account_count=warning_account_count,
-        over_quota_account_count=over_quota_account_count,
-        total_billable_tokens=total_billable_tokens,
-        total_tokens=total_tokens,
-        total_quota_tokens=total_quota_tokens,
-        total_remaining_tokens=total_remaining_tokens,
+        healthy_account_count=healthy_account_count,
+        low_balance_account_count=low_balance_account_count,
+        suspended_account_count=suspended_account_count,
+        total_balance_micro_yuan=total_balance_micro_yuan,
+        total_recharge_micro_yuan=total_recharge_micro_yuan,
+        total_consumed_micro_yuan=total_consumed_micro_yuan,
+        total_ledger_entry_count=total_ledger_entry_count,
     )
     return projections, summary
 
 
-def billing_projection_to_dict(projection: AccountBillingProjection) -> dict[str, object]:
-    """导出给 API/前端使用的投影字典。"""
+def balance_projection_to_dict(projection: AccountBalanceProjection) -> dict[str, object]:
+    """导出给 API/前端使用的余额投影字典。"""
 
     return asdict(projection)
 
 
-def billing_summary_to_dict(summary: BillingSummary) -> dict[str, object]:
-    """导出给 API/前端使用的总览字典。"""
+def balance_summary_to_dict(summary: BalanceSummary) -> dict[str, object]:
+    """导出给 API/前端使用的余额总览字典。"""
 
     return asdict(summary)
+
+
+def _balance_state(balance_micro_yuan: int, low_balance_threshold_micro_yuan: int, account_status: str) -> str:
+    if account_status != "active" or balance_micro_yuan <= 0:
+        return "suspended"
+    if balance_micro_yuan <= low_balance_threshold_micro_yuan:
+        return "low_balance"
+    return "balance"
+
+
+def _balance_state_label(state: str) -> str:
+    return {
+        "balance": "余额",
+        "low_balance": "低余额",
+        "suspended": "停用",
+    }[state]

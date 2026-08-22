@@ -16,6 +16,7 @@ from langchain_core.embeddings import Embeddings
 from .auth import AuthService
 from .config import (
     DEFAULT_ENV_PATH,
+    load_billing_settings,
     load_database_settings,
     load_object_storage_settings,
     load_semantic_matching_enabled,
@@ -102,6 +103,7 @@ class JobHuntingApp:
             load_database_settings(self.env_path)
         )
         self.store = SQLAlchemyStore(resolved_database_url)
+        self.store.configure_billing(load_billing_settings(self.env_path))
         # 直接运行 Web 或单元测试默认关闭队列；Compose 会显式开启并注入 Redis URL。
         self.task_queue_settings = load_task_queue_settings(self.env_path)
         self.task_queue = task_queue

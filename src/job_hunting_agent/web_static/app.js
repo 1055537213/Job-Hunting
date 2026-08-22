@@ -25,6 +25,7 @@ if (!window.Vue) {
   const FRONTEND_ROUTES = {
     auth: "/login",
     workspace: "/workspace",
+    profile: "/profile",
     admin: "/admin",
   };
 
@@ -33,6 +34,7 @@ if (!window.Vue) {
     const pathname = window.location?.pathname || "/";
     const normalized = pathname.replace(/\/+$/, "") || "/";
     if (normalized === FRONTEND_ROUTES.admin) return "admin";
+    if (normalized === FRONTEND_ROUTES.profile) return "profile";
     if (normalized === FRONTEND_ROUTES.auth || normalized === "/register") return "auth";
     return "workspace";
   }
@@ -42,7 +44,7 @@ if (!window.Vue) {
     const next = String(value || "").trim();
     if (!next || !next.startsWith("/") || next.startsWith("//")) return "";
     const pathname = next.split(/[?#]/, 1)[0].replace(/\/+$/, "") || "/";
-    if ([FRONTEND_ROUTES.workspace, FRONTEND_ROUTES.admin, "/"].includes(pathname)) {
+    if ([FRONTEND_ROUTES.workspace, FRONTEND_ROUTES.profile, FRONTEND_ROUTES.admin, "/"].includes(pathname)) {
       return pathname === "/" ? FRONTEND_ROUTES.workspace : next;
     }
     return "";
@@ -98,6 +100,7 @@ if (!window.Vue) {
         auth: {
           authenticated: false,
           account: null,
+          billing: null,
         },
         authMode: "login",
         authForm: {
@@ -133,6 +136,9 @@ if (!window.Vue) {
           events: [],
           usageTotal: 0,
           usagePage: 1,
+          balanceEvents: [],
+          balanceTotal: 0,
+          balancePage: 1,
           toolTraces: [],
           auditEvents: [],
           activeSection: "usage",
@@ -148,15 +154,18 @@ if (!window.Vue) {
           activeDetailTab: "tokens",
           selectedAccountId: 0,
           loadingEvents: false,
+          loadingBalanceEvents: false,
           loadingToolTraces: false,
           loadingToolTraceDetail: false,
           loadingAuditEvents: false,
           eventsError: "",
+          balanceEventsError: "",
           toolTracesError: "",
           toolTraceDetailError: "",
           auditLoadError: "",
           loadError: "",
           usageRequestVersion: 0,
+          balanceRequestVersion: 0,
           ledgerPageSize: ADMIN_LEDGER_PAGE_SIZE,
           ledgerMaxPages: ADMIN_LEDGER_MAX_PAGES,
           toolTracePage: 1,
@@ -165,6 +174,25 @@ if (!window.Vue) {
           auditRequestVersion: 0,
           toolTraceTotal: 0,
         },
+        profileCenter: {
+          balance: null,
+          entries: [],
+          total: 0,
+          limit: ADMIN_LEDGER_PAGE_SIZE,
+          offset: 0,
+          page_size: ADMIN_LEDGER_PAGE_SIZE,
+          max_pages: ADMIN_LEDGER_MAX_PAGES,
+          settings: {},
+        },
+        profileBalancePage: 1,
+        profileBalanceLoading: false,
+        profileBalanceError: "",
+        profileBalanceRequestVersion: 0,
+        profileRechargeForm: {
+          amountYuan: 20,
+          note: "",
+        },
+        profileRechargeLoading: false,
         profiles: [],
         jobs: [],
         matches: [],
@@ -243,6 +271,11 @@ if (!window.Vue) {
       /** 工作台只在工作台 URL 展示；后台和登录页不再靠 activeView 混在一起。 */
       showWorkspaceSurface() {
         return this.page === "workspace" && this.auth.authenticated && this.activeView === "workspace";
+      },
+
+      /** 个人中心页面在 /profile 展示，余额与充值入口和工作台分离。 */
+      showProfileSurface() {
+        return this.page === "profile" && this.auth.authenticated && this.activeView === "profile";
       },
 
       /** 后台只在 /admin 展示，权限由启动时的 Session 检查负责兜底。 */
@@ -362,14 +395,15 @@ if (!window.Vue) {
 
       /** 侧边栏展示的后台模块；数值用于快速识别当前模块的数据量。 */
       adminNavigationItems() {
+        const billingSummary = this.admin.billing?.summary || {};
         return [
           {
             key: "usage",
             short: "用量",
             title: "用量与账号",
-            description: "账号与 Token 用量",
+            description: "账号与余额账本",
             count: this.admin.accounts.length,
-            badge: `${(this.admin.billing?.summary?.total_billable_tokens ?? this.admin.summary.billable_tokens) || 0} Token`,
+            badge: `${this.formatYuanAmount(billingSummary.total_balance_micro_yuan || 0)} 余额`,
           },
           {
             key: "observability",
@@ -402,7 +436,7 @@ if (!window.Vue) {
       /** 当前后台模块的简短说明。 */
       adminSectionDescription() {
         return {
-          usage: "先看账号，再看配额状态、Token 明细和后台任务入口。",
+          usage: "先看账号，再看余额状态、Token、余额流水和工具调用。",
           observability: "看请求量、错误分布、限流与 CSRF 拦截。",
           audit: "记录状态变更、会话操作和系统探针。",
         }[this.admin.activeSection] || "后台管理";
@@ -440,12 +474,12 @@ if (!window.Vue) {
         return [
           { label: "账号数", value: this.admin.accounts.length, hint: "后台可见" },
           {
-            label: "可计费 Token",
-            value: (billingSummary.total_billable_tokens ?? this.admin.summary.billable_tokens) || 0,
-            hint: "账单投影",
+            label: "总余额",
+            value: this.formatYuanAmount(billingSummary.total_balance_micro_yuan || 0),
+            hint: "余额账本",
           },
-          { label: "预警账号", value: billingSummary.warning_account_count || 0, hint: "接近配额" },
-          { label: "超额账号", value: billingSummary.over_quota_account_count || 0, hint: "需要处理" },
+          { label: "低余额账号", value: billingSummary.low_balance_account_count || 0, hint: "需要充值" },
+          { label: "停用账号", value: billingSummary.suspended_account_count || 0, hint: "余额耗尽或禁用" },
         ];
       },
 
@@ -604,6 +638,7 @@ if (!window.Vue) {
         if (!app) return;
         app.classList.toggle("auth-page", this.page === "auth" && !authenticated);
         app.classList.toggle("workspace-page", this.page === "workspace");
+        app.classList.toggle("profile-page", this.page === "profile");
         app.classList.toggle("admin-page", this.page === "admin");
       },
 
@@ -642,6 +677,11 @@ if (!window.Vue) {
         this.navigateTo(FRONTEND_ROUTES.workspace);
       },
 
+      /** 从工作台或后台进入个人中心。 */
+      goProfile() {
+        this.navigateTo(FRONTEND_ROUTES.profile);
+      },
+
       /** 返回当前账号档案列表中的展示序号，不替代后端真实候选人 ID。 */
       profileDisplayNumber(profileId) {
         const index = this.profiles.findIndex((profile) => profile.id === profileId);
@@ -654,9 +694,11 @@ if (!window.Vue) {
           const data = await this.requestJson("/api/auth/me");
           this.auth.authenticated = Boolean(data.authenticated);
           this.auth.account = data.account || null;
+          this.auth.billing = data.billing || null;
         } catch (error) {
           this.auth.authenticated = false;
           this.auth.account = null;
+          this.auth.billing = null;
           // 初始化探测失败不等同于登录失败，避免刷新页面时提前显示错误框。
         }
         this.authChecked = true;
@@ -677,8 +719,13 @@ if (!window.Vue) {
           }
           this.activeView = "admin";
           this.admin.activeSection = "usage";
-          this.admin.activeDetailTab = "tokens";
+          this.admin.activeDetailTab = "balance";
           await this.loadAdminData();
+          return;
+        }
+        if (this.page === "profile") {
+          this.activeView = "profile";
+          await this.loadProfileCenter();
           return;
         }
         this.activeView = "workspace";
@@ -820,6 +867,7 @@ if (!window.Vue) {
         }
         this.auth.authenticated = false;
         this.auth.account = null;
+        this.auth.billing = null;
         this.activeView = "workspace";
         this.messages = [];
         this.profiles = [];
@@ -841,6 +889,7 @@ if (!window.Vue) {
         }
         this.auth.authenticated = false;
         this.auth.account = null;
+        this.auth.billing = null;
         this.activeView = "workspace";
         this.messages = [];
         this.profiles = [];
@@ -859,8 +908,13 @@ if (!window.Vue) {
           return;
         }
         this.admin.activeSection = "usage";
-        this.admin.activeDetailTab = "tokens";
+        this.admin.activeDetailTab = "balance";
         this.navigateTo(FRONTEND_ROUTES.admin);
+      },
+
+      /** 打开个人中心。 */
+      openProfile() {
+        this.navigateTo(FRONTEND_ROUTES.profile);
       },
 
       /** 切换后台左侧菜单，不重新洗牌数据，只改变主内容区。 */
@@ -919,6 +973,11 @@ if (!window.Vue) {
         }
       },
 
+      /** 读取个人中心的余额账本页面。 */
+      async loadProfileCenter() {
+        await this.loadMyBalance(1);
+      },
+
       /** 独立加载管理操作审计，避免审计接口异常影响账号和 Token 面板。 */
       async loadAdminAuditEvents() {
         const requestVersion = this.admin.auditRequestVersion + 1;
@@ -953,8 +1012,10 @@ if (!window.Vue) {
         this.admin.selectedToolTraceId = "";
         this.admin.toolTraceDetail = null;
         this.admin.usagePage = 1;
+        this.admin.balancePage = 1;
         this.admin.toolTracePage = 1;
         this.admin.eventsError = "";
+        this.admin.balanceEventsError = "";
         this.admin.toolTracesError = "";
         this.admin.toolTraceDetailError = "";
         await this.loadAdminActiveDetail(selectedAccountId);
@@ -974,14 +1035,19 @@ if (!window.Vue) {
         this.admin.events = [];
         this.admin.usageTotal = 0;
         this.admin.usagePage = 1;
+        this.admin.balanceEvents = [];
+        this.admin.balanceTotal = 0;
+        this.admin.balancePage = 1;
         this.admin.toolTraces = [];
         this.admin.selectedToolTraceId = "";
         this.admin.toolTraceDetail = null;
         this.admin.toolTracePage = 1;
         this.admin.eventsError = "";
+        this.admin.balanceEventsError = "";
         this.admin.toolTracesError = "";
         this.admin.toolTraceDetailError = "";
         this.admin.loadingEvents = false;
+        this.admin.loadingBalanceEvents = false;
         this.admin.loadingToolTraces = false;
         this.admin.loadingToolTraceDetail = false;
         this.admin.toolTraceTotal = 0;
@@ -991,6 +1057,8 @@ if (!window.Vue) {
       async loadAdminActiveDetail(accountId = this.admin.selectedAccountId) {
         if (this.admin.activeDetailTab === "tools") {
           await this.loadAdminToolTraces(accountId, this.admin.toolTracePage);
+        } else if (this.admin.activeDetailTab === "balance") {
+          await this.loadAdminBalanceEvents(accountId, this.admin.balancePage);
         } else {
           await this.loadAdminUsageEvents(accountId, this.admin.usagePage);
         }
@@ -998,10 +1066,58 @@ if (!window.Vue) {
 
       /** 切换账号详情标签；只加载当前用户正在看的数据。 */
       async setAdminDetailTab(tab) {
-        if (!["tokens", "tools"].includes(tab)) return;
+        if (!["tokens", "balance", "tools"].includes(tab)) return;
         if (this.admin.activeDetailTab === tab) return;
         this.admin.activeDetailTab = tab;
         await this.loadAdminActiveDetail();
+      },
+
+      /** 使用已有 account_id 查询参数按页读取单个账号的余额流水。 */
+      async loadAdminBalanceEvents(accountId = this.admin.selectedAccountId, page = this.admin.balancePage) {
+        const selectedAccountId = Number(accountId);
+        if (!Number.isInteger(selectedAccountId) || selectedAccountId <= 0) return;
+        const requestedPage = Math.max(1, Math.floor(Number(page) || 1));
+        const pageSize = Math.max(1, Number(this.admin.ledgerPageSize || ADMIN_LEDGER_PAGE_SIZE));
+
+        const requestVersion = this.admin.balanceRequestVersion + 1;
+        this.admin.balanceRequestVersion = requestVersion;
+        this.admin.loadingBalanceEvents = true;
+        this.admin.balanceEventsError = "";
+        this.admin.balancePage = requestedPage;
+        try {
+          const data = await this.requestJson(
+            `/api/admin/balance/events?account_id=${encodeURIComponent(selectedAccountId)}&limit=${encodeURIComponent(pageSize)}&offset=${encodeURIComponent((requestedPage - 1) * pageSize)}`
+          );
+          if (
+            requestVersion !== this.admin.balanceRequestVersion ||
+            !this.isAdminAccountSelected(selectedAccountId)
+          ) {
+            return;
+          }
+          const total = Number(data.total || 0);
+          const pageCount = this.adminLedgerPageCount(total);
+          if (pageCount > 0 && requestedPage > pageCount) {
+            await this.loadAdminBalanceEvents(selectedAccountId, pageCount);
+            return;
+          }
+          this.admin.balanceEvents = data.entries || [];
+          this.admin.balanceTotal = total;
+          this.admin.balancePage = pageCount > 0 ? requestedPage : 1;
+        } catch (error) {
+          if (
+            requestVersion !== this.admin.balanceRequestVersion ||
+            !this.isAdminAccountSelected(selectedAccountId)
+          ) {
+            return;
+          }
+          this.admin.balanceEvents = [];
+          this.admin.balanceTotal = 0;
+          this.admin.balanceEventsError = error.message || "余额流水加载失败，请稍后重试。";
+        } finally {
+          if (requestVersion === this.admin.balanceRequestVersion) {
+            this.admin.loadingBalanceEvents = false;
+          }
+        }
       },
 
       /** 使用已有 account_id 查询参数按页读取单个账号的 Token 流水。 */
@@ -1198,32 +1314,91 @@ if (!window.Vue) {
       },
 
       /** 返回指定账号的账单投影行。 */
-      accountBillingSummary(accountId) {
+      accountBalanceProjection(accountId) {
         return (this.admin.billing?.by_account || []).find(
           (entry) => Number(entry.account_id) === Number(accountId)
         ) || null;
       },
 
+      /** 返回指定账号的余额账本投影行。 */
+      accountBalanceSummary(accountId) {
+        return this.accountBalanceProjection(accountId);
+      },
+
+      /** 把微元金额格式化成元展示字符串。 */
+      formatYuanAmount(microYuan) {
+        const value = Number(microYuan || 0) / 1_000_000;
+        return value.toLocaleString("zh-CN", { maximumFractionDigits: 6 });
+      },
+
+      /** 把微元金额格式化成带正负号的账本金额。 */
+      formatLedgerYuanAmount(microYuan) {
+        const value = Number(microYuan || 0) / 1_000_000;
+        const sign = value >= 0 ? "+" : "-";
+        return `${sign}${Math.abs(value).toLocaleString("zh-CN", { maximumFractionDigits: 6 })}`;
+      },
+
       /** 返回指定账号的账单状态标签。 */
       accountBillingStateLabel(accountId) {
-        return this.accountBillingSummary(accountId)?.state_label || "未配置配额";
+        return this.accountBalanceSummary(accountId)?.state_label || "余额";
       },
 
       /** 返回指定账号的账单状态 class。 */
       accountBillingStateClass(accountId) {
         return {
-          healthy: "is-healthy",
-          warning: "is-warning",
-          over_quota: "is-over-quota",
-          unlimited: "is-unlimited",
-        }[this.accountBillingSummary(accountId)?.state || "unlimited"] || "is-unlimited";
+          balance: "is-balance",
+          low_balance: "is-low-balance",
+          suspended: "is-suspended",
+        }[this.accountBalanceSummary(accountId)?.state || "balance"] || "is-balance";
+      },
+
+      /** 个人中心使用当前账号自己的余额摘要，不依赖管理员投影。 */
+      profileBalanceStateClass() {
+        return {
+          balance: "is-balance",
+          low_balance: "is-low-balance",
+          suspended: "is-suspended",
+        }[this.profileCenter.balance?.state || "balance"] || "is-balance";
       },
 
       /** 返回指定账号的剩余额度文本。 */
       accountBillingRemainingLabel(accountId) {
-        const item = this.accountBillingSummary(accountId);
-        if (!item || item.quota_tokens === null) return "未配置配额";
-        return `剩余 ${item.remaining_tokens || 0} Token`;
+        const item = this.accountBalanceSummary(accountId);
+        if (!item) return "余额未知";
+        return `余额 ${this.formatYuanAmount(item.balance_micro_yuan)} 元`;
+      },
+
+      /** 返回指定账号的总充值金额。 */
+      accountBalanceRechargeLabel(accountId) {
+        const item = this.accountBalanceSummary(accountId);
+        return item ? `充值 ${this.formatYuanAmount(item.total_recharge_micro_yuan)} 元` : "充值未知";
+      },
+
+      /** 返回指定账号的总消费金额。 */
+      accountBalanceConsumedLabel(accountId) {
+        const item = this.accountBalanceSummary(accountId);
+        return item ? `消费 ${this.formatYuanAmount(item.total_consumed_micro_yuan)} 元` : "消费未知";
+      },
+
+      /** 返回指定账号的余额流水条数。 */
+      accountBalanceLedgerCount(accountId) {
+        return this.accountBalanceSummary(accountId)?.ledger_entry_count || 0;
+      },
+
+      /** 余额账本里的流水类型标签。 */
+      balanceLedgerKindLabel(kind) {
+        return {
+          initial_credit: "初始化",
+          recharge: "充值",
+          consumption: "扣费",
+          adjustment: "调整",
+        }[kind] || kind || "记录";
+      },
+
+      /** 单条余额流水的金额标签。 */
+      balanceLedgerAmountLabel(entry) {
+        if (!entry) return "-";
+        return `${this.formatLedgerYuanAmount(entry.amount_micro_yuan)} 元`;
       },
 
       /** 管理端审计中把账号 ID 转成人能读的标签；账号已删除时保留 ID。 */
@@ -1276,6 +1451,80 @@ if (!window.Vue) {
         }
         const pageSize = Math.max(1, Number(this.admin.ledgerPageSize || ADMIN_LEDGER_PAGE_SIZE));
         return `每页 ${pageSize} 条 · 共 ${pageCount} 页`;
+      },
+
+      /** 读取个人中心的余额流水分页。 */
+      async loadMyBalance(page = this.profileBalancePage) {
+        const requestedPage = Math.max(1, Math.floor(Number(page) || 1));
+        const pageSize = Math.max(1, Number(this.profileCenter.limit || ADMIN_LEDGER_PAGE_SIZE));
+        const requestVersion = this.profileBalanceRequestVersion + 1;
+        this.profileBalanceRequestVersion = requestVersion;
+        this.profileBalanceLoading = true;
+        this.profileBalanceError = "";
+        this.profileBalancePage = requestedPage;
+        try {
+          const data = await this.requestJson(
+            `/api/me/balance?limit=${encodeURIComponent(pageSize)}&offset=${encodeURIComponent((requestedPage - 1) * pageSize)}`
+          );
+          if (requestVersion !== this.profileBalanceRequestVersion) return;
+          const total = Number(data.total || 0);
+          const pageCount = this.adminLedgerPageCount(total);
+          if (pageCount > 0 && requestedPage > pageCount) {
+            await this.loadMyBalance(pageCount);
+            return;
+          }
+          this.profileCenter = {
+            balance: data.summary || null,
+            entries: data.entries || [],
+            total,
+            limit: Number(data.limit || pageSize),
+            offset: Number(data.offset || 0),
+            page_size: Number(data.page_size || pageSize),
+            max_pages: Number(data.max_pages || ADMIN_LEDGER_MAX_PAGES),
+            settings: data.settings || {},
+          };
+          this.profileBalancePage = pageCount > 0 ? requestedPage : 1;
+        } catch (error) {
+          if (requestVersion !== this.profileBalanceRequestVersion) return;
+          this.profileCenter.entries = [];
+          this.profileCenter.total = 0;
+          this.profileBalanceError = error.message || "余额流水加载失败，请稍后重试。";
+        } finally {
+          if (requestVersion === this.profileBalanceRequestVersion) {
+            this.profileBalanceLoading = false;
+          }
+        }
+      },
+
+      /** 个人中心里的余额分页跳转。 */
+      async selectProfileBalancePage(page) {
+        await this.loadMyBalance(page);
+      },
+
+      /** 个人中心里的模拟充值。 */
+      async rechargeMyBalance() {
+        const amountYuan = Number(this.profileRechargeForm.amountYuan);
+        if (!Number.isFinite(amountYuan) || amountYuan <= 0) {
+          this.profileBalanceError = "请输入大于 0 的充值金额。";
+          return;
+        }
+        this.profileRechargeLoading = true;
+        this.profileBalanceError = "";
+        try {
+          await this.requestJson("/api/me/balance/recharge", {
+            method: "POST",
+            body: JSON.stringify({
+              amount_yuan: amountYuan,
+              note: String(this.profileRechargeForm.note || "").trim() || undefined,
+            }),
+          });
+          this.profileRechargeForm.note = "";
+          await this.loadMyBalance(this.profileBalancePage);
+        } catch (error) {
+          this.profileBalanceError = error.message || "充值失败，请稍后重试。";
+        } finally {
+          this.profileRechargeLoading = false;
+        }
       },
 
       /** 把带 count 的对象行转换成按数量降序的可展示数组。 */

@@ -25,6 +25,7 @@ from .deduplication import (
 from .job_parser import classify_skill_requirements, parse_job_text, validate_job_text
 from .models import (
     AccountRecord,
+    AccountBalanceSummary,
     AdminAuditEventRecord,
     AuthSessionRecord,
     BackgroundTaskRecord,
@@ -41,12 +42,14 @@ from .models import (
     ResumeDraft,
     ResumeDraftRecord,
     SkillRequirement,
+    BalanceLedgerRecord,
     ToolCallTraceRecord,
     UsageEventRecord,
     sanitize_preference_weights,
 )
 from .profile_mutation import apply_candidate_profile_patch
 from .admin_ledger import ADMIN_LEDGER_MAX_RECORDS
+from .config import BillingSettings
 from .skill_normalization import normalize_skill_mapping
 
 RESUME_ARTIFACT_STATUSES = {"ready", "processing", "failed"}
@@ -87,6 +90,11 @@ class RepositoryConnection(Protocol):
 class RepositoryStore:
     """封装领域读写逻辑；连接、事务和 schema 由具体数据库适配层负责。"""
 
+    def __init__(self) -> None:
+        """初始化默认计费参数。"""
+
+        self._billing_settings = BillingSettings()
+
     def connect(self) -> RepositoryConnection:
         """返回一次短生命周期事务连接。"""
 
@@ -96,6 +104,16 @@ class RepositoryStore:
         """确认数据库已经由 Alembic 管理并完成迁移。"""
 
         raise NotImplementedError
+
+    def configure_billing(self, settings: BillingSettings) -> None:
+        """覆盖默认计费参数。"""
+
+        self._billing_settings = settings
+
+    def billing_settings(self) -> BillingSettings:
+        """返回当前计费参数。"""
+
+        return self._billing_settings
     # 账号、Session、会话和用量流水
     # ------------------------------------------------------------------
 
@@ -135,6 +153,7 @@ class RepositoryStore:
                 ),
             )
             account_id = int(cursor.lastrowid)
+            self._ensure_account_billing_row(conn, account_id)
         return self.get_account(account_id)
 
     def get_account(self, account_id: int) -> AccountRecord:
@@ -267,6 +286,576 @@ class RepositoryStore:
             if cursor.rowcount == 0:
                 raise KeyError(f"Account not found: {account_id}")
         return self.get_account(account_id)
+
+    def assert_account_can_spend(self, account_id: int) -> None:
+        """确认账号仍可进行模型调用；余额停用或手动禁用时抛出错误。"""
+
+        self.get_account(account_id)
+        summary = self.get_account_balance_summary(account_id)
+        if summary.state == "suspended":
+            account = self.get_account(account_id)
+            if account.status != "active":
+                raise ValueError("账号已停用，请联系管理员。")
+            raise ValueError("余额不足，请先充值。")
+
+    def get_account_balance_summary(self, account_id: int) -> AccountBalanceSummary:
+        """读取单个账号的余额与消费汇总，必要时自动补初始化余额。"""
+
+        account = self.get_account(account_id)
+        with self.connect() as conn:
+            self._ensure_account_billing_row(conn, account_id)
+            row = conn.execute(
+                """
+                SELECT
+                    account_id,
+                    balance_micro_yuan,
+                    total_recharge_micro_yuan,
+                    total_consumed_micro_yuan,
+                    low_balance_threshold_micro_yuan
+                FROM account_balances
+                WHERE account_id = ?
+                """,
+                (account_id,),
+            ).fetchone()
+            ledger_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM account_balance_ledger WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Account balance not found: {account_id}")
+        return AccountBalanceSummary(
+            account_id=account_id,
+            balance_micro_yuan=int(row["balance_micro_yuan"]),
+            total_recharge_micro_yuan=int(row["total_recharge_micro_yuan"]),
+            total_consumed_micro_yuan=int(row["total_consumed_micro_yuan"]),
+            ledger_entry_count=int(ledger_count["count"]),
+            low_balance_threshold_micro_yuan=int(row["low_balance_threshold_micro_yuan"]),
+            state=self._balance_state_value(
+                int(row["balance_micro_yuan"]),
+                int(row["low_balance_threshold_micro_yuan"]),
+                account.status,
+            ),
+            state_label=self._balance_state_label(
+                int(row["balance_micro_yuan"]),
+                int(row["low_balance_threshold_micro_yuan"]),
+                account.status,
+            ),
+        )
+
+    def get_account_balance_row(self, account_id: int) -> dict[str, object]:
+        """读取单个账号的原始余额行和派生状态。"""
+
+        summary = self.get_account_balance_summary(account_id)
+        account = self.get_account(account_id)
+        return {
+            "account_id": summary.account_id,
+            "balance_micro_yuan": summary.balance_micro_yuan,
+            "total_recharge_micro_yuan": summary.total_recharge_micro_yuan,
+            "total_consumed_micro_yuan": summary.total_consumed_micro_yuan,
+            "ledger_entry_count": summary.ledger_entry_count,
+            "low_balance_threshold_micro_yuan": summary.low_balance_threshold_micro_yuan,
+            "state": self._balance_state_value(
+                summary.balance_micro_yuan,
+                summary.low_balance_threshold_micro_yuan,
+                account.status,
+            ),
+            "state_label": self._balance_state_label(
+                summary.balance_micro_yuan,
+                summary.low_balance_threshold_micro_yuan,
+                account.status,
+            ),
+        }
+
+    def summarize_account_balances(self) -> list[dict[str, object]]:
+        """按账号汇总余额、充值和消费情况。"""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    b.account_id,
+                    b.balance_micro_yuan,
+                    b.total_recharge_micro_yuan,
+                    b.total_consumed_micro_yuan,
+                    b.low_balance_threshold_micro_yuan,
+                    COALESCE(l.ledger_entry_count, 0) AS ledger_entry_count
+                FROM account_balances b
+                LEFT JOIN (
+                    SELECT account_id, COUNT(*) AS ledger_entry_count
+                    FROM account_balance_ledger
+                    GROUP BY account_id
+                ) AS l ON l.account_id = b.account_id
+                ORDER BY b.account_id
+                """
+            ).fetchall()
+        results: list[dict[str, object]] = []
+        for row in rows:
+            account = self.get_account(int(row["account_id"]))
+            balance_micro_yuan = int(row["balance_micro_yuan"])
+            low_balance_threshold_micro_yuan = int(row["low_balance_threshold_micro_yuan"])
+            results.append(
+                {
+                    "account_id": int(row["account_id"]),
+                    "balance_micro_yuan": balance_micro_yuan,
+                    "total_recharge_micro_yuan": int(row["total_recharge_micro_yuan"]),
+                    "total_consumed_micro_yuan": int(row["total_consumed_micro_yuan"]),
+                    "ledger_entry_count": int(row["ledger_entry_count"]),
+                    "low_balance_threshold_micro_yuan": low_balance_threshold_micro_yuan,
+                    "state": self._balance_state_value(
+                        balance_micro_yuan,
+                        low_balance_threshold_micro_yuan,
+                        account.status,
+                    ),
+                    "state_label": self._balance_state_label(
+                        balance_micro_yuan,
+                        low_balance_threshold_micro_yuan,
+                        account.status,
+                    ),
+                }
+            )
+        return results
+
+    def recharge_account_balance(
+        self,
+        account_id: int,
+        amount_yuan: float,
+        *,
+        summary: str | None = None,
+        source_reference: str | None = None,
+        details: dict[str, object] | None = None,
+    ) -> BalanceLedgerRecord:
+        """给账号充值，并写入一条余额流水。"""
+
+        if amount_yuan <= 0:
+            raise ValueError("充值金额必须大于 0。")
+        self.get_account(account_id)
+        amount_micro_yuan = self._yuan_to_micro_yuan(amount_yuan)
+        if amount_micro_yuan <= 0:
+            raise ValueError("充值金额不能低于 0.000001 元。")
+        with self.connect() as conn:
+            self._ensure_account_billing_row(conn, account_id)
+            ledger_reference = source_reference or f"recharge:{uuid4().hex}"
+            existing_row = conn.execute(
+                """
+                SELECT * FROM account_balance_ledger
+                WHERE account_id = ? AND source_reference = ?
+                """,
+                (account_id, ledger_reference),
+            ).fetchone()
+            if existing_row is not None:
+                return self._balance_ledger_from_row(existing_row)
+            balance_row = self._lock_account_billing_row(conn, account_id)
+            if balance_row is None:
+                raise KeyError(f"Account balance not found: {account_id}")
+            before = int(balance_row["balance_micro_yuan"])
+            after = before + amount_micro_yuan
+            now = now_iso()
+            conn.execute(
+                """
+                UPDATE account_balances
+                SET balance_micro_yuan = ?, total_recharge_micro_yuan = total_recharge_micro_yuan + ?,
+                    updated_at = ?
+                WHERE account_id = ?
+                """,
+                (after, amount_micro_yuan, now, account_id),
+            )
+            payload = {
+                **(details or {}),
+                "amount_yuan": amount_yuan,
+            }
+            conn.execute(
+                """
+                INSERT INTO account_balance_ledger (
+                    account_id, entry_kind, amount_micro_yuan, balance_before_micro_yuan,
+                    balance_after_micro_yuan, token_count, price_per_million_tokens_yuan,
+                    source_reference, summary, details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (source_reference) DO NOTHING
+                """,
+                (
+                    account_id,
+                    "recharge",
+                    amount_micro_yuan,
+                    before,
+                    after,
+                    None,
+                    None,
+                    ledger_reference,
+                    summary or "用户充值",
+                    json.dumps(payload, ensure_ascii=False),
+                    now,
+                ),
+            )
+            self._prune_account_balance_ledger_for_account(
+                conn,
+                account_id,
+                max_records=ADMIN_LEDGER_MAX_RECORDS,
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM account_balance_ledger
+                WHERE source_reference = ? AND account_id = ?
+                """,
+                (ledger_reference, account_id),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("充值流水写入失败。")
+        return self._balance_ledger_from_row(row)
+
+    def list_account_balance_ledger(
+        self,
+        account_id: int | None = None,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[BalanceLedgerRecord]:
+        """分页列出余额流水。"""
+
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            parameters.append(account_id)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        parameters.extend([max(1, min(limit, ADMIN_LEDGER_MAX_RECORDS)), max(0, int(offset))])
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM account_balance_ledger{where}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                tuple(parameters),
+            ).fetchall()
+        return [self._balance_ledger_from_row(row) for row in rows]
+
+    def count_account_balance_ledger(
+        self,
+        account_id: int | None = None,
+    ) -> int:
+        """返回余额流水数量。"""
+
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            parameters.append(account_id)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM account_balance_ledger{where}",
+                tuple(parameters),
+            ).fetchone()
+        return int(row["count"])
+
+    def summarize_balance_ledger_by_account(self) -> list[dict[str, int]]:
+        """按账号汇总余额流水数量与金额。"""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    account_id,
+                    COALESCE(SUM(CASE WHEN entry_kind = 'recharge' THEN amount_micro_yuan ELSE 0 END), 0)
+                        AS total_recharge_micro_yuan,
+                    COALESCE(SUM(CASE WHEN entry_kind = 'consumption' THEN -amount_micro_yuan ELSE 0 END), 0)
+                        AS total_consumed_micro_yuan,
+                    COUNT(*) AS entry_count
+                FROM account_balance_ledger
+                GROUP BY account_id
+                ORDER BY account_id
+                """
+            ).fetchall()
+        return [{key: int(row[key]) for key in row} for row in rows]
+
+    def prune_account_balance_ledger_to_limit(
+        self,
+        account_id: int | None = None,
+        *,
+        max_records: int = ADMIN_LEDGER_MAX_RECORDS,
+    ) -> int:
+        """删除超出分页保留窗口的余额流水。"""
+
+        retain = max(1, int(max_records))
+        with self.connect() as conn:
+            if account_id is not None:
+                return self._prune_account_balance_ledger_for_account(
+                    conn,
+                    int(account_id),
+                    max_records=retain,
+                )
+            rows = conn.execute("SELECT DISTINCT account_id FROM account_balance_ledger").fetchall()
+            deleted = 0
+            for row in rows:
+                deleted += self._prune_account_balance_ledger_for_account(
+                    conn,
+                    int(row["account_id"]),
+                    max_records=retain,
+                )
+            return deleted
+
+    def _ensure_account_billing_row(self, conn: RepositoryConnection, account_id: int) -> None:
+        """确保账号拥有余额摘要行；首次创建时会写入初始化余额流水。"""
+
+        row = conn.execute(
+            "SELECT * FROM account_balances WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+        settings = self.billing_settings()
+        threshold_micro_yuan = self._yuan_to_micro_yuan(settings.low_balance_threshold_yuan)
+        if row is None:
+            starting_balance_micro_yuan = self._yuan_to_micro_yuan(settings.starting_balance_yuan)
+            now = now_iso()
+            conn.execute(
+                """
+                INSERT INTO account_balances (
+                    account_id, balance_micro_yuan, total_recharge_micro_yuan,
+                    total_consumed_micro_yuan, low_balance_threshold_micro_yuan,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                RETURNING account_id
+                """,
+                (
+                    account_id,
+                    starting_balance_micro_yuan,
+                    starting_balance_micro_yuan,
+                    0,
+                    threshold_micro_yuan,
+                    now,
+                    now,
+                ),
+            )
+            if starting_balance_micro_yuan > 0:
+                self._insert_balance_ledger_entry(
+                    conn,
+                    account_id=account_id,
+                    entry_kind="initial_credit",
+                    amount_micro_yuan=starting_balance_micro_yuan,
+                    balance_before_micro_yuan=0,
+                    balance_after_micro_yuan=starting_balance_micro_yuan,
+                    token_count=None,
+                    price_per_million_tokens_yuan=settings.price_per_million_tokens_yuan,
+                    source_reference=f"initial-credit:{account_id}",
+                    summary="系统初始化余额",
+                    details={"initial_balance_yuan": settings.starting_balance_yuan},
+                    created_at=now,
+                )
+            return
+        if int(row["low_balance_threshold_micro_yuan"]) != threshold_micro_yuan:
+            conn.execute(
+                """
+                UPDATE account_balances
+                SET low_balance_threshold_micro_yuan = ?, updated_at = ?
+                WHERE account_id = ?
+                """,
+                (threshold_micro_yuan, now_iso(), account_id),
+            )
+
+    def _lock_account_billing_row(
+        self,
+        conn: RepositoryConnection,
+        account_id: int,
+    ) -> RepositoryRow | None:
+        """按账号锁定余额摘要行。"""
+
+        return conn.execute(
+            "SELECT * FROM account_balances WHERE account_id = ? FOR UPDATE",
+            (account_id,),
+        ).fetchone()
+
+    def _insert_balance_ledger_entry(
+        self,
+        conn: RepositoryConnection,
+        *,
+        account_id: int,
+        entry_kind: str,
+        amount_micro_yuan: int,
+        balance_before_micro_yuan: int,
+        balance_after_micro_yuan: int,
+        token_count: int | None,
+        price_per_million_tokens_yuan: float | None,
+        source_reference: str | None,
+        summary: str,
+        details: dict[str, object] | None,
+        created_at: str,
+    ) -> None:
+        """在已有事务连接里写入一条余额流水。"""
+
+        conn.execute(
+            """
+            INSERT INTO account_balance_ledger (
+                account_id, entry_kind, amount_micro_yuan, balance_before_micro_yuan,
+                balance_after_micro_yuan, token_count, price_per_million_tokens_yuan,
+                source_reference, summary, details_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (source_reference) DO NOTHING
+            """,
+            (
+                account_id,
+                entry_kind,
+                amount_micro_yuan,
+                balance_before_micro_yuan,
+                balance_after_micro_yuan,
+                token_count,
+                price_per_million_tokens_yuan,
+                source_reference,
+                summary,
+                json.dumps(details or {}, ensure_ascii=False),
+                created_at,
+            ),
+        )
+
+    def _record_balance_consumption(
+        self,
+        conn: RepositoryConnection,
+        *,
+        account_id: int,
+        call_id: str,
+        operation: str,
+        total_tokens: int,
+        created_at: str,
+    ) -> None:
+        """把一次真实模型调用换算成余额扣减流水。"""
+
+        settings = self.billing_settings()
+        if total_tokens <= 0:
+            return
+        if conn.execute(
+            """
+            SELECT 1 FROM account_balance_ledger
+            WHERE account_id = ? AND source_reference = ?
+            """,
+            (account_id, call_id),
+        ).fetchone() is not None:
+            return
+        balance_row = self._lock_account_billing_row(conn, account_id)
+        if balance_row is None:
+            self._ensure_account_billing_row(conn, account_id)
+            balance_row = self._lock_account_billing_row(conn, account_id)
+        if balance_row is None:
+            raise KeyError(f"Account balance not found: {account_id}")
+        before = int(balance_row["balance_micro_yuan"])
+        price = settings.price_per_million_tokens_yuan
+        cost_micro_yuan = int(round(total_tokens * price))
+        after = before - cost_micro_yuan
+        now = created_at
+        conn.execute(
+            """
+            UPDATE account_balances
+            SET balance_micro_yuan = ?, total_consumed_micro_yuan = total_consumed_micro_yuan + ?,
+                updated_at = ?
+            WHERE account_id = ?
+            """,
+            (after, cost_micro_yuan, now, account_id),
+        )
+        self._insert_balance_ledger_entry(
+            conn,
+            account_id=account_id,
+            entry_kind="consumption",
+            amount_micro_yuan=-cost_micro_yuan,
+            balance_before_micro_yuan=before,
+            balance_after_micro_yuan=after,
+            token_count=total_tokens,
+            price_per_million_tokens_yuan=price,
+            source_reference=call_id,
+            summary=f"{operation} 扣费",
+            details={
+                "call_id": call_id,
+                "operation": operation,
+                "total_tokens": total_tokens,
+                "price_per_million_tokens_yuan": price,
+                "consumption_micro_yuan": cost_micro_yuan,
+            },
+            created_at=now,
+        )
+
+    def _prune_account_balance_ledger_for_account(
+        self,
+        conn: RepositoryConnection,
+        account_id: int,
+        *,
+        max_records: int = ADMIN_LEDGER_MAX_RECORDS,
+    ) -> int:
+        """保留某个账号最近的固定页数余额流水。"""
+
+        retain = max(1, int(max_records))
+        cursor = conn.execute(
+            """
+            DELETE FROM account_balance_ledger
+            WHERE account_id = ?
+              AND id NOT IN (
+                  SELECT id
+                  FROM account_balance_ledger
+                  WHERE account_id = ?
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT ?
+              )
+            """,
+            (account_id, account_id, retain),
+        )
+        return max(0, int(cursor.rowcount or 0))
+
+    def _balance_state_value(
+        self,
+        balance_micro_yuan: int,
+        low_balance_threshold_micro_yuan: int,
+        account_status: str,
+    ) -> str:
+        """把余额和账号状态压缩成前端稳定使用的状态值。"""
+
+        if account_status != "active":
+            return "suspended"
+        if balance_micro_yuan <= 0:
+            return "suspended"
+        if balance_micro_yuan <= low_balance_threshold_micro_yuan:
+            return "low_balance"
+        return "balance"
+
+    def _balance_state_label(
+        self,
+        balance_micro_yuan: int,
+        low_balance_threshold_micro_yuan: int,
+        account_status: str,
+    ) -> str:
+        """把余额状态转成更适合页面显示的中文标签。"""
+
+        state = self._balance_state_value(
+            balance_micro_yuan,
+            low_balance_threshold_micro_yuan,
+            account_status,
+        )
+        return {
+            "balance": "余额",
+            "low_balance": "低余额",
+            "suspended": "停用",
+        }[state]
+
+    def _yuan_to_micro_yuan(self, value: float) -> int:
+        """把元换算成微元，便于余额和计费统一存储。"""
+
+        return int(round(float(value) * 1_000_000))
+
+    def _balance_ledger_from_row(self, row: RepositoryRow) -> BalanceLedgerRecord:
+        """把余额流水行转换成领域对象。"""
+
+        return BalanceLedgerRecord(
+            id=int(row["id"]),
+            account_id=int(row["account_id"]),
+            entry_kind=str(row["entry_kind"]),
+            amount_micro_yuan=int(row["amount_micro_yuan"]),
+            balance_before_micro_yuan=int(row["balance_before_micro_yuan"]),
+            balance_after_micro_yuan=int(row["balance_after_micro_yuan"]),
+            token_count=int(row["token_count"]) if row["token_count"] is not None else None,
+            price_per_million_tokens_yuan=(
+                float(row["price_per_million_tokens_yuan"])
+                if row["price_per_million_tokens_yuan"] is not None
+                else None
+            ),
+            source_reference=row["source_reference"],
+            summary=str(row["summary"]),
+            details=_json_object(row["details_json"]),
+            created_at=str(row["created_at"]),
+        )
 
     def save_auth_session(
         self,
@@ -563,14 +1152,34 @@ class RepositoryStore:
                     event.pricing_version,
                 ),
             )
+            row = conn.execute(
+                "SELECT * FROM usage_events WHERE call_id = ?",
+                (event.call_id,),
+            ).fetchone()
+            if (
+                row is not None
+                and bool(row["billable"])
+                and row["usage_source"] == "provider"
+                and row["status"] == "succeeded"
+            ):
+                self._record_balance_consumption(
+                    conn,
+                    account_id=event.account_id,
+                    call_id=event.call_id,
+                    operation=event.operation,
+                    total_tokens=int(row["total_tokens"]),
+                    created_at=str(row["created_at"]),
+                )
+                self._prune_account_balance_ledger_for_account(
+                    conn,
+                    event.account_id,
+                    max_records=ADMIN_LEDGER_MAX_RECORDS,
+                )
             self._prune_usage_events_for_account(
                 conn,
                 event.account_id,
                 max_records=ADMIN_LEDGER_MAX_RECORDS,
             )
-            row = conn.execute(
-                "SELECT * FROM usage_events WHERE call_id = ?", (event.call_id,)
-            ).fetchone()
         if row is None:  # pragma: no cover - 仅在数据库异常时触发
             raise RuntimeError(f"Usage event was not persisted: {event.call_id}")
         return usage_event_from_row(row)

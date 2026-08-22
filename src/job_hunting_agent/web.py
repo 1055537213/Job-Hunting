@@ -53,9 +53,9 @@ from .auth import (
     verify_password,
 )
 from .billing_projection import (
-    billing_projection_to_dict,
-    billing_summary_to_dict,
-    project_account_billing,
+    balance_projection_to_dict,
+    balance_summary_to_dict,
+    project_account_balances,
 )
 from .config import (
     load_agent_memory_settings,
@@ -273,6 +273,13 @@ class ProjectCardConfirmationPayload(BaseModel):
     )
 
 
+class BalanceRechargePayload(BaseModel):
+    """个人中心余额充值表单。"""
+
+    amount_yuan: float = Field(gt=0)
+    note: str | None = None
+
+
 def create_web_app(
     env_file: str | Path = ".env",
     resume_dir: str | Path | None = None,
@@ -366,6 +373,7 @@ def create_web_app(
         """后台运维数据只保留固定分页窗口，并在管理员读取时补清旧数据。"""
 
         backend.store.prune_usage_events_to_limit()
+        backend.store.prune_account_balance_ledger_to_limit()
         backend.store.prune_tool_call_traces_to_limit()
 
     @web_app.post("/api/auth/register")
@@ -433,13 +441,16 @@ def create_web_app(
 
         account = current_account(request, required=False)
         csrf_token = None
+        billing_summary = None
         if account is not None:
             csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or new_csrf_token()
             set_csrf_cookie(response, csrf_token, secure=cookie_secure)
+            billing_summary = asdict(backend.store.get_account_balance_summary(account.id))
         return {
             "authenticated": account is not None,
             "account": asdict(account) if account else None,
             "csrf_token": csrf_token,
+            "billing": billing_summary,
         }
 
     @web_app.post("/api/auth/logout")
@@ -501,6 +512,12 @@ def create_web_app(
     @web_app.get("/workspace")
     def workspace_page() -> FileResponse:
         """求职工作台页面。"""
+
+        return frontend_shell()
+
+    @web_app.get("/profile")
+    def profile_page() -> FileResponse:
+        """个人中心页面。"""
 
         return frontend_shell()
 
@@ -1562,11 +1579,12 @@ def create_web_app(
         require_admin(request)
         prune_admin_retention_window()
         billing_settings = load_billing_settings(env_path)
-        billing_projections, billing_summary = project_account_billing(
+        balance_projections, balance_summary = project_account_balances(
             backend.store.list_accounts(),
-            backend.store.summarize_usage_by_account(),
-            quota_tokens=billing_settings.quota_tokens,
-            warning_ratio=billing_settings.warning_ratio,
+            backend.store.summarize_account_balances(),
+            price_per_million_tokens_yuan=billing_settings.price_per_million_tokens_yuan,
+            starting_balance_yuan=billing_settings.starting_balance_yuan,
+            low_balance_threshold_yuan=billing_settings.low_balance_threshold_yuan,
         )
         return {
             "summary": backend.store.summarize_usage(),
@@ -1574,14 +1592,81 @@ def create_web_app(
             "tool_calls_by_account": backend.store.summarize_tool_call_traces_by_account(),
             "billing": {
                 "settings": masked_billing_settings(billing_settings),
-                "summary": billing_summary_to_dict(billing_summary),
-                "by_account": [
-                    billing_projection_to_dict(projection)
-                    for projection in billing_projections
-                ],
+                "summary": balance_summary_to_dict(balance_summary),
+                "by_account": [balance_projection_to_dict(projection) for projection in balance_projections],
             },
             "page_size": ADMIN_LEDGER_PAGE_SIZE,
             "max_pages": ADMIN_LEDGER_MAX_PAGES,
+        }
+
+    @web_app.get("/api/admin/balance/events")
+    def admin_balance_events(
+        request: Request,
+        account_id: int | None = Query(default=None),
+        limit: int = Query(default=ADMIN_LEDGER_PAGE_SIZE, ge=1, le=ADMIN_LEDGER_PAGE_SIZE),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, object]:
+        """管理员分页查看账号余额与消费流水。"""
+
+        require_admin(request)
+        prune_admin_retention_window()
+        entries = backend.store.list_account_balance_ledger(
+            account_id,
+            limit=limit,
+            offset=offset,
+        )
+        total = backend.store.count_account_balance_ledger(account_id)
+        return {
+            "entries": [asdict(entry) for entry in entries],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "page_size": ADMIN_LEDGER_PAGE_SIZE,
+            "max_pages": ADMIN_LEDGER_MAX_PAGES,
+        }
+
+    @web_app.get("/api/me/balance")
+    def my_balance(
+        request: Request,
+        limit: int = Query(default=ADMIN_LEDGER_PAGE_SIZE, ge=1, le=ADMIN_LEDGER_PAGE_SIZE),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, object]:
+        """当前登录账号查看自己的余额与消费流水。"""
+
+        account = current_account(request)
+        prune_admin_retention_window()
+        summary = backend.store.get_account_balance_summary(account.id)
+        entries = backend.store.list_account_balance_ledger(account.id, limit=limit, offset=offset)
+        total = backend.store.count_account_balance_ledger(account.id)
+        return {
+            "summary": asdict(summary),
+            "entries": [asdict(entry) for entry in entries],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "page_size": ADMIN_LEDGER_PAGE_SIZE,
+            "max_pages": ADMIN_LEDGER_MAX_PAGES,
+            "settings": masked_billing_settings(load_billing_settings(env_path)),
+        }
+
+    @web_app.post("/api/me/balance/recharge")
+    def recharge_my_balance(payload: BalanceRechargePayload, request: Request) -> dict[str, object]:
+        """当前账号发起一次本地模拟充值。"""
+
+        account = current_account(request)
+        if load_web_security_settings(env_path).environment == "production":
+            raise HTTPException(status_code=503, detail="真实支付尚未接入，生产环境暂不开放模拟充值。")
+        try:
+            entry = backend.store.recharge_account_balance(
+                account.id,
+                payload.amount_yuan,
+                summary=payload.note or "个人中心充值",
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {
+            "entry": asdict(entry),
+            "summary": asdict(backend.store.get_account_balance_summary(account.id)),
         }
 
     @web_app.get("/api/admin/observability/requests")

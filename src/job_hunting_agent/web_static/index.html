@@ -130,6 +130,7 @@
         </button>
 
         <div class="topbar-actions">
+          <button class="nav-link" type="button" @click="openProfile">个人中心</button>
           <button v-if="auth.account && auth.account.role === 'admin'" class="nav-link" type="button" @click="openAdmin">后台</button>
           <span
             class="account-badge"
@@ -1058,6 +1059,147 @@
 
       </div>
 
+      <section v-if="showProfileSurface" class="profile-shell" aria-labelledby="profileCenterTitle">
+        <header class="profile-topbar">
+          <div class="profile-topbar-brand">
+            <button class="profile-topbar-mark" type="button" @click="goWorkspace" aria-label="返回工作台">JA</button>
+            <div>
+              <p class="eyebrow">Account Center</p>
+              <h1 id="profileCenterTitle">个人中心</h1>
+            </div>
+          </div>
+          <div class="profile-topbar-actions">
+            <span class="profile-account-label">{{ auth.account?.display_name || auth.account?.email || "账号" }}</span>
+            <button class="ghost-button compact" type="button" @click="goWorkspace">回到工作台</button>
+            <button v-if="auth.account && auth.account.role === 'admin'" class="ghost-button compact" type="button" @click="openAdmin">后台</button>
+            <button class="ghost-button compact" type="button" @click="logout">退出登录</button>
+          </div>
+        </header>
+
+        <main class="profile-main">
+          <header class="profile-main-head">
+            <div>
+              <p class="eyebrow">Balance & Billing</p>
+              <h2>余额与消费</h2>
+              <p>余额会按照模型实际使用的 Token 实时扣减；低余额只提示，不会在达到阈值时自动停用。</p>
+            </div>
+            <button class="ghost-button compact" type="button" :disabled="profileBalanceLoading" @click="loadMyBalance(profileBalancePage)">
+              {{ profileBalanceLoading ? "刷新中" : "刷新余额" }}
+            </button>
+          </header>
+
+          <div v-if="profileBalanceError" class="inline-error" role="alert">{{ profileBalanceError }}</div>
+
+          <section class="profile-balance-grid" aria-label="余额概览">
+            <article class="profile-balance-card profile-balance-card-primary">
+              <span class="profile-card-label">当前余额</span>
+              <strong>{{ formatYuanAmount(profileCenter.balance?.balance_micro_yuan || 0) }} 元</strong>
+              <span class="profile-balance-state" :class="profileBalanceStateClass()">
+                {{ profileCenter.balance?.state_label || "余额" }}
+              </span>
+            </article>
+            <article class="profile-balance-card">
+              <span class="profile-card-label">累计充值</span>
+              <strong>{{ formatYuanAmount(profileCenter.balance?.total_recharge_micro_yuan || 0) }} 元</strong>
+              <small>包含系统初始化余额</small>
+            </article>
+            <article class="profile-balance-card">
+              <span class="profile-card-label">累计消费</span>
+              <strong>{{ formatYuanAmount(profileCenter.balance?.total_consumed_micro_yuan || 0) }} 元</strong>
+              <small>{{ profileCenter.balance?.ledger_entry_count || 0 }} 条余额流水</small>
+            </article>
+            <article class="profile-balance-card">
+              <span class="profile-card-label">低余额提醒线</span>
+              <strong>{{ formatYuanAmount(profileCenter.balance?.low_balance_threshold_micro_yuan || 0) }} 元</strong>
+              <small>价格：{{ profileCenter.settings?.price_per_million_tokens_yuan || 25 }} 元 / M Token</small>
+            </article>
+          </section>
+
+          <section class="profile-billing-grid">
+            <article class="panel profile-recharge-panel">
+              <div class="panel-title-row">
+                <div>
+                  <p class="eyebrow">Recharge Preview</p>
+                  <h2 class="panel-title">余额充值</h2>
+                </div>
+                <span class="profile-simulation-badge">模拟入口</span>
+              </div>
+              <p class="profile-panel-lede">当前先提供本地模拟充值，提交后会立即写入余额流水。接入真实支付前不会产生实际扣款。</p>
+              <form class="profile-recharge-form" @submit.prevent="rechargeMyBalance">
+                <label class="field-group" for="profileRechargeAmount">
+                  <span>充值金额（元）</span>
+                  <input id="profileRechargeAmount" v-model.number="profileRechargeForm.amountYuan" class="field" type="number" min="0.01" step="0.01" required />
+                </label>
+                <label class="field-group" for="profileRechargeNote">
+                  <span>备注（可选）</span>
+                  <input id="profileRechargeNote" v-model.trim="profileRechargeForm.note" class="field" maxlength="120" placeholder="例如：测试充值" />
+                </label>
+                <button class="primary-button" type="submit" :disabled="profileRechargeLoading" :data-state="profileRechargeLoading ? 'loading' : 'idle'">
+                  {{ profileRechargeLoading ? "处理中" : "模拟充值" }}
+                </button>
+              </form>
+            </article>
+            <article class="panel profile-billing-note">
+              <p class="eyebrow">Billing State</p>
+              <h2 class="panel-title">余额状态说明</h2>
+              <dl>
+                <div><dt>余额</dt><dd>可继续使用 Agent。</dd></div>
+                <div><dt>低余额</dt><dd>余额不高于 {{ formatYuanAmount(profileCenter.balance?.low_balance_threshold_micro_yuan || 0) }} 元，继续可用并提示充值。</dd></div>
+                <div><dt>停用</dt><dd>账号被管理员禁用或余额耗尽，需要恢复账号或充值。</dd></div>
+              </dl>
+            </article>
+          </section>
+
+          <section class="panel profile-ledger-panel" aria-labelledby="profileLedgerTitle">
+            <div class="panel-title-row">
+              <div>
+                <p class="eyebrow">Balance Ledger</p>
+                <h2 id="profileLedgerTitle" class="panel-title">余额与消费记录</h2>
+              </div>
+              <span class="profile-ledger-count">{{ profileCenter.total || 0 }} 条</span>
+            </div>
+            <div v-if="profileBalanceLoading" class="admin-usage-notice" role="status">正在加载余额流水...</div>
+            <div v-else-if="!profileCenter.entries.length" class="empty-state compact-empty">
+              <strong>暂无余额流水</strong><span>充值或使用 Agent 后，记录会显示在这里。</span>
+            </div>
+            <div v-else class="admin-table-wrap profile-ledger-table-wrap">
+              <table class="admin-table profile-ledger-table">
+                <thead><tr><th>时间</th><th>类型</th><th>金额</th><th>余额前</th><th>余额后</th><th>Token</th><th>说明</th></tr></thead>
+                <tbody>
+                  <tr v-for="entry in profileCenter.entries" :key="entry.id">
+                    <td>{{ formatDate(entry.created_at) }}</td>
+                    <td>{{ balanceLedgerKindLabel(entry.entry_kind) }}</td>
+                    <td>{{ balanceLedgerAmountLabel(entry) }}</td>
+                    <td>{{ formatYuanAmount(entry.balance_before_micro_yuan) }} 元</td>
+                    <td>{{ formatYuanAmount(entry.balance_after_micro_yuan) }} 元</td>
+                    <td>{{ entry.token_count ?? "-" }}</td>
+                    <td>{{ entry.summary }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="admin-ledger-pagination profile-ledger-pagination" role="navigation" aria-label="个人余额流水分页">
+              <span class="admin-ledger-page-info">{{ adminLedgerPageInfo(profileCenter.total) }}</span>
+              <div class="admin-ledger-page-nav">
+                <button class="admin-ledger-page-button" type="button" :disabled="profileBalancePage <= 1 || profileBalanceLoading" @click="selectProfileBalancePage(profileBalancePage - 1)">上一页</button>
+                <button
+                  v-for="page in adminLedgerPageNumbers(profileCenter.total)"
+                  :key="`profile-balance-page-${page}`"
+                  class="admin-ledger-page-button"
+                  type="button"
+                  :aria-selected="String(profileBalancePage === page)"
+                  :disabled="profileBalanceLoading"
+                  @click="selectProfileBalancePage(page)"
+                >
+                  {{ page }}
+                </button>
+                <button class="admin-ledger-page-button" type="button" :disabled="profileBalancePage >= adminLedgerPageCount(profileCenter.total) || profileBalanceLoading" @click="selectProfileBalancePage(profileBalancePage + 1)">下一页</button>
+              </div>
+            </div>
+          </section>
+        </main>
+      </section>
+
       <section v-if="showAdminSurface" class="admin-shell" aria-labelledby="adminTopTitle">
         <header class="admin-topbar">
           <div class="admin-topbar-brand">
@@ -1074,6 +1216,7 @@
             <span class="admin-topbar-role">{{ auth.account?.role === 'admin' ? '管理员' : '账号' }}</span>
           </div>
           <div class="admin-topbar-actions">
+            <button class="ghost-button compact" type="button" @click="goProfile">个人中心</button>
             <button class="ghost-button compact" type="button" @click="goWorkspace">回到工作台</button>
             <button class="ghost-button compact" type="button" @click="refreshAdminSection">刷新当前页</button>
             <button class="ghost-button compact" type="button" @click="logout">退出登录</button>
@@ -1138,7 +1281,7 @@
               <div class="panel-title-row">
                 <div>
                   <p class="eyebrow">Account Usage</p>
-                  <h2 class="panel-title">账号与 Token 用量</h2>
+                  <h2 class="panel-title">账号与余额、Token 用量</h2>
                 </div>
               </div>
               <div v-if="admin.loadError" class="inline-error" role="alert">{{ admin.loadError }}</div>
@@ -1168,7 +1311,7 @@
                         >
                           <span class="admin-account-summary">
                             <strong>{{ account.email }}</strong>
-                            <span>{{ account.role }} · {{ account.status }} · {{ accountBillingStateLabel(account.id) }} · {{ accountUsage(account.id) }} 可计费 Token · {{ accountBillingRemainingLabel(account.id) }} · {{ accountToolCallCount(account.id) }} 个工具任务</span>
+                            <span>{{ account.role }} · {{ account.status }} · {{ accountBillingStateLabel(account.id) }} · {{ accountBillingRemainingLabel(account.id) }} · {{ accountBalanceConsumedLabel(account.id) }} · {{ accountBalanceLedgerCount(account.id) }} 条余额流水 · {{ accountUsage(account.id) }} Token · {{ accountToolCallCount(account.id) }} 个工具任务</span>
                           </span>
                           <span class="admin-account-event-count">{{ accountUsageEventCount(account.id) }} 条</span>
                           <span class="admin-account-chevron" aria-hidden="true">
@@ -1185,7 +1328,7 @@
                 <section
                   id="adminUsageDetail"
                   class="admin-account-usage"
-                  :aria-label="selectedAdminAccount ? `${selectedAdminAccount.email} 的 Token 使用明细` : 'Token 使用明细'"
+                  :aria-label="selectedAdminAccount ? `${selectedAdminAccount.email} 的余额、Token 和工具使用明细` : '余额、Token 和工具使用明细'"
                 >
                   <template v-if="selectedAdminAccount">
                     <div class="admin-account-usage-head">
@@ -1193,9 +1336,18 @@
                         <p class="eyebrow">Usage Ledger</p>
                         <h3>{{ selectedAdminAccount.email }} 的后台明细</h3>
                       </div>
-                      <span>{{ accountBillingStateLabel(selectedAdminAccount.id) }} · {{ accountUsageEventCount(selectedAdminAccount.id) }} Token · {{ accountToolCallCount(selectedAdminAccount.id) }} 工具</span>
+                      <span>{{ accountBillingStateLabel(selectedAdminAccount.id) }} · {{ accountBillingRemainingLabel(selectedAdminAccount.id) }} · {{ accountBalanceConsumedLabel(selectedAdminAccount.id) }} · {{ accountToolCallCount(selectedAdminAccount.id) }} 工具</span>
                     </div>
                     <div class="admin-detail-tabs" role="tablist" aria-label="后台明细切换">
+                      <button
+                        class="tab-button"
+                        type="button"
+                        role="tab"
+                        :aria-selected="String(admin.activeDetailTab === 'balance')"
+                        @click="setAdminDetailTab('balance')"
+                      >
+                        余额与消费
+                      </button>
                       <button
                         class="tab-button"
                         type="button"
@@ -1216,7 +1368,49 @@
                       </button>
                     </div>
 
-                    <template v-if="admin.activeDetailTab === 'tokens'">
+                    <template v-if="admin.activeDetailTab === 'balance'">
+                      <div v-if="admin.loadingBalanceEvents" class="admin-usage-notice" role="status">正在加载余额流水...</div>
+                      <div v-else-if="admin.balanceEventsError" class="inline-error" role="alert">{{ admin.balanceEventsError }}</div>
+                      <div v-else-if="!admin.balanceEvents.length" class="empty-state compact-empty">
+                        <strong>暂无余额流水</strong><span>该账号尚未产生可展示的余额或消费记录。</span>
+                      </div>
+                      <div v-else class="admin-table-wrap">
+                        <table class="admin-table">
+                          <thead><tr><th>时间</th><th>类型</th><th>金额</th><th>余额前</th><th>余额后</th><th>Token</th><th>来源</th><th>说明</th></tr></thead>
+                          <tbody>
+                            <tr v-for="entry in admin.balanceEvents" :key="entry.id">
+                              <td>{{ formatDate(entry.created_at) }}</td>
+                              <td>{{ balanceLedgerKindLabel(entry.entry_kind) }}</td>
+                              <td>{{ balanceLedgerAmountLabel(entry) }}</td>
+                              <td>{{ formatYuanAmount(entry.balance_before_micro_yuan) }} 元</td>
+                              <td>{{ formatYuanAmount(entry.balance_after_micro_yuan) }} 元</td>
+                              <td>{{ entry.token_count ?? "-" }}</td>
+                              <td>{{ entry.source_reference || "-" }}</td>
+                              <td>{{ entry.summary }}</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                      <div class="admin-ledger-pagination" role="navigation" aria-label="余额流水分页">
+                        <span class="admin-ledger-page-info">{{ adminLedgerPageInfo(admin.balanceTotal) }}</span>
+                        <div class="admin-ledger-page-nav">
+                          <button class="admin-ledger-page-button" type="button" :disabled="admin.balancePage <= 1" @click="loadAdminBalanceEvents(selectedAdminAccount.id, admin.balancePage - 1)">上一页</button>
+                          <button
+                            v-for="page in adminLedgerPageNumbers(admin.balanceTotal)"
+                            :key="`balance-page-${page}`"
+                            class="admin-ledger-page-button"
+                            type="button"
+                            :aria-selected="String(admin.balancePage === page)"
+                            @click="loadAdminBalanceEvents(selectedAdminAccount.id, page)"
+                          >
+                            {{ page }}
+                          </button>
+                          <button class="admin-ledger-page-button" type="button" :disabled="admin.balancePage >= adminLedgerPageCount(admin.balanceTotal)" @click="loadAdminBalanceEvents(selectedAdminAccount.id, admin.balancePage + 1)">下一页</button>
+                        </div>
+                      </div>
+                    </template>
+
+                    <template v-else-if="admin.activeDetailTab === 'tokens'">
                       <div v-if="admin.loadingEvents" class="admin-usage-notice" role="status">正在加载 Token 明细...</div>
                       <div v-else-if="admin.eventsError" class="inline-error" role="alert">{{ admin.eventsError }}</div>
                       <div v-else-if="!admin.events.length" class="empty-state compact-empty">

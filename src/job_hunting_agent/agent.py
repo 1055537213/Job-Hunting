@@ -171,6 +171,8 @@ class JobHuntingAgent:
 
         resolved_session_id = session_id or default_session_id(candidate_id, account_id)
         root_request_id = root_request_id or uuid.uuid4().hex
+        if account_id is not None:
+            self.app.store.assert_account_can_spend(account_id)
         result = self.graph.invoke(
             {"messages": self.build_turn_messages(message, candidate_id, resolved_session_id, account_id)},
             config={"configurable": {"thread_id": scoped_thread_id(account_id, candidate_id, resolved_session_id)}},
@@ -228,6 +230,8 @@ class JobHuntingAgent:
 
         resolved_session_id = session_id or default_session_id(candidate_id, account_id)
         root_request_id = root_request_id or uuid.uuid4().hex
+        if account_id is not None:
+            self.app.store.assert_account_can_spend(account_id)
         tool_and_final_messages: list[BaseMessage] = []
         streamed_reply_parts: list[str] = []
         streamed_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}

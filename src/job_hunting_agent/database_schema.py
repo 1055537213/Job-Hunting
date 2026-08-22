@@ -426,6 +426,74 @@ sa.Index("idx_usage_events_session", usage_events.c.session_id, usage_events.c.c
 sa.Index("idx_usage_events_request", usage_events.c.root_request_id, usage_events.c.created_at)
 
 
+# 余额总表保存当前可用余额与累计充值/消费金额；流水表保存每一次变动。
+account_balances = sa.Table(
+    "account_balances",
+    metadata,
+    sa.Column(
+        "account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    sa.Column("balance_micro_yuan", sa.BigInteger, nullable=False, server_default=sa.text("0")),
+    sa.Column(
+        "total_recharge_micro_yuan",
+        sa.BigInteger,
+        nullable=False,
+        server_default=sa.text("0"),
+    ),
+    sa.Column(
+        "total_consumed_micro_yuan",
+        sa.BigInteger,
+        nullable=False,
+        server_default=sa.text("0"),
+    ),
+    sa.Column(
+        "low_balance_threshold_micro_yuan",
+        sa.BigInteger,
+        nullable=False,
+        server_default=sa.text("10000000"),
+    ),
+    sa.Column("created_at", timestamp_type, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("updated_at", timestamp_type, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+)
+
+
+account_balance_ledger = sa.Table(
+    "account_balance_ledger",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column(
+        "account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("entry_kind", sa.String(32), nullable=False),
+    sa.Column("amount_micro_yuan", sa.BigInteger, nullable=False),
+    sa.Column("balance_before_micro_yuan", sa.BigInteger, nullable=False),
+    sa.Column("balance_after_micro_yuan", sa.BigInteger, nullable=False),
+    sa.Column("token_count", sa.Integer),
+    sa.Column("price_per_million_tokens_yuan", sa.Numeric(12, 6)),
+    sa.Column("source_reference", sa.String(160)),
+    sa.Column("summary", sa.Text, nullable=False),
+    sa.Column("details_json", json_type, nullable=False, server_default=sa.text("'{}'")),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.UniqueConstraint("source_reference", name="uq_account_balance_ledger_source_reference"),
+    sa.CheckConstraint(
+        "entry_kind IN ('initial_credit', 'recharge', 'consumption', 'adjustment')",
+        name="account_balance_ledger_entry_kind",
+    ),
+    sa.CheckConstraint("token_count >= 0", name="account_balance_ledger_token_count_non_negative"),
+)
+sa.Index(
+    "idx_account_balance_ledger_account_time",
+    account_balance_ledger.c.account_id,
+    account_balance_ledger.c.created_at.desc(),
+)
+
+
 # 工具调用审计只保留最近两天的任务轨迹，不保存 prompt、正文或完整模型上下文。
 tool_call_traces = sa.Table(
     "tool_call_traces",

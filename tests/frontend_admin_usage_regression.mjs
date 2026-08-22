@@ -329,20 +329,25 @@ const adminLoadContext = {
         by_account: [],
         tool_calls_by_account: [],
         billing: {
-          settings: { configured: false, quota_tokens: null, warning_ratio: 0.8 },
+          settings: {
+            configured: true,
+            price_per_million_tokens_yuan: 25,
+            starting_balance_yuan: 100,
+            low_balance_threshold_yuan: 10,
+          },
           summary: {
-            configured: false,
-            quota_tokens: null,
-            warning_ratio: 0.8,
+            configured: true,
+            price_per_million_tokens_yuan: 25,
+            starting_balance_yuan: 100,
+            low_balance_threshold_yuan: 10,
             account_count: 1,
-            billable_account_count: 0,
-            unlimited_account_count: 1,
-            warning_account_count: 0,
-            over_quota_account_count: 0,
-            total_billable_tokens: 0,
-            total_tokens: 0,
-            total_quota_tokens: null,
-            total_remaining_tokens: null,
+            healthy_account_count: 1,
+            low_balance_account_count: 0,
+            suspended_account_count: 0,
+            total_balance_micro_yuan: 100000000,
+            total_recharge_micro_yuan: 100000000,
+            total_consumed_micro_yuan: 0,
+            total_ledger_entry_count: 1,
           },
           by_account: [
             {
@@ -350,15 +355,13 @@ const adminLoadContext = {
               email: "admin@example.com",
               role: "admin",
               status: "active",
-              billable_tokens: 0,
-              total_tokens: 0,
-              quota_tokens: null,
-              warning_ratio: 0.8,
-              warning_threshold_tokens: null,
-              remaining_tokens: null,
-              usage_ratio: null,
-              state: "unlimited",
-              state_label: "未配置配额",
+              balance_micro_yuan: 100000000,
+              total_recharge_micro_yuan: 100000000,
+              total_consumed_micro_yuan: 0,
+              ledger_entry_count: 1,
+              low_balance_threshold_micro_yuan: 10000000,
+              state: "balance",
+              state_label: "余额",
             },
           ],
         },
@@ -401,7 +404,7 @@ assert.deepEqual(adminLoadContext.admin.requestMetrics, {
   average_duration_ms: 8.5,
 });
 assert.equal(adminLoadContext.admin.billing.summary.account_count, 1);
-assert.equal(adminLoadContext.admin.billing.by_account[0].state_label, "未配置配额");
+assert.equal(adminLoadContext.admin.billing.by_account[0].state_label, "余额");
 
 const auditUrls = [];
 const auditContext = {

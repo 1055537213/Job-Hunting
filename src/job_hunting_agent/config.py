@@ -134,14 +134,16 @@ class WebSecuritySettings:
 
 @dataclass(frozen=True)
 class BillingSettings:
-    """后台账单投影配置。
+    """实时扣费与余额展示配置。
 
-    这里先保存统一的每账号 Token 配额和预警比例，不把真实账单周期或价格版本
-    硬塞进配置层。账单快照仍然由 usage ledger 和后续账期逻辑生成。
+    余额以“微元”计量，便于把 `25/M token` 这类价格精确换算成逐次扣费。
+    `starting_balance_yuan` 仅用于新账号初始化和历史回填；`low_balance_threshold_yuan`
+    用于前端状态提示，不直接改变可用余额。
     """
 
-    quota_tokens: int | None = None
-    warning_ratio: float = 0.8
+    price_per_million_tokens_yuan: float = 25.0
+    starting_balance_yuan: float = 100.0
+    low_balance_threshold_yuan: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -712,7 +714,7 @@ def load_billing_settings(
     env_path: str | Path = DEFAULT_ENV_PATH,
     environ: Mapping[str, str] | None = None,
 ) -> BillingSettings:
-    """读取后台账单投影配置。"""
+    """读取实时计费和余额配置。"""
 
     file_values = load_dotenv_values(env_path)
     environment = os.environ if environ is None else environ
@@ -725,15 +727,18 @@ def load_billing_settings(
                 return file_values[key]
         return default
 
-    quota_value = get("JOB_AGENT_BILLING_QUOTA_TOKENS", default="")
-    quota_tokens = None
-    if quota_value:
-        quota_tokens = parse_positive_int(quota_value, "JOB_AGENT_BILLING_QUOTA_TOKENS")
     settings = BillingSettings(
-        quota_tokens=quota_tokens,
-        warning_ratio=parse_unit_interval(
-            get("JOB_AGENT_BILLING_WARNING_RATIO", default="0.8"),
-            "JOB_AGENT_BILLING_WARNING_RATIO",
+        price_per_million_tokens_yuan=parse_positive_float(
+            get("JOB_AGENT_BILLING_PRICE_PER_MILLION_TOKENS_YUAN", default="25"),
+            "JOB_AGENT_BILLING_PRICE_PER_MILLION_TOKENS_YUAN",
+        ),
+        starting_balance_yuan=parse_positive_float(
+            get("JOB_AGENT_BILLING_STARTING_BALANCE_YUAN", default="100"),
+            "JOB_AGENT_BILLING_STARTING_BALANCE_YUAN",
+        ),
+        low_balance_threshold_yuan=parse_positive_float(
+            get("JOB_AGENT_BILLING_LOW_BALANCE_THRESHOLD_YUAN", default="10"),
+            "JOB_AGENT_BILLING_LOW_BALANCE_THRESHOLD_YUAN",
         ),
     )
     return settings
@@ -743,9 +748,10 @@ def masked_billing_settings(settings: BillingSettings) -> dict[str, object]:
     """返回适合健康检查和管理页展示的账单配置。"""
 
     return {
-        "configured": settings.quota_tokens is not None,
-        "quota_tokens": settings.quota_tokens,
-        "warning_ratio": settings.warning_ratio,
+        "configured": True,
+        "price_per_million_tokens_yuan": settings.price_per_million_tokens_yuan,
+        "starting_balance_yuan": settings.starting_balance_yuan,
+        "low_balance_threshold_yuan": settings.low_balance_threshold_yuan,
     }
 
 
@@ -1130,6 +1136,18 @@ def parse_positive_int(value: str | None, field_name: str) -> int:
         parsed = int(value or "")
     except ValueError as error:
         raise ValueError(f"{field_name} 必须是正整数") from error
+    if parsed <= 0:
+        raise ValueError(f"{field_name} 必须大于 0")
+    return parsed
+
+
+def parse_positive_float(value: str | None, field_name: str) -> float:
+    """解析正浮点数配置，并给出可读错误。"""
+
+    try:
+        parsed = float(value or "")
+    except ValueError as error:
+        raise ValueError(f"{field_name} 必须是正数") from error
     if parsed <= 0:
         raise ValueError(f"{field_name} 必须大于 0")
     return parsed

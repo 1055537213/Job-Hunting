@@ -398,6 +398,7 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     home = client.get("/")
     login_page = client.get("/login")
     workspace_page = client.get("/workspace")
+    profile_page = client.get("/profile")
     admin_page = client.get("/admin")
     script = client.get("/static/app.js")
     styles = client.get("/static/styles.css")
@@ -405,7 +406,7 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     vue = client.get("/static/vendor/vue.global.prod.js")
 
     assert home.status_code == 200
-    for page in (login_page, workspace_page, admin_page):
+    for page in (login_page, workspace_page, profile_page, admin_page):
         assert page.status_code == 200
         assert page.headers["cache-control"] == "no-store, max-age=0"
         assert "/static/app.js?v=20260821-project-delete-v1" in page.text
@@ -415,6 +416,7 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert "safeFrontendNextRoute" in script.text
     assert 'v-if="showAuthSurface"' in home.text
     assert 'v-if="showWorkspaceSurface"' in home.text
+    assert 'v-if="showProfileSurface"' in home.text
     assert 'v-if="showAdminSurface"' in home.text
     assert 'v-if="showRouteLoading"' in home.text
     assert '/static/app.js?v=20260821-project-delete-v1' in home.text
@@ -432,6 +434,9 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert "deleteCurrentSession" not in home.text
     assert "session-list" not in home.text
     assert "deleteJob(job)" in home.text
+    assert "/api/me/balance" in script.text
+    assert "/api/me/balance/recharge" in script.text
+    assert "余额与消费记录" in home.text
     assert home.headers["cache-control"] == "no-store, max-age=0"
     assert script.status_code == 200
     assert script.headers["cache-control"] == "no-store, max-age=0"
@@ -445,6 +450,88 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert "oklch(" in tokens.text
     assert vue.status_code == 200
     assert "Vue" in vue.text
+
+
+def test_web_profile_balance_and_simulated_recharge_are_account_scoped(tmp_path):
+    """个人中心应展示初始余额，并把模拟充值写入同一账号的分页账本。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_BILLING_PRICE_PER_MILLION_TOKENS_YUAN=25",
+                "JOB_AGENT_BILLING_STARTING_BALANCE_YUAN=100",
+                "JOB_AGENT_BILLING_LOW_BALANCE_THRESHOLD_YUAN=10",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    client = login_test_account(
+        TestClient(create_web_app(env_file=env_path)),
+        email="balance-profile@example.com",
+    )
+
+    initial = client.get("/api/me/balance")
+    assert initial.status_code == 200, initial.text
+    assert initial.json()["summary"]["balance_micro_yuan"] == 100_000_000
+    assert initial.json()["summary"]["state"] == "balance"
+    assert initial.json()["total"] == 1
+    assert initial.json()["entries"][0]["entry_kind"] == "initial_credit"
+
+    recharged = client.post(
+        "/api/me/balance/recharge",
+        json={"amount_yuan": 12.5, "note": "测试充值"},
+    )
+    assert recharged.status_code == 200, recharged.text
+    assert recharged.json()["summary"]["balance_micro_yuan"] == 112_500_000
+
+    ledger = client.get("/api/me/balance?limit=1&offset=0")
+    assert ledger.status_code == 200
+    assert ledger.json()["total"] == 2
+    assert ledger.json()["entries"][0]["entry_kind"] == "recharge"
+    assert ledger.json()["entries"][0]["amount_micro_yuan"] == 12_500_000
+
+    invalid = client.post("/api/me/balance/recharge", json={"amount_yuan": 0})
+    assert invalid.status_code == 422
+
+
+def test_admin_balance_summary_and_ledger_are_paginated(tmp_path):
+    """管理员可以按账号读取余额流水，并和账号级余额投影保持一致。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_BOOTSTRAP_ADMIN_EMAIL=balance-admin@example.com",
+                "JOB_AGENT_BOOTSTRAP_ADMIN_PASSWORD=strong-password-123",
+                "JOB_AGENT_BILLING_STARTING_BALANCE_YUAN=100",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    client = login_test_account(
+        TestClient(create_web_app(env_file=env_path)),
+        email="balance-admin@example.com",
+        password="strong-password-123",
+    )
+
+    accounts = client.get("/api/admin/accounts")
+    assert accounts.status_code == 200
+    account_id = accounts.json()["accounts"][0]["id"]
+
+    summary = client.get("/api/admin/usage/summary")
+    assert summary.status_code == 200
+    assert summary.json()["billing"]["summary"]["total_balance_micro_yuan"] == 100_000_000
+    projection = summary.json()["billing"]["by_account"][0]
+    assert projection["account_id"] == account_id
+    assert projection["state"] == "balance"
+
+    events = client.get(f"/api/admin/balance/events?account_id={account_id}&limit=1&offset=0")
+    assert events.status_code == 200
+    assert events.json()["total"] == 1
+    assert events.json()["page_size"] == 100
+    assert events.json()["max_pages"] == 5
+    assert events.json()["entries"][0]["entry_kind"] == "initial_credit"
 
 
 def test_profile_delete_button_is_idle_without_a_selected_profile(tmp_path):
@@ -1562,9 +1649,9 @@ def test_admin_usage_events_keep_five_page_window_and_prune_old_rows(tmp_path):
         }
     ]
     assert summary["tool_calls_by_account"] == []
-    assert summary["billing"]["summary"]["configured"] is False
+    assert summary["billing"]["summary"]["configured"] is True
     assert summary["billing"]["summary"]["account_count"] == 1
-    assert summary["billing"]["by_account"][0]["state"] == "unlimited"
+    assert summary["billing"]["by_account"][0]["state"] == "balance"
 
 def test_web_chat_stream_records_admin_tool_trace_detail(tmp_path):
     """真实工具调用的流式消息应能在管理端看到同一条任务链路与步骤结果。"""

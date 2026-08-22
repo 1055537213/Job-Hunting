@@ -153,6 +153,10 @@ class ModelGateway:
         """创建一次调用上下文，并为缺失 ID 生成安全的随机值。"""
 
         normalized_operation = normalize_operation(operation)
+        if self.usage_store is not None and account_id is not None:
+            can_spend = getattr(self.usage_store, "assert_account_can_spend", None)
+            if callable(can_spend):
+                can_spend(account_id)
         resolved_root_request_id = root_request_id or uuid.uuid4().hex
         return ModelCallContext(
             operation=normalized_operation,
