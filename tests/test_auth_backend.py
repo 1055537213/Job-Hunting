@@ -15,6 +15,40 @@ from job_hunting_agent.models import CandidateProfileInput, UsageEventRecord
 from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
 
 
+def test_new_account_starts_with_zero_balance_and_no_initial_credit(database_url):
+    """默认新账号余额为 0，并且不伪造一条系统充值流水。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    auth = AuthService(store)
+
+    account = auth.register("zero-balance@example.com", "password-123")
+    balance = store.get_account_balance_summary(account.id)
+
+    assert balance.balance_micro_yuan == 0
+    assert balance.total_recharge_micro_yuan == 0
+    assert balance.total_consumed_micro_yuan == 0
+    assert balance.ledger_entry_count == 0
+
+
+def test_registration_never_uses_password_as_display_name(database_url):
+    """显示名称不能保存为明文密码，避免账号标签泄露凭据。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    auth = AuthService(store)
+
+    account = auth.register(
+        "display-name-guard@example.com",
+        "password-123",
+        "password-123",
+    )
+
+    assert account.display_name is None
+    saved, _ = store.get_account_by_email("display-name-guard@example.com")
+    assert saved.display_name is None
+
+
 def test_register_login_and_logout_all_use_server_side_session(database_url):
     """登录只返回原始令牌，数据库保存令牌摘要，退出所有设备会立即失效。"""
 
@@ -76,6 +110,12 @@ def test_account_filters_profiles_jobs_and_usage_events(database_url):
     auth = AuthService(store)
     account_a = auth.register("a@example.com", "password-123")
     account_b = auth.register("b@example.com", "password-123")
+    store.recharge_account_balance(
+        account_a.id,
+        100,
+        summary="用量计费测试充值",
+        source_reference="test-account-usage-funding",
+    )
 
     profile = CandidateProfileInput(
         name="档案 A",

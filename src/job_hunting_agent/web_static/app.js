@@ -131,6 +131,7 @@ if (!window.Vue) {
         sessions: [],
         activeSessionId: "",
         sessionMenuOpen: false,
+        accountMenuOpen: false,
         admin: {
           accounts: [],
           events: [],
@@ -460,7 +461,7 @@ if (!window.Vue) {
         }
         if (this.admin.activeSection === "audit") {
           return [
-            { label: "审计事件", value: this.adminAuditActionCounts.total, hint: "最近两天" },
+            { label: "审计事件", value: this.adminAuditActionCounts.total, hint: "最新记录" },
             { label: "账号状态变更", value: this.adminAuditActionCounts.status_updated, hint: "禁用 / 恢复" },
             { label: "系统探针", value: this.adminAuditActionCounts.system_probe_enqueued, hint: "运维验证" },
             {
@@ -653,10 +654,10 @@ if (!window.Vue) {
         }
       },
 
-      /** 登录页地址会带上 next，登录后回到用户原本想访问的前端页面。 */
-      navigateToAuth(replace = false) {
+      /** 登录页可保留受保护页面的 next；主动退出时不携带当前页面。 */
+      navigateToAuth(replace = false, preserveCurrentRoute = true) {
         const current = window.location.pathname || FRONTEND_ROUTES.workspace;
-        const next = safeFrontendNextRoute(current);
+        const next = preserveCurrentRoute ? safeFrontendNextRoute(current) : "";
         const suffix = next ? `?next=${encodeURIComponent(next)}` : "";
         if (replace) {
           window.location.replace(`${FRONTEND_ROUTES.auth}${suffix}`);
@@ -757,13 +758,24 @@ if (!window.Vue) {
         this.authSuccess = false;
       },
 
-      /** 显示认证错误，并在用户没有继续操作时自动隐藏。 */
-      showAuthError(message) {
+      /** 统一显示认证提示，并在用户没有继续操作时自动隐藏。 */
+      showAuthFeedback(message, success = false) {
         this.clearAuthFeedback();
-        this.authError = message || "认证请求失败。";
+        this.authSuccess = Boolean(success);
+        this.authError = message || (this.authSuccess ? "操作成功。" : "认证请求失败。");
         this.authErrorTimer = window.setTimeout(() => {
           this.clearAuthFeedback();
         }, AUTH_ERROR_DISMISS_MS);
+      },
+
+      /** 显示认证错误；错误提示和成功提示使用相同的自动消失周期。 */
+      showAuthError(message) {
+        this.showAuthFeedback(message, false);
+      },
+
+      /** 显示注册成功提示，并沿用认证提示的自动清理逻辑。 */
+      showAuthSuccess(message) {
+        this.showAuthFeedback(message, true);
       },
 
       /** 409 表示同一账号中已经存在相同内容；用统一居中提示而非表单内错误。 */
@@ -830,8 +842,7 @@ if (!window.Vue) {
           });
           if (this.authMode === "register") {
             this.authMode = "login";
-            this.authSuccess = true;
-            this.authError = "账号已创建，请登录。";
+            this.showAuthSuccess("账号已创建，请登录。");
             this.authForm.password = "";
             this.authPasswordVisible = false;
             return;
@@ -860,6 +871,7 @@ if (!window.Vue) {
 
       /** 注销当前设备；服务端会撤销 Session 并清理 Cookie。 */
       async logout() {
+        this.closeAccountMenu();
         try {
           await this.requestJson("/api/auth/logout", { method: "POST" });
         } catch (error) {
@@ -877,7 +889,7 @@ if (!window.Vue) {
         this.resumeJobSelections = {};
         this.sessions = [];
         this.activeSessionId = "";
-        this.navigateToAuth(true);
+        this.navigateToAuth(true, false);
       },
 
       /** 撤销当前账号在所有设备上的 Session，并回到登录页。 */
@@ -899,7 +911,7 @@ if (!window.Vue) {
         this.resumeJobSelections = {};
         this.sessions = [];
         this.activeSessionId = "";
-        this.navigateToAuth(true);
+        this.navigateToAuth(true, false);
       },
 
       /** 打开管理员用量页面并刷新脱敏后台数据。 */
@@ -907,6 +919,7 @@ if (!window.Vue) {
         if (this.auth.account?.role !== "admin") {
           return;
         }
+        this.closeAccountMenu();
         this.admin.activeSection = "usage";
         this.admin.activeDetailTab = "balance";
         this.navigateTo(FRONTEND_ROUTES.admin);
@@ -914,6 +927,7 @@ if (!window.Vue) {
 
       /** 打开个人中心。 */
       openProfile() {
+        this.closeAccountMenu();
         this.navigateTo(FRONTEND_ROUTES.profile);
       },
 
@@ -1343,15 +1357,6 @@ if (!window.Vue) {
         return this.accountBalanceSummary(accountId)?.state_label || "余额";
       },
 
-      /** 返回指定账号的账单状态 class。 */
-      accountBillingStateClass(accountId) {
-        return {
-          balance: "is-balance",
-          low_balance: "is-low-balance",
-          suspended: "is-suspended",
-        }[this.accountBalanceSummary(accountId)?.state || "balance"] || "is-balance";
-      },
-
       /** 个人中心使用当前账号自己的余额摘要，不依赖管理员投影。 */
       profileBalanceStateClass() {
         return {
@@ -1366,12 +1371,6 @@ if (!window.Vue) {
         const item = this.accountBalanceSummary(accountId);
         if (!item) return "余额未知";
         return `余额 ${this.formatYuanAmount(item.balance_micro_yuan)} 元`;
-      },
-
-      /** 返回指定账号的总充值金额。 */
-      accountBalanceRechargeLabel(accountId) {
-        const item = this.accountBalanceSummary(accountId);
-        return item ? `充值 ${this.formatYuanAmount(item.total_recharge_micro_yuan)} 元` : "充值未知";
       },
 
       /** 返回指定账号的总消费金额。 */
@@ -1568,7 +1567,9 @@ if (!window.Vue) {
             this.openCommandPalette();
           }
         } else if (event.key === "Escape") {
-          if (this.cityPickerOpen) {
+          if (this.accountMenuOpen) {
+            this.closeAccountMenu(true);
+          } else if (this.cityPickerOpen) {
             this.closeCityPicker();
           } else if (this.sessionMenuOpen) {
             this.closeSessionMenu();
@@ -1622,6 +1623,27 @@ if (!window.Vue) {
         this.sessionMenuOpen = false;
       },
 
+      /** 切换右上角账号选单；打开时收起其他浮层，避免菜单相互覆盖。 */
+      toggleAccountMenu() {
+        if (!this.accountMenuOpen) {
+          this.closeSessionMenu();
+          this.closeCityPicker();
+          if (this.commandPaletteOpen) {
+            this.closeCommandPalette();
+          }
+        }
+        this.accountMenuOpen = !this.accountMenuOpen;
+      },
+
+      /** 关闭账号选单；由 Escape 触发时把焦点还给账号按钮。 */
+      closeAccountMenu(restoreFocus = false) {
+        const wasOpen = this.accountMenuOpen;
+        this.accountMenuOpen = false;
+        if (wasOpen && restoreFocus) {
+          nextTick(() => this.$refs.accountMenuTrigger?.focus());
+        }
+      },
+
       /** 打开城市两级菜单，并在首次打开时定位到热门城市。 */
       openCityPicker() {
         this.cityPickerOpen = true;
@@ -1672,6 +1694,7 @@ if (!window.Vue) {
 
       /** 打开命令面板，并把焦点交给搜索输入框。 */
       openCommandPalette() {
+        this.closeAccountMenu();
         this.commandPaletteOpen = true;
         this.commandQuery = "";
         this.activeCommandIndex = 0;
@@ -1927,30 +1950,6 @@ if (!window.Vue) {
           if (wasActive) {
             await this.loadChatHistory();
           }
-        } catch (error) {
-          this.appendAssistant(`删除对话失败：${error.message || "未知错误"}`, true);
-        } finally {
-          this.deletingSessionId = "";
-        }
-      },
-
-      /** 永久删除当前对话及其消息，不影响候选人档案事实和计费流水。 */
-      async deleteCurrentSession() {
-        if (!this.activeSessionId) return;
-        const session = this.sessions.find((item) => item.session_id === this.activeSessionId);
-        const title = session?.title || "当前对话";
-        if (!window.confirm(`确定删除“${title}”吗？\n该对话的历史消息将被永久删除。`)) {
-          return;
-        }
-        const sessionId = this.activeSessionId;
-        this.deletingSessionId = sessionId;
-        try {
-          await this.requestJson(`/api/chat/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
-          localStorage.removeItem(`activeSessionId:${this.auth.account?.id || "legacy"}:${this.currentProfileId}`);
-          this.activeSessionId = "";
-          this.messages = [];
-          await this.loadChatSessions();
-          await this.loadChatHistory();
         } catch (error) {
           this.appendAssistant(`删除对话失败：${error.message || "未知错误"}`, true);
         } finally {

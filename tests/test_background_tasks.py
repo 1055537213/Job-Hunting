@@ -7,13 +7,16 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from job_hunting_agent.app import JobHuntingApp
-from job_hunting_agent.background_tasks import purge_old_operational_audit_records, run_registered_task
+from job_hunting_agent.background_tasks import (
+    background_task_error_policy,
+    purge_old_operational_audit_records,
+    run_registered_task,
+)
 from job_hunting_agent.config import TaskQueueSettings, load_task_queue_settings
 from job_hunting_agent.models import (
     CandidateProfileInput,
@@ -22,8 +25,8 @@ from job_hunting_agent.models import (
     UsageEventRecord,
 )
 from job_hunting_agent.resume_document import ResumeFileStore
+from job_hunting_agent.storage import InsufficientBalanceError
 from job_hunting_agent.task_queue import CeleryTaskQueue, TaskQueueError
-from job_hunting_agent.tool_audit import tool_audit_retention_cutoff
 from job_hunting_agent.web import load_or_new_tool_trace, new_task_trace, owned_or_new_root_request_id
 
 
@@ -39,6 +42,18 @@ class FakeCeleryProducer:
         """保存一次投递调用。"""
 
         self.calls.append({"name": name, **kwargs})
+
+
+def test_insufficient_balance_error_is_actionable_and_non_retryable() -> None:
+    """余额不足是用户可处理的业务错误，必须显示固定提示且不重复消耗重试次数。"""
+
+    summary, retryable = background_task_error_policy(
+        InsufficientBalanceError(),
+        "rag_index",
+    )
+
+    assert summary == "余额不足，请先充值后重试。"
+    assert retryable is False
 
 
 class FailOnceCeleryProducer(FakeCeleryProducer):
@@ -274,12 +289,6 @@ def test_rag_index_task_runs_with_scoped_context(
     assert saved.progress == 100
 
 
-def test_tool_audit_retention_cutoff_keeps_two_shanghai_natural_days() -> None:
-    """保留窗口应从上海时区的昨日 0 点开始，而不是按 UTC 自然日误删。"""
-
-    assert tool_audit_retention_cutoff(datetime(2026, 8, 19, 1, 0, tzinfo=UTC)) == "2026-08-17T16:00:00+00:00"
-
-
 def test_operational_audit_retention_task_purges_usage_events(database_url: str) -> None:
     """后台保留期维护任务在正常写入后应保持幂等。"""
 
@@ -334,11 +343,11 @@ def test_operational_audit_retention_task_purges_usage_events(database_url: str)
     backend.store.close()
 
 
-def test_tool_trace_helpers_respect_account_isolation_and_retention_window(
+def test_tool_trace_helpers_respect_account_isolation_for_retained_records(
     database_url: str,
     tmp_path: Path,
 ) -> None:
-    """工具轨迹续接必须受账号和两天保留期约束。"""
+    """分页窗口内的工具轨迹可以续接，但不能跨账号复用。"""
 
     backend = JobHuntingApp(
         database_url=database_url,

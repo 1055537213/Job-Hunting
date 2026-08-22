@@ -4,11 +4,11 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>求职助手 Agent</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260821-project-delete-v1" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260823-cleanup-v1" />
   </head>
   <body>
     <!-- Vue 还没有挂载完成时隐藏模板，避免用户短暂看到未编译的 {{ }}。 -->
-    <div id="app" class="app-shell" v-cloak @click="closeSessionMenu(); closeCityPicker()">
+    <div id="app" class="app-shell" v-cloak @click="closeSessionMenu(); closeCityPicker(); closeAccountMenu()">
       <main v-if="showRouteLoading" class="route-loading" role="status" aria-live="polite">
         正在进入...
       </main>
@@ -95,7 +95,15 @@
                 autocomplete="name"
               />
             </label>
-            <div v-if="authError" id="authError" class="inline-error" role="alert">{{ authError }}</div>
+            <div
+              v-if="authError"
+              id="authError"
+              class="inline-error"
+              :class="{ 'is-success': authSuccess }"
+              role="alert"
+            >
+              {{ authError }}
+            </div>
             <button
               class="primary-button auth-submit"
               type="submit"
@@ -130,16 +138,41 @@
         </button>
 
         <div class="topbar-actions">
-          <button class="nav-link" type="button" @click="openProfile">个人中心</button>
           <button v-if="auth.account && auth.account.role === 'admin'" class="nav-link" type="button" @click="openAdmin">后台</button>
-          <span
-            class="account-badge"
-            :title="auth.account?.display_name || auth.account?.email || '账号'"
-            aria-label="当前登录账号"
-          >
-            {{ auth.account?.display_name || auth.account?.email || "账号" }}
-          </span>
-          <button class="nav-link logout-link" type="button" @click="logout">退出</button>
+          <div class="account-menu" @click.stop>
+            <button
+              ref="accountMenuTrigger"
+              class="account-menu-trigger"
+              type="button"
+              aria-haspopup="menu"
+              aria-controls="workspaceAccountMenu"
+              :aria-expanded="String(accountMenuOpen)"
+              :title="auth.account?.email || auth.account?.display_name || '账号'"
+              @click="toggleAccountMenu"
+            >
+              <span class="account-menu-label">
+                {{ auth.account?.email || auth.account?.display_name || "账号" }}
+              </span>
+              <span class="account-menu-chevron" aria-hidden="true">
+                <svg viewBox="0 0 24 24" focusable="false"><path d="m6 9 6 6 6-6"></path></svg>
+              </span>
+            </button>
+            <div
+              v-if="accountMenuOpen"
+              id="workspaceAccountMenu"
+              class="account-menu-popover"
+              role="menu"
+              aria-label="账号选单"
+            >
+              <button class="account-menu-item" type="button" role="menuitem" @click="openProfile">
+                个人中心
+              </button>
+              <div class="account-menu-divider" role="separator"></div>
+              <button class="account-menu-item is-danger" type="button" role="menuitem" @click="logout">
+                退出登录
+              </button>
+            </div>
+          </div>
         </div>
       </header>
 
@@ -576,7 +609,11 @@
                 <div v-if="record.card.detected_core_features?.length" class="project-card-meta">
                   {{ record.card.detected_core_features.join(" · ") }}
                 </div>
-                <details class="project-card-details" open>
+                <details
+                  :key="`${record.id}:${record.status}`"
+                  class="project-card-details"
+                  :open="record.status === '待确认'"
+                >
                   <summary>
                     <span>按组确认内容</span>
                     <span class="project-review-count">{{ projectReviewSummary(record) }}</span>
@@ -1069,7 +1106,7 @@
             </div>
           </div>
           <div class="profile-topbar-actions">
-            <span class="profile-account-label">{{ auth.account?.display_name || auth.account?.email || "账号" }}</span>
+            <span class="profile-account-label">{{ auth.account?.email || auth.account?.display_name || "账号" }}</span>
             <button class="ghost-button compact" type="button" @click="goWorkspace">回到工作台</button>
             <button v-if="auth.account && auth.account.role === 'admin'" class="ghost-button compact" type="button" @click="openAdmin">后台</button>
             <button class="ghost-button compact" type="button" @click="logout">退出登录</button>
@@ -1101,7 +1138,7 @@
             <article class="profile-balance-card">
               <span class="profile-card-label">累计充值</span>
               <strong>{{ formatYuanAmount(profileCenter.balance?.total_recharge_micro_yuan || 0) }} 元</strong>
-              <small>包含系统初始化余额</small>
+              <small>{{ Number(profileCenter.settings?.starting_balance_yuan || 0) > 0 ? "包含系统初始化余额" : "仅统计充值到账金额" }}</small>
             </article>
             <article class="profile-balance-card">
               <span class="profile-card-label">累计消费</span>
@@ -1212,7 +1249,7 @@
             </div>
           </div>
           <div class="admin-topbar-user">
-            <span class="admin-topbar-account">{{ auth.account?.display_name || auth.account?.email || "账号" }}</span>
+            <span class="admin-topbar-account">{{ auth.account?.email || auth.account?.display_name || "账号" }}</span>
             <span class="admin-topbar-role">{{ auth.account?.role === 'admin' ? '管理员' : '账号' }}</span>
           </div>
           <div class="admin-topbar-actions">
@@ -1311,9 +1348,7 @@
                         >
                           <span class="admin-account-summary">
                             <strong>{{ account.email }}</strong>
-                            <span>{{ account.role }} · {{ account.status }} · {{ accountBillingStateLabel(account.id) }} · {{ accountBillingRemainingLabel(account.id) }} · {{ accountBalanceConsumedLabel(account.id) }} · {{ accountBalanceLedgerCount(account.id) }} 条余额流水 · {{ accountUsage(account.id) }} Token · {{ accountToolCallCount(account.id) }} 个工具任务</span>
                           </span>
-                          <span class="admin-account-event-count">{{ accountUsageEventCount(account.id) }} 条</span>
                           <span class="admin-account-chevron" aria-hidden="true">
                             <svg viewBox="0 0 24 24" focusable="false"><path d="m6 9 6 6 6-6"></path></svg>
                           </span>
@@ -1336,7 +1371,9 @@
                         <p class="eyebrow">Usage Ledger</p>
                         <h3>{{ selectedAdminAccount.email }} 的后台明细</h3>
                       </div>
-                      <span>{{ accountBillingStateLabel(selectedAdminAccount.id) }} · {{ accountBillingRemainingLabel(selectedAdminAccount.id) }} · {{ accountBalanceConsumedLabel(selectedAdminAccount.id) }} · {{ accountToolCallCount(selectedAdminAccount.id) }} 工具</span>
+                      <span class="admin-account-usage-meta">
+                        {{ selectedAdminAccount.role }} · {{ selectedAdminAccount.status }} · {{ accountBillingStateLabel(selectedAdminAccount.id) }} · {{ accountBillingRemainingLabel(selectedAdminAccount.id) }} · {{ accountBalanceConsumedLabel(selectedAdminAccount.id) }} · {{ accountBalanceLedgerCount(selectedAdminAccount.id) }} 条余额流水 · {{ accountUsage(selectedAdminAccount.id) }} Token · {{ accountUsageEventCount(selectedAdminAccount.id) }} 条 Token 明细 · {{ accountToolCallCount(selectedAdminAccount.id) }} 个工具任务
+                      </span>
                     </div>
                     <div class="admin-detail-tabs" role="tablist" aria-label="后台明细切换">
                       <button
@@ -1445,7 +1482,7 @@
                       <div v-if="admin.loadingToolTraces" class="admin-usage-notice" role="status">正在加载工具调用记录...</div>
                       <div v-else-if="admin.toolTracesError" class="inline-error" role="alert">{{ admin.toolTracesError }}</div>
                       <div v-else-if="!admin.toolTraces.length" class="empty-state compact-empty">
-                        <strong>暂无工具调用任务</strong><span>最近两天内没有需要记录的工具调用。</span>
+                        <strong>暂无工具调用任务</strong><span>该账号尚未产生需要记录的工具调用。</span>
                       </div>
                       <div v-else class="admin-tool-workspace">
                         <div class="admin-tool-list">
@@ -1825,6 +1862,6 @@
     <!-- Vue 3 global build 已放入本地静态目录，避免本地页面依赖外部 CDN。 -->
     <script src="/static/vendor/vue.global.prod.js?v=20260731-auth-admin"></script>
     <script src="/static/china_cities.js?v=20260803-cities"></script>
-    <script src="/static/app.js?v=20260821-project-delete-v1"></script>
+    <script src="/static/app.js?v=20260823-project-collapse-v1"></script>
   </body>
 </html>

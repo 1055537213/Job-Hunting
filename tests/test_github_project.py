@@ -363,6 +363,69 @@ def test_github_project_submission_rejects_duplicate_and_confirmation_stays_idem
     assert len(producer.calls) == 2
 
 
+def test_deleted_github_project_releases_legacy_success_task_idempotency(
+    database_url: str,
+    account_id: int,
+    tmp_path: Path,
+) -> None:
+    """旧版成功任务仍带幂等键时，删除项目后同一仓库可以重新导入。"""
+
+    producer = FakeCeleryProducer()
+    app = JobHuntingApp(
+        database_url=database_url,
+        object_storage=ResumeFileStore(tmp_path / "resume-files"),
+        task_queue=CeleryTaskQueue(
+            TaskQueueSettings(enabled=True, redis_url="redis://:secret@redis:6379/0"),
+            celery_app=producer,
+        ),
+        semantic_matching=False,
+    )
+    candidate_id = app.save_candidate_profile(candidate_input(), account_id=account_id)
+    repository_url = "https://github.com/example/sample-repository"
+    first = app.enqueue_github_project_analysis_task(
+        repository_url=repository_url,
+        account_id=account_id,
+        candidate_id=candidate_id,
+    )
+    claimed = app.store.claim_background_task(first.task_key)
+    assert claimed is not None
+    completed = app.store.complete_background_task(first.task_key, {"legacy": True})
+    assert completed.status == "succeeded"
+    assert completed.idempotency_key == first.idempotency_key
+
+    card = app.store.save_project_card(
+        candidate_id,
+        ProjectExperienceCard(
+            card_type="待确认项目经历卡片",
+            project_name="sample-repository",
+            read_files=["README.md"],
+            skipped_summary={},
+            detected_tech_stack=["Python"],
+            detected_core_features=["接口/API 服务"],
+            responsibility_draft=["负责接口设计"],
+            highlight_draft=[],
+            resume_expression_draft=["使用 Python 开发接口"],
+            questions_for_candidate=[],
+            source_type="github_public_repository",
+            source_url=repository_url,
+            source_ref="main",
+        ),
+        account_id=account_id,
+    )
+    app.delete_project_card(card.id, account_id=account_id)
+
+    retried = app.enqueue_github_project_analysis_task(
+        repository_url=repository_url,
+        account_id=account_id,
+        candidate_id=candidate_id,
+    )
+
+    assert retried.task_key != first.task_key
+    assert retried.status == "queued"
+    assert len(producer.calls) == 2
+    assert app.store.get_background_task_by_idempotency(account_id, first.idempotency_key or "").task_key == retried.task_key
+
+
 def test_web_queues_github_project_analysis_and_rejects_non_github_url() -> None:
     """网页 API 验证链接后只登记异步任务，前端无需上传本地目录。"""
 

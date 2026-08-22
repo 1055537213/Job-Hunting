@@ -494,7 +494,7 @@ sa.Index(
 )
 
 
-# 工具调用审计只保留最近两天的任务轨迹，不保存 prompt、正文或完整模型上下文。
+# 工具调用审计按账号保留最多五页任务轨迹，不保存 prompt、正文或完整模型上下文。
 tool_call_traces = sa.Table(
     "tool_call_traces",
     metadata,

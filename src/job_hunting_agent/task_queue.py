@@ -12,8 +12,10 @@ from typing import Any, Protocol
 from .config import TaskQueueSettings
 
 BACKGROUND_TASK_NAME = "job_hunting_agent.background_tasks.execute_background_task"
-# 工具调用审计只保留最近两个上海自然日，由 Celery Beat 每天 0 点触发清理。
-TOOL_AUDIT_RETENTION_TASK_NAME = "job_hunting_agent.background_tasks.purge_tool_call_traces"
+# Token 和工具调用记录均按账号保留固定分页窗口，Beat 每天触发一次兜底裁剪。
+OPERATIONAL_LEDGER_RETENTION_TASK_NAME = (
+    "job_hunting_agent.background_tasks.prune_operational_ledgers"
+)
 # RAG 增量索引使用独立任务类型，Web、应用门面和 Worker 共用这个稳定标识。
 RAG_INDEX_TASK_TYPE = "rag_index"
 # 扫描 PDF OCR 先完成正文提取，再由 Worker 创建独立的 RAG 增量索引任务。
@@ -67,8 +69,8 @@ def build_celery_app(settings: TaskQueueSettings) -> Any:
         task_time_limit=settings.task_time_limit_seconds,
         task_soft_time_limit=settings.task_soft_time_limit_seconds,
         beat_schedule={
-            "purge-tool-call-traces-at-shanghai-midnight": {
-                "task": TOOL_AUDIT_RETENTION_TASK_NAME,
+            "prune-operational-ledgers-daily": {
+                "task": OPERATIONAL_LEDGER_RETENTION_TASK_NAME,
                 "schedule": crontab(hour=0, minute=0),
                 "options": {"queue": settings.queue_name},
             }

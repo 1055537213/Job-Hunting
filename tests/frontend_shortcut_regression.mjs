@@ -66,4 +66,23 @@ handleGlobalShortcut.call(
 );
 assert.equal(screenshotNoticeClosed, true);
 
+// 账号选单打开时，Esc 应先收起选单并要求把焦点还给触发按钮。
+let accountMenuRestoreFocus = false;
+handleGlobalShortcut.call(
+  {
+    duplicateNotice: { open: false },
+    jobImportNotice: { open: false },
+    accountMenuOpen: true,
+    closeAccountMenu(restoreFocus) {
+      accountMenuRestoreFocus = restoreFocus;
+    },
+  },
+  {
+    key: "Escape",
+    ctrlKey: false,
+    metaKey: false,
+  },
+);
+assert.equal(accountMenuRestoreFocus, true);
+
 console.log("frontend shortcut regression: PASS");

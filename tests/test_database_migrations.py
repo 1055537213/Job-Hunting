@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 import sqlalchemy as sa
 
@@ -133,6 +135,109 @@ def test_upgrade_repairs_legacy_0003_without_job_import_provenance(temporary_dat
 
     assert {"content_fingerprint", "import_method", "captured_at"}.issubset(job_columns)
     assert version == latest_database_revision()
+
+
+def test_zero_starting_balance_migration_preserves_user_recharge(temporary_database_url):
+    """取消历史初始化赠送额时，用户实际充值必须保留并可审计。"""
+
+    upgrade_database(temporary_database_url, "20260820_0006")
+    engine = sa.create_engine(temporary_database_url)
+    now = datetime.now(UTC)
+    try:
+        with engine.begin() as connection:
+            account_id = connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO accounts (
+                        email, password_hash, display_name, role, status,
+                        must_change_password, created_at, updated_at
+                    ) VALUES (
+                        :email, :password_hash, NULL, 'user', 'active',
+                        FALSE, :created_at, :updated_at
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "email": "migration-zero-balance@example.com",
+                    "password_hash": "test-hash",
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            ).scalar_one()
+
+        upgrade_database(temporary_database_url, "20260822_0007")
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    """
+                    UPDATE account_balances
+                    SET balance_micro_yuan = 120000000,
+                        total_recharge_micro_yuan = 120000000,
+                        updated_at = :updated_at
+                    WHERE account_id = :account_id
+                    """
+                ),
+                {"account_id": account_id, "updated_at": now},
+            )
+            connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO account_balance_ledger (
+                        account_id, entry_kind, amount_micro_yuan,
+                        balance_before_micro_yuan, balance_after_micro_yuan,
+                        token_count, price_per_million_tokens_yuan,
+                        source_reference, summary, details_json, created_at
+                    ) VALUES (
+                        :account_id, 'recharge', 20000000,
+                        100000000, 120000000,
+                        NULL, NULL,
+                        :source_reference, '测试充值', CAST('{}' AS JSONB), :created_at
+                    )
+                    """
+                ),
+                {
+                    "account_id": account_id,
+                    "source_reference": f"migration-test-recharge:{account_id}",
+                    "created_at": now,
+                },
+            )
+
+        upgrade_database(temporary_database_url)
+        with engine.connect() as connection:
+            balance = connection.execute(
+                sa.text(
+                    """
+                    SELECT balance_micro_yuan, total_recharge_micro_yuan
+                    FROM account_balances
+                    WHERE account_id = :account_id
+                    """
+                ),
+                {"account_id": account_id},
+            ).mappings().one()
+            ledger = connection.execute(
+                sa.text(
+                    """
+                    SELECT entry_kind, amount_micro_yuan
+                    FROM account_balance_ledger
+                    WHERE account_id = :account_id
+                    ORDER BY id
+                    """
+                ),
+                {"account_id": account_id},
+            ).mappings().all()
+            version = connection.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert version == "20260822_0008"
+    assert balance["balance_micro_yuan"] == 20_000_000
+    assert balance["total_recharge_micro_yuan"] == 20_000_000
+    assert [(row["entry_kind"], row["amount_micro_yuan"]) for row in ledger] == [
+        ("initial_credit", 100_000_000),
+        ("recharge", 20_000_000),
+        ("adjustment", -100_000_000),
+    ]
 
 
 def test_downgrade_database_returns_an_empty_revision_chain(temporary_database_url):

@@ -1,218 +1,322 @@
 # 求职助手 Agent
 
-## 1. 项目概述
+[![CI](https://github.com/1055537213/Job-Hunting/actions/workflows/ci.yml/badge.svg)](https://github.com/1055537213/Job-Hunting/actions/workflows/ci.yml)
 
-求职助手 Agent 是一个面向 BOSS 直聘求职场景的网页应用。一个账号可以创建多个候选人档案，每个档案可以建立多个独立对话。系统通过 LangChain Agent 组合候选人资料、职位信息、项目证据、简历文件和对话记忆，为不同求职者提供通用的职位匹配与材料生成能力。
+一个面向求职准备场景的多账号 Agent 工作台。系统将候选人档案、职位、项目经历、简历文件和对话记忆组织为可追溯事实，并通过 LangChain Agent、RAG 与后台任务完成职位匹配、材料整理和定制简历生成。
 
-当前核心功能：
+## 1. 项目简介
 
-- 保存学历、经验年限、技能、证书、目标城市、薪资和不可接受条件等结构化档案。
-- 审核并导入用户复制的 BOSS 职位文本，或用户主动上传截图后由多模态模型先判定、再转写的职位文本；非招聘图片和无关文本不会保存。
-- 按学历、经验、技能和明确不可接受条件淘汰职位，再用普通偏好进行排序。
-- 分析用户主动提供的公开 GitHub 仓库，生成待确认项目经历卡片；确认后写入长文本事实源并自动创建 RAG 增量索引任务。
-- 上传 DOCX、文字版 PDF 或扫描版 PDF 简历，提取正文并保存文件版本；扫描件由后台 Worker 执行 OCR。
-- 根据目标职位生成职位定制简历草稿和 DOCX/PDF 文件，不覆盖候选人档案或原始简历。
-- 根据 HR 问题生成可编辑回复草稿，并保持候选人事实与模型推断的边界。
-- 持久化聊天记录，启动时恢复上下文；超出上下文预算时压缩旧消息。
-- 记录聊天、Embedding 和 Rerank 的 Token 用量，为后台统计和后续按量计费提供数据。
+求职过程中，个人信息、职位要求、项目经历和简历版本通常分散在不同位置，直接让模型自由生成又容易混入未经确认的内容。本项目解决以下问题：
 
-系统当前采用用户主动提供数据的方式接入 BOSS 直聘，不自动登录、抓取隐藏接口、投递简历或发送消息。
+- 用结构化档案保存学历、经验、技能熟练度、目标方向、城市和薪资偏好。
+- 审核用户粘贴的职位文本或主动上传的职位截图，拒绝无关内容和重复导入。
+- 分析用户提供的公开 GitHub 仓库，将推断出的技术与职责先交给用户按组确认。
+- 将确认后的长文本建立账号隔离的 pgvector 索引，为匹配和简历生成提供可追溯证据。
+- 通过 SSE 流式展示 Agent 回复，通过 Celery Worker 执行 OCR、项目分析和 RAG 索引。
+- 记录供应商返回的 Token 用量，按配置价格实时扣减余额，并向管理员提供分页账本和工具调用轨迹。
 
-## 2. 技术栈
+PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis 只传递任务键。系统不会自动登录 BOSS、抓取隐藏接口、投递简历或发送招聘消息。
 
-| 分类 | 技术 | 作用 |
+## 2. 页面预览
+
+仓库暂未提供公开在线环境。本地启动后可访问：
+
+| 页面 | 地址 | 用途 |
 | --- | --- | --- |
-| 前端 | Vue、HTML、CSS、JavaScript | 构建登录页、候选人工作台、流式聊天、职位与简历管理界面 |
-| 前端 | Server-Sent Events、Markdown 渲染 | 接收流式 Agent 回复并展示表格、列表和代码块 |
-| 后端 | Python 3.12.13、FastAPI、Uvicorn | 提供网页服务、认证、业务 API、文件上传下载和流式响应 |
-| 后端 | LangChain、LangGraph | 创建 Agent、注册工具、编排模型调用和管理会话状态 |
-| 后端 | Celery、Redis | 异步执行 OCR、RAG 索引和 GitHub 项目分析任务 |
-| 后端 | RapidOCR、PDFium、pdfplumber、python-docx、ReportLab | 识别、解析和生成 DOCX/PDF 简历文件 |
-| 数据库 | PostgreSQL、SQLAlchemy | 保存账号、候选人档案、职位、会话、任务、文件元数据和 Token 用量 |
-| 数据库 | pgvector | 保存 RAG 文本向量并执行账号隔离的语义检索 |
-| 数据库 | Alembic | 以版本化迁移管理数据库表、约束和索引 |
-| 存储 | MinIO、S3-compatible API | 保存上传的原始简历和生成的职位定制文件 |
-| 开发工具 | Docker、Docker Compose | 统一启动数据库、对象存储、消息队列、迁移、Web 和 Worker |
-| 开发工具 | pytest | 验证业务规则、API、数据库迁移、RAG、后台任务和前端回归行为 |
+| 登录与注册 | `http://127.0.0.1:8000/login` | 注册、登录和认证反馈 |
+| 工作台 | `http://127.0.0.1:8000/workspace` | 档案、Agent 对话、职位、项目和简历 |
+| 个人中心 | `http://127.0.0.1:8000/profile` | 余额、消费流水和模拟充值入口 |
+| 管理后台 | `http://127.0.0.1:8000/admin` | 账号用量、余额账本、工具轨迹、请求观测和管理员审计 |
+| Swagger | `http://127.0.0.1:8000/docs` | 交互式 API 文档 |
 
-### Python 运行时基线
+前端是随 FastAPI 一起发布的 Vue 单页应用，不需要单独启动 Node 开发服务器。
 
-- Docker 基础镜像固定为 `python:3.12.13-slim`，避免 `python:3.12-slim` 这类浮动标签在未来构建时自动切换补丁版本。
-- 本项目在宿主机直接使用 `E:\Anaconda\envs\langchain1.2`，其中运行的是 Python 3.12.13；该环境也是本地测试和 `pip-tools` 的运行环境。
-- 运行时依赖由 `requirements.lock` 固定，解释器版本由本地 Conda 环境和 Docker 基础镜像共同固定。
+## 3. 功能清单
 
-## 3. 项目架构
+### 账号与工作区
 
-### 整体架构与模块关系
+- 邮箱注册、Argon2id 密码哈希、服务端 Session、CSRF 和登录限流。
+- 登录页、工作台、个人中心和管理后台使用独立路由。
+- 一个账号可创建多个候选人档案，每个档案可维护多个独立对话。
+- 账号、档案、职位、项目、简历、RAG 和用量数据均按归属隔离。
 
-```text
-浏览器中的 Vue 页面
-        |
-        | HTTP / SSE
-        v
-FastAPI Web API
-        |
-        v
-JobHuntingApp 业务门面
-        |
-        +---------------- LangChain Agent ----------------+
-        |                    |                             |
-        |                    v                             v
-        |             Model Gateway                 Agent 工具集
-        |          聊天 / Embedding / Rerank     档案 / 职位 / 项目 / 简历
-        |                                                  |
-        +--------------------+-----------------------------+
-                             |
-             +---------------+----------------+
-             |               |                |
-             v               v                v
-        PostgreSQL       MinIO 对象存储    Redis 消息队列
-        结构化事实源      简历二进制文件        |
-        long_texts                              v
-        rag_chunks                         Celery Worker
-        background_tasks                  OCR / RAG / GitHub 分析
-```
+### 候选人档案与对话
 
-`PostgreSQL` 是系统的权威事实源。`long_texts` 保存可追溯的长文本原文，`rag_chunks` 是通过 pgvector 建立的可重建派生索引。Redis 只传递 `task_key`，后台任务的状态、参数和结果摘要仍保存在 PostgreSQL；简历正文和仓库源码不会写入 Redis。
+- 保存学历、经验、技能熟练度、证书、求职方向、城市和薪资偏好。
+- 技能名称支持大小写与常见别名归一化，明确不会的技能不进入匹配和简历证据。
+- 对话可更新档案事实；明确的“改为”语义会替换目标方向而不是追加。
+- SSE 流式回复、持久化聊天记录、上下文恢复和超预算历史压缩。
+- 任务过程以内嵌折叠区显示，任务完成后自动收起。
 
-### 主要数据流
+### 职位、项目与简历
 
-1. 用户登录后选择候选人档案和对话会话。
-2. FastAPI 接收聊天、职位文本、用户主动上传的职位截图、GitHub 链接或简历文件，并校验账号与候选人归属；截图模型先返回是否为职位和置信度，再由本地职位解析器复审。截图只在识别请求期间传给模型，服务端不会访问其来源链接或持久化截图本体。
-3. LangChain Agent 根据用户意图调用档案、职位、项目、RAG、简历或 HR 回复工具。
-4. 可精确比较的字段写入 PostgreSQL；职位同时记录用户填写的来源链接、导入方式和接收时间；项目描述、职位全文和简历正文登记到 `long_texts`。
-5. OCR、RAG 索引和 GitHub 分析等可持久化耗时操作先创建 `background_tasks` 记录，再由 Redis/Celery Worker 认领；重复消息只有一个 Worker 可以执行。截图识别为了不持久化图片，采用带并发上限的前台线程调用。
-6. RAG Worker 切分长文本、调用 Embedding，并将向量写入 `rag_chunks`；检索时先按账号和候选人过滤。
-7. Agent 结合结构化事实、职位要求和 RAG 证据生成匹配解释、简历草稿或 HR 回复。
-8. 前端通过 SSE 接收聊天输出，通过任务 API 轮询 OCR、GitHub 分析和 RAG 索引状态。
+- 粘贴职位文本导入，或上传职位截图后由多模态模型识别并由本地解析器复审。
+- 职位、候选人、项目和原始简历按各自归属范围进行内容指纹去重。
+- 按学历、经验和明确禁忌做硬筛选，按技能、方向、城市和薪资偏好排序并解释。
+- 分析公开 GitHub 仓库，不执行仓库代码，不读取敏感文件；推断内容必须由用户按组确认。
+- 删除项目时同步删除 PostgreSQL 卡片、长文本事实和对应 pgvector 索引。
+- 上传 DOCX、文字 PDF 或扫描 PDF；扫描件由 Worker OCR。
+- 基于职位和已确认候选人证据生成独立 DOCX/PDF 定制简历，不覆盖原始简历。
 
-## 4. 目录结构
+### RAG、后台任务与管理
+
+- 结构化事实与长文本索引分离，Embedding 身份变化时不会混用旧向量。
+- 检索先做账号与候选人过滤，再进行余弦相似度召回，可选 Rerank。
+- Celery 任务支持幂等键、原子认领、进度、有限重试、错误摘要和刷新后恢复。
+- 管理后台展示账号余额、消费流水、Token 明细、工具调用流程、请求指标和管理员审计。
+- Token、工具调用和余额流水每账号最多保留 `5` 页，每页 `100` 条，超出 `500` 条的旧记录从数据库删除。
+- 新账号余额默认为 `0`；开发环境可模拟充值，生产环境在接入真实支付前禁用该入口。
+
+## 4. 技术栈
+
+| 层次 | 技术 | 主要职责 |
+| --- | --- | --- |
+| 前端 | Vue 3、HTML、CSS、JavaScript | 多路由工作台、折叠任务过程、管理后台和响应式交互 |
+| 通信 | FastAPI、SSE、JSON API | 认证 API、业务接口、文件下载和流式回复 |
+| Agent | LangChain、LangGraph、OpenAI-compatible API | 模型适配、工具调用、会话状态和流式 Agent |
+| 模型网关 | Chat、Embedding、Rerank adapters | 调用上下文、有限重试、供应商 usage 和幂等计费 |
+| 数据 | PostgreSQL 16、SQLAlchemy、Alembic | 权威事实、事务、约束、账号隔离和版本化迁移 |
+| RAG | pgvector、LangChain Text Splitters | 文本切片、向量索引、余弦召回和可选重排 |
+| 异步任务 | Celery、Redis、Celery Beat | OCR、RAG 索引、GitHub 分析和周期维护 |
+| 文件 | MinIO / S3、python-docx、ReportLab | 原始简历和导出文件的对象存储与生成 |
+| 文档识别 | pdfplumber、PDFium、RapidOCR、ONNX Runtime | DOCX/PDF 解析、扫描件检测和 OCR |
+| 工程 | Docker Compose、Caddy、GitHub Actions | 本地复现、单机生产基线、HTTPS 和持续集成 |
+| 质量 | pytest、Ruff、Node 回归脚本 | 业务、迁移、API、前端和发布基线验证 |
+
+运行时固定为 Python `3.12.x`，Docker 基础镜像当前固定到 `python:3.12.13-slim`。生产依赖与开发质量工具分别锁定在 `requirements.lock` 和 `requirements-dev.lock`。
+
+## 5. 项目亮点
+
+1. **事实和推断分离**：只有候选人明确提供或确认的内容才能成为简历与匹配证据，职位要求不能反向污染候选人能力。
+2. **结构化库和知识库联动删除**：项目、职位和简历删除沿 PostgreSQL 外键及应用服务边界清理，pgvector 不保留孤立索引。
+3. **多租户隔离贯穿全链路**：数据库查询、对象键、RAG 检索、任务、工具轨迹和账单都携带账号归属。
+4. **后台任务可恢复**：Redis 消息只包含 `task_key`，任务权威状态在 PostgreSQL；幂等键和原子认领防止重复执行。
+5. **实时计量和余额账本**：只使用供应商确认的 Token usage 计费，调用 ID 防止重试重复扣费，余额不足时阻止新的模型调用。
+6. **安全的外部内容入口**：职位截图仅在识别请求期间使用；GitHub 分析限制公开仓库、文件类型、归档大小和重定向目标。
+7. **可执行的上线基线**：包含 CI、生产 Compose、HTTPS 反向代理、迁移门禁、备份与恢复脚本及上线前评测入口。
+
+## 6. 目录结构说明
 
 ```text
 Job-hunting Agent/
 ├─ src/job_hunting_agent/
-│  ├─ web.py                     # FastAPI、认证、业务 API 与 SSE 入口
-│  ├─ agent.py                   # LangChain Agent、提示词与工具注册
-│  ├─ app.py                     # 应用服务门面和模块编排
-│  ├─ storage.py                 # PostgreSQL 领域读写逻辑
-│  ├─ sqlalchemy_store.py        # SQLAlchemy 连接与事务适配
-│  ├─ database_schema.py         # PostgreSQL/pgvector 表结构定义
-│  ├─ models.py                  # 领域模型和 API 数据对象
-│  ├─ model_gateway.py           # 模型调用、重试、调用 ID 和 Token 用量
-│  ├─ pgvector_rag.py            # pgvector 索引与语义检索
-│  ├─ background_tasks.py        # Celery 任务状态机和执行器
-│  ├─ worker.py                  # Celery Worker 入口
-│  ├─ job_screenshot.py          # 职位截图校验、多模态审核与短生命周期转写
-│  ├─ deduplication.py           # 内容规范化、SHA-256 指纹与重复资源错误
-│  ├─ github_project.py          # GitHub URL 校验、归档读取与安全筛选
-│  ├─ resume_document.py         # DOCX/PDF 解析与 OCR
-│  ├─ resume_writer.py           # 职位定制简历内容生成
-│  ├─ resume_exporter.py         # DOCX/PDF 简历导出
-│  └─ web_static/                # Vue 页面、样式、城市数据和前端脚本
-├─ alembic/
-│  └─ versions/
-│     └─ 20260814_0003_content_deduplication.py # 内容指纹与职位来源追溯迁移
-├─ tests/                        # Python 测试与前端回归脚本
-├─ docs/
-│  ├─ adr/                       # 架构决策记录
-│  ├─ learning/                  # 技术栈学习与操作说明
-│  └─ research/                  # BOSS 接入与职位标准化研究
-├─ compose.yaml                  # 完整本地容器拓扑
-├─ compose.dev.yaml              # 源码挂载和热更新覆盖配置
-├─ Dockerfile                    # Web/Worker 镜像构建
-├─ requirements.lock             # pip-tools 生成的精确运行时依赖版本
-├─ alembic.ini                   # Alembic 配置
-├─ pyproject.toml                # Python 依赖、包配置和命令入口
-├─ .env.example                  # 环境变量模板，不包含真实密钥
-├─ CONTEXT.md                    # 产品边界与领域上下文
-└─ DECISION_MAP.md               # 已确认决策和后续问题队列
+│  ├─ web.py                  # FastAPI 路由、SSE 和页面入口
+│  ├─ web_hardening.py        # CSRF、限流、安全头、请求 ID 与指标
+│  ├─ agent.py                # LangChain Agent、提示词和工具注册
+│  ├─ app.py                  # 业务门面与模块编排
+│  ├─ storage.py              # PostgreSQL 领域仓储与事务逻辑
+│  ├─ database_schema.py      # SQLAlchemy 表、约束和索引
+│  ├─ model_gateway.py        # 模型调用、usage、重试与计费边界
+│  ├─ rag.py                  # Embedding、Rerank 和切片协议
+│  ├─ pgvector_rag.py         # pgvector 索引、检索和删除
+│  ├─ background_tasks.py     # Celery 任务状态机和执行器
+│  ├─ job_screenshot.py       # 职位截图多模态识别
+│  ├─ github_project.py       # 公开仓库安全读取与筛选
+│  ├─ resume_document.py      # DOCX/PDF 解析与 OCR
+│  ├─ resume_writer.py        # 证据约束的定制简历内容
+│  ├─ resume_exporter.py      # DOCX/PDF 导出
+│  ├─ evals/                  # RAG 与对话语义评测
+│  └─ web_static/             # Vue 页面、前端逻辑和样式
+├─ alembic/versions/          # PostgreSQL 版本化迁移
+├─ tests/                     # Python 测试和前端 Node 回归脚本
+├─ scripts/
+│  ├─ enterprise_acceptance.ps1 # 完整本地验收
+│  ├─ backup.ps1                # PostgreSQL + MinIO 备份
+│  └─ restore.ps1               # 受控恢复演练
+├─ deploy/                    # Caddy 与生产环境变量模板
+├─ docs/                      # ADR、研究、部署和学习文档
+├─ compose.yaml               # 基础服务拓扑
+├─ compose.dev.yaml           # 本地源码挂载与热更新
+├─ compose.prod.yaml          # 单机生产覆盖配置
+├─ Dockerfile
+├─ requirements.lock
+├─ requirements-dev.lock
+├─ CONTEXT.md                 # 产品边界与权威上下文
+└─ DECISION_MAP.md            # 已确认决策与后续队列
 ```
 
-运行数据不提交到 Git。PostgreSQL、MinIO 和 Redis 数据分别保存在 Docker named volume 中；`.env`、缓存、构建产物和本地运行文件由忽略规则排除。
+`.env`、数据库文件、缓存、构建产物和本地运行数据均被 Git 忽略。PostgreSQL、MinIO 和 Redis 默认使用 Docker named volume。
 
-## 5. 核心文件说明
+## 7. 运行步骤
 
-### 项目入口和配置
+### 7.1 环境要求
 
-- `src/job_hunting_agent/web.py`：网页主入口，提供注册登录、候选人档案、会话、职位、匹配、项目、简历、RAG、后台任务和管理员 API。
-- `src/job_hunting_agent/web_hardening.py`：Web 边缘安全和基础观测中间件，统一处理请求 ID、安全响应头、CSRF、限流、访问日志和请求指标快照。
-- `src/job_hunting_agent/worker.py`：独立 Worker 入口，注册 Celery 任务并消费 Redis 队列。
-- `src/job_hunting_agent/config.py`：读取 `.env`，校验数据库、对象存储、队列、模型、Embedding、Rerank、记忆和 Session 配置。
-- `compose.yaml`：启动 PostgreSQL、MinIO、Redis、Alembic 迁移、Web 和 Worker。首次运行前需要将 `.env.example` 复制为 `.env`，替换占位凭据和模型配置，然后执行 `docker compose up -d --build`。
-- `compose.dev.yaml`：本地开发覆盖配置，挂载源码并开启 Web 热更新。
-- `pyproject.toml`：声明依赖、包数据以及 `job-agent-web`、`job-agent-worker` 命令入口。
-- `requirements.lock`：由 `pip-tools` 根据 `pyproject.toml` 生成的运行时依赖锁定文件；Docker
-  构建使用它安装依赖，修改 `pyproject.toml` 后必须重新生成。
+- Git
+- Docker Desktop 或兼容的 Docker Engine
+- Docker Compose v2
+- 可用的 OpenAI-compatible Chat 模型配置
+- 可选：Python 3.12、Node.js 22，用于宿主机测试
 
-### 核心业务实现
-
-- `src/job_hunting_agent/app.py`：连接存储、Agent、RAG、项目分析、职位匹配、简历处理和后台任务，是 Web 与工具层共用的业务门面。
-- `src/job_hunting_agent/agent.py`：使用 LangChain 创建 Agent，定义系统提示词并注册候选人资料、职位、GitHub 项目、简历和 HR 回复工具。
-- `src/job_hunting_agent/matcher.py`：实现学历硬门槛、经验差距淘汰、不可接受条件淘汰、技能评分和普通偏好排序。
-- `src/job_hunting_agent/job_parser.py`、`job_screenshot.py`：分别复审职位文本、校验用户截图；截图必须经多模态模型明确判断为职位后才进入解析器。
-- `src/job_hunting_agent/deduplication.py`：将内容规范化为 SHA-256 指纹；职位和候选人档案在账号内去重，项目经历和原始简历在同一候选人内去重，避免共享账号中不同人的材料相互阻塞。
-- `src/job_hunting_agent/conversation_ingestion.py`：判断对话内容应写入结构化档案、长文本知识来源或仅保留为聊天消息。
-- `src/job_hunting_agent/conversation_memory.py`：恢复持久化对话，计算上下文预算并压缩较早消息。
-- `src/job_hunting_agent/project_analyzer.py`、`github_project.py`：从受控项目文本提取技术栈和功能线索；GitHub 模块只访问公开仓库官方端点，不执行仓库代码。
-- `src/job_hunting_agent/resume_writer.py`、`resume_exporter.py`：生成证据约束的职位定制草稿，并导出独立 DOCX/PDF 文件。
-
-### 数据模型和 API
-
-- `src/job_hunting_agent/models.py`：定义账号、候选人、职位、项目卡片、简历、聊天、RAG、任务和 Token 用量等领域对象。
-- `src/job_hunting_agent/database_schema.py`：定义目标 PostgreSQL 表、外键、唯一约束、状态检查、职位来源字段和 pgvector 字段。
-- `src/job_hunting_agent/storage.py`：实现账号隔离的领域查询、写入和后台任务原子认领。
-- `src/job_hunting_agent/sqlalchemy_store.py`：将仓储接口连接到 SQLAlchemy Engine，并统一 PostgreSQL 参数与事务行为。
-- `alembic/versions/`：保存可审计的数据库升级脚本；Web 启动时只校验版本，不自行建表。
-- `src/job_hunting_agent/web.py`：将核心业务暴露为 JSON API、文件下载响应和 SSE 流式聊天接口。
-
-### 关键组件和服务模块
-
-- `src/job_hunting_agent/model_gateway.py`、`llm.py`：统一聊天、Embedding、Rerank 的供应商配置、有限重试、调用 ID 和 Token usage 记录；兼容通用 OpenAI-compatible 模型与旧版 DeepSeek 思考参数。
-- `src/job_hunting_agent/rag.py`、`pgvector_rag.py`：负责文本切分、Embedding 协议、可选 Rerank、向量写入和来源可追溯检索。
-- `src/job_hunting_agent/evals/rag_eval.py`：执行 RAG 黄金用例评测，输出 Recall@K、MRR 和禁止召回命中率，用于换模型、改切片或上线前验收。
-- `src/job_hunting_agent/evals/conversation_eval.py`：执行候选人档案变更回归，验证方向替换、技能熟练度、城市覆盖等固定语义规则。
-- `src/job_hunting_agent/object_storage.py`：通过 S3-compatible 接口读写 MinIO，数据库只保存对象键、哈希、版本和归属。
-- `src/job_hunting_agent/task_queue.py`：封装 Celery 投递，队列消息只包含安全的 `task_key`。
-- `src/job_hunting_agent/background_tasks.py`：原子认领任务并处理进度、重试、失败恢复、OCR、RAG 和 GitHub 分析。
-- `src/job_hunting_agent/resume_document.py`：校验文件类型和大小，解析 DOCX、文字 PDF，并为扫描 PDF 提供 OCR 流程。
-- `src/job_hunting_agent/web_static/index.html`、`app.js`、`styles.css`：实现登录、工作台、Markdown、SSE、任务轮询和响应式界面。
-- `tests/`：覆盖数据库迁移、认证隔离、职位匹配、Agent、RAG、对象存储、后台任务、简历和网页回归行为。
-
-## 6. 企业级质量验收
-
-RAG 召回评测使用固定黄金用例校验检索结果。先生成可编辑模板：
+### 7.2 获取代码与配置
 
 ```powershell
-E:\Anaconda\envs\langchain1.2\python.exe -m job_hunting_agent.evals.rag_eval --write-example data\runtime\rag_eval_cases.example.json
+git clone https://github.com/1055537213/Job-Hunting.git
+Set-Location Job-Hunting
+Copy-Item .env.example .env
 ```
 
-把模板里的 `expected_long_text_ids`、`expected_source_labels` 和 `forbidden_source_labels` 改成当前数据库中真实材料的 ID 或来源标签后运行：
+编辑本地 `.env`，至少替换其中的模型 API、MinIO、Redis 和管理员引导占位配置。不要提交 `.env`，不要在日志、Issue 或截图中公开密钥。
 
-```powershell
-E:\Anaconda\envs\langchain1.2\python.exe -m job_hunting_agent.evals.rag_eval --cases data\runtime\rag_eval_cases.example.json --account-id 8 --top-k 5
+计费相关配置：
+
+```dotenv
+JOB_AGENT_BILLING_PRICE_PER_MILLION_TOKENS_YUAN=25
+JOB_AGENT_BILLING_STARTING_BALANCE_YUAN=0
+JOB_AGENT_BILLING_LOW_BALANCE_THRESHOLD_YUAN=10
 ```
 
-退出码为 0 表示所有用例通过；失败时报告会显示具体用例的 Recall@K、MRR 和禁止召回命中数。上线前建议同时执行：
+### 7.3 启动本地开发环境
 
 ```powershell
+docker compose -f compose.yaml -f compose.dev.yaml up -d --build
+docker compose -f compose.yaml -f compose.dev.yaml ps
+```
+
+迁移服务会先执行 `alembic upgrade head`，成功后 Web、Worker 和 Beat 才会启动。浏览器访问：
+
+```text
+http://127.0.0.1:8000/login
+```
+
+常用检查：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/health
+docker compose -f compose.yaml -f compose.dev.yaml logs --tail 100 web worker beat
+```
+
+开发覆盖已挂载 `src/` 和 `alembic/`。Python Web 代码会自动重载，前端静态文件刷新浏览器即可；Worker 或 Beat 代码变化后应重启对应容器：
+
+```powershell
+docker compose -f compose.yaml -f compose.dev.yaml restart worker beat
+```
+
+### 7.4 本地质量验收
+
+先确保开发 PostgreSQL 正在运行，再安装锁定依赖：
+
+```powershell
+python -m pip install -r requirements.lock -r requirements-dev.lock
+python -m pip install --no-deps -e .
 .\scripts\enterprise_acceptance.ps1
 ```
 
-如果已经维护了真实 RAG 黄金用例，可以把它接入同一套验收：
+也可以单独执行：
 
 ```powershell
-.\scripts\enterprise_acceptance.ps1 -RagCases data\runtime\rag_eval_cases.example.json -AccountId 8 -TopK 5
+python -m pytest -q
+ruff check src tests alembic
+python -m compileall -q src tests alembic
+Get-ChildItem tests -Filter "frontend_*.mjs" | ForEach-Object { node $_.FullName }
 ```
 
-候选人档案变更回归不依赖知识库规模，适合在改动“求职方向替换、城市覆盖、技能熟练度、偏好权重”等规则后快速跑：
+RAG 黄金集准备完成后，将其加入统一验收：
 
 ```powershell
-E:\Anaconda\envs\langchain1.2\python.exe -m job_hunting_agent.evals.conversation_eval --write-example data\runtime\conversation_eval_cases.example.json
-E:\Anaconda\envs\langchain1.2\python.exe -m job_hunting_agent.evals.conversation_eval --cases data\runtime\conversation_eval_cases.example.json
+python -m job_hunting_agent.evals.rag_eval --write-example data\runtime\rag_eval_cases.example.json
+.\scripts\enterprise_acceptance.ps1 -RagCases data\runtime\rag_eval_cases.example.json -AccountId 1 -TopK 5
 ```
 
-如果希望把它一起纳入统一验收，可以这样执行：
+### 7.5 单机生产基线
+
+生产部署必须使用独立密码、独立数据卷、预创建对象存储 bucket 和不可变镜像标签。详细步骤见 [生产发布与恢复基线](docs/learning/production-release.md)。核心命令：
 
 ```powershell
-.\scripts\enterprise_acceptance.ps1 -ConversationCases data\runtime\conversation_eval_cases.example.json
+docker build --tag $env:JOB_AGENT_IMAGE .
+docker compose -f compose.yaml -f compose.prod.yaml config --quiet
+docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 ```
+
+生产覆盖使用 PostgreSQL SCRAM 密码认证，内部服务不暴露宿主机端口，由 Caddy 提供 HTTPS。上线前至少完成一次：
+
+```powershell
+.\scripts\backup.ps1
+.\scripts\restore.ps1 -BackupDirectory <backup-directory> -ConfirmRestore
+```
+
+## 8. 接口文档
+
+启动后可直接访问 `/docs` 或 `/redoc` 查看由 FastAPI 生成的完整请求模型。主要接口如下：
+
+| 模块 | 方法与路径 | 说明 |
+| --- | --- | --- |
+| 认证 | `POST /api/auth/register` | 注册普通账号 |
+| 认证 | `POST /api/auth/login` | 登录并设置服务端 Session Cookie |
+| 认证 | `GET /api/auth/me` | 获取当前账号、CSRF 和余额摘要 |
+| 认证 | `POST /api/auth/logout`、`POST /api/auth/logout-all` | 退出当前设备或全部设备 |
+| 档案 | `GET/POST /api/profiles` | 列出或创建候选人档案 |
+| 档案 | `GET/DELETE /api/profiles/{candidate_id}` | 查看或删除档案 |
+| 对话 | `POST /api/chat/stream` | SSE 流式 Agent 对话 |
+| 对话 | `/api/chat/sessions`、`/api/chat/history` | 会话和历史记录管理 |
+| 职位 | `POST /api/jobs`、`POST /api/jobs/screenshots` | 文本或截图导入职位 |
+| 职位 | `GET /api/jobs`、`DELETE /api/jobs/{job_id}` | 列出或删除职位 |
+| 匹配 | `GET /api/matches/{candidate_id}` | 返回排序结果和解释 |
+| 项目 | `POST /api/projects/github` | 提交公开 GitHub 项目分析 |
+| 项目 | `POST /api/projects/{record_id}/confirm` | 保存用户确认的项目内容 |
+| 项目 | `GET /api/projects`、`DELETE /api/projects/{record_id}` | 列出或级联删除项目证据 |
+| 简历 | `POST /api/resumes/upload` | 上传 DOCX/PDF 原始简历 |
+| 简历 | `POST /api/resumes/{artifact_id}/tailor` | 生成职位定制简历 |
+| 简历 | `GET /api/resumes/{artifact_id}/download` | 鉴权下载简历文件 |
+| RAG | `GET /api/rag/search` | 账号隔离的检索调试接口 |
+| 余额 | `GET /api/me/balance` | 当前账号余额与分页流水 |
+| 余额 | `POST /api/me/balance/recharge` | 仅开发环境模拟充值 |
+| 管理 | `/api/admin/usage/*`、`/api/admin/balance/*` | Token、余额和消费记录 |
+| 管理 | `/api/admin/tools/traces*` | 工具调用任务与步骤详情 |
+| 管理 | `/api/admin/observability/requests` | 进程内请求指标快照 |
+| 管理 | `/api/admin/audit/events` | 管理员操作审计 |
+| 运维 | `GET /api/health` | 数据库、存储、模型和队列健康摘要 |
+
+已登录的写操作需要同源 Cookie 和 `X-CSRF-Token`。管理接口要求 `admin` 角色；所有资源接口还会校验账号归属。
+
+## 9. 常见问题
+
+### 为什么 `localhost:8000` 无法访问，但 `127.0.0.1:8000` 可以？
+
+开发 Compose 显式绑定 IPv4 回环地址。部分 Windows 环境会把 `localhost` 优先解析到 IPv6 `::1`，请使用 `http://127.0.0.1:8000`。
+
+### 修改前端后为什么页面没有变化？
+
+先确认使用了 `compose.dev.yaml`，它会把 `src/` 挂载进容器。普通 HTML/CSS/JS 修改只需刷新；若浏览器仍持有旧资源，执行硬刷新。没有使用开发覆盖时，需要重新创建 Web 容器或重建镜像。
+
+### 为什么新账号无法调用模型？
+
+新账号初始余额为 `0`。本地开发可进入个人中心使用模拟充值；生产环境会禁用模拟入口，真实支付接入前应由受控运维流程充值。余额不足统一返回“余额不足，请先充值后重试。”
+
+### 为什么项目确认后 RAG 任务失败？
+
+项目卡片已经保存在 PostgreSQL，RAG 是后续派生索引任务。先检查余额、Worker、Redis 和模型网关日志；修复后可重新触发索引，不要重复创建项目。
+
+### 删除项目后数据库和知识库会一起删除吗？
+
+会。删除接口校验账号归属后删除项目卡片和关联长文本，pgvector 分块通过数据库级联删除；成功删除后同一 GitHub 仓库可以再次导入。
+
+### 数据库结构应该怎样修改？
+
+新增或修改表结构必须创建 Alembic revision，再执行 `alembic upgrade head`。Web 启动只校验 revision，不会绕过迁移自行建表。
+
+### PostgreSQL、MinIO 和 Redis 数据保存在哪里？
+
+本地默认保存在 Docker named volume。`docker compose down` 不会删除数据，`docker compose down -v` 会删除卷，执行前必须确认已备份。
+
+### 如何查看服务故障？
+
+先访问 `/api/health`，再查看 `web`、`worker`、`beat`、`postgres`、`redis` 和 `minio` 日志。管理员可在后台查看请求错误摘要、工具失败原因和审计记录。
+
+## 10. TODO / 未来计划
+
+- [ ] 接入真实支付渠道、签名 Webhook、充值订单和退款对账。
+- [ ] 在上线前建立足量 RAG 黄金测试集，确定 Recall@K、MRR 和禁止召回阈值。
+- [ ] 把请求指标接入 Prometheus/OpenTelemetry，并配置生产告警和长期趋势。
+- [ ] 将进程内限流、短期 Agent 状态和指标迁移到共享基础设施，支持 Web 多副本。
+- [ ] 将定制简历导出迁移到 Worker，并补充大文件和高并发容量测试。
+- [ ] 建立严格类型检查基线，逐步消化第三方 stub 和内部 Protocol 类型债务。
+- [ ] 完成依赖与镜像漏洞扫描、渗透测试、灾难恢复演练和密钥轮换流程。
+- [ ] 在确定正式 Embedding 模型后评估 pgvector HNSW/IVFFlat 索引参数。
+
+## 11. 联系方式与声明
+
+- 问题反馈：[GitHub Issues](https://github.com/1055537213/Job-Hunting/issues)
+- 架构边界：[CONTEXT.md](CONTEXT.md)、[DECISION_MAP.md](DECISION_MAP.md) 和 [ADR](docs/adr/)
+- 部署说明：[生产发布与恢复基线](docs/learning/production-release.md)
+
+本项目用于求职材料管理与工程实践。模型输出可能不准确，候选人应审核所有档案、项目、简历和 HR 回复后再使用。使用者需自行确认上传内容、第三方模型、对象存储和部署环境符合隐私、版权、平台条款及适用法律要求。本项目不承诺求职结果，也不提供绕过招聘网站登录、反爬或风控机制的能力。

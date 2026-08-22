@@ -142,7 +142,7 @@ class BillingSettings:
     """
 
     price_per_million_tokens_yuan: float = 25.0
-    starting_balance_yuan: float = 100.0
+    starting_balance_yuan: float = 0.0
     low_balance_threshold_yuan: float = 10.0
 
 
@@ -367,17 +367,6 @@ def load_model_gateway_settings(
     )
 
 
-def masked_model_gateway_settings(settings: ModelGatewaySettings) -> dict[str, object]:
-    """返回可安全展示的 Gateway 配置摘要。"""
-
-    return {
-        "environment": settings.environment,
-        "chat_max_retries": settings.chat_max_retries,
-        "embedding_max_retries": settings.embedding_max_retries,
-        "rerank_max_retries": settings.rerank_max_retries,
-    }
-
-
 def load_database_settings(
     env_path: str | Path = DEFAULT_ENV_PATH,
     environ: Mapping[str, str] | None = None,
@@ -471,16 +460,6 @@ def mask_database_url(value: str) -> str:
     return urlunsplit(
         (parts.scheme, masked_credentials + "@" + host, parts.path, parts.query, parts.fragment)
     )
-
-
-def masked_database_settings(settings: DatabaseSettings) -> dict[str, object]:
-    """返回数据库配置的脱敏摘要。"""
-
-    return {
-        "configured": settings.configured,
-        "dialect": settings.dialect,
-        "url": settings.masked_url,
-    }
 
 
 def load_object_storage_settings(
@@ -732,8 +711,8 @@ def load_billing_settings(
             get("JOB_AGENT_BILLING_PRICE_PER_MILLION_TOKENS_YUAN", default="25"),
             "JOB_AGENT_BILLING_PRICE_PER_MILLION_TOKENS_YUAN",
         ),
-        starting_balance_yuan=parse_positive_float(
-            get("JOB_AGENT_BILLING_STARTING_BALANCE_YUAN", default="100"),
+        starting_balance_yuan=parse_non_negative_float(
+            get("JOB_AGENT_BILLING_STARTING_BALANCE_YUAN", default="0"),
             "JOB_AGENT_BILLING_STARTING_BALANCE_YUAN",
         ),
         low_balance_threshold_yuan=parse_positive_float(
@@ -1140,7 +1119,6 @@ def parse_positive_int(value: str | None, field_name: str) -> int:
         raise ValueError(f"{field_name} 必须大于 0")
     return parsed
 
-
 def parse_positive_float(value: str | None, field_name: str) -> float:
     """解析正浮点数配置，并给出可读错误。"""
 
@@ -1153,6 +1131,18 @@ def parse_positive_float(value: str | None, field_name: str) -> float:
     return parsed
 
 
+def parse_non_negative_float(value: str | None, field_name: str) -> float:
+    """解析允许为 0 的非负浮点数配置。"""
+
+    try:
+        parsed = float(value or "")
+    except ValueError as error:
+        raise ValueError(f"{field_name} 必须是非负数") from error
+    if parsed < 0:
+        raise ValueError(f"{field_name} 不能小于 0")
+    return parsed
+
+
 def parse_non_negative_int(value: str | None, field_name: str) -> int:
     """解析允许为 0 的非负整数配置。"""
 
@@ -1162,16 +1152,4 @@ def parse_non_negative_int(value: str | None, field_name: str) -> int:
         raise ValueError(f"{field_name} 必须是非负整数") from error
     if parsed < 0:
         raise ValueError(f"{field_name} 不能小于 0")
-    return parsed
-
-
-def parse_unit_interval(value: str | None, field_name: str) -> float:
-    """解析 0 到 1 之间的浮点比例。"""
-
-    try:
-        parsed = float(value or "")
-    except ValueError as error:
-        raise ValueError(f"{field_name} 必须是 0 到 1 之间的小数") from error
-    if not 0 < parsed <= 1:
-        raise ValueError(f"{field_name} 必须位于 0 到 1 之间")
     return parsed

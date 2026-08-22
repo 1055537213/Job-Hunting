@@ -44,6 +44,12 @@ def test_gateway_records_idempotent_provider_usage_without_prompt_content(tmp_pa
     store = SQLAlchemyStore(database_url)
     store.initialize()
     account = store.create_account("gateway@example.com", "not-used-by-this-test")
+    store.recharge_account_balance(
+        account.id,
+        1,
+        summary="Gateway 测试充值",
+        source_reference="gateway-usage-test-funding",
+    )
     gateway = ModelGateway(
         tmp_path / ".env",
         usage_store=store,
@@ -102,6 +108,12 @@ def test_gateway_records_rerank_usage_under_the_rerank_model_identity(tmp_path, 
     store = SQLAlchemyStore(database_url)
     store.initialize()
     account = store.create_account("rerank@example.com", "not-used-by-this-test")
+    store.recharge_account_balance(
+        account.id,
+        1,
+        summary="Rerank 测试充值",
+        source_reference="rerank-usage-test-funding",
+    )
     gateway = ModelGateway(
         tmp_path / ".env",
         usage_store=store,

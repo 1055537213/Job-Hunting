@@ -32,8 +32,8 @@ function extractMethod(signature, functionSignature) {
 }
 
 assert.match(page, /class="project-review-choice is-accept"/);
-assert.match(page, /href="\/static\/styles\.css\?v=20260821-project-delete-v1"/);
-assert.match(page, /src="\/static\/app\.js\?v=20260821-project-delete-v1"/);
+assert.match(page, /href="\/static\/styles\.css\?v=20260823-cleanup-v1"/);
+assert.match(page, /src="\/static\/app\.js\?v=20260823-project-collapse-v1"/);
 assert.match(page, /@click="deleteProjectCard\(record\)"/);
 assert.match(page, /class="danger-button compact project-card-delete"/);
 assert.match(source, /async deleteProjectCard\(record\) \{/);
@@ -41,6 +41,7 @@ assert.match(page, /@click="setProjectReviewDecision\(record, item, 'accepted'\)
 assert.match(page, /@click="setProjectReviewDecision\(record, item, 'rejected'\)"/);
 assert.match(page, /按组确认内容/);
 assert.match(page, /<summary>\s*<span>按组确认内容<\/span>/);
+assert.match(page, /:key="`\$\{record\.id\}:\$\{record\.status\}`"[\s\S]*?class="project-card-details"[\s\S]*?:open="record\.status === '待确认'"/);
 assert.match(page, /保存已确认内容/);
 assert.match(page, /message\.taskTrace\.approval\.kind !== 'project_card_confirmation'/);
 assert.match(source, /captureProjectTasksFromChat\(data\.background_tasks \|\| \[\]\)/);
@@ -271,6 +272,7 @@ assert.equal(
   "0123456789abcdef0123456789abcdef",
 );
 assert.equal(confirmContext.projectReviewSelections["12"], undefined);
+assert.equal(confirmContext.projectCards[0].status, "已确认");
 assert.equal(approvalReconciliations, 1);
 assert.match(savedMessages[0], /只有你确认的内容/);
 

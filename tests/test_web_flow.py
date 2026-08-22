@@ -77,6 +77,36 @@ def legacy_client(*_unused):
     return login_test_account(TestClient(create_web_app()))
 
 
+def test_web_registration_does_not_persist_password_as_display_name():
+    """Web 注册也不能把密码误写入账号显示名。"""
+
+    client = TestClient(create_web_app())
+    response = client.post(
+        "/api/auth/register",
+        json={
+            "email": "display-name-web-guard@example.com",
+            "password": "password-123",
+            "display_name": "password-123",
+        },
+    )
+
+    assert response.status_code == 200
+    account = response.json()["account"]
+    assert account["email"] == "display-name-web-guard@example.com"
+    assert account["display_name"] is None
+    assert "password_hash" not in account
+
+    logged_in = client.post(
+        "/api/auth/login",
+        json={
+            "email": "display-name-web-guard@example.com",
+            "password": "password-123",
+        },
+    )
+    assert logged_in.status_code == 200
+    assert logged_in.json()["account"]["email"] == "display-name-web-guard@example.com"
+
+
 def test_web_chat_payload_defaults_to_langchain_agent() -> None:
     """省略旧开关字段时，后端也必须默认走 LangChain Agent 主流程。"""
 
@@ -409,7 +439,7 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     for page in (login_page, workspace_page, profile_page, admin_page):
         assert page.status_code == 200
         assert page.headers["cache-control"] == "no-store, max-age=0"
-        assert "/static/app.js?v=20260821-project-delete-v1" in page.text
+        assert "/static/app.js?v=20260823-project-collapse-v1" in page.text
     assert "Job Hunting Agent" in home.text
     assert "syncAuthPageClass" in script.text
     assert "FRONTEND_ROUTES" in script.text
@@ -419,8 +449,14 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert 'v-if="showProfileSurface"' in home.text
     assert 'v-if="showAdminSurface"' in home.text
     assert 'v-if="showRouteLoading"' in home.text
-    assert '/static/app.js?v=20260821-project-delete-v1' in home.text
-    assert '/static/styles.css?v=20260821-project-delete-v1' in home.text
+    assert '/static/app.js?v=20260823-project-collapse-v1' in home.text
+    assert '/static/styles.css?v=20260823-cleanup-v1' in home.text
+    assert 'class="account-menu-trigger"' in home.text
+    assert 'id="workspaceAccountMenu"' in home.text
+    assert 'role="menuitem" @click="openProfile"' in home.text
+    assert 'role="menuitem" @click="logout"' in home.text
+    assert 'class="account-badge"' not in home.text
+    assert 'class="nav-link logout-link"' not in home.text
     assert "本地运行 · 用户复制职位文本" not in home.text
     assert "Conversation Workspace" not in home.text
     assert "整理求职证据" not in home.text
@@ -616,6 +652,9 @@ def test_web_profile_form_uses_city_picker_and_auth_copy(tmp_path):
     assert "Local Boundary" not in home
     assert "运行边界" not in home
     assert home.count("退出所有设备") == 1
+    assert ':title="auth.account?.email || auth.account?.display_name || \'账号\'"' in home
+    assert '{{ auth.account?.email || auth.account?.display_name || "账号" }}' in home
+    assert home.count('auth.account?.email || auth.account?.display_name || "账号"') == 3
     for education in ("高中及以下", "大专", "本科", "硕士", "博士"):
         assert f'<option value="{education}">{education}</option>' in home
     assert 'class="city-picker"' in home
@@ -627,8 +666,8 @@ def test_web_profile_form_uses_city_picker_and_auth_copy(tmp_path):
     assert "省份及直辖市" in home
     assert '<optgroup' not in home
     assert '/static/china_cities.js?v=20260803-cities' in home
-    assert '/static/styles.css?v=20260821-project-delete-v1' in home
-    assert '/static/app.js?v=20260821-project-delete-v1' in home
+    assert '/static/styles.css?v=20260823-cleanup-v1' in home
+    assert '/static/app.js?v=20260823-project-collapse-v1' in home
     assert "cityGroups: buildSortedCityGroups()" in script
     assert "HOT_CITY_NAMES" in script
     assert "cityPickerOpen: false" in script

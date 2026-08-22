@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Protocol
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
@@ -182,15 +182,3 @@ def extract_message_text(message: BaseMessage | object) -> str:
     if isinstance(content, (int, float)):
         return str(content)
     raise LLMRequestError("LLM 响应缺少可读取的文本内容")
-
-
-def masked_chat_model_settings(model: BaseChatModel) -> dict[str, Any]:
-    """返回适合调试展示的 LangChain ChatModel 摘要。"""
-
-    return {
-        "model_name": getattr(model, "model_name", None),
-        "base_url": getattr(model, "openai_api_base", None),
-        "timeout": getattr(model, "request_timeout", None),
-        "reasoning_effort": getattr(model, "reasoning_effort", None),
-        "uses_responses_api": getattr(model, "use_responses_api", None),
-    }

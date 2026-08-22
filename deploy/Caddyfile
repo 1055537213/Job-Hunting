@@ -1,0 +1,13 @@
+{
+    email {$JOB_AGENT_TLS_EMAIL}
+}
+
+{$JOB_AGENT_DOMAIN} {
+    encode gzip
+
+    request_body {
+        max_size 25MB
+    }
+
+    reverse_proxy web:8000
+}

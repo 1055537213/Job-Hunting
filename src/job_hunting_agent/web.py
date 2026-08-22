@@ -45,6 +45,7 @@ from .auth import (
     AccountAlreadyExistsError,
     hash_password,
     is_session_expired,
+    normalize_display_name,
     iso_utc,
     new_session_token,
     session_expiry,
@@ -388,7 +389,7 @@ def create_web_app(
             account = backend.store.create_account(
                 email=email,
                 password_hash=password_hash,
-                display_name=(payload.display_name or "").strip() or None,
+                display_name=normalize_display_name(payload.display_name, payload.password),
                 role="user",
             )
         except ValueError as error:

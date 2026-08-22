@@ -29,6 +29,7 @@ function extractMethod(signature, functionSignature) {
 
 assert.match(source, /const AUTH_ERROR_DISMISS_MS = 6000;/);
 assert.equal((page.match(/@input="clearAuthFeedback"/g) || []).length, 2);
+assert.match(page, /class="inline-error"\s+:class="\{ 'is-success': authSuccess \}"/);
 
 const clearAuthFeedback = extractMethod(
   "clearAuthFeedback() {",
@@ -37,6 +38,14 @@ const clearAuthFeedback = extractMethod(
 const showAuthError = extractMethod(
   "showAuthError(message) {",
   "function showAuthError(message) {",
+);
+const showAuthFeedback = extractMethod(
+  "showAuthFeedback(message, success = false) {",
+  "function showAuthFeedback(message, success = false) {",
+);
+const showAuthSuccess = extractMethod(
+  "showAuthSuccess(message) {",
+  "function showAuthSuccess(message) {",
 );
 const submitAuth = extractMethod(
   "async submitAuth() {",
@@ -74,7 +83,9 @@ const context = {
     return false;
   },
   clearAuthFeedback,
+  showAuthFeedback,
   showAuthError,
+  showAuthSuccess,
   async requestJson() {
     throw new Error("邮箱或密码错误。");
   },
@@ -98,5 +109,35 @@ context.showAuthError("邮箱或密码错误。");
 scheduledCallback();
 assert.equal(context.authError, "");
 assert.equal(context.authErrorTimer, null);
+
+// 注册成功必须走成功提示路径，并在同一个自动清理周期后消失。
+scheduledCallback = null;
+scheduledDelay = null;
+const registerContext = {
+  ...context,
+  authMode: "register",
+  authSuccess: false,
+  authError: "",
+  authErrorTimer: null,
+  authPasswordVisible: true,
+  authForm: {
+    email: "new-candidate@example.com",
+    password: "strong-password-123",
+    displayName: "新候选人",
+  },
+  async requestJson() {
+    return { account: null };
+  },
+};
+await submitAuth.call(registerContext);
+assert.equal(registerContext.authMode, "login");
+assert.equal(registerContext.authSuccess, true);
+assert.equal(registerContext.authError, "账号已创建，请登录。");
+assert.equal(registerContext.authErrorTimer, "auth-error-timer");
+assert.equal(scheduledDelay, 6000);
+scheduledCallback();
+assert.equal(registerContext.authError, "");
+assert.equal(registerContext.authSuccess, false);
+assert.equal(registerContext.authErrorTimer, null);
 
 console.log("frontend auth error feedback regression: PASS");

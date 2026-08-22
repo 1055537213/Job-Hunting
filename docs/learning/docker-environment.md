@@ -210,11 +210,11 @@ docker compose -f compose.yaml -f compose.dev.yaml restart web
 
 ## 安全边界
 
-- 当前 Compose 使用 `POSTGRES_HOST_AUTH_METHOD=trust`，只绑定 `127.0.0.1`，仅适合本机开发。
-- 生产环境必须改用强密码、Secret 管理、私有网络、最小权限账号和 TLS。
+- 基础开发 Compose 使用 `POSTGRES_HOST_AUTH_METHOD=trust`，只绑定 `127.0.0.1`，仅适合本机开发。
+- `compose.prod.yaml` 使用 SCRAM 密码认证、内部私有端口和 Caddy TLS；生产 `.env` 仍必须由服务器受限目录管理。
 - `.env` 仍只读挂载到容器，不会复制进镜像；不要把真实 API Key、数据库密码或 Session 写入 `compose.yaml`。
 - `JOB_AGENT_DOCKER_BASE_IMAGE`、`JOB_AGENT_POSTGRES_IMAGE`、`JOB_AGENT_MINIO_IMAGE` 和
   `JOB_AGENT_REDIS_IMAGE` 仅解决镜像下载问题，不应作为生产固定依赖。
 - 当前 Redis/Worker 已完成队列基础设施、系统探针、公开 GitHub 项目分析、扫描 PDF OCR 和简历 RAG 增量索引；
-  尚未完成的是项目分析的本地目录客户端入口、简历导出迁移、备份、监控和高可用，因此不能把当前
-  Compose 直接当作生产部署方案。
+  单机生产覆盖、HTTPS 反向代理、备份和恢复演练脚本也已有可执行基线。仍未完成的是实际支付接入、
+  外部指标采集与告警、高可用部署，以及把文档导出迁移到 Worker，因此正式上线前仍需完成容量和故障演练。

@@ -248,10 +248,11 @@ Kubernetes 不是上线前置条件。只有出现以下需求时再进入该阶
 - 本轮新增：SQLAlchemy、Alembic、PostgreSQL + pgvector Compose 服务、冻结的生产 schema，
   `postgres -> migrate -> web/worker` 启动链，以及 MinIO/S3 对象存储边界。Web 的结构化业务
   读写已切换到 PostgreSQL，简历文件已切换到 MinIO named volume。
-- 本轮新增后台基础设施：Redis broker、Celery Worker、`background_tasks` 状态表、任务幂等键、
-  进度/重试/错误摘要和管理员探针接口；并把扫描 PDF OCR、简历上传后的 RAG 增量 Embedding
-  迁移到了 Worker，Vue 会轮询任务状态并在刷新页面后恢复未完成任务；公开 GitHub 项目分析
-  也已接入同一 Worker 边界。尚未实施的是文档导出迁移和生产可观测性。
+- 后台基础设施：Redis broker、Celery Worker、`background_tasks` 状态表、任务幂等键、
+  进度/重试/错误摘要和管理员探针接口；扫描 PDF OCR、简历 RAG 增量 Embedding 和公开 GitHub
+  项目分析均已接入 Worker。当前还具备单机生产 Compose、HTTPS、备份恢复脚本、请求指标和管理员审计。
+  尚未实施的是文档导出异步化、外部指标采集与告警、真实支付回调和高可用部署。
 
 后续改造必须按上述阶段逐步提交。当前 pgvector RAG 已进入生产读写路径；测试和 Web 共用
-PostgreSQL 后端。文件正文已不再依赖宿主机目录，但在引入 Worker 前仍不能先做多副本部署。
+PostgreSQL 后端。文件正文已不再依赖宿主机目录；多副本部署前仍需把进程内会话记忆、限流和指标
+迁移到共享基础设施，并完成并发与故障演练。

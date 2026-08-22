@@ -357,8 +357,13 @@ class JobHuntingApp:
             # 中另一个人的档案可以独立分析相同的公开仓库。
             idempotency_key = f"github-project:{candidate_id}:{fingerprint[:40]}"
         existing = self.store.get_background_task_by_idempotency(account_id, idempotency_key)
-        if existing is not None and existing.status != "failed":
-            raise DuplicateResourceError("GitHub 项目")
+        if existing is not None:
+            if existing.status in {"succeeded", "cancelled"}:
+                # 项目卡片是成功任务的事实去重依据；旧版本曾把已完成任务的幂等键
+                # 永久保留，导致项目删除后仍无法重新导入同一仓库。只释放键，保留任务审计。
+                self.store.release_background_task_idempotency(existing.task_key)
+            elif existing.status != "failed":
+                raise DuplicateResourceError("GitHub 项目")
         return self.enqueue_background_task(
             account_id=account_id,
             task_type=GITHUB_PROJECT_ANALYSIS_TASK_TYPE,

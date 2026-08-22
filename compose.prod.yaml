@@ -1,0 +1,121 @@
+# 单机生产覆盖配置。必须和 compose.yaml 一起使用：
+# docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
+name: job-hunting-agent-production
+
+services:
+  postgres:
+    environment:
+      # 生产环境使用密码认证；不要复用开发库的 trust 配置或数据卷。
+      POSTGRES_PASSWORD: "${JOB_AGENT_POSTGRES_PASSWORD:?set JOB_AGENT_POSTGRES_PASSWORD in .env}"
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+    ports: !reset []
+    volumes: !override
+      - postgres_prod_data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  minio:
+    ports: !reset []
+    volumes: !override
+      - minio_prod_data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  redis:
+    ports: !reset []
+    volumes: !override
+      - redis_prod_data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  migrate:
+    build: !reset null
+    image: "${JOB_AGENT_IMAGE:?set JOB_AGENT_IMAGE in .env}"
+    environment:
+      JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}:${JOB_AGENT_POSTGRES_PASSWORD:?set JOB_AGENT_POSTGRES_PASSWORD in .env}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
+
+  web:
+    build: !reset null
+    image: "${JOB_AGENT_IMAGE:?set JOB_AGENT_IMAGE in .env}"
+    environment:
+      JOB_AGENT_ENVIRONMENT: production
+      JOB_AGENT_COOKIE_SECURE: "true"
+      JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}:${JOB_AGENT_POSTGRES_PASSWORD:?set JOB_AGENT_POSTGRES_PASSWORD in .env}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
+      JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET: "false"
+    ports: !reset []
+    expose:
+      - "8000"
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  worker:
+    build: !reset null
+    image: "${JOB_AGENT_IMAGE:?set JOB_AGENT_IMAGE in .env}"
+    environment:
+      JOB_AGENT_ENVIRONMENT: production
+      JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}:${JOB_AGENT_POSTGRES_PASSWORD:?set JOB_AGENT_POSTGRES_PASSWORD in .env}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
+      JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET: "false"
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 3G
+
+  beat:
+    build: !reset null
+    image: "${JOB_AGENT_IMAGE:?set JOB_AGENT_IMAGE in .env}"
+    environment:
+      JOB_AGENT_ENVIRONMENT: production
+      JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}:${JOB_AGENT_POSTGRES_PASSWORD:?set JOB_AGENT_POSTGRES_PASSWORD in .env}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
+
+  reverse-proxy:
+    image: caddy:2.9.1-alpine
+    restart: unless-stopped
+    environment:
+      JOB_AGENT_DOMAIN: "${JOB_AGENT_DOMAIN:?set JOB_AGENT_DOMAIN in .env}"
+      JOB_AGENT_TLS_EMAIL: "${JOB_AGENT_TLS_EMAIL:?set JOB_AGENT_TLS_EMAIL in .env}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+volumes:
+  postgres_prod_data:
+    name: job-hunting-agent-production_postgres_prod_data
+  minio_prod_data:
+    name: job-hunting-agent-production_minio_prod_data
+  redis_prod_data:
+    name: job-hunting-agent-production_redis_prod_data
+  caddy_data:
+    name: job-hunting-agent-production_caddy_data
+  caddy_config:
+    name: job-hunting-agent-production_caddy_config
+
+networks:
+  default:
+    name: job-hunting-agent-production

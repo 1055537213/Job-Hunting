@@ -71,7 +71,6 @@ def normalize_city_list(values: list[str] | tuple[str, ...] | None) -> list[str]
             result.append(city)
     return result
 
-
 @lru_cache(maxsize=1)
 def city_groups() -> tuple[dict[str, object], ...]:
     """读取前端随包分发的全国城市目录。"""
@@ -156,16 +155,3 @@ def nearby_cities(city_names: list[str] | tuple[str, ...]) -> list[str]:
             if canonical and canonical not in result and canonical not in source_set:
                 result.append(canonical)
     return result
-
-
-def city_province(city: str | None) -> str | None:
-    """返回城市所属省级行政区，无法识别时返回 None。"""
-
-    canonical = normalize_city_name(city)
-    if not canonical:
-        return None
-    for group in city_groups():
-        cities = {normalize_city_name(str(value)) for value in group.get("cities", [])}
-        if canonical in cities:
-            return str(group.get("province") or "") or None
-    return None

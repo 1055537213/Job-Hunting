@@ -1,5 +1,5 @@
 param(
-    [string]$Python = "E:\Anaconda\envs\langchain1.2\python.exe",
+    [string]$Python = "python",
     [string]$RagCases = "",
     [string]$ConversationCases = "",
     [int]$AccountId = 0,
@@ -7,6 +7,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+    $PSNativeCommandUseErrorActionPreference = $true
+}
 
 function Invoke-Check {
     param(
@@ -16,6 +19,9 @@ function Invoke-Check {
 
     Write-Host "==> $Name"
     & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Name failed with exit code $LASTEXITCODE."
+    }
 }
 
 Invoke-Check "Python tests" {
@@ -23,19 +29,22 @@ Invoke-Check "Python tests" {
 }
 
 Invoke-Check "Ruff" {
-    & ruff check src tests
+    & ruff check src tests alembic
 }
 
 Invoke-Check "Compile Python sources" {
-    & $Python -m compileall -q src tests
+    & $Python -m compileall -q src tests alembic
 }
 
-Invoke-Check "Admin frontend regression" {
-    & node tests/frontend_admin_usage_regression.mjs
-}
-
-Invoke-Check "Project review frontend regression" {
-    & node tests/frontend_project_review_regression.mjs
+Invoke-Check "Frontend regressions" {
+    Get-ChildItem tests -Filter "frontend_*.mjs" |
+        Sort-Object Name |
+        ForEach-Object {
+            & node $_.FullName
+            if ($LASTEXITCODE -ne 0) {
+                throw "Frontend regression failed: $($_.Name)"
+            }
+        }
 }
 
 if ($RagCases) {

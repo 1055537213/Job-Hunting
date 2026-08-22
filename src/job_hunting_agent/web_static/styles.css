@@ -234,7 +234,7 @@ kbd {
 }
 
 .nav-link,
-.account-badge,
+.account-menu-trigger,
 .primary-button,
 .ghost-button,
 .danger-button,
@@ -272,7 +272,7 @@ kbd {
 
 .ghost-button,
 .nav-link,
-.account-badge {
+.account-menu-trigger {
   color: var(--color-ink-2);
   background: var(--color-paper-raised);
   border: var(--rule-thin) solid var(--color-rule);
@@ -294,13 +294,136 @@ kbd {
   padding-inline: var(--space-sm);
 }
 
-.account-badge {
+/* Hallmark; component: account-menu; states: default-hover-focus-active-disabled-loading-error-success */
+.account-menu {
+  position: relative;
   min-width: 0;
-  max-width: 13rem;
-  padding-inline: var(--space-sm);
+  max-width: 16rem;
+}
+
+.account-menu-trigger {
+  width: 100%;
+  max-width: 16rem;
+  padding-inline: var(--space-sm) var(--space-xs);
+  cursor: pointer;
+}
+
+.account-menu-label {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  cursor: default;
+}
+
+.account-menu-chevron {
+  width: var(--space-md);
+  height: var(--space-md);
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  color: var(--color-muted-2);
+  transition: transform var(--dur-short) var(--ease-out);
+}
+
+.account-menu-chevron svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.account-menu-trigger[aria-expanded="true"] {
+  color: var(--color-ink);
+  background: var(--color-accent-soft);
+  border-color: var(--color-rule-strong);
+}
+
+.account-menu-trigger[aria-expanded="true"] .account-menu-chevron {
+  transform: rotate(180deg);
+}
+
+.account-menu-popover {
+  position: absolute;
+  z-index: var(--z-dropdown);
+  inset-block-start: calc(100% + var(--space-xs));
+  inset-inline-end: 0;
+  width: min(14rem, calc(100vw - var(--space-xl)));
+  display: grid;
+  gap: var(--space-2xs);
+  padding: var(--space-xs);
+  background: var(--color-paper-raised);
+  border: var(--rule-thin) solid var(--color-rule-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-whisper);
+}
+
+.account-menu-item {
+  min-height: var(--size-hit);
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  padding-inline: var(--space-sm);
+  color: var(--color-ink-2);
+  background: transparent;
+  border: var(--rule-thin) solid transparent;
+  border-radius: var(--radius-xs);
+  font-weight: 700;
+  text-align: start;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--dur-micro) var(--ease-out), background-color var(--dur-micro) var(--ease-out);
+}
+
+.account-menu-item.is-danger {
+  color: var(--color-error);
+}
+
+.account-menu-divider {
+  height: var(--rule-thin);
+  margin-inline: var(--space-xs);
+  background: var(--color-rule);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .account-menu-trigger:hover,
+  .account-menu-item:hover {
+    color: var(--color-ink);
+    background: var(--color-paper-2);
+  }
+
+  .account-menu-item.is-danger:hover {
+    color: var(--color-error);
+    background: var(--color-error-soft);
+  }
+}
+
+.account-menu-trigger:active,
+.account-menu-item:active {
+  transform: translateY(var(--rule-thin));
+}
+
+.account-menu-trigger:disabled,
+.account-menu-item:disabled,
+.account-menu-trigger[data-state="loading"],
+.account-menu-item[data-state="loading"] {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.account-menu-trigger[data-state="error"],
+.account-menu-item[data-state="error"] {
+  color: var(--color-error);
+  border-color: var(--color-error);
+}
+
+.account-menu-trigger[data-state="success"],
+.account-menu-item[data-state="success"] {
+  color: var(--color-success);
+  border-color: var(--color-success);
 }
 
 .send-button {
@@ -543,12 +666,6 @@ textarea:disabled {
   background: var(--color-paper-2);
 }
 
-.boundary-note {
-  color: var(--color-muted);
-  background: var(--color-paper-2);
-}
-
-.boundary-note p,
 .job-card-desc,
 .empty-state span {
   margin: 0;
@@ -1784,27 +1901,6 @@ textarea:focus-visible,
   border-block-start: var(--rule-thin) solid var(--color-graphite-rule);
 }
 
-.composer-options {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-md);
-  color: var(--color-graphite-muted);
-  font-size: var(--text-sm);
-}
-
-.check-row {
-  min-height: var(--size-hit);
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-xs);
-}
-
-.check-row input {
-  width: var(--space-md);
-  height: var(--space-md);
-  accent-color: var(--color-accent);
-}
-
 .composer-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -2260,6 +2356,12 @@ textarea:focus-visible,
   line-height: 1.55;
 }
 
+.inline-error.is-success {
+  color: var(--color-success);
+  background: var(--color-success-soft);
+  border-color: var(--color-success);
+}
+
 .cmdk {
   position: fixed;
   inset: 0;
@@ -2597,6 +2699,17 @@ textarea:focus-visible,
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .account-menu,
+  .account-menu-trigger {
+    width: 100%;
+    max-width: none;
+  }
+
+  .account-menu-popover {
+    inset-inline: 0;
+    width: auto;
+  }
+
   .bubble {
     max-width: 100%;
   }
@@ -2638,11 +2751,17 @@ textarea:focus-visible,
   .cmdk.is-open .cmdk-panel,
   .searchpill,
   .nav-link,
+  .account-menu-trigger,
+  .account-menu-item,
   .primary-button,
   .ghost-button,
   .send-button,
   .cmdk-item {
     transform: none;
+  }
+
+  .account-menu-chevron {
+    transition: none;
   }
 
   .task-step.is-running .task-step-mark {
@@ -2696,20 +2815,6 @@ textarea:focus-visible,
   font-size: var(--text-md);
 }
 
-.auth-rule {
-  width: min(100%, 20rem);
-  height: 1px;
-  margin: var(--space-xl) 0 var(--space-md);
-  background: var(--auth-rule);
-}
-
-.auth-note,
-.auth-footnote {
-  margin: 0;
-  color: var(--auth-muted);
-  font-size: var(--text-sm);
-}
-
 .auth-form {
   width: 100%;
   padding: clamp(var(--space-lg), 4vw, var(--space-xl));
@@ -2720,7 +2825,6 @@ textarea:focus-visible,
 }
 
 .auth-form-head,
-.admin-head,
 .chat-head {
   display: flex;
   align-items: flex-start;
@@ -2729,7 +2833,6 @@ textarea:focus-visible,
 }
 
 .auth-form h2,
-.admin-head h1,
 .chat-title {
   margin: 0;
   color: var(--auth-ink);
@@ -2882,34 +2985,7 @@ textarea:focus-visible,
   color: var(--auth-ink);
 }
 
-.admin-head,
-.admin-metrics,
 .admin-account-ledger { width: min(100%, 90rem); margin-inline: auto; }
-.admin-head { margin-bottom: var(--space-xl); }
-.admin-lede { max-width: 52ch; margin: var(--space-sm) 0 0; color: var(--auth-muted); }
-.admin-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-xs); }
-
-.admin-metrics {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 1px;
-  margin-bottom: var(--space-lg);
-  background: var(--auth-rule);
-  border: 1px solid var(--auth-rule);
-}
-
-.admin-metric {
-  min-height: 6.5rem;
-  display: grid;
-  align-content: space-between;
-  gap: var(--space-sm);
-  padding: var(--space-md);
-  background: var(--auth-paper);
-}
-
-.admin-metric span,
-.admin-account-summary span { color: var(--auth-muted); font-size: var(--text-sm); }
-.admin-metric strong { color: var(--auth-ink); font-family: var(--font-mono); font-size: var(--text-xl); font-weight: 600; }
 
 .admin-observability {
   display: grid;
@@ -3131,31 +3207,30 @@ textarea:focus-visible,
 .admin-account-list { min-width: 0; display: grid; gap: 1px; max-block-size: min(42rem, calc(100svh - 19rem)); overflow-y: auto; background: var(--auth-rule); }
 .admin-account-entry { min-width: 0; background: var(--auth-paper); }
 .admin-account-row { min-width: 0; display: flex; align-items: center; gap: var(--space-xs); background: var(--auth-paper); }
-.admin-account-select { min-width: 0; flex: 1 1 auto; display: grid; grid-template-columns: minmax(0, 1fr) auto var(--space-lg); align-items: center; gap: var(--space-sm); padding: var(--space-md); color: var(--auth-ink); background: transparent; cursor: pointer; text-align: start; }
+.admin-account-select { min-width: 0; flex: 1 1 auto; display: grid; grid-template-columns: minmax(0, 1fr) var(--space-lg); align-items: center; gap: var(--space-sm); padding: var(--space-md); color: var(--auth-ink); background: transparent; cursor: pointer; text-align: start; }
 .admin-account-select:hover,
 .admin-account-entry.is-selected .admin-account-select { background: var(--auth-paper-2); }
 .admin-account-select:focus-visible { outline: 2px solid var(--auth-focus); outline-offset: -2px; }
-.admin-account-summary { min-width: 0; display: grid; gap: var(--space-3xs); }
+.admin-account-summary { min-width: 0; }
 .admin-account-summary strong { overflow-wrap: anywhere; }
-.admin-account-event-count { color: var(--auth-muted); font-family: var(--font-mono); font-size: var(--text-xs); white-space: nowrap; }
 .admin-account-chevron { width: var(--space-lg); height: var(--space-lg); display: grid; place-items: center; color: var(--auth-muted); font-size: 0; transform: rotate(0deg); transform-origin: center; transition: transform var(--dur-short) var(--ease-out), color var(--dur-short) var(--ease-out); }
 .admin-account-chevron svg { width: var(--space-sm); height: var(--space-sm); display: block; overflow: visible; }
 .admin-account-chevron path { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .admin-account-entry.is-selected .admin-account-chevron { color: var(--auth-accent); transform: rotate(90deg); }
 .admin-account-status-action { flex: 0 0 auto; margin-inline-end: var(--space-md); }
 .admin-account-usage { min-block-size: 0; display: grid; grid-template-rows: auto auto auto; align-self: start; align-content: start; gap: var(--space-sm); padding: var(--space-md); background: color-mix(in oklch, var(--auth-paper-2) 72%, var(--auth-paper)); }
-.admin-account-usage-head { min-width: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-sm); }
+.admin-account-usage-head { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: var(--space-2xs); }
 .admin-account-usage-head > div { min-width: 0; }
 .admin-account-usage-head .eyebrow { margin: 0 0 var(--space-3xs); }
-.admin-account-usage-head h3 { margin: 0; color: var(--auth-ink); font-family: var(--font-display); font-size: var(--text-md); line-height: 1.2; overflow-wrap: anywhere; }
-.admin-account-usage-head > span { flex: 0 0 auto; color: var(--auth-muted); font-family: var(--font-mono); font-size: var(--text-xs); white-space: nowrap; }
+.admin-account-usage-head h3 { min-width: 0; margin: 0; color: var(--auth-ink); font-family: var(--font-display); font-size: var(--text-md); line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.admin-account-usage-meta { min-width: 0; max-width: 100%; justify-self: end; color: var(--auth-muted); font-family: var(--font-mono); font-size: var(--text-xs); line-height: 1.5; text-align: end; white-space: nowrap; overflow-x: auto; overflow-y: hidden; }
 .admin-usage-notice,
 .admin-usage-prompt { display: grid; gap: var(--space-2xs); padding: var(--space-md); color: var(--auth-muted); background: var(--auth-paper-2); border: 1px solid var(--auth-rule); }
 .admin-usage-prompt strong { color: var(--auth-ink); }
 .admin-detail-tabs {
   width: 100%;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: var(--space-2xs);
   padding: var(--space-3xs);
   align-items: start;
@@ -3177,6 +3252,7 @@ textarea:focus-visible,
   font-weight: 600;
   line-height: 1.2;
   text-align: center;
+  white-space: nowrap;
 }
 .tab-button:hover { color: var(--auth-ink); background: var(--auth-paper); }
 .tab-button[aria-selected="true"] {
@@ -3747,7 +3823,6 @@ textarea:focus-visible,
   .admin-main { order: 1; padding-inline: 0; }
   .admin-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .admin-nav { grid-template-columns: 1fr; overflow: visible; }
-  .admin-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .admin-observability-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .admin-observability-grid { grid-template-columns: 1fr; }
   .admin-audit-event-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -3765,11 +3840,8 @@ textarea:focus-visible,
   .auth-frame { gap: var(--space-xl); }
   .auth-intro h1 { max-width: none; font-size: clamp(2.15rem, 11vw, 3rem); }
   .auth-form-head,
-  .admin-head,
   .chat-head { display: grid; }
-  .admin-actions,
   .chat-session-actions { justify-content: stretch; }
-  .admin-actions > *,
   .chat-session-actions > * { flex: 1 1 auto; }
   .chat-session-actions .workspace-toggle { flex: 0 0 auto; }
   .session-trigger { width: 100%; max-width: none; }
@@ -3790,7 +3862,6 @@ textarea:focus-visible,
   .admin-main-head { flex-direction: column; align-items: flex-start; }
   .admin-topbar-brand,
   .admin-topbar-actions { flex-direction: row; align-items: center; }
-  .admin-metrics { grid-template-columns: 1fr; }
   .admin-observability-summary { grid-template-columns: 1fr; }
   .admin-observability-error-head,
   .admin-audit-event-main,
@@ -3802,6 +3873,8 @@ textarea:focus-visible,
   .admin-account-select { gap: var(--space-xs); padding: var(--space-sm); }
   .admin-account-directory-head,
   .admin-account-usage { padding: var(--space-sm); }
+  .admin-account-usage-head { gap: var(--space-xs); }
+  .admin-account-usage-meta { justify-self: stretch; text-align: start; }
   .admin-tool-detail { padding: var(--space-sm); }
   .project-review-item { grid-template-columns: 1fr; }
   .project-review-actions { justify-content: stretch; }

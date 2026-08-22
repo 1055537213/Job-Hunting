@@ -740,29 +740,6 @@ def require_candidate_id(context: JobHuntingAgentContext) -> int:
     return candidate_id
 
 
-def build_tool_usage_callback(
-    app: JobHuntingApp,
-    context: JobHuntingAgentContext,
-    operation: str,
-):
-    """为兼容旧调用方构造 Gateway 驱动的工具用量回调。"""
-
-    call_context = app.model_gateway.new_call_context(
-        operation,
-        account_id=context.get("account_id"),
-        candidate_id=context.get("candidate_id"),
-        session_id=context.get("session_id"),
-        root_request_id=context.get("root_request_id"),
-    )
-
-    def callback(message: object) -> None:
-        """把一次单轮工具调用委托给 Gateway 记录。"""
-
-        app.model_gateway.record_chat_response(call_context, message)
-
-    return callback
-
-
 def dumps_tool_output(value: dict[str, Any]) -> str:
     """统一序列化工具输出，方便 Agent 阅读，也方便 Web API 再解析。
 
@@ -823,57 +800,6 @@ def merge_usage(target: dict[str, int], incoming: dict[str, int]) -> None:
 
     for key in ("input_tokens", "output_tokens", "total_tokens"):
         target[key] = max(target.get(key, 0), incoming.get(key, 0))
-
-
-def record_usage_summary(
-    app: JobHuntingApp,
-    usage: dict[str, int],
-    *,
-    account_id: int | None,
-    candidate_id: int | None,
-    session_id: str,
-    root_request_id: str,
-    operation: str = "agent_model",
-    call_id: str | None = None,
-    model: str = "agent",
-) -> dict[str, int | str]:
-    """兼容旧接口，并把汇总 usage 委托给内部 Model Gateway。"""
-
-    context = app.model_gateway.new_call_context(
-        operation,
-        account_id=account_id,
-        candidate_id=candidate_id,
-        session_id=session_id,
-        root_request_id=root_request_id,
-        call_id=call_id,
-    )
-    return app.model_gateway.record_usage(
-        context,
-        usage,
-        provider="configured-llm",
-        model=model,
-    )
-
-
-def record_agent_usage(
-    app: JobHuntingApp,
-    messages: list[BaseMessage],
-    *,
-    account_id: int | None,
-    candidate_id: int | None,
-    session_id: str,
-    root_request_id: str,
-) -> dict[str, int | str]:
-    """兼容旧接口，并按每个 AIMessage 拆分为 Gateway 用量流水。"""
-
-    return app.model_gateway.record_chat_messages(
-        operation="agent_model",
-        messages=messages,
-        account_id=account_id,
-        candidate_id=candidate_id,
-        session_id=session_id,
-        root_request_id=root_request_id,
-    )
 
 
 def default_session_id(candidate_id: int | None, account_id: int | None = None) -> str:

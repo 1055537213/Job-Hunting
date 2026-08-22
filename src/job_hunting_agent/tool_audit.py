@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime, time, timedelta
-from zoneinfo import ZoneInfo
 
 from .models import ToolCallTraceRecord
 
 AUDIT_SKIP_STEP_NAMES = {"compose_reply"}
-TOOL_AUDIT_RETENTION_TIMEZONE = "Asia/Shanghai"
 
 TOOL_STEP_LABELS = {
     "ingest_candidate_message": "整理并保存候选人资料",
@@ -49,16 +46,6 @@ def background_task_tool_name(task_type: str) -> str:
         "system_probe": "system_probe",
     }
     return aliases.get(task_type, task_type or "background_task")
-
-
-def tool_audit_retention_cutoff(now: datetime | None = None) -> str:
-    """返回工具审计保留窗口的 UTC 截止时间。"""
-
-    timezone = ZoneInfo(TOOL_AUDIT_RETENTION_TIMEZONE)
-    current = (now or datetime.now(UTC)).astimezone(timezone)
-    today_start = datetime.combine(current.date(), time.min, tzinfo=timezone)
-    cutoff = today_start - timedelta(days=1)
-    return cutoff.astimezone(UTC).isoformat(timespec="seconds")
 
 
 def audited_steps(trace: Mapping[str, object] | None) -> list[dict[str, object]]:

@@ -53,6 +53,14 @@ from .config import BillingSettings
 from .skill_normalization import normalize_skill_mapping
 
 RESUME_ARTIFACT_STATUSES = {"ready", "processing", "failed"}
+INSUFFICIENT_BALANCE_MESSAGE = "余额不足，请先充值后重试。"
+
+
+class InsufficientBalanceError(ValueError):
+    """账号余额不足，当前模型调用不能开始。"""
+
+    def __init__(self, message: str = INSUFFICIENT_BALANCE_MESSAGE) -> None:
+        super().__init__(message)
 
 
 class RepositoryRow(Protocol):
@@ -296,7 +304,7 @@ class RepositoryStore:
             account = self.get_account(account_id)
             if account.status != "active":
                 raise ValueError("账号已停用，请联系管理员。")
-            raise ValueError("余额不足，请先充值。")
+            raise InsufficientBalanceError()
 
     def get_account_balance_summary(self, account_id: int) -> AccountBalanceSummary:
         """读取单个账号的余额与消费汇总，必要时自动补初始化余额。"""
@@ -1922,16 +1930,19 @@ class RepositoryStore:
         self,
         task_key: str,
         result: Mapping[str, object] | None = None,
+        *,
+        clear_idempotency_key: bool = False,
     ) -> BackgroundTaskRecord:
         """把任务标记为成功，并保存不含正文的结果摘要。"""
 
         now = now_iso()
+        idempotency_assignment = "idempotency_key = NULL,\n                    " if clear_idempotency_key else ""
         with self.connect() as conn:
             cursor = conn.execute(
-                """
+                f"""
                 UPDATE background_tasks
                 SET status = 'succeeded', progress = 100, result_json = ?,
-                    error_summary = NULL, finished_at = ?, updated_at = ?
+                    {idempotency_assignment}error_summary = NULL, finished_at = ?, updated_at = ?
                 WHERE task_key = ? AND status = 'running'
                 """,
                 (json.dumps(dict(result or {}), ensure_ascii=False), now, now, task_key),
@@ -1939,6 +1950,19 @@ class RepositoryStore:
             if cursor.rowcount == 0:
                 raise KeyError(f"Running background task not found: {task_key}")
         return self.get_background_task(task_key)
+
+    def release_background_task_idempotency(self, task_key: str) -> None:
+        """释放已结束任务的幂等键，但保留任务记录供审计和排查。"""
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE background_tasks
+                SET idempotency_key = NULL, updated_at = ?
+                WHERE task_key = ? AND status IN ('succeeded', 'cancelled')
+                """,
+                (now_iso(), task_key),
+            )
 
     def requeue_background_task(self, task_key: str, error_summary: str | None = None) -> BackgroundTaskRecord:
         """把本轮可重试的任务放回 queued 状态，保留尝试次数和错误摘要。"""
@@ -3918,18 +3942,3 @@ def long_text_from_row(row: RepositoryRow) -> LongTextRecord:
         account_id=row.get("account_id"),
         candidate_id=row.get("candidate_id"),
     )
-
-
-def project_card_index_text(card: ProjectExperienceCard) -> str:
-    """把已确认项目卡片整理成一段可进入长文本检索的材料。"""
-
-    parts = [
-        card.project_name,
-        "技术栈：" + "、".join(card.detected_tech_stack),
-        "核心功能：" + "、".join(card.detected_core_features),
-        "职责草稿：" + "；".join(card.responsibility_draft),
-        "亮点草稿：" + "；".join(card.highlight_draft),
-        "简历表达草稿：" + "；".join(card.resume_expression_draft),
-    ]
-    # 过滤空段落，避免向长文本表写入一堆无意义的空字段。
-    return "\n".join(part for part in parts if part.strip())

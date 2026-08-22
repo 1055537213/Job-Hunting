@@ -23,12 +23,13 @@ from .github_project import (
 )
 from .models import BackgroundTaskRecord
 from .resume_document import ResumeDocumentError
+from .storage import INSUFFICIENT_BALANCE_MESSAGE, InsufficientBalanceError
 from .task_queue import (
     BACKGROUND_TASK_NAME,
     GITHUB_PROJECT_ANALYSIS_TASK_TYPE,
+    OPERATIONAL_LEDGER_RETENTION_TASK_NAME,
     RAG_INDEX_TASK_TYPE,
     RESUME_OCR_TASK_TYPE,
-    TOOL_AUDIT_RETENTION_TASK_NAME,
 )
 from .tool_audit import (
     background_task_tool_name,
@@ -186,12 +187,6 @@ def _record_background_task_trace(
     )
 
 
-def purge_old_tool_call_traces(backend: JobHuntingApp) -> int:
-    """删除超出分页保留窗口的工具调用审计记录。"""
-
-    return backend.store.prune_tool_call_traces_to_limit()
-
-
 def purge_old_operational_audit_records(backend: JobHuntingApp) -> dict[str, int]:
     """删除超出分页保留窗口的后台运维记录。"""
 
@@ -205,6 +200,18 @@ def purge_old_operational_audit_records(backend: JobHuntingApp) -> dict[str, int
 
 class NonRetryableTaskError(RuntimeError):
     """任务类型或参数不可恢复，不应浪费队列重试次数。"""
+
+
+def background_task_error_policy(error: Exception, task_type: str) -> tuple[str, bool]:
+    """把后台异常转换成安全摘要，并标记是否值得自动重试。"""
+
+    if isinstance(error, InsufficientBalanceError):
+        return INSUFFICIENT_BALANCE_MESSAGE, False
+    if task_type == RESUME_OCR_TASK_TYPE:
+        return "扫描版 PDF OCR 失败，请确认文件清晰且未加密后重试。", True
+    if task_type == GITHUB_PROJECT_ANALYSIS_TASK_TYPE:
+        return "GitHub 仓库分析失败，请确认仓库公开可访问且未超出分析限制。", True
+    return f"任务执行异常：{type(error).__name__}", True
 
 
 def _rag_task_payload(record: BackgroundTaskRecord) -> tuple[list[int], str | None]:
@@ -430,6 +437,7 @@ def run_registered_task(
                 "project_name": project_card.card.project_name,
                 "source_url": project_card.card.source_url,
             },
+            clear_idempotency_key=True,
         )
         _record_background_task_trace(
             backend,
@@ -534,11 +542,11 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
 
     @celery_app.task(
         bind=True,
-        name=TOOL_AUDIT_RETENTION_TASK_NAME,
+        name=OPERATIONAL_LEDGER_RETENTION_TASK_NAME,
         ignore_result=True,
     )
-    def purge_tool_call_traces(self: Any) -> dict[str, object]:
-        """按上海自然日清理过期工具调用审计和 Token 用量记录。"""
+    def prune_operational_ledgers(self: Any) -> dict[str, object]:
+        """按每账号分页上限裁剪工具调用审计和 Token 用量记录。"""
 
         backend = JobHuntingApp(env_path=env_path)
         try:
@@ -607,12 +615,32 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
         except Exception as error:
             # 数据库本身不可用时这里会直接抛出，由 Celery 的 broker 重试机制处理。
             record = backend.store.get_background_task(task_key)
-            if record.task_type == RESUME_OCR_TASK_TYPE:
-                safe_summary = "扫描版 PDF OCR 失败，请确认文件清晰且未加密后重试。"
-            elif record.task_type == GITHUB_PROJECT_ANALYSIS_TASK_TYPE:
-                safe_summary = "GitHub 仓库分析失败，请确认仓库公开可访问且未超出分析限制。"
-            else:
-                safe_summary = f"任务执行异常：{type(error).__name__}"
+            safe_summary, retryable = background_task_error_policy(error, record.task_type)
+            if not retryable:
+                _mark_resume_ocr_artifact_failed(backend, task_key)
+                _record_background_task_trace(
+                    backend,
+                    record,
+                    step_status="failed",
+                    trace_status="failed",
+                    attempt_status="failed",
+                    summary=safe_summary,
+                    result={
+                        "ok": False,
+                        "task_key": record.task_key,
+                        "task_type": record.task_type,
+                        "status": "failed",
+                        "error": type(error).__name__,
+                        "error_summary": safe_summary,
+                    },
+                    finish_attempt=True,
+                )
+                failed_record = backend.store.fail_background_task(task_key, safe_summary)
+                return {
+                    "task_key": failed_record.task_key,
+                    "status": failed_record.status,
+                    "error_summary": failed_record.error_summary,
+                }
             if record.attempt < record.max_attempts:
                 _record_background_task_trace(
                     backend,

@@ -1,8 +1,8 @@
 [project]
-# Python 包的基础元数据。当前项目还是本地 MVP，没有发布到 PyPI。
+# Python 包的基础元数据。项目作为应用部署，不发布到 PyPI。
 name = "job-hunting-agent"
 version = "0.1.0"
-description = "A local, read-only job hunting assistant MVP."
+description = "A multi-tenant job hunting assistant with RAG, background tasks, and usage billing."
 # 本项目的本地 Conda 环境和 Docker 镜像均以 Python 3.12.13 验证，避免补丁版本漂移。
 requires-python = ">=3.12,<3.13"
 dependencies = [

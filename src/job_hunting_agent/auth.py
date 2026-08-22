@@ -32,37 +32,6 @@ PASSWORD_SCHEME = "argon2id" if PASSWORD_HASHER is not None else "scrypt"
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
-@dataclass(frozen=True)
-class AuthUser:
-    """登录后供 Web/Agent 使用的最小账号信息。"""
-
-    id: int
-    email: str
-    role: str
-    status: str
-    created_at: str
-    last_login_at: str | None
-
-
-@dataclass(frozen=True)
-class AuthSession:
-    """服务端 Session 记录；原始 token 只在登录响应中出现一次。"""
-
-    id: int
-    user_id: int
-    created_at: str
-    last_seen_at: str
-    expires_at: str
-    absolute_expires_at: str
-    revoked_at: str | None
-
-    @property
-    def account_id(self) -> int:
-        """兼容旧 `user_id` 命名，业务层统一使用 account_id。"""
-
-        return self.user_id
-
-
 def hash_password(password: str) -> str:
     """用 Argon2id 生成密码哈希；缺少可选依赖时使用标准库 scrypt。"""
 
@@ -84,6 +53,15 @@ def hash_password(password: str) -> str:
         dklen=32,
     )
     return "scrypt$1$" + salt.hex() + "$" + derived.hex()
+
+
+def normalize_display_name(display_name: str | None, password: str) -> str | None:
+    """清洗账号显示名，绝不把明文密码保存为可展示字段。"""
+
+    candidate = (display_name or "").strip()
+    if not candidate or candidate == password:
+        return None
+    return candidate
 
 
 def verify_password(password_hash: str, password: str) -> bool:
@@ -237,7 +215,7 @@ class AuthService:
             return self.store.create_account(
                 normalized,
                 password_hash,
-                display_name=(display_name or "").strip() or None,
+                display_name=normalize_display_name(display_name, password),
                 role="user",
             )
         except Exception as error:
@@ -261,7 +239,7 @@ class AuthService:
             return self.store.create_account(
                 normalized,
                 password_hash,
-                display_name=(display_name or "").strip() or None,
+                display_name=normalize_display_name(display_name, password),
                 role="admin",
             )
         except Exception as error:
