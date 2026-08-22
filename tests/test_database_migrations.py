@@ -66,6 +66,13 @@ def test_upgrade_database_creates_versioned_postgresql_schema(temporary_database
                 )
             }
             version = connection.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+            vector_extension_schema = connection.execute(
+                sa.text(
+                    "SELECT n.nspname FROM pg_extension AS e "
+                    "JOIN pg_namespace AS n ON n.oid = e.extnamespace "
+                    "WHERE e.extname = 'vector'"
+                )
+            ).scalar_one()
             candidate_columns = {
                 row[0]
                 for row in connection.execute(
@@ -104,6 +111,7 @@ def test_upgrade_database_creates_versioned_postgresql_schema(temporary_database
         "background_tasks",
     }.issubset(tables)
     assert version == latest_database_revision()
+    assert vector_extension_schema == "public"
     assert "content_fingerprint" in candidate_columns
     assert {"content_fingerprint", "import_method", "captured_at"}.issubset(job_columns)
 

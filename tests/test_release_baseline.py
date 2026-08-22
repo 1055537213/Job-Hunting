@@ -12,9 +12,9 @@ def test_ci_runs_quality_checks_and_builds_release_image():
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
     for required in (
-        "actions/checkout@v4",
-        "actions/setup-python@v5",
-        "actions/setup-node@v4",
+        "actions/checkout@v7",
+        "actions/setup-python@v7",
+        "actions/setup-node@v7",
         "requirements-dev.lock",
         "python -m pip install -r requirements.lock -r requirements-dev.lock",
         "python -m pytest -q",

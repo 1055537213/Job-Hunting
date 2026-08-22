@@ -34,8 +34,10 @@ def upgrade() -> None:
     """Create the frozen baseline schema and enable pgvector when available."""
 
     if op.get_bind().dialect.name == "postgresql":
-        # pgvector is an extension owned by PostgreSQL, so it must exist before VECTOR columns.
-        op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        # 测试和租户迁移会覆盖 search_path；扩展必须固定在共享 public schema，
+        # 否则 VECTOR 类型会被装进临时 schema，其他迁移连接将无法解析。
+        op.execute("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
+        op.execute("ALTER EXTENSION vector SET SCHEMA public")
 
     op.create_table(
         "accounts",
