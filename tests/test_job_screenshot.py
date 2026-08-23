@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage
 from PIL import Image
 
 from job_hunting_agent.app import JobHuntingApp
+from job_hunting_agent.concurrency_control import ConcurrencyLimitExceeded
 from job_hunting_agent.job_screenshot import (
     JobScreenshot,
     JobScreenshotError,
@@ -39,6 +40,22 @@ class RecordingChatModel:
         return AIMessage(content=self.response)
 
 
+class BusyScreenshotController:
+    """模拟另一 Web 副本已经占满截图处理额度。"""
+
+    def acquire(
+        self,
+        resource: str,
+        *,
+        account_id: int | None,
+        wait_timeout_seconds: float | None = None,
+    ) -> object:
+        assert resource == "screenshot"
+        assert account_id is not None
+        assert wait_timeout_seconds == 0
+        raise ConcurrencyLimitExceeded("职位截图识别请求较多，请稍后重试。")
+
+
 class RecordingGateway:
     """只实现截图转写所需的 Gateway 小接口。"""
 
@@ -52,9 +69,16 @@ class RecordingGateway:
         self.contexts.append(context)
         return context
 
-    def chat_model(self, operation: str, temperature: float = 0) -> RecordingChatModel:
+    def chat_model(
+        self,
+        operation: str,
+        temperature: float = 0,
+        *,
+        account_id: int | None = None,
+    ) -> RecordingChatModel:
         assert operation == "job_screenshot_extraction"
         assert temperature == 0
+        assert account_id == 7
         return self.model
 
     def record_chat_response(self, context: object, response: object) -> None:
@@ -228,6 +252,31 @@ def test_web_rejects_incomplete_job_screenshot(monkeypatch) -> None:
 
     assert response.status_code == 400
     assert "职位截图信息不完整" in response.json()["detail"]
+
+
+def test_web_rejects_screenshot_before_reading_when_shared_capacity_is_full() -> None:
+    """共享截图额度已满时返回 429，不进入图片识别和保存流程。"""
+
+    client = TestClient(
+        create_web_app(concurrency_controller=BusyScreenshotController())
+    )
+    assert client.post(
+        "/api/auth/register",
+        json={"email": "screenshot-busy@example.com", "password": "password-123"},
+    ).status_code == 200
+    assert client.post(
+        "/api/auth/login",
+        json={"email": "screenshot-busy@example.com", "password": "password-123"},
+    ).status_code == 200
+
+    response = client.post(
+        "/api/jobs/screenshots",
+        files=[("screenshots", ("job.png", png_bytes(), "image/png"))],
+    )
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "1"
+    assert response.json()["detail"] == "职位截图识别请求较多，请稍后重试。"
 
 
 def test_web_rejects_duplicate_job_imported_from_screenshot(monkeypatch) -> None:

@@ -75,8 +75,8 @@ ModelGateway.embed(operation, texts, context)
 - 已完成：类型化运行环境配置、聊天模型、Embedding 与 Rerank 的统一工厂、有限重试、
   `root_request_id`/`call_id`、供应商 request ID 提取和不含正文的 usage 流水。
 - 已迁移：LangChain Agent 主聊天、工具内单轮 LLM、网页端简历改写、RAG Embedding 和可选 Rerank。
-- 后续补齐：并发限流、熔断、分布式 trace 和供应商故障告警；这些需要和 Redis、
-  可观测性基础设施一起在后续阶段实施。
+- 已完成 Web 请求级 Redis 分布式限流，以及 Chat、Embedding、Rerank、截图处理的
+  Redis 全局/单账号共享并发租约；后续补齐熔断、分布式 trace 和供应商故障告警。
 
 只有出现以下任一条件时才考虑拆成独立服务：多个产品共同使用、需要独立扩缩容、
 供应商路由规则频繁变化，或模型调用故障需要与主业务进程隔离。
@@ -107,7 +107,8 @@ ModelGateway.embed(operation, texts, context)
 
 实施状态：核心模型边界已完成。`model_gateway.py` 是当前模块化单体中的唯一模型
 入口，`JOB_AGENT_ENVIRONMENT` 可显式选择 development/test/production，现有业务调用
-已迁移到 Gateway；并发控制与熔断留待 Redis 和可观测性阶段实现。
+已迁移到 Gateway；模型与截图并发已由 Redis 租约跨 Web/Worker 副本共享，熔断仍留待
+后续供应商故障治理阶段实现。
 
 ### 阶段 2：PostgreSQL、pgvector 与 Alembic
 
@@ -177,8 +178,8 @@ RAG 增量 Embedding 迁移：Web 先保存文件和 `long_texts`，再登记 `r
 第 4.2 步已完成请求指标快照切片。Web 硬化中间件在进程内聚合总请求数、状态码分组、
 平均/最大耗时、正在处理的请求数、限流次数、CSRF 拦截次数、endpoint 低基数统计和最近
 错误摘要；管理员可通过后台页面和 `/api/admin/observability/requests` 查看。指标不保存
-请求正文、查询参数、候选人材料或聊天内容。该实现适合当前单机 Compose 阶段；多副本上线
-前仍需接入集中指标系统或 Prometheus/反向代理层统计。
+请求正文、查询参数、候选人材料或聊天内容。管理员页面仍只展示当前响应副本的进程内快照；
+跨副本趋势、容量和告警由 Prometheus 聚合。
 
 第 4.3 步已完成后台请求观测面板。管理端顶部保留摘要指标，下面补充状态分布、请求方法、
 endpoint 热点和最近错误列表，方便管理员在同一页面定位限流、CSRF 和 5xx 问题；仍然不
@@ -188,6 +189,13 @@ endpoint 热点和最近错误列表，方便管理员在同一页面定位限�
 “管理员审计”面板，记录账号状态变更、退出所有设备和系统探针投递等低敏操作，并保存
 `request_id` 以便和访问日志、请求指标关联；审计详情只保存资源 ID、状态和计数，不保存
 候选人正文、查询参数或密钥。
+
+第 4.5 步已完成 Prometheus 请求指标切片。Web 通过内部 `/internal/metrics` 导出标准
+Prometheus 文本指标，生产 Compose 每 15 秒采集并保留 15 天趋势；告警规则覆盖 Web 不可用、
+5xx 比例、平均耗时、安全拦截和并发请求。Prometheus 通过 Docker DNS 把每个 Web 副本作为
+独立 target 采集，告警按 job 聚合；Caddy 同样动态发现副本并轮询分发流量。`validate_multi_replica.ps1`
+会实际验证两个 Web 副本、跨副本 Redis 限流和两个健康采集目标。Caddy 明确拒绝公网
+`/internal/*`，Prometheus 页面只绑定服务器回环地址；仍需在确定值班渠道后接入 Alertmanager。
 
 完成门槛：可以从 request ID 追踪一次请求到任务、模型调用和用量流水；安全扫描无高危项。
 
@@ -251,8 +259,14 @@ Kubernetes 不是上线前置条件。只有出现以下需求时再进入该阶
 - 后台基础设施：Redis broker、Celery Worker、`background_tasks` 状态表、任务幂等键、
   进度/重试/错误摘要和管理员探针接口；扫描 PDF OCR、简历 RAG 增量 Embedding 和公开 GitHub
   项目分析均已接入 Worker。当前还具备单机生产 Compose、HTTPS、备份恢复脚本、请求指标和管理员审计。
-  尚未实施的是文档导出异步化、外部指标采集与告警、真实支付回调和高可用部署。
+  支付记账基础已新增充值订单、低敏支付事件、幂等到账和管理员人工补款；人工补款不伪装成支付收入，
+  且余额、流水和管理员审计同事务提交。Prometheus 已接入低敏请求指标、15 天趋势和告警规则。
+  Caddy 与 Prometheus 均可动态发现多个 Web 副本，仓库提供可自动恢复单实例开发环境的
+  双副本验收脚本。
+  尚未实施的是文档导出异步化、Alertmanager 通知与分布式 Trace、真实支付渠道签名回调、
+  退款对账和高可用部署。
 
 后续改造必须按上述阶段逐步提交。当前 pgvector RAG 已进入生产读写路径；测试和 Web 共用
-PostgreSQL 后端。文件正文已不再依赖宿主机目录；多副本部署前仍需把进程内会话记忆、限流和指标
-迁移到共享基础设施，并完成并发与故障演练。
+PostgreSQL 后端。文件正文已不再依赖宿主机目录，请求限流和模型/截图并发已迁移到 Redis；
+多副本指标采集和共享保护已完成验证；正式启用多副本前仍需迁移进程内会话记忆，并完成
+更长时间的并发、滚动更新和故障演练。

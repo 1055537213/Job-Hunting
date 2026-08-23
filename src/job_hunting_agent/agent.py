@@ -175,7 +175,16 @@ class JobHuntingAgent:
             self.app.store.assert_account_can_spend(account_id)
         result = self.graph.invoke(
             {"messages": self.build_turn_messages(message, candidate_id, resolved_session_id, account_id)},
-            config={"configurable": {"thread_id": scoped_thread_id(account_id, candidate_id, resolved_session_id)}},
+            config={
+                "configurable": {
+                    "thread_id": scoped_thread_id(
+                        account_id,
+                        candidate_id,
+                        resolved_session_id,
+                    )
+                },
+                "metadata": {"account_id": account_id},
+            },
             context={
                 "candidate_id": candidate_id,
                 "account_id": account_id,
@@ -239,7 +248,16 @@ class JobHuntingAgent:
 
         for stream_item in self.graph.stream(
             {"messages": self.build_turn_messages(message, candidate_id, resolved_session_id, account_id)},
-            config={"configurable": {"thread_id": scoped_thread_id(account_id, candidate_id, resolved_session_id)}},
+            config={
+                "configurable": {
+                    "thread_id": scoped_thread_id(
+                        account_id,
+                        candidate_id,
+                        resolved_session_id,
+                    )
+                },
+                "metadata": {"account_id": account_id},
+            },
             context={
                 "candidate_id": candidate_id,
                 "account_id": account_id,
@@ -306,6 +324,7 @@ class JobHuntingAgent:
                 session_id=resolved_session_id,
                 root_request_id=root_request_id,
                 call_id=f"{root_request_id}-agent_chat-stream",
+                authorize_spend=False,
             ),
             streamed_usage,
         )

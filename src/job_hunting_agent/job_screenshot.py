@@ -20,6 +20,7 @@ from langchain_core.messages import BaseMessage, HumanMessage
 from PIL import Image, UnidentifiedImageError
 
 from .job_parser import validate_job_text
+from .concurrency_control import ConcurrencyControlError
 from .llm import LLMRequestError, extract_message_text
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,13 @@ class ScreenshotModelGateway(Protocol):
     def new_call_context(self, operation: str, *, account_id: int | None = None) -> Any:
         """创建可计量的模型调用上下文。"""
 
-    def chat_model(self, operation: str, temperature: float = 0) -> BaseChatModel:
+    def chat_model(
+        self,
+        operation: str,
+        temperature: float = 0,
+        *,
+        account_id: int | None = None,
+    ) -> BaseChatModel:
         """返回指定操作使用的聊天模型。"""
 
     def record_chat_response(self, context: Any, response: BaseMessage | object) -> object:
@@ -105,7 +112,10 @@ class JobScreenshotExtractor:
             response = self.model_gateway.chat_model(
                 "job_screenshot_extraction",
                 temperature=0,
+                account_id=context.account_id,
             ).invoke([build_screenshot_message(normalized)])
+        except ConcurrencyControlError:
+            raise
         except Exception as error:
             raise JobScreenshotModelError(
                 "职位截图识别失败，请检查当前模型是否支持图片输入，或改用文本导入。"

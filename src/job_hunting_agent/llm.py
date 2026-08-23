@@ -16,11 +16,13 @@ import logging
 from collections.abc import Callable
 from typing import Protocol
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_openai import ChatOpenAI
 
 from .config import LLMSettings
+from .concurrency_control import ConcurrencyControlError
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,8 @@ class LangChainLLMClient:
 
         try:
             response = self.model.invoke(prompt)
+        except ConcurrencyControlError:
+            raise
         except Exception as error:
             raise LLMRequestError(f"LLM 调用失败：{error}") from error
         if self.usage_callback is not None:
@@ -98,6 +102,7 @@ def build_chat_model(
     settings: LLMSettings,
     temperature: float = 0,
     max_retries: int = 2,
+    callbacks: list[BaseCallbackHandler] | None = None,
 ) -> BaseChatModel:
     """根据 `.env` 配置创建标准 LangChain ChatModel。
 
@@ -132,6 +137,7 @@ def build_chat_model(
         # 请求流式结束块携带 usage；如果供应商不支持，计量层会标记为 missing，
         # 而不是把估算值直接当成正式账单。
         stream_usage=True,
+        callbacks=callbacks,
     )
 
 

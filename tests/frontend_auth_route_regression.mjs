@@ -57,7 +57,7 @@ assert.match(
   /navigateToAuth\(replace = false, preserveCurrentRoute = true\)/,
 );
 assert.equal((source.match(/this\.navigateToAuth\(true, false\);/g) || []).length, 2);
-assert.match(template, /app\.js\?v=20260823-project-collapse-v1/);
+assert.match(template, /app\.js\?v=20260823-billing-v1/);
 
 const navigateToAuth = extractMethod(
   "navigateToAuth(replace = false, preserveCurrentRoute = true) {",

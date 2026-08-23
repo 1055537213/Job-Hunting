@@ -110,11 +110,11 @@ def test_account_filters_profiles_jobs_and_usage_events(database_url):
     auth = AuthService(store)
     account_a = auth.register("a@example.com", "password-123")
     account_b = auth.register("b@example.com", "password-123")
-    store.recharge_account_balance(
+    store.create_simulated_recharge_order(
         account_a.id,
         100,
-        summary="用量计费测试充值",
-        source_reference="test-account-usage-funding",
+        idempotency_key="test-account-usage-funding",
+        description="用量计费测试充值",
     )
 
     profile = CandidateProfileInput(

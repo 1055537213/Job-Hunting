@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>求职助手 Agent</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260823-cleanup-v1" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260823-billing-v1" />
   </head>
   <body>
     <!-- Vue 还没有挂载完成时隐藏模板，避免用户短暂看到未编译的 {{ }}。 -->
@@ -1165,16 +1165,17 @@
               <form class="profile-recharge-form" @submit.prevent="rechargeMyBalance">
                 <label class="field-group" for="profileRechargeAmount">
                   <span>充值金额（元）</span>
-                  <input id="profileRechargeAmount" v-model.number="profileRechargeForm.amountYuan" class="field" type="number" min="0.01" step="0.01" required />
+                  <input id="profileRechargeAmount" v-model.number="profileRechargeForm.amountYuan" class="field" type="number" min="0.01" max="1000000" step="0.01" required @input="profileRechargeForm.idempotencyKey = ''; profileRechargeSuccess = ''" />
                 </label>
                 <label class="field-group" for="profileRechargeNote">
                   <span>备注（可选）</span>
-                  <input id="profileRechargeNote" v-model.trim="profileRechargeForm.note" class="field" maxlength="120" placeholder="例如：测试充值" />
+                  <input id="profileRechargeNote" v-model.trim="profileRechargeForm.note" class="field" maxlength="120" placeholder="例如：测试充值" @input="profileRechargeForm.idempotencyKey = ''; profileRechargeSuccess = ''" />
                 </label>
                 <button class="primary-button" type="submit" :disabled="profileRechargeLoading" :data-state="profileRechargeLoading ? 'loading' : 'idle'">
                   {{ profileRechargeLoading ? "处理中" : "模拟充值" }}
                 </button>
               </form>
+              <div v-if="profileRechargeSuccess" class="inline-error is-success" role="status">{{ profileRechargeSuccess }}</div>
             </article>
             <article class="panel profile-billing-note">
               <p class="eyebrow">Billing State</p>
@@ -1216,11 +1217,11 @@
               </table>
             </div>
             <div class="admin-ledger-pagination profile-ledger-pagination" role="navigation" aria-label="个人余额流水分页">
-              <span class="admin-ledger-page-info">{{ adminLedgerPageInfo(profileCenter.total) }}</span>
+              <span class="admin-ledger-page-info">{{ balanceLedgerPageInfo(profileCenter.total) }}</span>
               <div class="admin-ledger-page-nav">
                 <button class="admin-ledger-page-button" type="button" :disabled="profileBalancePage <= 1 || profileBalanceLoading" @click="selectProfileBalancePage(profileBalancePage - 1)">上一页</button>
                 <button
-                  v-for="page in adminLedgerPageNumbers(profileCenter.total)"
+                  v-for="page in balanceLedgerPageNumbers(profileCenter.total, profileBalancePage)"
                   :key="`profile-balance-page-${page}`"
                   class="admin-ledger-page-button"
                   type="button"
@@ -1230,7 +1231,7 @@
                 >
                   {{ page }}
                 </button>
-                <button class="admin-ledger-page-button" type="button" :disabled="profileBalancePage >= adminLedgerPageCount(profileCenter.total) || profileBalanceLoading" @click="selectProfileBalancePage(profileBalancePage + 1)">下一页</button>
+                <button class="admin-ledger-page-button" type="button" :disabled="profileBalancePage >= balanceLedgerPageCount(profileCenter.total) || profileBalanceLoading" @click="selectProfileBalancePage(profileBalancePage + 1)">下一页</button>
               </div>
             </div>
           </section>
@@ -1406,6 +1407,47 @@
                     </div>
 
                     <template v-if="admin.activeDetailTab === 'balance'">
+                      <form class="admin-balance-credit-form" @submit.prevent="creditAdminBalance">
+                        <div class="admin-balance-credit-head">
+                          <div>
+                            <p class="eyebrow">Manual Credit</p>
+                            <h4>管理员补款</h4>
+                          </div>
+                          <span>不经过支付渠道 · 审计留痕</span>
+                        </div>
+                        <label class="field-group" for="adminBalanceCreditAmount">
+                          <span>补款金额（元）</span>
+                          <input
+                            id="adminBalanceCreditAmount"
+                            v-model.number="admin.balanceCreditForm.amountYuan"
+                            class="field"
+                            type="number"
+                            min="0.01"
+                            max="1000000"
+                            step="0.01"
+                            required
+                            @input="admin.balanceCreditForm.idempotencyKey = ''; admin.balanceCreditSuccess = ''"
+                          />
+                        </label>
+                        <label class="field-group" for="adminBalanceCreditReason">
+                          <span>补款原因</span>
+                          <input
+                            id="adminBalanceCreditReason"
+                            v-model.trim="admin.balanceCreditForm.reason"
+                            class="field"
+                            minlength="2"
+                            maxlength="500"
+                            placeholder="例如：支付异常人工补款"
+                            required
+                            @input="admin.balanceCreditForm.idempotencyKey = ''; admin.balanceCreditSuccess = ''"
+                          />
+                        </label>
+                        <button class="primary-button compact" type="submit" :disabled="admin.balanceCreditLoading">
+                          {{ admin.balanceCreditLoading ? "处理中" : "确认补款" }}
+                        </button>
+                      </form>
+                      <div v-if="admin.balanceCreditError" class="inline-error" role="alert">{{ admin.balanceCreditError }}</div>
+                      <div v-else-if="admin.balanceCreditSuccess" class="inline-error is-success" role="status">{{ admin.balanceCreditSuccess }}</div>
                       <div v-if="admin.loadingBalanceEvents" class="admin-usage-notice" role="status">正在加载余额流水...</div>
                       <div v-else-if="admin.balanceEventsError" class="inline-error" role="alert">{{ admin.balanceEventsError }}</div>
                       <div v-else-if="!admin.balanceEvents.length" class="empty-state compact-empty">
@@ -1413,7 +1455,7 @@
                       </div>
                       <div v-else class="admin-table-wrap">
                         <table class="admin-table">
-                          <thead><tr><th>时间</th><th>类型</th><th>金额</th><th>余额前</th><th>余额后</th><th>Token</th><th>来源</th><th>说明</th></tr></thead>
+                          <thead><tr><th>时间</th><th>类型</th><th>金额</th><th>余额前</th><th>余额后</th><th>Token</th><th>操作者</th><th>来源</th><th>说明</th></tr></thead>
                           <tbody>
                             <tr v-for="entry in admin.balanceEvents" :key="entry.id">
                               <td>{{ formatDate(entry.created_at) }}</td>
@@ -1422,6 +1464,7 @@
                               <td>{{ formatYuanAmount(entry.balance_before_micro_yuan) }} 元</td>
                               <td>{{ formatYuanAmount(entry.balance_after_micro_yuan) }} 元</td>
                               <td>{{ entry.token_count ?? "-" }}</td>
+                              <td>{{ entry.operator_account_id ? adminAccountLabel(entry.operator_account_id) : "-" }}</td>
                               <td>{{ entry.source_reference || "-" }}</td>
                               <td>{{ entry.summary }}</td>
                             </tr>
@@ -1429,11 +1472,11 @@
                         </table>
                       </div>
                       <div class="admin-ledger-pagination" role="navigation" aria-label="余额流水分页">
-                        <span class="admin-ledger-page-info">{{ adminLedgerPageInfo(admin.balanceTotal) }}</span>
+                        <span class="admin-ledger-page-info">{{ balanceLedgerPageInfo(admin.balanceTotal) }}</span>
                         <div class="admin-ledger-page-nav">
                           <button class="admin-ledger-page-button" type="button" :disabled="admin.balancePage <= 1" @click="loadAdminBalanceEvents(selectedAdminAccount.id, admin.balancePage - 1)">上一页</button>
                           <button
-                            v-for="page in adminLedgerPageNumbers(admin.balanceTotal)"
+                            v-for="page in balanceLedgerPageNumbers(admin.balanceTotal, admin.balancePage)"
                             :key="`balance-page-${page}`"
                             class="admin-ledger-page-button"
                             type="button"
@@ -1442,7 +1485,7 @@
                           >
                             {{ page }}
                           </button>
-                          <button class="admin-ledger-page-button" type="button" :disabled="admin.balancePage >= adminLedgerPageCount(admin.balanceTotal)" @click="loadAdminBalanceEvents(selectedAdminAccount.id, admin.balancePage + 1)">下一页</button>
+                          <button class="admin-ledger-page-button" type="button" :disabled="admin.balancePage >= balanceLedgerPageCount(admin.balanceTotal)" @click="loadAdminBalanceEvents(selectedAdminAccount.id, admin.balancePage + 1)">下一页</button>
                         </div>
                       </div>
                     </template>
@@ -1862,6 +1905,6 @@
     <!-- Vue 3 global build 已放入本地静态目录，避免本地页面依赖外部 CDN。 -->
     <script src="/static/vendor/vue.global.prod.js?v=20260731-auth-admin"></script>
     <script src="/static/china_cities.js?v=20260803-cities"></script>
-    <script src="/static/app.js?v=20260823-project-collapse-v1"></script>
+    <script src="/static/app.js?v=20260823-billing-v1"></script>
   </body>
 </html>

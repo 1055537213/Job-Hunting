@@ -72,5 +72,12 @@ jobs:
           JOB_AGENT_REDIS_PASSWORD: ci-redis-password
         run: docker compose --env-file .env.example -f compose.yaml config --quiet
 
+      - name: Validate Prometheus configuration and alert rules
+        run: >-
+          docker run --rm --entrypoint /bin/promtool
+          -v "$PWD/deploy/prometheus:/etc/prometheus:ro"
+          prom/prometheus:v3.13.1
+          check config /etc/prometheus/prometheus.yml
+
       - name: Build release image
         run: docker build --tag job-hunting-agent:ci .

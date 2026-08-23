@@ -1,0 +1,88 @@
+groups:
+  - name: job-hunting-agent-web
+    rules:
+      - alert: JobAgentWebDown
+        expr: |
+          sum(up{job="job-hunting-agent-web"}) == 0
+          or
+          absent(up{job="job-hunting-agent-web"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Job Hunting Agent Web is unavailable
+          description: Prometheus has failed to scrape the Web process for two minutes.
+
+      - alert: JobAgentHighServerErrorRate
+        expr: |
+          (
+            sum(rate(job_agent_http_responses_total{status_family="5xx"}[5m]))
+            /
+            clamp_min(sum(rate(job_agent_http_requests_total[5m])), 0.001)
+          ) > 0.05
+          and
+          sum(increase(job_agent_http_responses_total{status_family="5xx"}[5m])) >= 5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Job Hunting Agent 5xx rate is above 5 percent
+          description: At least five 5xx responses occurred and the five-minute error rate stayed above 5 percent.
+
+      - alert: JobAgentSlowAverageResponse
+        expr: |
+          (
+            sum(rate(job_agent_http_request_duration_seconds_sum[5m]))
+            /
+            clamp_min(sum(rate(job_agent_http_request_duration_seconds_count[5m])), 0.001)
+          ) > 2
+          and
+          sum(increase(job_agent_http_request_duration_seconds_count[5m])) >= 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Job Hunting Agent average response time is above two seconds
+          description: Average HTTP response time stayed above two seconds with at least ten requests in five minutes.
+
+      - alert: JobAgentSecurityRejectionsSpike
+        expr: |
+          sum(increase(job_agent_security_rejections_total[10m])) >= 20
+          or
+          sum(increase(job_agent_rate_limit_backend_errors_total[5m])) >= 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Job Hunting Agent security rejections increased sharply
+          description: Security controls rejected at least twenty requests, or the shared rate-limit backend affected requests.
+
+      - alert: JobAgentHighInFlightRequests
+        expr: sum(job_agent_http_requests_in_flight) >= 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Job Hunting Agent has many concurrent requests
+          description: All Web replicas together have handled at least twenty concurrent requests for five minutes.
+
+      - alert: JobAgentConcurrencyProtectionErrors
+        expr: |
+          sum(increase(job_agent_concurrency_backend_errors_total[5m])) >= 1
+          or
+          sum(increase(job_agent_concurrency_release_errors_total[10m])) >= 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Job Hunting Agent shared concurrency protection is unhealthy
+          description: Redis lease acquisition or release errors were observed; model and OCR admission may be unreliable.
+
+      - alert: JobAgentConcurrencyCapacityPressure
+        expr: sum(increase(job_agent_concurrency_leases_rejected_total[10m])) >= 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Job Hunting Agent model or OCR concurrency capacity is saturated
+          description: Shared concurrency leases were rejected repeatedly; inspect provider latency and configured limits.

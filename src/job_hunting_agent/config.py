@@ -54,6 +54,28 @@ class ModelGatewaySettings:
 
 
 @dataclass(frozen=True)
+class ConcurrencySettings:
+    """模型供应商与截图处理的共享并发配置。
+
+    请求频率限制解决“单位时间内能发多少次”，这里解决“同一时刻有多少个昂贵操作
+    正在执行”。Docker/生产使用 Redis 租约，开发和测试默认使用进程内实现。
+    """
+
+    enabled: bool = True
+    environment: str = "development"
+    backend: str = "memory"
+    redis_url: str | None = None
+    redis_timeout_seconds: float = 1.0
+    key_prefix: str = "job_agent:concurrency"
+    model_global_limit: int = 8
+    model_account_limit: int = 2
+    screenshot_global_limit: int = 2
+    screenshot_account_limit: int = 1
+    lease_ttl_seconds: int = 900
+    wait_timeout_seconds: float = 5.0
+
+
+@dataclass(frozen=True)
 class DatabaseSettings:
     """生产数据库连接配置。
 
@@ -108,8 +130,9 @@ class ObjectStorageSettings:
 class TaskQueueSettings:
     """后台任务队列配置。
 
-    Redis 只承担 Celery broker 的短期消息传递；任务状态、归属、进度和错误摘要
-    始终写入 PostgreSQL。这样 Redis 重启或过期后，网页仍能从数据库恢复任务状态。
+    Redis 的数据库 0 默认承担 Celery broker 的短期消息传递；任务状态、归属、进度和
+    错误摘要始终写入 PostgreSQL。共享限流使用独立键空间，Compose 默认放在数据库 1。
+    这样 Redis 重启或过期后，网页仍能从数据库恢复任务状态。
     """
 
     enabled: bool = False
@@ -130,6 +153,14 @@ class WebSecuritySettings:
     rate_limit_window_seconds: int = 60
     rate_limit_default_requests: int = 240
     rate_limit_auth_requests: int = 20
+    rate_limit_model_requests: int = 60
+    rate_limit_upload_requests: int = 20
+    rate_limit_admin_requests: int = 120
+    rate_limit_write_requests: int = 120
+    rate_limit_backend: str = "memory"
+    rate_limit_redis_url: str | None = None
+    rate_limit_redis_timeout_seconds: float = 1.0
+    rate_limit_key_prefix: str = "job_agent:rate_limit"
 
 
 @dataclass(frozen=True)
@@ -365,6 +396,120 @@ def load_model_gateway_settings(
             "JOB_AGENT_MODEL_GATEWAY_RERANK_MAX_RETRIES",
         ),
     )
+
+
+def load_concurrency_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> ConcurrencySettings:
+    """读取模型和截图共享并发租约配置。"""
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(*keys: str, default: str | None = None) -> str | None:
+        for key in keys:
+            if environment.get(key):
+                return environment[key]
+            if file_values.get(key):
+                return file_values[key]
+        return default
+
+    runtime_environment = (
+        get("JOB_AGENT_ENVIRONMENT", default="development") or "development"
+    ).lower()
+    if runtime_environment not in {"development", "test", "production"}:
+        raise ValueError(
+            "JOB_AGENT_ENVIRONMENT 只能是 development、test 或 production"
+        )
+    backend = (
+        get(
+            "JOB_AGENT_CONCURRENCY_BACKEND",
+            default="redis" if runtime_environment == "production" else "memory",
+        )
+        or "memory"
+    ).strip().lower()
+    if backend not in {"memory", "redis"}:
+        raise ValueError("JOB_AGENT_CONCURRENCY_BACKEND 只能是 memory 或 redis")
+    redis_url = get(
+        "JOB_AGENT_CONCURRENCY_REDIS_URL",
+        "JOB_AGENT_RATE_LIMIT_REDIS_URL",
+        "JOB_AGENT_REDIS_URL",
+    )
+    if redis_url:
+        parsed_url = urlsplit(redis_url)
+        if parsed_url.scheme not in {"redis", "rediss"} or not parsed_url.netloc:
+            raise ValueError(
+                "JOB_AGENT_CONCURRENCY_REDIS_URL 必须使用 redis:// 或 rediss:// 地址。"
+            )
+    key_prefix = (
+        get("JOB_AGENT_CONCURRENCY_KEY_PREFIX", default="job_agent:concurrency")
+        or "job_agent:concurrency"
+    ).strip(": ")
+    if not key_prefix or len(key_prefix) > 80:
+        raise ValueError("JOB_AGENT_CONCURRENCY_KEY_PREFIX 必须为 1 到 80 个字符")
+
+    settings = ConcurrencySettings(
+        enabled=parse_bool(get("JOB_AGENT_CONCURRENCY_ENABLED", default="true")),
+        environment=runtime_environment,
+        backend=backend,
+        redis_url=redis_url,
+        redis_timeout_seconds=parse_positive_float(
+            get("JOB_AGENT_CONCURRENCY_REDIS_TIMEOUT_SECONDS", default="1"),
+            "JOB_AGENT_CONCURRENCY_REDIS_TIMEOUT_SECONDS",
+        ),
+        key_prefix=key_prefix,
+        model_global_limit=parse_positive_int(
+            get("JOB_AGENT_MODEL_GLOBAL_CONCURRENCY", default="8"),
+            "JOB_AGENT_MODEL_GLOBAL_CONCURRENCY",
+        ),
+        model_account_limit=parse_positive_int(
+            get("JOB_AGENT_MODEL_ACCOUNT_CONCURRENCY", default="2"),
+            "JOB_AGENT_MODEL_ACCOUNT_CONCURRENCY",
+        ),
+        screenshot_global_limit=parse_positive_int(
+            get("JOB_AGENT_SCREENSHOT_GLOBAL_CONCURRENCY", default="2"),
+            "JOB_AGENT_SCREENSHOT_GLOBAL_CONCURRENCY",
+        ),
+        screenshot_account_limit=parse_positive_int(
+            get("JOB_AGENT_SCREENSHOT_ACCOUNT_CONCURRENCY", default="1"),
+            "JOB_AGENT_SCREENSHOT_ACCOUNT_CONCURRENCY",
+        ),
+        lease_ttl_seconds=parse_positive_int(
+            get("JOB_AGENT_CONCURRENCY_LEASE_TTL_SECONDS", default="900"),
+            "JOB_AGENT_CONCURRENCY_LEASE_TTL_SECONDS",
+        ),
+        wait_timeout_seconds=parse_non_negative_float(
+            get("JOB_AGENT_CONCURRENCY_WAIT_TIMEOUT_SECONDS", default="5"),
+            "JOB_AGENT_CONCURRENCY_WAIT_TIMEOUT_SECONDS",
+        ),
+    )
+    if settings.environment == "production":
+        if not settings.enabled:
+            raise ValueError("生产环境不能关闭共享并发保护。")
+        if settings.backend != "redis":
+            raise ValueError("生产环境必须使用 Redis 共享并发租约。")
+    if settings.enabled and settings.backend == "redis" and not settings.redis_url:
+        raise ValueError(
+            "启用 Redis 共享并发租约时必须配置 JOB_AGENT_CONCURRENCY_REDIS_URL。"
+        )
+    return settings
+
+
+def masked_concurrency_settings(settings: ConcurrencySettings) -> dict[str, object]:
+    """返回不含 Redis 地址和账号标识的共享并发配置摘要。"""
+
+    return {
+        "enabled": settings.enabled,
+        "backend": settings.backend,
+        "redis_configured": bool(settings.redis_url),
+        "model_global_limit": settings.model_global_limit,
+        "model_account_limit": settings.model_account_limit,
+        "screenshot_global_limit": settings.screenshot_global_limit,
+        "screenshot_account_limit": settings.screenshot_account_limit,
+        "lease_ttl_seconds": settings.lease_ttl_seconds,
+        "wait_timeout_seconds": settings.wait_timeout_seconds,
+    }
 
 
 def load_database_settings(
@@ -638,6 +783,35 @@ def load_web_security_settings(
         raise ValueError(
             "JOB_AGENT_ENVIRONMENT 只能是 development、test 或 production"
         )
+    rate_limit_backend = (
+        get(
+            "JOB_AGENT_RATE_LIMIT_BACKEND",
+            default="redis" if runtime_environment == "production" else "memory",
+        )
+        or "memory"
+    ).strip().lower()
+    if rate_limit_backend not in {"memory", "redis"}:
+        raise ValueError("JOB_AGENT_RATE_LIMIT_BACKEND 只能是 memory 或 redis")
+    rate_limit_redis_url = get(
+        "JOB_AGENT_RATE_LIMIT_REDIS_URL",
+        "JOB_AGENT_REDIS_URL",
+    )
+    if rate_limit_redis_url:
+        parsed_rate_limit_url = urlsplit(rate_limit_redis_url)
+        if (
+            parsed_rate_limit_url.scheme not in {"redis", "rediss"}
+            or not parsed_rate_limit_url.netloc
+        ):
+            raise ValueError(
+                "JOB_AGENT_RATE_LIMIT_REDIS_URL 必须使用 redis:// 或 rediss:// 地址。"
+            )
+    rate_limit_key_prefix = (
+        get("JOB_AGENT_RATE_LIMIT_KEY_PREFIX", default="job_agent:rate_limit")
+        or "job_agent:rate_limit"
+    ).strip(": ")
+    if not rate_limit_key_prefix or len(rate_limit_key_prefix) > 80:
+        raise ValueError("JOB_AGENT_RATE_LIMIT_KEY_PREFIX 必须为 1 到 80 个字符")
+
     settings = WebSecuritySettings(
         environment=runtime_environment,
         csrf_enabled=parse_bool(get("JOB_AGENT_CSRF_ENABLED", default="true")),
@@ -657,6 +831,29 @@ def load_web_security_settings(
             get("JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS", default="20"),
             "JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS",
         ),
+        rate_limit_model_requests=parse_positive_int(
+            get("JOB_AGENT_RATE_LIMIT_MODEL_REQUESTS", default="60"),
+            "JOB_AGENT_RATE_LIMIT_MODEL_REQUESTS",
+        ),
+        rate_limit_upload_requests=parse_positive_int(
+            get("JOB_AGENT_RATE_LIMIT_UPLOAD_REQUESTS", default="20"),
+            "JOB_AGENT_RATE_LIMIT_UPLOAD_REQUESTS",
+        ),
+        rate_limit_admin_requests=parse_positive_int(
+            get("JOB_AGENT_RATE_LIMIT_ADMIN_REQUESTS", default="120"),
+            "JOB_AGENT_RATE_LIMIT_ADMIN_REQUESTS",
+        ),
+        rate_limit_write_requests=parse_positive_int(
+            get("JOB_AGENT_RATE_LIMIT_WRITE_REQUESTS", default="120"),
+            "JOB_AGENT_RATE_LIMIT_WRITE_REQUESTS",
+        ),
+        rate_limit_backend=rate_limit_backend,
+        rate_limit_redis_url=rate_limit_redis_url,
+        rate_limit_redis_timeout_seconds=parse_positive_float(
+            get("JOB_AGENT_RATE_LIMIT_REDIS_TIMEOUT_SECONDS", default="1"),
+            "JOB_AGENT_RATE_LIMIT_REDIS_TIMEOUT_SECONDS",
+        ),
+        rate_limit_key_prefix=rate_limit_key_prefix,
     )
     if settings.environment == "production":
         disabled_controls = [
@@ -672,6 +869,16 @@ def load_web_security_settings(
             raise ValueError(
                 "生产环境不能关闭以下 Web 安全控制：" + "、".join(disabled_controls)
             )
+        if settings.rate_limit_backend != "redis":
+            raise ValueError("生产环境必须使用 Redis 分布式请求限流。")
+    if (
+        settings.rate_limit_enabled
+        and settings.rate_limit_backend == "redis"
+        and not settings.rate_limit_redis_url
+    ):
+        raise ValueError(
+            "启用 Redis 请求限流时必须配置 JOB_AGENT_RATE_LIMIT_REDIS_URL。"
+        )
     return settings
 
 
@@ -686,6 +893,12 @@ def masked_web_security_settings(settings: WebSecuritySettings) -> dict[str, obj
         "rate_limit_window_seconds": settings.rate_limit_window_seconds,
         "rate_limit_default_requests": settings.rate_limit_default_requests,
         "rate_limit_auth_requests": settings.rate_limit_auth_requests,
+        "rate_limit_model_requests": settings.rate_limit_model_requests,
+        "rate_limit_upload_requests": settings.rate_limit_upload_requests,
+        "rate_limit_admin_requests": settings.rate_limit_admin_requests,
+        "rate_limit_write_requests": settings.rate_limit_write_requests,
+        "rate_limit_backend": settings.rate_limit_backend,
+        "rate_limit_redis_configured": bool(settings.rate_limit_redis_url),
     }
 
 

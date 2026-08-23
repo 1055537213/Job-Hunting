@@ -3227,6 +3227,31 @@ textarea:focus-visible,
 .admin-usage-notice,
 .admin-usage-prompt { display: grid; gap: var(--space-2xs); padding: var(--space-md); color: var(--auth-muted); background: var(--auth-paper-2); border: 1px solid var(--auth-rule); }
 .admin-usage-prompt strong { color: var(--auth-ink); }
+.admin-balance-credit-form {
+  display: grid;
+  grid-template-columns: minmax(11rem, 0.65fr) minmax(16rem, 1.35fr) auto;
+  gap: var(--space-sm);
+  align-items: end;
+  padding: var(--space-md);
+  background: var(--auth-paper);
+  border: 1px solid var(--auth-rule);
+  border-radius: var(--radius-sm);
+}
+.admin-balance-credit-head {
+  grid-column: 1 / -1;
+  min-width: 0;
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  padding-block-end: var(--space-xs);
+  border-block-end: 1px solid var(--auth-rule);
+}
+.admin-balance-credit-head .eyebrow { margin: 0 0 var(--space-3xs); }
+.admin-balance-credit-head h4 { margin: 0; color: var(--auth-ink); font-size: var(--text-md); }
+.admin-balance-credit-head > span { color: var(--auth-muted); font-family: var(--font-mono); font-size: var(--text-xs); white-space: nowrap; }
+.admin-balance-credit-form .field-group { min-width: 0; }
+.admin-balance-credit-form .primary-button { min-width: 7.5rem; }
 .admin-detail-tabs {
   width: 100%;
   display: grid;
@@ -3875,6 +3900,8 @@ textarea:focus-visible,
   .admin-account-usage { padding: var(--space-sm); }
   .admin-account-usage-head { gap: var(--space-xs); }
   .admin-account-usage-meta { justify-self: stretch; text-align: start; }
+  .admin-balance-credit-form { grid-template-columns: minmax(9rem, 0.7fr) minmax(0, 1.3fr); }
+  .admin-balance-credit-form .primary-button { grid-column: 1 / -1; justify-self: end; }
   .admin-tool-detail { padding: var(--space-sm); }
   .project-review-item { grid-template-columns: 1fr; }
   .project-review-actions { justify-content: stretch; }
@@ -4035,4 +4062,8 @@ textarea:focus-visible,
   .profile-recharge-form .primary-button { width: 100%; }
   .profile-topbar-brand,
   .profile-topbar-actions { align-items: flex-start; }
+  .admin-balance-credit-form { grid-template-columns: 1fr; }
+  .admin-balance-credit-head { align-items: flex-start; flex-direction: column; }
+  .admin-balance-credit-head > span { white-space: normal; }
+  .admin-balance-credit-form .primary-button { grid-column: auto; width: 100%; }
 }

@@ -460,6 +460,85 @@ account_balances = sa.Table(
 )
 
 
+recharge_orders = sa.Table(
+    "recharge_orders",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column("order_number", sa.String(64), nullable=False),
+    sa.Column(
+        "account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "created_by_account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="SET NULL"),
+    ),
+    sa.Column("amount_micro_yuan", sa.BigInteger, nullable=False),
+    sa.Column("status", sa.String(24), nullable=False, server_default=sa.text("'pending'")),
+    sa.Column("payment_provider", sa.String(32), nullable=False),
+    sa.Column("provider_order_id", sa.String(160)),
+    sa.Column("idempotency_key", sa.String(128), nullable=False),
+    sa.Column("description", sa.Text, nullable=False),
+    sa.Column("failure_reason", sa.Text),
+    sa.Column("details_json", json_type, nullable=False, server_default=sa.text("'{}'")),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.Column("updated_at", timestamp_type, nullable=False),
+    sa.Column("paid_at", timestamp_type),
+    sa.Column("cancelled_at", timestamp_type),
+    sa.Column("refunded_at", timestamp_type),
+    sa.UniqueConstraint("order_number", name="uq_recharge_orders_order_number"),
+    sa.UniqueConstraint("account_id", "idempotency_key", name="uq_recharge_orders_account_idempotency"),
+    sa.UniqueConstraint(
+        "payment_provider",
+        "provider_order_id",
+        name="uq_recharge_orders_provider_order",
+    ),
+    sa.CheckConstraint("amount_micro_yuan > 0", name="recharge_orders_amount_positive"),
+    sa.CheckConstraint(
+        "status IN ('pending', 'paid', 'failed', 'cancelled', 'refunded')",
+        name="recharge_orders_status",
+    ),
+)
+sa.Index("idx_recharge_orders_account_time", recharge_orders.c.account_id, recharge_orders.c.created_at.desc())
+sa.Index("idx_recharge_orders_status_time", recharge_orders.c.status, recharge_orders.c.created_at.desc())
+
+
+payment_events = sa.Table(
+    "payment_events",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column(
+        "recharge_order_id",
+        sa.Integer,
+        sa.ForeignKey("recharge_orders.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("payment_provider", sa.String(32), nullable=False),
+    sa.Column("provider_event_id", sa.String(160), nullable=False),
+    sa.Column("event_type", sa.String(64), nullable=False),
+    sa.Column("processing_status", sa.String(24), nullable=False),
+    sa.Column("signature_valid", sa.Boolean, nullable=False),
+    sa.Column("payload_sha256", sa.String(64), nullable=False),
+    sa.Column("error_summary", sa.Text),
+    sa.Column("details_json", json_type, nullable=False, server_default=sa.text("'{}'")),
+    sa.Column("received_at", timestamp_type, nullable=False),
+    sa.Column("processed_at", timestamp_type),
+    sa.UniqueConstraint(
+        "payment_provider",
+        "provider_event_id",
+        name="uq_payment_events_provider_event",
+    ),
+    sa.CheckConstraint(
+        "processing_status IN ('received', 'processed', 'ignored', 'failed')",
+        name="payment_events_processing_status",
+    ),
+)
+sa.Index("idx_payment_events_order_time", payment_events.c.recharge_order_id, payment_events.c.received_at.desc())
+
+
 account_balance_ledger = sa.Table(
     "account_balance_ledger",
     metadata,
@@ -476,6 +555,16 @@ account_balance_ledger = sa.Table(
     sa.Column("balance_after_micro_yuan", sa.BigInteger, nullable=False),
     sa.Column("token_count", sa.Integer),
     sa.Column("price_per_million_tokens_yuan", sa.Numeric(12, 6)),
+    sa.Column(
+        "operator_account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="SET NULL"),
+    ),
+    sa.Column(
+        "recharge_order_id",
+        sa.Integer,
+        sa.ForeignKey("recharge_orders.id", ondelete="SET NULL"),
+    ),
     sa.Column("source_reference", sa.String(160)),
     sa.Column("summary", sa.Text, nullable=False),
     sa.Column("details_json", json_type, nullable=False, server_default=sa.text("'{}'")),
@@ -491,6 +580,10 @@ sa.Index(
     "idx_account_balance_ledger_account_time",
     account_balance_ledger.c.account_id,
     account_balance_ledger.c.created_at.desc(),
+)
+sa.Index(
+    "idx_account_balance_ledger_recharge_order",
+    account_balance_ledger.c.recharge_order_id,
 )
 
 

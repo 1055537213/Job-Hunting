@@ -7,14 +7,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Protocol, Self
 from uuid import uuid4
 
+from .admin_ledger import ADMIN_LEDGER_MAX_RECORDS, ADMIN_LEDGER_PAGE_SIZE
 from .city_catalog import normalize_city_list
+from .config import BillingSettings
 from .deduplication import (
     DuplicateResourceError,
     candidate_profile_content_fingerprint,
@@ -24,11 +28,12 @@ from .deduplication import (
 )
 from .job_parser import classify_skill_requirements, parse_job_text, validate_job_text
 from .models import (
-    AccountRecord,
     AccountBalanceSummary,
+    AccountRecord,
     AdminAuditEventRecord,
     AuthSessionRecord,
     BackgroundTaskRecord,
+    BalanceLedgerRecord,
     CandidateProfile,
     CandidateProfileInput,
     CandidateProfilePatch,
@@ -36,20 +41,19 @@ from .models import (
     ChatSessionRecord,
     ImportedJob,
     LongTextRecord,
+    PaymentEventRecord,
     ProjectExperienceCard,
     ProjectExperienceRecord,
+    RechargeOrderRecord,
     ResumeArtifactRecord,
     ResumeDraft,
     ResumeDraftRecord,
     SkillRequirement,
-    BalanceLedgerRecord,
     ToolCallTraceRecord,
     UsageEventRecord,
     sanitize_preference_weights,
 )
 from .profile_mutation import apply_candidate_profile_patch
-from .admin_ledger import ADMIN_LEDGER_MAX_RECORDS
-from .config import BillingSettings
 from .skill_normalization import normalize_skill_mapping
 
 RESUME_ARTIFACT_STATUSES = {"ready", "processing", "failed"}
@@ -61,6 +65,10 @@ class InsufficientBalanceError(ValueError):
 
     def __init__(self, message: str = INSUFFICIENT_BALANCE_MESSAGE) -> None:
         super().__init__(message)
+
+
+class IdempotencyConflictError(ValueError):
+    """同一个幂等键被用于不同的资金操作。"""
 
 
 class RepositoryRow(Protocol):
@@ -423,41 +431,102 @@ class RepositoryStore:
             )
         return results
 
-    def recharge_account_balance(
+    def create_simulated_recharge_order(
         self,
         account_id: int,
-        amount_yuan: float,
+        amount_yuan: float | Decimal,
         *,
-        summary: str | None = None,
-        source_reference: str | None = None,
-        details: dict[str, object] | None = None,
-    ) -> BalanceLedgerRecord:
-        """给账号充值，并写入一条余额流水。"""
+        idempotency_key: str,
+        description: str = "个人中心模拟充值",
+    ) -> tuple[RechargeOrderRecord, BalanceLedgerRecord]:
+        """开发环境创建并立即结算模拟订单，完整经过订单和支付事件链路。"""
 
-        if amount_yuan <= 0:
-            raise ValueError("充值金额必须大于 0。")
-        self.get_account(account_id)
-        amount_micro_yuan = self._yuan_to_micro_yuan(amount_yuan)
-        if amount_micro_yuan <= 0:
-            raise ValueError("充值金额不能低于 0.000001 元。")
+        account = self.get_account(account_id)
+        amount_micro_yuan = self._positive_money_amount(amount_yuan)
+        key = self._validated_idempotency_key(idempotency_key)
+        clean_description = description.strip()[:500] or "个人中心模拟充值"
         with self.connect() as conn:
             self._ensure_account_billing_row(conn, account_id)
-            ledger_reference = source_reference or f"recharge:{uuid4().hex}"
-            existing_row = conn.execute(
-                """
-                SELECT * FROM account_balance_ledger
-                WHERE account_id = ? AND source_reference = ?
-                """,
-                (account_id, ledger_reference),
-            ).fetchone()
-            if existing_row is not None:
-                return self._balance_ledger_from_row(existing_row)
             balance_row = self._lock_account_billing_row(conn, account_id)
             if balance_row is None:
                 raise KeyError(f"Account balance not found: {account_id}")
+            existing_order_row = conn.execute(
+                """
+                SELECT * FROM recharge_orders
+                WHERE account_id = ? AND idempotency_key = ?
+                """,
+                (account_id, key),
+            ).fetchone()
+            if existing_order_row is not None:
+                if (
+                    int(existing_order_row["amount_micro_yuan"]) != amount_micro_yuan
+                    or str(existing_order_row["payment_provider"]) != "simulated"
+                ):
+                    raise IdempotencyConflictError("该幂等键已用于另一笔充值请求。")
+                ledger_row = conn.execute(
+                    "SELECT * FROM account_balance_ledger WHERE recharge_order_id = ?",
+                    (int(existing_order_row["id"]),),
+                ).fetchone()
+                if ledger_row is None or str(existing_order_row["status"]) != "paid":
+                    raise RuntimeError("模拟充值订单尚未完成，请稍后重试。")
+                return (
+                    self._recharge_order_from_row(existing_order_row),
+                    self._balance_ledger_from_row(ledger_row),
+                )
+
+            now = now_iso()
+            order_number = f"recharge-{uuid4().hex}"
+            order_cursor = conn.execute(
+                """
+                INSERT INTO recharge_orders (
+                    order_number, account_id, created_by_account_id, amount_micro_yuan,
+                    status, payment_provider, provider_order_id, idempotency_key,
+                    description, failure_reason, details_json, created_at, updated_at,
+                    paid_at, cancelled_at, refunded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    order_number,
+                    account_id,
+                    account.id,
+                    amount_micro_yuan,
+                    "pending",
+                    "simulated",
+                    order_number,
+                    key,
+                    clean_description,
+                    None,
+                    json.dumps({"environment": "development"}, ensure_ascii=False),
+                    now,
+                    now,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            order_id = order_cursor.lastrowid
+            if order_id is None:
+                raise RuntimeError("模拟充值订单创建失败。")
             before = int(balance_row["balance_micro_yuan"])
             after = before + amount_micro_yuan
-            now = now_iso()
+            ledger_reference = f"recharge-order:{order_number}"
+            ledger_id = self._insert_balance_ledger_entry(
+                conn,
+                account_id=account_id,
+                entry_kind="recharge",
+                amount_micro_yuan=amount_micro_yuan,
+                balance_before_micro_yuan=before,
+                balance_after_micro_yuan=after,
+                token_count=None,
+                price_per_million_tokens_yuan=None,
+                source_reference=ledger_reference,
+                summary=clean_description,
+                details={"payment_provider": "simulated", "order_number": order_number},
+                created_at=now,
+                recharge_order_id=order_id,
+            )
+            if ledger_id is None:
+                raise RuntimeError("模拟充值流水创建失败。")
             conn.execute(
                 """
                 UPDATE account_balances
@@ -467,48 +536,211 @@ class RepositoryStore:
                 """,
                 (after, amount_micro_yuan, now, account_id),
             )
-            payload = {
-                **(details or {}),
-                "amount_yuan": amount_yuan,
-            }
             conn.execute(
                 """
-                INSERT INTO account_balance_ledger (
-                    account_id, entry_kind, amount_micro_yuan, balance_before_micro_yuan,
-                    balance_after_micro_yuan, token_count, price_per_million_tokens_yuan,
-                    source_reference, summary, details_json, created_at
+                UPDATE recharge_orders
+                SET status = 'paid', paid_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, order_id),
+            )
+            payload_hash = hashlib.sha256(
+                f"{order_number}:{amount_micro_yuan}:paid".encode()
+            ).hexdigest()
+            conn.execute(
+                """
+                INSERT INTO payment_events (
+                    recharge_order_id, payment_provider, provider_event_id, event_type,
+                    processing_status, signature_valid, payload_sha256, error_summary,
+                    details_json, received_at, processed_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (source_reference) DO NOTHING
                 """,
                 (
-                    account_id,
-                    "recharge",
-                    amount_micro_yuan,
-                    before,
-                    after,
+                    order_id,
+                    "simulated",
+                    f"simulated:{order_number}",
+                    "payment.succeeded",
+                    "processed",
+                    True,
+                    payload_hash,
                     None,
-                    None,
-                    ledger_reference,
-                    summary or "用户充值",
-                    json.dumps(payload, ensure_ascii=False),
+                    json.dumps({"simulation": True}, ensure_ascii=False),
+                    now,
                     now,
                 ),
             )
-            self._prune_account_balance_ledger_for_account(
+            order_row = conn.execute(
+                "SELECT * FROM recharge_orders WHERE id = ?",
+                (order_id,),
+            ).fetchone()
+            ledger_row = conn.execute(
+                "SELECT * FROM account_balance_ledger WHERE id = ?",
+                (ledger_id,),
+            ).fetchone()
+        if order_row is None or ledger_row is None:
+            raise RuntimeError("模拟充值结算结果读取失败。")
+        return self._recharge_order_from_row(order_row), self._balance_ledger_from_row(ledger_row)
+
+    def credit_account_balance_with_audit(
+        self,
+        account_id: int,
+        amount_yuan: float | Decimal,
+        *,
+        actor_account_id: int,
+        reason: str,
+        idempotency_key: str,
+        audit_event: AdminAuditEventRecord,
+    ) -> BalanceLedgerRecord:
+        """管理员人工补款；余额、流水和审计必须在同一事务提交。"""
+
+        actor = self.get_account(actor_account_id)
+        if actor.role != "admin":
+            raise PermissionError("只有管理员可以执行人工补款。")
+        self.get_account(account_id)
+        if audit_event.actor_account_id != actor_account_id or audit_event.target_account_id != account_id:
+            raise ValueError("管理员补款审计事件与操作账号不一致。")
+        self._validate_admin_audit_event(audit_event)
+        amount_micro_yuan = self._positive_money_amount(amount_yuan)
+        clean_reason = reason.strip()
+        if len(clean_reason) < 2:
+            raise ValueError("管理员补款原因至少需要 2 个字符。")
+        if len(clean_reason) > 500:
+            raise ValueError("管理员补款原因不能超过 500 个字符。")
+        key = self._validated_idempotency_key(idempotency_key)
+        ledger_reference = f"admin-credit:{actor_account_id}:{key}"
+        with self.connect() as conn:
+            self._ensure_account_billing_row(conn, account_id)
+            balance_row = self._lock_account_billing_row(conn, account_id)
+            if balance_row is None:
+                raise KeyError(f"Account balance not found: {account_id}")
+            before = int(balance_row["balance_micro_yuan"])
+            after = before + amount_micro_yuan
+            now = now_iso()
+            ledger_id = self._insert_balance_ledger_entry(
                 conn,
-                account_id,
-                max_records=ADMIN_LEDGER_MAX_RECORDS,
+                account_id=account_id,
+                entry_kind="adjustment",
+                amount_micro_yuan=amount_micro_yuan,
+                balance_before_micro_yuan=before,
+                balance_after_micro_yuan=after,
+                token_count=None,
+                price_per_million_tokens_yuan=None,
+                source_reference=ledger_reference,
+                summary="管理员人工补款",
+                details={"reason": clean_reason, "adjustment_type": "manual_credit"},
+                created_at=now,
+                operator_account_id=actor_account_id,
             )
-            row = conn.execute(
+            if ledger_id is None:
+                existing_row = conn.execute(
+                    "SELECT * FROM account_balance_ledger WHERE source_reference = ?",
+                    (ledger_reference,),
+                ).fetchone()
+                if existing_row is None:
+                    raise RuntimeError("管理员补款幂等流水读取失败。")
+                if (
+                    int(existing_row["account_id"]) != account_id
+                    or int(existing_row["amount_micro_yuan"]) != amount_micro_yuan
+                    or existing_row.get("operator_account_id") != actor_account_id
+                    or _json_object(existing_row["details_json"]).get("reason") != clean_reason
+                ):
+                    raise IdempotencyConflictError("该幂等键已用于另一笔管理员补款。")
+                return self._balance_ledger_from_row(existing_row)
+            conn.execute(
                 """
-                SELECT * FROM account_balance_ledger
-                WHERE source_reference = ? AND account_id = ?
+                UPDATE account_balances
+                SET balance_micro_yuan = ?, updated_at = ?
+                WHERE account_id = ?
                 """,
-                (ledger_reference, account_id),
+                (after, now, account_id),
+            )
+            event = replace(
+                audit_event,
+                details={
+                    **(audit_event.details or {}),
+                    "amount_micro_yuan": amount_micro_yuan,
+                    "balance_before_micro_yuan": before,
+                    "balance_after_micro_yuan": after,
+                    "reason": clean_reason,
+                    "ledger_reference": ledger_reference,
+                },
+            )
+            self._insert_admin_audit_event(conn, event)
+            row = conn.execute(
+                "SELECT * FROM account_balance_ledger WHERE id = ?",
+                (ledger_id,),
             ).fetchone()
         if row is None:
-            raise RuntimeError("充值流水写入失败。")
+            raise RuntimeError("管理员补款流水写入失败。")
         return self._balance_ledger_from_row(row)
+
+    def list_recharge_orders(
+        self,
+        account_id: int | None = None,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[RechargeOrderRecord]:
+        """分页读取充值订单；管理员补款不会出现在这里。"""
+
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            parameters.append(account_id)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        parameters.extend([max(1, min(int(limit), ADMIN_LEDGER_PAGE_SIZE)), max(0, int(offset))])
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM recharge_orders{where}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                tuple(parameters),
+            ).fetchall()
+        return [self._recharge_order_from_row(row) for row in rows]
+
+    def count_recharge_orders(self, account_id: int | None = None) -> int:
+        """返回充值订单数量。"""
+
+        where = " WHERE account_id = ?" if account_id is not None else ""
+        parameters: tuple[object, ...] = (account_id,) if account_id is not None else ()
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM recharge_orders{where}",
+                parameters,
+            ).fetchone()
+        return int(row["count"])
+
+    def get_recharge_order(self, order_id: int) -> RechargeOrderRecord:
+        """按内部 ID 读取一笔充值订单。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM recharge_orders WHERE id = ?",
+                (order_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Recharge order not found: {order_id}")
+        return self._recharge_order_from_row(row)
+
+    def list_payment_events(
+        self,
+        recharge_order_id: int,
+    ) -> list[PaymentEventRecord]:
+        """读取一笔充值订单的低敏支付事件，供后台排障。"""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM payment_events
+                WHERE recharge_order_id = ?
+                ORDER BY received_at, id
+                """,
+                (recharge_order_id,),
+            ).fetchall()
+        return [self._payment_event_from_row(row) for row in rows]
 
     def list_account_balance_ledger(
         self,
@@ -525,7 +757,7 @@ class RepositoryStore:
             conditions.append("account_id = ?")
             parameters.append(account_id)
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-        parameters.extend([max(1, min(limit, ADMIN_LEDGER_MAX_RECORDS)), max(0, int(offset))])
+        parameters.extend([max(1, min(limit, ADMIN_LEDGER_PAGE_SIZE)), max(0, int(offset))])
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
@@ -575,32 +807,6 @@ class RepositoryStore:
                 """
             ).fetchall()
         return [{key: int(row[key]) for key in row} for row in rows]
-
-    def prune_account_balance_ledger_to_limit(
-        self,
-        account_id: int | None = None,
-        *,
-        max_records: int = ADMIN_LEDGER_MAX_RECORDS,
-    ) -> int:
-        """删除超出分页保留窗口的余额流水。"""
-
-        retain = max(1, int(max_records))
-        with self.connect() as conn:
-            if account_id is not None:
-                return self._prune_account_balance_ledger_for_account(
-                    conn,
-                    int(account_id),
-                    max_records=retain,
-                )
-            rows = conn.execute("SELECT DISTINCT account_id FROM account_balance_ledger").fetchall()
-            deleted = 0
-            for row in rows:
-                deleted += self._prune_account_balance_ledger_for_account(
-                    conn,
-                    int(row["account_id"]),
-                    max_records=retain,
-                )
-            return deleted
 
     def _ensure_account_billing_row(self, conn: RepositoryConnection, account_id: int) -> None:
         """确保账号拥有余额摘要行；首次创建时会写入初始化余额流水。"""
@@ -686,16 +892,19 @@ class RepositoryStore:
         summary: str,
         details: dict[str, object] | None,
         created_at: str,
-    ) -> None:
+        operator_account_id: int | None = None,
+        recharge_order_id: int | None = None,
+    ) -> int | None:
         """在已有事务连接里写入一条余额流水。"""
 
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO account_balance_ledger (
                 account_id, entry_kind, amount_micro_yuan, balance_before_micro_yuan,
                 balance_after_micro_yuan, token_count, price_per_million_tokens_yuan,
-                source_reference, summary, details_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                operator_account_id, recharge_order_id, source_reference, summary,
+                details_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (source_reference) DO NOTHING
             """,
             (
@@ -706,12 +915,15 @@ class RepositoryStore:
                 balance_after_micro_yuan,
                 token_count,
                 price_per_million_tokens_yuan,
+                operator_account_id,
+                recharge_order_id,
                 source_reference,
                 summary,
                 json.dumps(details or {}, ensure_ascii=False),
                 created_at,
             ),
         )
+        return cursor.lastrowid
 
     def _record_balance_consumption(
         self,
@@ -728,23 +940,29 @@ class RepositoryStore:
         settings = self.billing_settings()
         if total_tokens <= 0:
             return
-        if conn.execute(
-            """
-            SELECT 1 FROM account_balance_ledger
-            WHERE account_id = ? AND source_reference = ?
-            """,
-            (account_id, call_id),
-        ).fetchone() is not None:
-            return
         balance_row = self._lock_account_billing_row(conn, account_id)
         if balance_row is None:
             self._ensure_account_billing_row(conn, account_id)
             balance_row = self._lock_account_billing_row(conn, account_id)
         if balance_row is None:
             raise KeyError(f"Account balance not found: {account_id}")
+        existing_ledger = conn.execute(
+            """
+            SELECT account_id, entry_kind FROM account_balance_ledger
+            WHERE source_reference = ?
+            """,
+            (call_id,),
+        ).fetchone()
+        if existing_ledger is not None:
+            if (
+                int(existing_ledger["account_id"]) != account_id
+                or str(existing_ledger["entry_kind"]) != "consumption"
+            ):
+                raise IdempotencyConflictError("该模型调用标识已用于另一笔余额流水。")
+            return
         before = int(balance_row["balance_micro_yuan"])
         price = settings.price_per_million_tokens_yuan
-        cost_micro_yuan = int(round(total_tokens * price))
+        cost_micro_yuan = round(total_tokens * price)
         after = before - cost_micro_yuan
         now = created_at
         conn.execute(
@@ -756,7 +974,7 @@ class RepositoryStore:
             """,
             (after, cost_micro_yuan, now, account_id),
         )
-        self._insert_balance_ledger_entry(
+        ledger_id = self._insert_balance_ledger_entry(
             conn,
             account_id=account_id,
             entry_kind="consumption",
@@ -776,32 +994,8 @@ class RepositoryStore:
             },
             created_at=now,
         )
-
-    def _prune_account_balance_ledger_for_account(
-        self,
-        conn: RepositoryConnection,
-        account_id: int,
-        *,
-        max_records: int = ADMIN_LEDGER_MAX_RECORDS,
-    ) -> int:
-        """保留某个账号最近的固定页数余额流水。"""
-
-        retain = max(1, int(max_records))
-        cursor = conn.execute(
-            """
-            DELETE FROM account_balance_ledger
-            WHERE account_id = ?
-              AND id NOT IN (
-                  SELECT id
-                  FROM account_balance_ledger
-                  WHERE account_id = ?
-                  ORDER BY created_at DESC, id DESC
-                  LIMIT ?
-              )
-            """,
-            (account_id, account_id, retain),
-        )
-        return max(0, int(cursor.rowcount or 0))
+        if ledger_id is None:  # pragma: no cover - 账号余额行锁下不应再发生并发冲突
+            raise RuntimeError("模型用量扣费流水写入失败。")
 
     def _balance_state_value(
         self,
@@ -838,10 +1032,36 @@ class RepositoryStore:
             "suspended": "停用",
         }[state]
 
-    def _yuan_to_micro_yuan(self, value: float) -> int:
+    def _yuan_to_micro_yuan(self, value: float | Decimal) -> int:
         """把元换算成微元，便于余额和计费统一存储。"""
 
-        return int(round(float(value) * 1_000_000))
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, ValueError) as error:
+            raise ValueError("金额格式无效。") from error
+        if not amount.is_finite():
+            raise ValueError("金额格式无效。")
+        return int((amount * Decimal(1000000)).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+
+    def _positive_money_amount(self, value: float | Decimal) -> int:
+        """把正数金额转换成微元，并限制单笔金额以避免误操作。"""
+
+        amount_micro_yuan = self._yuan_to_micro_yuan(value)
+        if amount_micro_yuan <= 0:
+            raise ValueError("充值金额必须大于 0。")
+        if amount_micro_yuan > 1_000_000_000_000:
+            raise ValueError("单笔充值金额不能超过 100 万元。")
+        return amount_micro_yuan
+
+    def _validated_idempotency_key(self, value: str) -> str:
+        """校验资金操作幂等键，避免空键或不可控长文本进入唯一索引。"""
+
+        key = str(value or "").strip()
+        if len(key) < 16 or len(key) > 128:
+            raise ValueError("充值幂等键长度必须在 16 到 128 个字符之间。")
+        if not all(character.isalnum() or character in "-_:" for character in key):
+            raise ValueError("充值幂等键只能包含字母、数字、短横线、下划线和冒号。")
+        return key
 
     def _balance_ledger_from_row(self, row: RepositoryRow) -> BalanceLedgerRecord:
         """把余额流水行转换成领域对象。"""
@@ -859,10 +1079,69 @@ class RepositoryStore:
                 if row["price_per_million_tokens_yuan"] is not None
                 else None
             ),
+            operator_account_id=(
+                int(row["operator_account_id"])
+                if row.get("operator_account_id") is not None
+                else None
+            ),
+            recharge_order_id=(
+                int(row["recharge_order_id"])
+                if row.get("recharge_order_id") is not None
+                else None
+            ),
             source_reference=row["source_reference"],
             summary=str(row["summary"]),
             details=_json_object(row["details_json"]),
             created_at=str(row["created_at"]),
+        )
+
+    def _recharge_order_from_row(self, row: RepositoryRow) -> RechargeOrderRecord:
+        """把充值订单行转换为领域对象。"""
+
+        return RechargeOrderRecord(
+            id=int(row["id"]),
+            order_number=str(row["order_number"]),
+            account_id=int(row["account_id"]),
+            created_by_account_id=(
+                int(row["created_by_account_id"])
+                if row["created_by_account_id"] is not None
+                else None
+            ),
+            amount_micro_yuan=int(row["amount_micro_yuan"]),
+            status=str(row["status"]),
+            payment_provider=str(row["payment_provider"]),
+            provider_order_id=row["provider_order_id"],
+            idempotency_key=str(row["idempotency_key"]),
+            description=str(row["description"]),
+            failure_reason=row["failure_reason"],
+            details=_json_object(row["details_json"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+            paid_at=str(row["paid_at"]) if row["paid_at"] is not None else None,
+            cancelled_at=(
+                str(row["cancelled_at"])
+                if row["cancelled_at"] is not None
+                else None
+            ),
+            refunded_at=str(row["refunded_at"]) if row["refunded_at"] is not None else None,
+        )
+
+    def _payment_event_from_row(self, row: RepositoryRow) -> PaymentEventRecord:
+        """把支付事件行转换为领域对象。"""
+
+        return PaymentEventRecord(
+            id=int(row["id"]),
+            recharge_order_id=int(row["recharge_order_id"]),
+            payment_provider=str(row["payment_provider"]),
+            provider_event_id=str(row["provider_event_id"]),
+            event_type=str(row["event_type"]),
+            processing_status=str(row["processing_status"]),
+            signature_valid=bool(row["signature_valid"]),
+            payload_sha256=str(row["payload_sha256"]),
+            error_summary=row["error_summary"],
+            details=_json_object(row["details_json"]),
+            received_at=str(row["received_at"]),
+            processed_at=str(row["processed_at"]) if row["processed_at"] is not None else None,
         )
 
     def save_auth_session(
@@ -1126,7 +1405,7 @@ class RepositoryStore:
         if event.candidate_id is not None:
             self.get_candidate_profile(event.candidate_id, account_id=event.account_id)
         with self.connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO usage_events (
                     account_id, candidate_id, session_id, root_request_id, call_id,
@@ -1164,6 +1443,41 @@ class RepositoryStore:
                 "SELECT * FROM usage_events WHERE call_id = ?",
                 (event.call_id,),
             ).fetchone()
+            if row is not None and cursor.lastrowid is None:
+                requested_identity = (
+                    event.account_id,
+                    event.candidate_id,
+                    event.session_id,
+                    event.root_request_id,
+                    event.provider,
+                    event.model,
+                    event.operation,
+                    max(0, int(event.input_tokens)),
+                    max(0, int(event.output_tokens)),
+                    max(0, int(event.total_tokens)),
+                    event.usage_source,
+                    event.status,
+                    bool(event.billable and event.usage_source == "provider" and event.status == "succeeded"),
+                    event.pricing_version,
+                )
+                stored_identity = (
+                    int(row["account_id"]),
+                    int(row["candidate_id"]) if row["candidate_id"] is not None else None,
+                    row["session_id"],
+                    row["root_request_id"],
+                    str(row["provider"]),
+                    str(row["model"]),
+                    str(row["operation"]),
+                    int(row["input_tokens"]),
+                    int(row["output_tokens"]),
+                    int(row["total_tokens"]),
+                    str(row["usage_source"]),
+                    str(row["status"]),
+                    bool(row["billable"]),
+                    row["pricing_version"],
+                )
+                if stored_identity != requested_identity:
+                    raise IdempotencyConflictError("该模型调用标识已用于另一笔用量记录。")
             if (
                 row is not None
                 and bool(row["billable"])
@@ -1172,16 +1486,11 @@ class RepositoryStore:
             ):
                 self._record_balance_consumption(
                     conn,
-                    account_id=event.account_id,
-                    call_id=event.call_id,
-                    operation=event.operation,
+                    account_id=int(row["account_id"]),
+                    call_id=str(row["call_id"]),
+                    operation=str(row["operation"]),
                     total_tokens=int(row["total_tokens"]),
                     created_at=str(row["created_at"]),
-                )
-                self._prune_account_balance_ledger_for_account(
-                    conn,
-                    event.account_id,
-                    max_records=ADMIN_LEDGER_MAX_RECORDS,
                 )
             self._prune_usage_events_for_account(
                 conn,
@@ -1375,27 +1684,6 @@ class RepositoryStore:
         updated_at = trace.updated_at or now
         trace_payload = json.dumps(trace.trace or {}, ensure_ascii=False)
         with self.connect() as conn:
-            # Beat 可能尚未在午夜完成清理。若同一链路 ID 在保留窗口外再次出现，
-            # 先移除旧记录，避免 ON CONFLICT 保留过期 created_at 后被查询条件隐藏。
-            existing = conn.execute(
-                """
-                SELECT account_id, created_at FROM tool_call_traces
-                WHERE root_request_id = ?
-                """,
-                (root_request_id,),
-            ).fetchone()
-            if (
-                existing is not None
-                and int(existing["account_id"]) == trace.account_id
-                and False
-            ):
-                conn.execute(
-                    """
-                    DELETE FROM tool_call_traces
-                    WHERE root_request_id = ? AND account_id = ?
-                    """,
-                    (root_request_id, trace.account_id),
-                )
             conn.execute(
                 """
                 INSERT INTO tool_call_traces (

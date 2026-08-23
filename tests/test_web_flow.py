@@ -163,6 +163,8 @@ def test_production_rejects_disabled_web_security_controls(
         "JOB_AGENT_CSRF_ENABLED": "true",
         "JOB_AGENT_SECURITY_HEADERS_ENABLED": "true",
         "JOB_AGENT_RATE_LIMIT_ENABLED": "true",
+        "JOB_AGENT_CONCURRENCY_BACKEND": "redis",
+        "JOB_AGENT_CONCURRENCY_REDIS_URL": "redis://redis:6379/1",
     }
     settings[disabled_setting] = "false"
     for key in settings:
@@ -317,6 +319,17 @@ def test_admin_can_read_low_cardinality_request_metrics(tmp_path) -> None:
     assert latest_error["endpoint"] == "/api/missing"
     assert "secret" not in str(metrics)
 
+    prometheus = client.get("/internal/metrics")
+    assert prometheus.status_code == 200
+    assert prometheus.headers["content-type"] == (
+        "text/plain; version=0.0.4; charset=utf-8"
+    )
+    assert "# TYPE job_agent_http_requests_total counter" in prometheus.text
+    assert 'endpoint="/api/auth/login"' in prometheus.text
+    assert "secret" not in prometheus.text
+    assert "request_id" not in prometheus.text
+    assert "/internal/metrics" not in client.get("/openapi.json").json()["paths"]
+
 
 def test_admin_account_status_change_is_visible_in_audit_log(tmp_path) -> None:
     """管理员账号状态变更应写入低敏审计日志，并保留 request_id。"""
@@ -439,7 +452,7 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     for page in (login_page, workspace_page, profile_page, admin_page):
         assert page.status_code == 200
         assert page.headers["cache-control"] == "no-store, max-age=0"
-        assert "/static/app.js?v=20260823-project-collapse-v1" in page.text
+        assert "/static/app.js?v=20260823-billing-v1" in page.text
     assert "Job Hunting Agent" in home.text
     assert "syncAuthPageClass" in script.text
     assert "FRONTEND_ROUTES" in script.text
@@ -449,8 +462,8 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert 'v-if="showProfileSurface"' in home.text
     assert 'v-if="showAdminSurface"' in home.text
     assert 'v-if="showRouteLoading"' in home.text
-    assert '/static/app.js?v=20260823-project-collapse-v1' in home.text
-    assert '/static/styles.css?v=20260823-cleanup-v1' in home.text
+    assert '/static/app.js?v=20260823-billing-v1' in home.text
+    assert '/static/styles.css?v=20260823-billing-v1' in home.text
     assert 'class="account-menu-trigger"' in home.text
     assert 'id="workspaceAccountMenu"' in home.text
     assert 'role="menuitem" @click="openProfile"' in home.text
@@ -516,10 +529,33 @@ def test_web_profile_balance_and_simulated_recharge_are_account_scoped(tmp_path)
 
     recharged = client.post(
         "/api/me/balance/recharge",
-        json={"amount_yuan": 12.5, "note": "测试充值"},
+        json={
+            "amount_yuan": 12.5,
+            "note": "测试充值",
+            "idempotency_key": "web-profile-recharge-1",
+        },
     )
     assert recharged.status_code == 200, recharged.text
     assert recharged.json()["summary"]["balance_micro_yuan"] == 112_500_000
+    assert recharged.json()["order"]["status"] == "paid"
+    assert recharged.json()["entry"]["recharge_order_id"] == recharged.json()["order"]["id"]
+
+    duplicate = client.post(
+        "/api/me/balance/recharge",
+        json={
+            "amount_yuan": 12.5,
+            "note": "测试充值",
+            "idempotency_key": "web-profile-recharge-1",
+        },
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()["order"]["id"] == recharged.json()["order"]["id"]
+    assert duplicate.json()["summary"]["balance_micro_yuan"] == 112_500_000
+
+    orders = client.get("/api/me/recharge/orders")
+    assert orders.status_code == 200
+    assert orders.json()["total"] == 1
+    assert orders.json()["orders"][0]["payment_provider"] == "simulated"
 
     ledger = client.get("/api/me/balance?limit=1&offset=0")
     assert ledger.status_code == 200
@@ -566,8 +602,108 @@ def test_admin_balance_summary_and_ledger_are_paginated(tmp_path):
     assert events.status_code == 200
     assert events.json()["total"] == 1
     assert events.json()["page_size"] == 100
-    assert events.json()["max_pages"] == 5
+    assert events.json()["max_pages"] is None
     assert events.json()["entries"][0]["entry_kind"] == "initial_credit"
+
+
+def test_admin_can_credit_self_or_any_account_without_payment(tmp_path):
+    """管理员补款不受生产模拟支付开关影响，并对任意目标账号保留审计。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_BOOTSTRAP_ADMIN_EMAIL=manual-credit-admin@example.com",
+                "JOB_AGENT_BOOTSTRAP_ADMIN_PASSWORD=strong-password-123",
+                "JOB_AGENT_BILLING_STARTING_BALANCE_YUAN=0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(create_web_app(env_file=env_path))
+    registered = client.post(
+        "/api/auth/register",
+        json={"email": "manual-credit-user@example.com", "password": "password-123"},
+    )
+    assert registered.status_code == 200
+    client = login_test_account(
+        client,
+        email="manual-credit-admin@example.com",
+        password="strong-password-123",
+    )
+    accounts = client.get("/api/admin/accounts").json()["accounts"]
+    admin_id = next(item["id"] for item in accounts if item["role"] == "admin")
+    user_id = next(item["id"] for item in accounts if item["role"] == "user")
+    before_billing = client.get("/api/admin/usage/summary").json()["billing"]["by_account"]
+    admin_before = next(item for item in before_billing if item["account_id"] == admin_id)
+    user_before = next(item for item in before_billing if item["account_id"] == user_id)
+    disabled = client.patch(f"/api/admin/accounts/{user_id}/status", json={"status": "disabled"})
+    assert disabled.status_code == 200
+
+    user_credit = client.post(
+        f"/api/admin/accounts/{user_id}/balance/credit",
+        json={
+            "amount_yuan": 30,
+            "reason": "支付异常人工补款",
+            "idempotency_key": "web-admin-credit-user-1",
+        },
+    )
+    self_credit = client.post(
+        f"/api/admin/accounts/{admin_id}/balance/credit",
+        json={
+            "amount_yuan": 10,
+            "reason": "管理员测试补款",
+            "idempotency_key": "web-admin-credit-self-1",
+        },
+    )
+
+    assert user_credit.status_code == 200, user_credit.text
+    assert user_credit.json()["summary"]["balance_micro_yuan"] == user_before["balance_micro_yuan"] + 30_000_000
+    assert (
+        user_credit.json()["summary"]["total_recharge_micro_yuan"]
+        == user_before["total_recharge_micro_yuan"]
+    )
+    assert user_credit.json()["entry"]["operator_account_id"] == admin_id
+    assert user_credit.json()["entry"]["entry_kind"] == "adjustment"
+    assert self_credit.status_code == 200, self_credit.text
+    assert self_credit.json()["summary"]["balance_micro_yuan"] == admin_before["balance_micro_yuan"] + 10_000_000
+
+    duplicate = client.post(
+        f"/api/admin/accounts/{user_id}/balance/credit",
+        json={
+            "amount_yuan": 30,
+            "reason": "支付异常人工补款",
+            "idempotency_key": "web-admin-credit-user-1",
+        },
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()["entry"]["id"] == user_credit.json()["entry"]["id"]
+    assert duplicate.json()["summary"]["balance_micro_yuan"] == user_before["balance_micro_yuan"] + 30_000_000
+
+    audit = client.get("/api/admin/audit/events?limit=20")
+    assert audit.status_code == 200
+    manual_events = [event for event in audit.json()["events"] if event["action"] == "balance.manual_credit"]
+    assert len(manual_events) == 2
+    assert {event["target_account_id"] for event in manual_events} == {admin_id, user_id}
+
+
+def test_regular_account_cannot_use_admin_manual_credit(tmp_path):
+    """普通账号不能调用管理员人工补款接口。"""
+
+    client = login_test_account(
+        TestClient(create_web_app(env_file=tmp_path / ".env")),
+        email="manual-credit-denied@example.com",
+    )
+    account_id = client.get("/api/auth/me").json()["account"]["id"]
+    response = client.post(
+        f"/api/admin/accounts/{account_id}/balance/credit",
+        json={
+            "amount_yuan": 10,
+            "reason": "越权补款",
+            "idempotency_key": "web-admin-credit-denied-1",
+        },
+    )
+    assert response.status_code == 403
 
 
 def test_profile_delete_button_is_idle_without_a_selected_profile(tmp_path):
@@ -666,8 +802,8 @@ def test_web_profile_form_uses_city_picker_and_auth_copy(tmp_path):
     assert "省份及直辖市" in home
     assert '<optgroup' not in home
     assert '/static/china_cities.js?v=20260803-cities' in home
-    assert '/static/styles.css?v=20260823-cleanup-v1' in home
-    assert '/static/app.js?v=20260823-project-collapse-v1' in home
+    assert '/static/styles.css?v=20260823-billing-v1' in home
+    assert '/static/app.js?v=20260823-billing-v1' in home
     assert "cityGroups: buildSortedCityGroups()" in script
     assert "HOT_CITY_NAMES" in script
     assert "cityPickerOpen: false" in script

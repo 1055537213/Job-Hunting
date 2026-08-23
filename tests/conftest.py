@@ -130,11 +130,11 @@ def account_id(postgres_test_schema: str) -> Iterator[int]:
             password_hash="test-only-password-hash",
             display_name="测试账号",
         )
-        store.recharge_account_balance(
+        store.create_simulated_recharge_order(
             account.id,
             100,
-            summary="测试夹具充值",
-            source_reference=f"test-fixture-recharge:{account.id}",
+            idempotency_key=f"test-fixture-recharge:{account.id}",
+            description="测试夹具充值",
         )
         yield account.id
     finally:

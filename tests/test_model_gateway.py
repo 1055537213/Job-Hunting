@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from job_hunting_agent.config import (
     EmbeddingSettings,
     LLMSettings,
@@ -12,6 +14,7 @@ from job_hunting_agent.config import (
 from job_hunting_agent.model_gateway import ModelGateway, extract_provider_request_id
 from job_hunting_agent.rag import EmbeddingRequestError, OpenAICompatibleEmbeddings
 from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
+from job_hunting_agent.storage import IdempotencyConflictError, InsufficientBalanceError
 
 
 def test_gateway_settings_distinguish_runtime_environment_and_retry_policy(tmp_path):
@@ -44,11 +47,11 @@ def test_gateway_records_idempotent_provider_usage_without_prompt_content(tmp_pa
     store = SQLAlchemyStore(database_url)
     store.initialize()
     account = store.create_account("gateway@example.com", "not-used-by-this-test")
-    store.recharge_account_balance(
+    store.create_simulated_recharge_order(
         account.id,
         1,
-        summary="Gateway 测试充值",
-        source_reference="gateway-usage-test-funding",
+        idempotency_key="gateway-usage-test-funding",
+        description="Gateway 测试充值",
     )
     gateway = ModelGateway(
         tmp_path / ".env",
@@ -80,7 +83,7 @@ def test_gateway_records_idempotent_provider_usage_without_prompt_content(tmp_pa
     )
     second = gateway.record_chat_usage_summary(
         context,
-        {"input_tokens": 999, "output_tokens": 999, "total_tokens": 1998},
+        {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
     )
     events = store.list_usage_events(account_id=account.id)
 
@@ -92,6 +95,12 @@ def test_gateway_records_idempotent_provider_usage_without_prompt_content(tmp_pa
     assert events[0].model == "chat-model"
     assert events[0].raw_usage == {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18}
     assert "secret-not-persisted" not in str(events[0].raw_usage)
+
+    with pytest.raises(IdempotencyConflictError, match="另一笔用量记录"):
+        gateway.record_chat_usage_summary(
+            context,
+            {"input_tokens": 999, "output_tokens": 999, "total_tokens": 1998},
+        )
 
 
 def test_gateway_extracts_provider_request_id_from_response_headers():
@@ -108,11 +117,11 @@ def test_gateway_records_rerank_usage_under_the_rerank_model_identity(tmp_path, 
     store = SQLAlchemyStore(database_url)
     store.initialize()
     account = store.create_account("rerank@example.com", "not-used-by-this-test")
-    store.recharge_account_balance(
+    store.create_simulated_recharge_order(
         account.id,
         1,
-        summary="Rerank 测试充值",
-        source_reference="rerank-usage-test-funding",
+        idempotency_key="rerank-usage-test-funding",
+        description="Rerank 测试充值",
     )
     gateway = ModelGateway(
         tmp_path / ".env",
@@ -149,6 +158,31 @@ def test_gateway_records_rerank_usage_under_the_rerank_model_identity(tmp_path, 
     assert events[0].provider_request_id == "rerank-request-42"
     assert events[0].total_tokens == 12
     assert "secret-not-persisted" not in str(events[0].raw_usage)
+
+
+def test_gateway_can_create_post_call_context_after_balance_is_exhausted(tmp_path, database_url):
+    """已经发生的供应商调用必须能落账，不能在记录阶段再次被余额准入拦截。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    account = store.create_account("post-call-usage@example.com", "not-used-by-this-test")
+    gateway = ModelGateway(
+        tmp_path / ".env",
+        usage_store=store,
+        settings=ModelGatewaySettings(environment="test"),
+    )
+
+    with pytest.raises(InsufficientBalanceError):
+        gateway.new_call_context("agent_chat", account_id=account.id)
+
+    context = gateway.new_call_context(
+        "agent_chat",
+        account_id=account.id,
+        authorize_spend=False,
+    )
+
+    assert context.account_id == account.id
+    store.close()
 
 
 def test_embedding_adapter_retries_transient_gateway_failure_once():

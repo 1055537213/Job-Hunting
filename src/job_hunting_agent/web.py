@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
-import threading
 import time
 import uuid
 from dataclasses import asdict
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import quote
 
@@ -32,7 +33,7 @@ from fastapi import (
     Response,
     UploadFile,
 )
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
@@ -45,9 +46,9 @@ from .auth import (
     AccountAlreadyExistsError,
     hash_password,
     is_session_expired,
-    normalize_display_name,
     iso_utc,
     new_session_token,
+    normalize_display_name,
     session_expiry,
     session_token_hash,
     utc_now,
@@ -58,10 +59,16 @@ from .billing_projection import (
     balance_summary_to_dict,
     project_account_balances,
 )
+from .concurrency_control import (
+    ConcurrencyBackendUnavailable,
+    ConcurrencyController,
+    ConcurrencyLimitExceeded,
+)
 from .config import (
     load_agent_memory_settings,
     load_billing_settings,
     load_bootstrap_admin_settings,
+    load_concurrency_settings,
     load_cookie_secure,
     load_database_settings,
     load_embedding_settings,
@@ -72,6 +79,7 @@ from .config import (
     load_web_security_settings,
     masked_agent_memory_settings,
     masked_billing_settings,
+    masked_concurrency_settings,
     masked_embedding_settings,
     masked_llm_settings,
     masked_object_storage_settings,
@@ -101,8 +109,10 @@ from .models import (
     ToolCallTraceRecord,
 )
 from .rag import RAGProviderRequestError
+from .rate_limiting import RateLimiter
 from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
 from .skill_normalization import normalize_skill_mapping
+from .storage import IdempotencyConflictError
 from .task_queue import BackgroundTaskQueue, TaskQueueError
 from .tool_audit import (
     background_task_tool_name,
@@ -113,7 +123,9 @@ from .tool_audit import (
 )
 from .web_hardening import (
     CSRF_COOKIE_NAME,
+    PROMETHEUS_CONTENT_TYPE,
     delete_csrf_cookie,
+    format_prometheus_request_metrics,
     install_web_hardening,
     new_csrf_token,
     set_csrf_cookie,
@@ -126,6 +138,7 @@ SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 # 仅在进程内存在的环境变量传递，不写进用户的 .env 文件。
 WEB_RELOAD_ENV_FILE_ENV = "JOB_AGENT_WEB_RELOAD_ENV_FILE"
 WEB_RELOAD_RESUME_DIR_ENV = "JOB_AGENT_WEB_RELOAD_RESUME_DIR"
+web_logger = logging.getLogger("job_hunting_agent.web")
 
 
 def bootstrap_initial_admin(backend: JobHuntingApp, env_path: Path) -> None:
@@ -277,8 +290,17 @@ class ProjectCardConfirmationPayload(BaseModel):
 class BalanceRechargePayload(BaseModel):
     """个人中心余额充值表单。"""
 
-    amount_yuan: float = Field(gt=0)
-    note: str | None = None
+    amount_yuan: Decimal = Field(gt=0, le=1_000_000, decimal_places=6)
+    note: str | None = Field(default=None, max_length=120)
+    idempotency_key: str | None = Field(default=None, min_length=16, max_length=128)
+
+
+class AdminBalanceCreditPayload(BaseModel):
+    """管理员为指定账号执行人工补款。"""
+
+    amount_yuan: Decimal = Field(gt=0, le=1_000_000, decimal_places=6)
+    reason: str = Field(min_length=2, max_length=500)
+    idempotency_key: str = Field(min_length=16, max_length=128)
 
 
 def create_web_app(
@@ -288,6 +310,8 @@ def create_web_app(
     resume_llm_client: LLMClient | None = None,
     database_url: str | None = None,
     task_queue: BackgroundTaskQueue | None = None,
+    rate_limiter: RateLimiter | None = None,
+    concurrency_controller: ConcurrencyController | None = None,
 ) -> FastAPI:
     """创建本地 FastAPI 应用。
 
@@ -304,6 +328,7 @@ def create_web_app(
         resume_dir=resume_dir,
         database_url=database_url,
         task_queue=task_queue,
+        concurrency_controller=concurrency_controller,
     )
     backend.initialize()
     env_path = Path(env_file)
@@ -321,16 +346,68 @@ def create_web_app(
 
     web_app = FastAPI(title="Job Hunting Agent Web", version="0.1.0")
     web_app.state.backend = backend
+
+    @web_app.exception_handler(ConcurrencyLimitExceeded)
+    async def concurrency_limit_handler(
+        request: Request,
+        error: ConcurrencyLimitExceeded,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": str(error)},
+            headers={"Retry-After": "1"},
+        )
+
+    @web_app.exception_handler(ConcurrencyBackendUnavailable)
+    async def concurrency_backend_handler(
+        request: Request,
+        error: ConcurrencyBackendUnavailable,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "并发保护服务暂时不可用，请稍后重试。"},
+            headers={"Retry-After": "1"},
+        )
+
+    def rate_limit_identity(request: Request) -> str:
+        """把有效登录态映射为账号级限流键，并缓存已读取的 Session。"""
+
+        host = request.client.host if request.client and request.client.host else "unknown"
+        network_identity = f"ip:{host}"
+        if not request.url.path.startswith("/api/"):
+            return network_identity
+        token = request.cookies.get(SESSION_COOKIE_NAME)
+        if not token:
+            return network_identity
+        try:
+            session = backend.store.get_auth_session_by_token_hash(
+                session_token_hash(token)
+            )
+        except Exception as error:  # noqa: BLE001 - 数据库故障时仍保留 IP 级请求保护。
+            web_logger.warning(
+                "rate-limit identity fell back to network source: %s",
+                type(error).__name__,
+            )
+            return network_identity
+        if (
+            session is None
+            or session.revoked_at is not None
+            or is_session_expired(session.expires_at, session.absolute_expires_at)
+        ):
+            return network_identity
+        request.state.auth_session = session
+        return f"account:{session.account_id}"
+
     install_web_hardening(
         web_app,
         settings=web_security_settings,
         session_cookie_name=SESSION_COOKIE_NAME,
+        identity_resolver=rate_limit_identity,
+        rate_limiter=rate_limiter,
     )
     web_app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")
     # 截图本体不持久化，无法安全地只向 Worker 投递 task_key；因此它是一个有界的
-    # 前台导入例外。实际模型调用在工作线程执行，避免阻塞 FastAPI 事件循环，同时最多
-    # 允许两个请求占用多模态模型和图片内存。
-    screenshot_import_slots = threading.BoundedSemaphore(value=2)
+    # 前台导入例外。实际模型调用在线程池执行，共享并发控制器负责限制图片内存占用。
 
     def current_account(request: Request, required: bool = True) -> AccountRecord | None:
         """从 HttpOnly Cookie 解析当前账号，并顺延 Session 闲置窗口。"""
@@ -340,7 +417,11 @@ def create_web_app(
             if required:
                 raise HTTPException(status_code=401, detail="请先登录。")
             return None
-        session = backend.store.get_auth_session_by_token_hash(session_token_hash(token))
+        session = getattr(request.state, "auth_session", None)
+        if session is None:
+            session = backend.store.get_auth_session_by_token_hash(
+                session_token_hash(token)
+            )
         if (
             session is None
             or session.revoked_at is not None
@@ -371,10 +452,9 @@ def create_web_app(
         return account
 
     def prune_admin_retention_window() -> None:
-        """后台运维数据只保留固定分页窗口，并在管理员读取时补清旧数据。"""
+        """仅裁剪非财务运维记录；余额账本作为财务事实永久追加保存。"""
 
         backend.store.prune_usage_events_to_limit()
-        backend.store.prune_account_balance_ledger_to_limit()
         backend.store.prune_tool_call_traces_to_limit()
 
     @web_app.post("/api/auth/register")
@@ -574,6 +654,12 @@ def create_web_app(
             billing_config = masked_billing_settings(load_billing_settings(env_path))
         except ValueError as error:
             billing_config = {"configured": False, "error": str(error)}
+        try:
+            concurrency_config = masked_concurrency_settings(
+                load_concurrency_settings(env_path)
+            )
+        except ValueError as error:
+            concurrency_config = {"configured": False, "error": str(error)}
         if account is None or account.role != "admin":
             return {
                 "status": "ok",
@@ -591,6 +677,10 @@ def create_web_app(
                     "rate_limit_enabled": bool(web_security_config.get("rate_limit_enabled")),
                 },
                 "billing": {"configured": bool(billing_config.get("configured"))},
+                "concurrency": {
+                    "configured": not bool(concurrency_config.get("error")),
+                    "enabled": bool(concurrency_config.get("enabled")),
+                },
             }
         return {
             "status": "ok",
@@ -605,11 +695,29 @@ def create_web_app(
             "task_queue": task_queue_config,
             "web_security": web_security_config,
             "billing": billing_config,
+            "concurrency": concurrency_config,
             "agent": {
                 "configured": chat_agent is not None,
                 "error": agent_error,
             },
         }
+
+    @web_app.get("/internal/metrics", include_in_schema=False)
+    def prometheus_metrics() -> Response:
+        """供内部 Prometheus 采集当前 Web 进程的低敏请求指标。"""
+
+        # 并发控制器只返回固定资源名和计数，不把账号、租约 token 或请求正文带入
+        # 监控系统。Worker 没有 HTTP 指标端点，因此 Web 端只暴露自身观察到的事件。
+        concurrency_snapshot = getattr(
+            backend.concurrency_controller,
+            "metrics_snapshot",
+            lambda: {"resources": {}},
+        )()
+        body = format_prometheus_request_metrics(
+            web_app.state.request_metrics.snapshot(),
+            concurrency_snapshot,
+        )
+        return Response(content=body, media_type=PROMETHEUS_CONTENT_TYPE)
 
     @web_app.get("/api/profiles")
     def list_profiles(request: Request) -> dict[str, object]:
@@ -785,6 +893,18 @@ def create_web_app(
                     account_id=account_id,
                     root_request_id=root_request_id,
                 )
+            except ConcurrencyLimitExceeded as error:
+                raise HTTPException(
+                    status_code=429,
+                    detail=str(error),
+                    headers={"Retry-After": "1"},
+                ) from error
+            except ConcurrencyBackendUnavailable as error:
+                raise HTTPException(
+                    status_code=503,
+                    detail="并发保护服务暂时不可用，请稍后重试。",
+                    headers={"Retry-After": "1"},
+                ) from error
             except RAGProviderRequestError as error:
                 raise HTTPException(status_code=502, detail=str(error)) from error
             except Exception as error:
@@ -1002,7 +1122,33 @@ def create_web_app(
         account = current_account(request)
         assert account is not None
         if len(screenshots) > MAX_JOB_SCREENSHOT_FILES:
+            for screenshot in screenshots:
+                await screenshot.close()
             raise HTTPException(status_code=400, detail=f"一次最多上传 {MAX_JOB_SCREENSHOT_FILES} 张职位截图。")
+
+        try:
+            screenshot_lease = await run_in_threadpool(
+                backend.concurrency_controller.acquire,
+                "screenshot",
+                account_id=account.id,
+                wait_timeout_seconds=0,
+            )
+        except ConcurrencyLimitExceeded as error:
+            for screenshot in screenshots:
+                await screenshot.close()
+            raise HTTPException(
+                status_code=429,
+                detail=str(error),
+                headers={"Retry-After": "1"},
+            ) from error
+        except ConcurrencyBackendUnavailable as error:
+            for screenshot in screenshots:
+                await screenshot.close()
+            raise HTTPException(
+                status_code=503,
+                detail="并发保护服务暂时不可用，请稍后重试。",
+                headers={"Retry-After": "1"},
+            ) from error
 
         uploaded_screenshots: list[JobScreenshot] = []
         try:
@@ -1015,16 +1161,6 @@ def create_web_app(
                         media_type=screenshot.content_type,
                     )
                 )
-        finally:
-            for screenshot in screenshots:
-                await screenshot.close()
-
-        if not screenshot_import_slots.acquire(blocking=False):
-            raise HTTPException(
-                status_code=429,
-                detail="职位截图识别请求较多，请稍后重试。",
-            )
-        try:
             # `invoke()` 是同步 SDK 调用；转到线程池后，其他登录、聊天和任务轮询请求
             # 仍可由事件循环处理。Gateway 自己的超时配置限制这次前台等待时间。
             job = await run_in_threadpool(
@@ -1042,7 +1178,9 @@ def create_web_app(
         except DuplicateResourceError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         finally:
-            screenshot_import_slots.release()
+            for screenshot in screenshots:
+                await screenshot.close()
+            screenshot_lease.release()
         return {
             "job": asdict(job),
             "extraction": {
@@ -1610,7 +1748,6 @@ def create_web_app(
         """管理员分页查看账号余额与消费流水。"""
 
         require_admin(request)
-        prune_admin_retention_window()
         entries = backend.store.list_account_balance_ledger(
             account_id,
             limit=limit,
@@ -1623,7 +1760,90 @@ def create_web_app(
             "limit": limit,
             "offset": offset,
             "page_size": ADMIN_LEDGER_PAGE_SIZE,
-            "max_pages": ADMIN_LEDGER_MAX_PAGES,
+            "max_pages": None,
+        }
+
+    @web_app.post("/api/admin/accounts/{account_id}/balance/credit")
+    def admin_credit_account_balance(
+        account_id: int,
+        payload: AdminBalanceCreditPayload,
+        request: Request,
+    ) -> dict[str, object]:
+        """管理员不经过支付渠道为自己或任意账号补款。"""
+
+        actor = require_admin(request)
+        try:
+            target = backend.store.get_account(account_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="账号不存在。") from error
+        clean_reason = payload.reason.strip()
+        audit_event = AdminAuditEventRecord(
+            id=0,
+            actor_account_id=actor.id,
+            target_account_id=target.id,
+            action="balance.manual_credit",
+            target_type="account_balance",
+            target_id=str(target.id),
+            outcome="succeeded",
+            summary=f"管理员为账号 #{target.id} 执行人工补款。",
+            details={"target_role": target.role},
+            request_id=getattr(request.state, "request_id", None),
+        )
+        try:
+            entry = backend.store.credit_account_balance_with_audit(
+                target.id,
+                payload.amount_yuan,
+                actor_account_id=actor.id,
+                reason=clean_reason,
+                idempotency_key=payload.idempotency_key,
+                audit_event=audit_event,
+            )
+        except IdempotencyConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (PermissionError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {
+            "entry": asdict(entry),
+            "summary": asdict(backend.store.get_account_balance_summary(target.id)),
+        }
+
+    @web_app.get("/api/admin/recharge/orders")
+    def admin_recharge_orders(
+        request: Request,
+        account_id: int | None = Query(default=None),
+        limit: int = Query(default=ADMIN_LEDGER_PAGE_SIZE, ge=1, le=ADMIN_LEDGER_PAGE_SIZE),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, object]:
+        """管理员分页查看充值订单，便于排查用户充值问题。"""
+
+        require_admin(request)
+        if account_id is not None:
+            try:
+                backend.store.get_account(account_id)
+            except KeyError as error:
+                raise HTTPException(status_code=404, detail="账号不存在。") from error
+        orders = backend.store.list_recharge_orders(account_id, limit=limit, offset=offset)
+        return {
+            "orders": [asdict(order) for order in orders],
+            "total": backend.store.count_recharge_orders(account_id),
+            "limit": limit,
+            "offset": offset,
+            "page_size": ADMIN_LEDGER_PAGE_SIZE,
+            "max_pages": None,
+        }
+
+    @web_app.get("/api/admin/recharge/orders/{order_id}/events")
+    def admin_recharge_order_events(order_id: int, request: Request) -> dict[str, object]:
+        """管理员查看充值订单对应的低敏支付事件。"""
+
+        require_admin(request)
+        try:
+            order = backend.store.get_recharge_order(order_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="充值订单不存在。") from error
+        return {
+            "order": asdict(order),
+            "events": [asdict(event) for event in backend.store.list_payment_events(order_id)],
         }
 
     @web_app.get("/api/me/balance")
@@ -1635,7 +1855,6 @@ def create_web_app(
         """当前登录账号查看自己的余额与消费流水。"""
 
         account = current_account(request)
-        prune_admin_retention_window()
         summary = backend.store.get_account_balance_summary(account.id)
         entries = backend.store.list_account_balance_ledger(account.id, limit=limit, offset=offset)
         total = backend.store.count_account_balance_ledger(account.id)
@@ -1646,8 +1865,25 @@ def create_web_app(
             "limit": limit,
             "offset": offset,
             "page_size": ADMIN_LEDGER_PAGE_SIZE,
-            "max_pages": ADMIN_LEDGER_MAX_PAGES,
+            "max_pages": None,
             "settings": masked_billing_settings(load_billing_settings(env_path)),
+        }
+
+    @web_app.get("/api/me/recharge/orders")
+    def my_recharge_orders(
+        request: Request,
+        limit: int = Query(default=ADMIN_LEDGER_PAGE_SIZE, ge=1, le=ADMIN_LEDGER_PAGE_SIZE),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, object]:
+        """当前账号分页查看自己的充值订单。"""
+
+        account = current_account(request)
+        orders = backend.store.list_recharge_orders(account.id, limit=limit, offset=offset)
+        return {
+            "orders": [asdict(order) for order in orders],
+            "total": backend.store.count_recharge_orders(account.id),
+            "limit": limit,
+            "offset": offset,
         }
 
     @web_app.post("/api/me/balance/recharge")
@@ -1658,14 +1894,18 @@ def create_web_app(
         if load_web_security_settings(env_path).environment == "production":
             raise HTTPException(status_code=503, detail="真实支付尚未接入，生产环境暂不开放模拟充值。")
         try:
-            entry = backend.store.recharge_account_balance(
+            order, entry = backend.store.create_simulated_recharge_order(
                 account.id,
                 payload.amount_yuan,
-                summary=payload.note or "个人中心充值",
+                idempotency_key=payload.idempotency_key or uuid.uuid4().hex,
+                description=(payload.note or "个人中心模拟充值").strip(),
             )
+        except IdempotencyConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return {
+            "order": asdict(order),
             "entry": asdict(entry),
             "summary": asdict(backend.store.get_account_balance_summary(account.id)),
         }

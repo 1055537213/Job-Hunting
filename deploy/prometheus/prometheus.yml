@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 5s
+  evaluation_interval: 30s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: job-hunting-agent-web
+    metrics_path: /internal/metrics
+    # Docker Compose 为扩容后的同名服务返回多个 A 记录；DNS 服务发现会把每个 Web
+    # 容器保留为独立 target，再由 PromQL 按 job 聚合。
+    dns_sd_configs:
+      - names:
+          - web
+        type: A
+        port: 8000
+        refresh_interval: 5s

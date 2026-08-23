@@ -14,9 +14,14 @@ from pathlib import Path
 from langchain_core.embeddings import Embeddings
 
 from .auth import AuthService
+from .concurrency_control import (
+    ConcurrencyController,
+    build_concurrency_controller,
+)
 from .config import (
     DEFAULT_ENV_PATH,
     load_billing_settings,
+    load_concurrency_settings,
     load_database_settings,
     load_object_storage_settings,
     load_semantic_matching_enabled,
@@ -60,6 +65,7 @@ from .project_analyzer import analyze_project
 from .rag import Reranker
 from .resume_document import (
     PDF_EXTENSION,
+    ResumeExtraction,
     ResumeFileStore,
     extract_resume_document,
     inspect_pdf_for_ocr,
@@ -95,6 +101,7 @@ class JobHuntingApp:
         database_url: str | None = None,
         object_storage: ObjectStorage | None = None,
         task_queue: BackgroundTaskQueue | None = None,
+        concurrency_controller: ConcurrencyController | None = None,
     ):
         """绑定数据库、项目 `.env`、对象存储和可选后台任务队列。"""
 
@@ -118,9 +125,19 @@ class JobHuntingApp:
             if semantic_matching is None
             else bool(semantic_matching)
         )
+        self.concurrency_settings = load_concurrency_settings(self.env_path)
+        self.concurrency_controller = (
+            concurrency_controller
+            if concurrency_controller is not None
+            else build_concurrency_controller(self.concurrency_settings)
+        )
         # 所有真实模型/Embedding 调用都通过内部 Gateway 构造和计量；它是惰性加载的，
         # 所以纯本地规则和离线测试不需要在创建 App 时提供 API Key。
-        self.model_gateway = ModelGateway(self.env_path, usage_store=self.store)
+        self.model_gateway = ModelGateway(
+            self.env_path,
+            usage_store=self.store,
+            concurrency_controller=self.concurrency_controller,
+        )
         self.job_screenshot_extractor = JobScreenshotExtractor(self.model_gateway)
         if object_storage is not None:
             # 测试或宿主机集成可以注入一个实现，业务层不关心具体厂商。
@@ -834,6 +851,19 @@ class JobHuntingApp:
         if self.store.find_resume_source_by_content_fingerprint(account_id, candidate_id, content_sha256) is not None:
             raise DuplicateResourceError("简历")
         pending_ocr = False
+
+        def extract_pdf_with_lease() -> ResumeExtraction:
+            """在可能触发页面渲染/OCR 的 PDF 解析期间占用图片资源额度。"""
+
+            lease = self.concurrency_controller.acquire(
+                "screenshot",
+                account_id=account_id,
+            )
+            try:
+                return extract_resume_document(clean_filename, content)
+            finally:
+                lease.release()
+
         if defer_ocr and extension == PDF_EXTENSION:
             inspection = inspect_pdf_for_ocr(content)
             pending_ocr = bool(inspection.pages_needing_ocr)
@@ -842,12 +872,16 @@ class JobHuntingApp:
                 extracted_text = ""
                 page_count = inspection.page_count
             else:
-                extraction = extract_resume_document(clean_filename, content)
+                extraction = extract_pdf_with_lease()
                 extraction_method = extraction.method
                 extracted_text = extraction.text
                 page_count = extraction.page_count
         else:
-            extraction = extract_resume_document(clean_filename, content)
+            extraction = (
+                extract_pdf_with_lease()
+                if extension == PDF_EXTENSION
+                else extract_resume_document(clean_filename, content)
+            )
             extraction_method = extraction.method
             extracted_text = extraction.text
             page_count = extraction.page_count
@@ -899,10 +933,19 @@ class JobHuntingApp:
             return artifact
         if artifact.status != "processing":
             raise ValueError("这份简历当前不处于 OCR 待处理状态。")
-        extraction = extract_resume_document(
-            artifact.original_filename,
-            self.read_resume_file(artifact),
+        # Worker 也必须遵守与 Web 截图导入相同的图片/OCR并发额度；否则扩容 Worker
+        # 后扫描版 PDF 会绕过 Redis 共享保护，直接把 OCR 内存和 CPU 放大到副本数。
+        lease = self.concurrency_controller.acquire(
+            "screenshot",
+            account_id=account_id,
         )
+        try:
+            extraction = extract_resume_document(
+                artifact.original_filename,
+                self.read_resume_file(artifact),
+            )
+        finally:
+            lease.release()
         return self.store.complete_resume_artifact_extraction(
             artifact.id,
             extraction_method=extraction.method,

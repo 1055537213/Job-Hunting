@@ -47,8 +47,8 @@ assert.doesNotMatch(template, /class="admin-account-event-count"/);
 assert.doesNotMatch(template, /accountBillingStateLabel\(account\.id\)[\s\S]*?accountToolCallCount\(account\.id\)/);
 assert.match(template, /class="admin-account-usage-meta"[\s\S]*?selectedAdminAccount\.role[\s\S]*?selectedAdminAccount\.status[\s\S]*?accountBalanceLedgerCount\(selectedAdminAccount\.id\)[\s\S]*?accountUsageEventCount\(selectedAdminAccount\.id\)[\s\S]*?个工具任务/);
 assert.match(template, /选择一个账号/);
-assert.match(template, /styles\.css\?v=20260823-cleanup-v1/);
-assert.match(template, /app\.js\?v=20260823-project-collapse-v1/);
+assert.match(template, /styles\.css\?v=20260823-billing-v1/);
+assert.match(template, /app\.js\?v=20260823-billing-v1/);
 assert.match(template, /工具调用/);
 assert.match(template, /class="panel admin-panel admin-observability"/);
 assert.match(template, /请求观测/);
@@ -70,6 +70,12 @@ assert.match(template, /class="admin-tool-detail"/);
 assert.match(template, /class="admin-ledger-pagination"/);
 assert.match(template, /aria-label="Token 明细分页"/);
 assert.match(template, /aria-label="工具调用分页"/);
+assert.match(template, /class="admin-balance-credit-form"/);
+assert.match(template, /@submit\.prevent="creditAdminBalance"/);
+assert.match(template, /不经过支付渠道 · 审计留痕/);
+assert.match(template, /v-if="profileRechargeSuccess"[\s\S]*?role="status"/);
+assert.match(template, /balanceLedgerPageInfo\(admin\.balanceTotal\)/);
+assert.match(template, /balanceLedgerPageNumbers\(admin\.balanceTotal, admin\.balancePage\)/);
 assert.match(template, /adminLedgerPageInfo\(admin\.usageTotal\)/);
 assert.match(template, /adminLedgerPageInfo\(admin\.toolTraceTotal\)/);
 assert.match(template, /adminLedgerPageNumbers\(admin\.usageTotal\)/);
@@ -105,6 +111,12 @@ assert.match(source, /adminAuditEvents\(\)/);
 assert.match(source, /adminLedgerPageCount\(total\)/);
 assert.match(source, /adminLedgerPageNumbers\(total\)/);
 assert.match(source, /adminLedgerPageInfo\(total\)/);
+assert.match(source, /creditAdminBalance\(\)/);
+assert.match(source, /profileRechargeSuccess:\s*""/);
+assert.match(source, /balanceLedgerPageCount\(total\)/);
+assert.match(source, /balanceLedgerPageNumbers\(total, currentPage\)/);
+assert.match(source, /newIdempotencyKey\(prefix = "request"\)/);
+assert.match(source, /\/api\/admin\/accounts\/\$\{encodeURIComponent\(selectedAccountId\)\}\/balance\/credit/);
 assert.match(source, /label:\s*"HTTP 请求"/);
 assert.match(source, /label:\s*"错误请求"/);
 assert.match(source, /label:\s*"平均耗时"/);
@@ -152,6 +164,7 @@ assert.match(styles, /\.admin-audit-list\s*\{[\s\S]*?max-block-size:\s*min\(34re
 assert.match(styles, /\.admin-audit-event\s*\{[\s\S]*?border:\s*1px solid var\(--auth-rule\);/);
 assert.match(styles, /\.admin-audit-event-meta\s*\{[\s\S]*?grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\);/);
 assert.match(styles, /\.admin-detail-tabs\s*\{[\s\S]*?width:\s*100%;[\s\S]*?display:\s*grid;[\s\S]*?grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\);[\s\S]*?align-items:\s*start;/);
+assert.match(styles, /\.admin-balance-credit-form\s*\{[\s\S]*?grid-template-columns:[\s\S]*?border:\s*1px solid var\(--auth-rule\);/);
 assert.match(styles, /\.tab-button\s*\{[\s\S]*?min-height:\s*calc\(var\(--size-control\) - var\(--space-sm\)\);[\s\S]*?width:\s*100%;[\s\S]*?padding:\s*var\(--space-3xs\) var\(--space-sm\);[\s\S]*?text-align:\s*center;[\s\S]*?white-space:\s*nowrap;/);
 assert.match(styles, /\.tab-button\[aria-selected="true"\]\s*\{[\s\S]*?border-color:\s*var\(--auth-rule-strong\);/);
 assert.match(styles, /\.admin-account-chevron\s*\{[\s\S]*?place-items:\s*center;/);
@@ -218,6 +231,22 @@ const adminLedgerPageInfo = extractMethod(
   "adminLedgerPageInfo(total) {",
   "function adminLedgerPageInfo(total) {",
 );
+const balanceLedgerPageCount = extractMethod(
+  "balanceLedgerPageCount(total) {",
+  "function balanceLedgerPageCount(total) {",
+);
+const balanceLedgerPageNumbers = extractMethod(
+  "balanceLedgerPageNumbers(total, currentPage) {",
+  "function balanceLedgerPageNumbers(total, currentPage) {",
+);
+const creditAdminBalance = extractMethod(
+  "async creditAdminBalance() {",
+  "async function creditAdminBalance() {",
+);
+const rechargeMyBalance = extractMethod(
+  "async rechargeMyBalance() {",
+  "async function rechargeMyBalance() {",
+);
 const adminAccountLabel = extractMethod(
   "adminAccountLabel(accountId) {",
   "function adminAccountLabel(accountId) {",
@@ -244,6 +273,9 @@ const selectionContext = {
     selectedAccountId: 0,
     loadingEvents: false,
     eventsError: "",
+    balanceCreditError: "",
+    balanceCreditSuccess: "",
+    balanceCreditForm: { amountYuan: 20, reason: "", idempotencyKey: "" },
     loadError: "",
     usageRequestVersion: 0,
     activeDetailTab: "tokens",
@@ -311,6 +343,9 @@ const adminLoadContext = {
     loadingToolTraces: false,
     loadingToolTraceDetail: false,
     eventsError: "",
+    balanceCreditError: "",
+    balanceCreditSuccess: "",
+    balanceCreditForm: { amountYuan: 20, reason: "", idempotencyKey: "" },
     toolTraces: [],
     selectedToolTraceId: "",
     toolTraceDetail: null,
@@ -539,6 +574,65 @@ assert.equal(
   "background_task #task-1",
 );
 assert.equal(adminAuditActionLabel.call({}, "account.status_updated"), "账号状态变更");
+assert.equal(adminAuditActionLabel.call({}, "balance.manual_credit"), "管理员补款");
 assert.equal(adminAuditActionLabel.call({}, "unknown.action"), "unknown.action");
+
+const permanentLedgerContext = {
+  admin: { ledgerPageSize: ADMIN_LEDGER_PAGE_SIZE },
+  balanceLedgerPageCount,
+};
+assert.equal(adminLedgerPageCount.call({ admin: { ledgerPageSize: 100, ledgerMaxPages: 5 } }, 650), 5);
+assert.equal(balanceLedgerPageCount.call(permanentLedgerContext, 650), 7);
+assert.deepEqual(balanceLedgerPageNumbers.call(permanentLedgerContext, 650, 7), [3, 4, 5, 6, 7]);
+
+const adminCreditUrls = [];
+const adminCreditContext = {
+  admin: {
+    selectedAccountId: 7,
+    balanceCreditForm: { amountYuan: 20, reason: "支付异常人工补款", idempotencyKey: "" },
+    balanceCreditLoading: false,
+    balanceCreditError: "",
+    balanceCreditSuccess: "",
+  },
+  auth: { account: { id: 1 }, billing: null },
+  selectedAdminAccount: { id: 7, email: "target@example.com" },
+  newIdempotencyKey: () => "admin-credit-stable-key",
+  requestJson: async (url) => {
+    adminCreditUrls.push(url);
+    if (url.endsWith("/balance/credit")) return { summary: { balance_micro_yuan: 20_000_000 } };
+    throw new Error("summary refresh unavailable");
+  },
+  loadAdminBalanceEvents: async () => {},
+  loadAdminAuditEvents: async () => {},
+};
+await creditAdminBalance.call(adminCreditContext);
+assert.equal(adminCreditContext.admin.balanceCreditError, "");
+assert.match(adminCreditContext.admin.balanceCreditSuccess, /已为 target@example\.com 补款 20 元/);
+assert.match(adminCreditContext.admin.balanceCreditSuccess, /明细刷新失败/);
+assert.equal(adminCreditContext.admin.balanceCreditForm.idempotencyKey, "");
+assert.equal(adminCreditUrls.filter((url) => url.endsWith("/balance/credit")).length, 1);
+
+const rechargeContext = {
+  profileRechargeForm: { amountYuan: 20, note: "测试充值", idempotencyKey: "" },
+  profileRechargeLoading: false,
+  profileBalanceError: "",
+  profileRechargeSuccess: "",
+  profileBalancePage: 1,
+  profileCenter: { balance: null },
+  newIdempotencyKey: () => "recharge-stable-key",
+  requestJson: async (url) => {
+    assert.equal(url, "/api/me/balance/recharge");
+    return { summary: { balance_micro_yuan: 20_000_000 } };
+  },
+  loadMyBalance: async function () {
+    this.profileBalanceError = "余额流水加载失败，请稍后重试。";
+  },
+};
+await rechargeMyBalance.call(rechargeContext);
+assert.equal(rechargeContext.profileCenter.balance.balance_micro_yuan, 20_000_000);
+assert.match(rechargeContext.profileRechargeSuccess, /已充值 20 元/);
+assert.match(rechargeContext.profileRechargeSuccess, /余额已到账，但明细刷新失败/);
+assert.equal(rechargeContext.profileRechargeForm.idempotencyKey, "");
+assert.equal(rechargeContext.profileRechargeLoading, false);
 
 console.log("frontend admin usage regression: PASS");

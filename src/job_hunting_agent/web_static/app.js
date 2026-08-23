@@ -161,6 +161,14 @@ if (!window.Vue) {
           loadingAuditEvents: false,
           eventsError: "",
           balanceEventsError: "",
+          balanceCreditError: "",
+          balanceCreditSuccess: "",
+          balanceCreditLoading: false,
+          balanceCreditForm: {
+            amountYuan: 20,
+            reason: "",
+            idempotencyKey: "",
+          },
           toolTracesError: "",
           toolTraceDetailError: "",
           auditLoadError: "",
@@ -182,16 +190,18 @@ if (!window.Vue) {
           limit: ADMIN_LEDGER_PAGE_SIZE,
           offset: 0,
           page_size: ADMIN_LEDGER_PAGE_SIZE,
-          max_pages: ADMIN_LEDGER_MAX_PAGES,
+          max_pages: null,
           settings: {},
         },
         profileBalancePage: 1,
         profileBalanceLoading: false,
         profileBalanceError: "",
+        profileRechargeSuccess: "",
         profileBalanceRequestVersion: 0,
         profileRechargeForm: {
           amountYuan: 20,
           note: "",
+          idempotencyKey: "",
         },
         profileRechargeLoading: false,
         profiles: [],
@@ -1030,6 +1040,10 @@ if (!window.Vue) {
         this.admin.toolTracePage = 1;
         this.admin.eventsError = "";
         this.admin.balanceEventsError = "";
+        this.admin.balanceCreditError = "";
+        this.admin.balanceCreditSuccess = "";
+        this.admin.balanceCreditForm.reason = "";
+        this.admin.balanceCreditForm.idempotencyKey = "";
         this.admin.toolTracesError = "";
         this.admin.toolTraceDetailError = "";
         await this.loadAdminActiveDetail(selectedAccountId);
@@ -1058,6 +1072,8 @@ if (!window.Vue) {
         this.admin.toolTracePage = 1;
         this.admin.eventsError = "";
         this.admin.balanceEventsError = "";
+        this.admin.balanceCreditError = "";
+        this.admin.balanceCreditSuccess = "";
         this.admin.toolTracesError = "";
         this.admin.toolTraceDetailError = "";
         this.admin.loadingEvents = false;
@@ -1109,7 +1125,7 @@ if (!window.Vue) {
             return;
           }
           const total = Number(data.total || 0);
-          const pageCount = this.adminLedgerPageCount(total);
+          const pageCount = this.balanceLedgerPageCount(total);
           if (pageCount > 0 && requestedPage > pageCount) {
             await this.loadAdminBalanceEvents(selectedAccountId, pageCount);
             return;
@@ -1131,6 +1147,72 @@ if (!window.Vue) {
           if (requestVersion === this.admin.balanceRequestVersion) {
             this.admin.loadingBalanceEvents = false;
           }
+        }
+      },
+
+      /** 管理员对当前选中账号执行人工补款；失败重试复用同一幂等键。 */
+      async creditAdminBalance() {
+        const selectedAccountId = Number(this.admin.selectedAccountId);
+        const amountYuan = Number(this.admin.balanceCreditForm.amountYuan);
+        const reason = String(this.admin.balanceCreditForm.reason || "").trim();
+        if (!Number.isInteger(selectedAccountId) || selectedAccountId <= 0) return;
+        if (!Number.isFinite(amountYuan) || amountYuan <= 0) {
+          this.admin.balanceCreditError = "请输入大于 0 的补款金额。";
+          return;
+        }
+        if (reason.length < 2) {
+          this.admin.balanceCreditError = "请填写至少 2 个字符的补款原因。";
+          return;
+        }
+        const idempotencyKey = this.admin.balanceCreditForm.idempotencyKey || this.newIdempotencyKey("admin-credit");
+        this.admin.balanceCreditForm.idempotencyKey = idempotencyKey;
+        this.admin.balanceCreditLoading = true;
+        this.admin.balanceCreditError = "";
+        this.admin.balanceCreditSuccess = "";
+        let data;
+        try {
+          data = await this.requestJson(
+            `/api/admin/accounts/${encodeURIComponent(selectedAccountId)}/balance/credit`,
+            {
+              method: "POST",
+              body: JSON.stringify({
+                amount_yuan: amountYuan,
+                reason,
+                idempotency_key: idempotencyKey,
+              }),
+            }
+          );
+        } catch (error) {
+          this.admin.balanceCreditError = error.message || "管理员补款失败，请稍后重试。";
+          this.admin.balanceCreditLoading = false;
+          return;
+        }
+
+        if (Number(this.auth.account?.id) === selectedAccountId) {
+          this.auth.billing = data.summary || this.auth.billing;
+        }
+        this.admin.balanceCreditForm.reason = "";
+        this.admin.balanceCreditForm.idempotencyKey = "";
+        const successMessage = `已为 ${this.selectedAdminAccount?.email || "该账号"} 补款 ${amountYuan.toLocaleString("zh-CN", { maximumFractionDigits: 6 })} 元。`;
+        this.admin.balanceCreditSuccess = successMessage;
+        try {
+          await Promise.all([
+            this.loadAdminBalanceEvents(selectedAccountId, 1),
+            this.loadAdminAuditEvents(),
+          ]);
+          if (this.admin.balanceEventsError || this.admin.auditLoadError) {
+            this.admin.balanceCreditSuccess = `${successMessage} 部分明细刷新失败，请稍后刷新页面。`;
+          }
+          const summary = await this.requestJson("/api/admin/usage/summary");
+          this.admin.billing = {
+            settings: summary.billing?.settings || {},
+            summary: summary.billing?.summary || {},
+            by_account: summary.billing?.by_account || [],
+          };
+        } catch {
+          this.admin.balanceCreditSuccess = `${successMessage} 部分明细刷新失败，请稍后刷新页面。`;
+        } finally {
+          this.admin.balanceCreditLoading = false;
         }
       },
 
@@ -1424,6 +1506,7 @@ if (!window.Vue) {
           "account.status_updated": "账号状态变更",
           "auth.logout_all_devices": "退出所有设备",
           "system.probe_enqueued": "系统探针",
+          "balance.manual_credit": "管理员补款",
         };
         return labels[action] || action || "管理员操作";
       },
@@ -1452,6 +1535,30 @@ if (!window.Vue) {
         return `每页 ${pageSize} 条 · 共 ${pageCount} 页`;
       },
 
+      /** 财务流水永久保留，因此页数不受后台五页运维窗口限制。 */
+      balanceLedgerPageCount(total) {
+        const pageSize = Math.max(1, Number(this.admin.ledgerPageSize || ADMIN_LEDGER_PAGE_SIZE));
+        return Math.ceil(Math.max(0, Number(total || 0)) / pageSize);
+      },
+
+      /** 财务流水页码只显示当前页附近，避免长期账本生成过多按钮。 */
+      balanceLedgerPageNumbers(total, currentPage) {
+        const pageCount = this.balanceLedgerPageCount(total);
+        if (!pageCount) return [];
+        const current = Math.min(pageCount, Math.max(1, Number(currentPage) || 1));
+        const start = Math.max(1, Math.min(current - 2, pageCount - 4));
+        const end = Math.min(pageCount, start + 4);
+        return Array.from({ length: end - start + 1 }, (_, index) => start + index);
+      },
+
+      /** 财务流水分页说明。 */
+      balanceLedgerPageInfo(total) {
+        const pageCount = this.balanceLedgerPageCount(total);
+        if (!pageCount) return "暂无记录";
+        const pageSize = Math.max(1, Number(this.admin.ledgerPageSize || ADMIN_LEDGER_PAGE_SIZE));
+        return `每页 ${pageSize} 条 · 共 ${pageCount} 页 · 财务记录永久保留`;
+      },
+
       /** 读取个人中心的余额流水分页。 */
       async loadMyBalance(page = this.profileBalancePage) {
         const requestedPage = Math.max(1, Math.floor(Number(page) || 1));
@@ -1467,7 +1574,7 @@ if (!window.Vue) {
           );
           if (requestVersion !== this.profileBalanceRequestVersion) return;
           const total = Number(data.total || 0);
-          const pageCount = this.adminLedgerPageCount(total);
+          const pageCount = this.balanceLedgerPageCount(total);
           if (pageCount > 0 && requestedPage > pageCount) {
             await this.loadMyBalance(pageCount);
             return;
@@ -1479,7 +1586,7 @@ if (!window.Vue) {
             limit: Number(data.limit || pageSize),
             offset: Number(data.offset || 0),
             page_size: Number(data.page_size || pageSize),
-            max_pages: Number(data.max_pages || ADMIN_LEDGER_MAX_PAGES),
+            max_pages: data.max_pages ?? null,
             settings: data.settings || {},
           };
           this.profileBalancePage = pageCount > 0 ? requestedPage : 1;
@@ -1507,23 +1614,44 @@ if (!window.Vue) {
           this.profileBalanceError = "请输入大于 0 的充值金额。";
           return;
         }
+        const idempotencyKey = this.profileRechargeForm.idempotencyKey || this.newIdempotencyKey("recharge");
+        this.profileRechargeForm.idempotencyKey = idempotencyKey;
         this.profileRechargeLoading = true;
         this.profileBalanceError = "";
+        this.profileRechargeSuccess = "";
+        let data;
         try {
-          await this.requestJson("/api/me/balance/recharge", {
+          data = await this.requestJson("/api/me/balance/recharge", {
             method: "POST",
             body: JSON.stringify({
               amount_yuan: amountYuan,
               note: String(this.profileRechargeForm.note || "").trim() || undefined,
+              idempotency_key: idempotencyKey,
             }),
           });
-          this.profileRechargeForm.note = "";
-          await this.loadMyBalance(this.profileBalancePage);
         } catch (error) {
           this.profileBalanceError = error.message || "充值失败，请稍后重试。";
-        } finally {
           this.profileRechargeLoading = false;
+          return;
         }
+
+        this.profileCenter.balance = data.summary || this.profileCenter.balance;
+        this.profileRechargeForm.note = "";
+        this.profileRechargeForm.idempotencyKey = "";
+        this.profileRechargeSuccess = `已充值 ${amountYuan.toLocaleString("zh-CN", { maximumFractionDigits: 6 })} 元。`;
+        await this.loadMyBalance(this.profileBalancePage);
+        if (this.profileBalanceError) {
+          this.profileRechargeSuccess += " 余额已到账，但明细刷新失败，请稍后刷新页面。";
+        }
+        this.profileRechargeLoading = false;
+      },
+
+      /** 为资金请求生成浏览器侧幂等键；旧浏览器使用时间戳和随机数兜底。 */
+      newIdempotencyKey(prefix = "request") {
+        const randomPart = globalThis.crypto?.randomUUID
+          ? globalThis.crypto.randomUUID().replaceAll("-", "")
+          : `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+        return `${prefix}:${randomPart}`;
       },
 
       /** 把带 count 的对象行转换成按数量降序的可展示数组。 */

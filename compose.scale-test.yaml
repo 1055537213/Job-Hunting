@@ -1,0 +1,9 @@
+# 多 Web 副本验收覆盖。只能通过 scripts/validate_multi_replica.ps1 临时使用；脚本结束后
+# 会恢复 compose.dev.yaml 的单 Web 和 127.0.0.1:8000 端口。
+services:
+  web:
+    # 固定宿主机端口不能被多个副本同时绑定；验收请求从 Compose 内网直连每个容器。
+    ports: !reset []
+    environment:
+      # 使用较小额度验证两个 Web 进程确实共享同一个 Redis 窗口。
+      JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS: "4"

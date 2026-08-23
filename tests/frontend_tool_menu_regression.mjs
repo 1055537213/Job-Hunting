@@ -81,7 +81,7 @@ assert.equal(
   6,
 );
 assert.doesNotMatch(template, /class="tool-panel-chevron"[^>]*>⌄/);
-assert.match(template, /styles\.css\?v=20260823-cleanup-v1/);
-assert.match(template, /app\.js\?v=20260823-project-collapse-v1/);
+assert.match(template, /styles\.css\?v=20260823-billing-v1/);
+assert.match(template, /app\.js\?v=20260823-billing-v1/);
 
 console.log("frontend tool menu regression: PASS");

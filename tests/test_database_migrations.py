@@ -91,6 +91,16 @@ def test_upgrade_database_creates_versioned_postgresql_schema(temporary_database
                     )
                 )
             }
+            balance_ledger_columns = {
+                row[0]
+                for row in connection.execute(
+                    sa.text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'account_balance_ledger'"
+                    )
+                )
+            }
     finally:
         engine.dispose()
 
@@ -109,11 +119,17 @@ def test_upgrade_database_creates_versioned_postgresql_schema(temporary_database
         "usage_events",
         "tool_call_traces",
         "background_tasks",
+        "account_balances",
+        "account_balance_ledger",
+        "recharge_orders",
+        "payment_events",
+        "admin_audit_events",
     }.issubset(tables)
     assert version == latest_database_revision()
     assert vector_extension_schema == "public"
     assert "content_fingerprint" in candidate_columns
     assert {"content_fingerprint", "import_method", "captured_at"}.issubset(job_columns)
+    assert {"operator_account_id", "recharge_order_id"}.issubset(balance_ledger_columns)
 
 
 def test_upgrade_repairs_legacy_0003_without_job_import_provenance(temporary_database_url):
@@ -238,7 +254,7 @@ def test_zero_starting_balance_migration_preserves_user_recharge(temporary_datab
     finally:
         engine.dispose()
 
-    assert version == "20260822_0008"
+    assert version == "20260823_0009"
     assert balance["balance_micro_yuan"] == 20_000_000
     assert balance["total_recharge_micro_yuan"] == 20_000_000
     assert [(row["entry_kind"], row["amount_micro_yuan"]) for row in ledger] == [

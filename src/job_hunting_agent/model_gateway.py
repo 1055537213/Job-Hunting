@@ -18,16 +18,19 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 
 from .auth import utc_now
+from .concurrency_control import ConcurrencyController, ConcurrencyLease
 from .config import (
     DEFAULT_ENV_PATH,
     EmbeddingSettings,
@@ -41,7 +44,13 @@ from .config import (
 )
 from .llm import LangChainLLMClient, LLMClient, build_chat_model
 from .models import UsageEventRecord
-from .rag import Reranker, build_rag_embeddings, build_reranker, extract_embedding_usage
+from .rag import (
+    Reranker,
+    RerankResult,
+    build_rag_embeddings,
+    build_reranker,
+    extract_embedding_usage,
+)
 
 
 class UsageEventStore(Protocol):
@@ -77,6 +86,163 @@ class ModelCallContext:
         return replace(self, attempt=self.attempt + 1)
 
 
+class ModelConcurrencyCallbackHandler(BaseCallbackHandler):
+    """只在真实聊天模型调用期间持有共享模型租约。"""
+
+    raise_error = True
+
+    def __init__(
+        self,
+        controller: ConcurrencyController,
+        *,
+        account_id: int | None = None,
+    ) -> None:
+        self.controller = controller
+        self.account_id = account_id
+        self._leases: dict[object, ConcurrencyLease] = {}
+        self._starting: set[object] = set()
+        self._lock = threading.Lock()
+
+    def on_chat_model_start(
+        self,
+        serialized: dict[str, object],
+        messages: list[list[BaseMessage]],
+        *,
+        run_id: object,
+        metadata: dict[str, object] | None = None,
+        **kwargs: object,
+    ) -> None:
+        self._start(run_id, metadata)
+
+    def on_llm_start(
+        self,
+        serialized: dict[str, object],
+        prompts: list[str],
+        *,
+        run_id: object,
+        metadata: dict[str, object] | None = None,
+        **kwargs: object,
+    ) -> None:
+        self._start(run_id, metadata)
+
+    def on_llm_end(
+        self,
+        response: object,
+        *,
+        run_id: object,
+        **kwargs: object,
+    ) -> None:
+        self._finish(run_id)
+
+    def on_llm_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: object,
+        **kwargs: object,
+    ) -> None:
+        self._finish(run_id)
+
+    def _start(
+        self,
+        run_id: object,
+        metadata: dict[str, object] | None,
+    ) -> None:
+        with self._lock:
+            if run_id in self._leases or run_id in self._starting:
+                return
+            self._starting.add(run_id)
+        try:
+            lease = self.controller.acquire(
+                "model",
+                account_id=self._resolve_account_id(metadata),
+            )
+        except Exception:
+            with self._lock:
+                self._starting.discard(run_id)
+            raise
+        with self._lock:
+            self._starting.discard(run_id)
+            self._leases[run_id] = lease
+
+    def _finish(self, run_id: object) -> None:
+        with self._lock:
+            lease = self._leases.pop(run_id, None)
+            self._starting.discard(run_id)
+        if lease is not None:
+            lease.release()
+
+    def _resolve_account_id(
+        self,
+        metadata: dict[str, object] | None,
+    ) -> int | None:
+        if self.account_id is not None:
+            return self.account_id
+        value = metadata.get("account_id") if metadata else None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return None
+
+
+class ConcurrencyLimitedEmbeddings(Embeddings):
+    """在真实 Embedding HTTP 请求期间获取并释放模型租约。"""
+
+    def __init__(
+        self,
+        delegate: Embeddings,
+        controller: ConcurrencyController,
+        account_id: int | None,
+    ) -> None:
+        self.delegate = delegate
+        self.controller = controller
+        self.account_id = account_id
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        lease = self.controller.acquire("model", account_id=self.account_id)
+        try:
+            return self.delegate.embed_documents(texts)
+        finally:
+            lease.release()
+
+    def embed_query(self, text: str) -> list[float]:
+        lease = self.controller.acquire("model", account_id=self.account_id)
+        try:
+            return self.delegate.embed_query(text)
+        finally:
+            lease.release()
+
+
+class ConcurrencyLimitedReranker:
+    """在真实 Rerank HTTP 请求期间获取并释放模型租约。"""
+
+    def __init__(
+        self,
+        delegate: Reranker,
+        controller: ConcurrencyController,
+        account_id: int | None,
+    ) -> None:
+        self.delegate = delegate
+        self.controller = controller
+        self.account_id = account_id
+        self.candidate_multiplier = delegate.candidate_multiplier
+
+    def rerank(
+        self,
+        query: str,
+        documents: list[str],
+        top_n: int,
+    ) -> list[RerankResult]:
+        lease = self.controller.acquire("model", account_id=self.account_id)
+        try:
+            return self.delegate.rerank(query, documents, top_n)
+        finally:
+            lease.release()
+
+
 class ModelGateway:
     """模块化单体中的模型调用门面。
 
@@ -93,6 +259,7 @@ class ModelGateway:
         embedding_settings: EmbeddingSettings | None = None,
         rerank_settings: RerankSettings | None = None,
         settings: ModelGatewaySettings | None = None,
+        concurrency_controller: ConcurrencyController | None = None,
     ):
         """绑定配置位置和可选的用量流水存储。
 
@@ -106,6 +273,7 @@ class ModelGateway:
         self._embedding_settings = embedding_settings
         self._rerank_settings = rerank_settings
         self._settings = settings
+        self.concurrency_controller = concurrency_controller
 
     @property
     def settings(self) -> ModelGatewaySettings:
@@ -149,11 +317,12 @@ class ModelGateway:
         root_request_id: str | None = None,
         call_id: str | None = None,
         attempt: int = 1,
+        authorize_spend: bool = True,
     ) -> ModelCallContext:
-        """创建一次调用上下文，并为缺失 ID 生成安全的随机值。"""
+        """创建调用上下文；真正发起调用前可执行一次余额准入。"""
 
         normalized_operation = normalize_operation(operation)
-        if self.usage_store is not None and account_id is not None:
+        if authorize_spend and self.usage_store is not None and account_id is not None:
             can_spend = getattr(self.usage_store, "assert_account_can_spend", None)
             if callable(can_spend):
                 can_spend(account_id)
@@ -169,7 +338,13 @@ class ModelGateway:
             attempt=max(1, attempt),
         )
 
-    def chat_model(self, operation: str, temperature: float = 0) -> BaseChatModel:
+    def chat_model(
+        self,
+        operation: str,
+        temperature: float = 0,
+        *,
+        account_id: int | None = None,
+    ) -> BaseChatModel:
         """构造供 LangChain Agent 使用的聊天模型。
 
         当前所有供应商仍通过 OpenAI-compatible 接口接入；未来新增供应商路由时只
@@ -177,39 +352,68 @@ class ModelGateway:
         """
 
         normalize_operation(operation)
+        callbacks = None
+        if self.concurrency_controller is not None:
+            callbacks = [
+                ModelConcurrencyCallbackHandler(
+                    self.concurrency_controller,
+                    account_id=account_id,
+                )
+            ]
         return build_chat_model(
             self.llm_settings,
             temperature=temperature,
             max_retries=self.settings.chat_max_retries,
+            callbacks=callbacks,
         )
 
     def llm_client(self, context: ModelCallContext, temperature: float = 0) -> LLMClient:
         """返回适合单次 prompt 场景的业务级 LLM 客户端。"""
 
         return LangChainLLMClient(
-            self.chat_model(context.operation, temperature=temperature),
+            self.chat_model(
+                context.operation,
+                temperature=temperature,
+                account_id=context.account_id,
+            ),
             usage_callback=lambda message: self.record_chat_response(context, message),
         )
 
     def embeddings(self, context: ModelCallContext) -> Embeddings:
         """返回带 Gateway 用量回调的 LangChain Embeddings 实现。"""
 
-        return build_rag_embeddings(
+        embeddings = build_rag_embeddings(
             self.env_path,
             settings=self.embedding_settings,
             usage_callback=lambda response: self.record_embedding_response(context, response),
             usage_operation=context.operation,
             max_retries=self.settings.embedding_max_retries,
         )
+        if self.concurrency_controller is None or self.embedding_settings is None:
+            return embeddings
+        if self.embedding_settings.api_style == "local_hash":
+            return embeddings
+        return ConcurrencyLimitedEmbeddings(
+            embeddings,
+            self.concurrency_controller,
+            context.account_id,
+        )
 
     def reranker(self, context: ModelCallContext) -> Reranker | None:
         """返回带 Gateway 计量回调的可选 Rerank 实现。"""
 
-        return build_reranker(
+        reranker = build_reranker(
             self.env_path,
             settings=self.rerank_settings,
             usage_callback=lambda response: self.record_rerank_response(context, response),
             max_retries=self.settings.rerank_max_retries,
+        )
+        if reranker is None or self.concurrency_controller is None:
+            return reranker
+        return ConcurrencyLimitedReranker(
+            reranker,
+            self.concurrency_controller,
+            context.account_id,
         )
 
     def record_chat_response(
@@ -258,6 +462,7 @@ class ModelGateway:
                 session_id=session_id,
                 root_request_id=root_request_id,
                 call_id=f"{root_request_id}-{normalize_operation(operation)}-{index}",
+                authorize_spend=False,
             )
             self.record_usage(
                 context,
@@ -278,6 +483,7 @@ class ModelGateway:
                 session_id=session_id,
                 root_request_id=root_request_id,
                 call_id=f"{root_request_id}-{normalize_operation(operation)}-missing",
+                authorize_spend=False,
             )
             self.record_usage(
                 context,

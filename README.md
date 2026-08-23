@@ -13,7 +13,7 @@
 - 分析用户提供的公开 GitHub 仓库，将推断出的技术与职责先交给用户按组确认。
 - 将确认后的长文本建立账号隔离的 pgvector 索引，为匹配和简历生成提供可追溯证据。
 - 通过 SSE 流式展示 Agent 回复，通过 Celery Worker 执行 OCR、项目分析和 RAG 索引。
-- 记录供应商返回的 Token 用量，按配置价格实时扣减余额，并向管理员提供分页账本和工具调用轨迹。
+- 记录供应商返回的 Token 用量并实时扣减余额；充值订单、支付事件、管理员补款和资金流水均可追溯。
 
 PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis 只传递任务键。系统不会自动登录 BOSS、抓取隐藏接口、投递简历或发送招聘消息。
 
@@ -25,8 +25,8 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 | --- | --- | --- |
 | 登录与注册 | `http://127.0.0.1:8000/login` | 注册、登录和认证反馈 |
 | 工作台 | `http://127.0.0.1:8000/workspace` | 档案、Agent 对话、职位、项目和简历 |
-| 个人中心 | `http://127.0.0.1:8000/profile` | 余额、消费流水和模拟充值入口 |
-| 管理后台 | `http://127.0.0.1:8000/admin` | 账号用量、余额账本、工具轨迹、请求观测和管理员审计 |
+| 个人中心 | `http://127.0.0.1:8000/profile` | 余额、消费流水和开发环境模拟充值入口 |
+| 管理后台 | `http://127.0.0.1:8000/admin` | 账号用量、人工补款、余额账本、工具轨迹、请求观测和管理员审计 |
 | Swagger | `http://127.0.0.1:8000/docs` | 交互式 API 文档 |
 
 前端是随 FastAPI 一起发布的 Vue 单页应用，不需要单独启动 Node 开发服务器。
@@ -63,9 +63,11 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 - 结构化事实与长文本索引分离，Embedding 身份变化时不会混用旧向量。
 - 检索先做账号与候选人过滤，再进行余弦相似度召回，可选 Rerank。
 - Celery 任务支持幂等键、原子认领、进度、有限重试、错误摘要和刷新后恢复。
-- 管理后台展示账号余额、消费流水、Token 明细、工具调用流程、请求指标和管理员审计。
-- Token、工具调用和余额流水每账号最多保留 `5` 页，每页 `100` 条，超出 `500` 条的旧记录从数据库删除。
-- 新账号余额默认为 `0`；开发环境可模拟充值，生产环境在接入真实支付前禁用该入口。
+- Docker Web 使用 Redis 原子滑动窗口共享认证、模型、上传、管理和写请求额度，增加 Web 进程不会重复获得限流配额。
+- Web 与 Worker 使用 Redis 租约共享 Chat、Embedding、Rerank 和截图并发额度，并按账号限制模型占用。
+- 管理后台展示账号余额、消费流水、Token 明细、工具调用流程、请求指标和管理员审计；管理员可为自己或任意账号执行有原因、有操作者记录的人工补款。
+- Token 与工具调用每账号最多保留 `5` 页、每页 `100` 条；余额流水、充值订单和支付事件属于财务事实，永久追加保存并按页读取。
+- 新账号余额默认为 `0`；开发环境模拟充值也会生成幂等充值订单和支付事件，生产环境在接入真实支付前禁用用户模拟入口。
 
 ## 4. 技术栈
 
@@ -91,7 +93,7 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 2. **结构化库和知识库联动删除**：项目、职位和简历删除沿 PostgreSQL 外键及应用服务边界清理，pgvector 不保留孤立索引。
 3. **多租户隔离贯穿全链路**：数据库查询、对象键、RAG 检索、任务、工具轨迹和账单都携带账号归属。
 4. **后台任务可恢复**：Redis 消息只包含 `task_key`，任务权威状态在 PostgreSQL；幂等键和原子认领防止重复执行。
-5. **实时计量和余额账本**：只使用供应商确认的 Token usage 计费，调用 ID 防止重试重复扣费，余额不足时阻止新的模型调用。
+5. **实时计量和资金闭环**：只使用供应商确认的 Token usage 计费；调用 ID、充值幂等键和数据库行锁防止重复扣费或重复到账，管理员补款与真实支付严格分开。
 6. **安全的外部内容入口**：职位截图仅在识别请求期间使用；GitHub 分析限制公开仓库、文件类型、归档大小和重定向目标。
 7. **可执行的上线基线**：包含 CI、生产 Compose、HTTPS 反向代理、迁移门禁、备份与恢复脚本及上线前评测入口。
 
@@ -102,6 +104,8 @@ Job-hunting Agent/
 ├─ src/job_hunting_agent/
 │  ├─ web.py                  # FastAPI 路由、SSE 和页面入口
 │  ├─ web_hardening.py        # CSRF、限流、安全头、请求 ID 与指标
+│  ├─ rate_limiting.py        # 内存/Redis 滑动窗口与后端故障策略
+│  ├─ concurrency_control.py   # 模型/截图全局与账号级共享并发租约
 │  ├─ agent.py                # LangChain Agent、提示词和工具注册
 │  ├─ app.py                  # 业务门面与模块编排
 │  ├─ storage.py              # PostgreSQL 领域仓储与事务逻辑
@@ -121,12 +125,14 @@ Job-hunting Agent/
 ├─ tests/                     # Python 测试和前端 Node 回归脚本
 ├─ scripts/
 │  ├─ enterprise_acceptance.ps1 # 完整本地验收
+│  ├─ validate_multi_replica.ps1 # 双 Web、共享限流和多目标采集验收
 │  ├─ backup.ps1                # PostgreSQL + MinIO 备份
 │  └─ restore.ps1               # 受控恢复演练
-├─ deploy/                    # Caddy 与生产环境变量模板
+├─ deploy/                    # Caddy、Prometheus 与生产环境变量模板
 ├─ docs/                      # ADR、研究、部署和学习文档
 ├─ compose.yaml               # 基础服务拓扑
 ├─ compose.dev.yaml           # 本地源码挂载与热更新
+├─ compose.scale-test.yaml    # 临时多 Web 副本验收覆盖
 ├─ compose.prod.yaml          # 单机生产覆盖配置
 ├─ Dockerfile
 ├─ requirements.lock
@@ -185,6 +191,19 @@ Invoke-RestMethod http://127.0.0.1:8000/api/health
 docker compose -f compose.yaml -f compose.dev.yaml logs --tail 100 web worker beat
 ```
 
+Docker Web/Worker 默认使用 Redis 数据库 `1` 保存短期限流窗口与并发租约，Celery broker
+使用数据库 `0`；这些短期状态都不是业务事实源。Prometheus 会随基础 Compose 启动，
+通过 Docker DNS 发现每个 Web 副本，并把各副本保留为独立采集目标；告警表达式再按整个
+Web 服务聚合。副本可通过 Prometheus 的 `instance` 标签区分。本地监控页面和采集状态分别位于：
+
+```text
+http://127.0.0.1:9090
+http://127.0.0.1:9090/targets
+http://127.0.0.1:9090/alerts
+```
+
+当前只启用 Prometheus 指标、趋势和告警状态页面，没有启动 Alertmanager，也不会向外发送通知。
+
 开发覆盖已挂载 `src/` 和 `alembic/`。Python Web 代码会自动重载，前端静态文件刷新浏览器即可；Worker 或 Beat 代码变化后应重启对应容器：
 
 ```powershell
@@ -210,6 +229,16 @@ python -m compileall -q src tests alembic
 Get-ChildItem tests -Filter "frontend_*.mjs" | ForEach-Object { node $_.FullName }
 ```
 
+需要验证真实双 Web 副本、共享 Redis 限流和 Prometheus 多实例采集时执行：
+
+```powershell
+.\scripts\validate_multi_replica.ps1
+```
+
+脚本会临时移除 Web 的宿主机固定端口、启动两个副本，从 Worker 所在的 Compose 网络逐个
+探测副本，并确认跨副本共享限流和两个 Prometheus target；结束或失败后都会恢复单 Web
+开发拓扑与 `127.0.0.1:8000`。
+
 RAG 黄金集准备完成后，将其加入统一验收：
 
 ```powershell
@@ -233,6 +262,12 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 .\scripts\backup.ps1
 .\scripts\restore.ps1 -BackupDirectory <backup-directory> -ConfirmRestore
 ```
+
+生产 Compose 同时启动 Prometheus，默认保留 15 天请求趋势，并加载 Web 不可用、5xx 比例、
+平均耗时、安全拦截和并发请求告警规则。Prometheus 页面只绑定服务器 `127.0.0.1:9090`，
+应通过 SSH 端口转发访问；`/internal/metrics` 不会由 Caddy 暴露到公网。告警通知接收方需在
+正式确定邮件、企业微信或其他值班渠道后，通过 Alertmanager 单独接入。Caddy 和 Prometheus
+均通过 Docker DNS 动态发现 Web 副本，Caddy 轮询分发请求，告警按整个 Web 服务聚合。
 
 ## 8. 接口文档
 
@@ -259,8 +294,11 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 | 简历 | `GET /api/resumes/{artifact_id}/download` | 鉴权下载简历文件 |
 | RAG | `GET /api/rag/search` | 账号隔离的检索调试接口 |
 | 余额 | `GET /api/me/balance` | 当前账号余额与分页流水 |
-| 余额 | `POST /api/me/balance/recharge` | 仅开发环境模拟充值 |
+| 余额 | `POST /api/me/balance/recharge` | 仅开发环境创建并结算模拟充值订单 |
+| 余额 | `GET /api/me/recharge/orders` | 当前账号的充值订单 |
 | 管理 | `/api/admin/usage/*`、`/api/admin/balance/*` | Token、余额和消费记录 |
+| 管理 | `POST /api/admin/accounts/{id}/balance/credit` | 管理员人工补款，要求原因和幂等键 |
+| 管理 | `/api/admin/recharge/orders*` | 充值订单和低敏支付事件排障 |
 | 管理 | `/api/admin/tools/traces*` | 工具调用任务与步骤详情 |
 | 管理 | `/api/admin/observability/requests` | 进程内请求指标快照 |
 | 管理 | `/api/admin/audit/events` | 管理员操作审计 |
@@ -280,7 +318,7 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 
 ### 为什么新账号无法调用模型？
 
-新账号初始余额为 `0`。本地开发可进入个人中心使用模拟充值；生产环境会禁用模拟入口，真实支付接入前应由受控运维流程充值。余额不足统一返回“余额不足，请先充值后重试。”
+新账号初始余额为 `0`。本地开发可进入个人中心使用模拟充值；生产环境会禁用用户模拟入口。管理员仍可在后台为自己或指定账号人工补款，金额、原因、操作者、目标账号和补款前后余额会在同一事务中写入资金流水与管理员审计。余额不足统一返回“余额不足，请先充值后重试。”
 
 ### 为什么项目确认后 RAG 任务失败？
 
@@ -300,14 +338,21 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 
 ### 如何查看服务故障？
 
-先访问 `/api/health`，再查看 `web`、`worker`、`beat`、`postgres`、`redis` 和 `minio` 日志。管理员可在后台查看请求错误摘要、工具失败原因和审计记录。
+先访问 `/api/health`，再查看 `web`、`worker`、`beat`、`postgres`、`redis` 和 `minio` 日志。
+管理员可在后台查看请求错误摘要、工具失败原因和审计记录；生产运维可在 Prometheus 查看
+15 天趋势和当前告警状态。
 
 ## 10. TODO / 未来计划
 
-- [ ] 接入真实支付渠道、签名 Webhook、充值订单和退款对账。
+- [x] 建立充值订单、支付事件、幂等到账和管理员人工补款基础链路。
+- [ ] 接入真实支付渠道、签名 Webhook、退款状态机和渠道对账。
 - [ ] 在上线前建立足量 RAG 黄金测试集，确定 Recall@K、MRR 和禁止召回阈值。
-- [ ] 把请求指标接入 Prometheus/OpenTelemetry，并配置生产告警和长期趋势。
-- [ ] 将进程内限流、短期 Agent 状态和指标迁移到共享基础设施，支持 Web 多副本。
+- [x] 把低敏请求指标接入 Prometheus，配置单机生产告警规则和 15 天趋势保留。
+- [ ] 接入 Alertmanager 通知渠道、OpenTelemetry 分布式 Trace 和集中日志平台。
+- [x] 将 Web 请求限流迁移到 Redis 原子滑动窗口，并明确 Redis 故障时的分组降级策略。
+- [x] 将模型/截图并发名额迁移到 Redis 租约，并同时限制全局和单账号占用。
+- [x] 完成 Web 多副本流量验证、Caddy 动态后端发现与 Prometheus 多实例采集。
+- [ ] 将短期 Agent 状态迁移到共享基础设施，避免副本切换时依赖单进程内存。
 - [ ] 将定制简历导出迁移到 Worker，并补充大文件和高并发容量测试。
 - [ ] 建立严格类型检查基线，逐步消化第三方 stub 和内部 Protocol 类型债务。
 - [ ] 完成依赖与镜像漏洞扫描、渗透测试、灾难恢复演练和密钥轮换流程。

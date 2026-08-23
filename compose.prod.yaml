@@ -49,6 +49,9 @@ services:
     environment:
       JOB_AGENT_ENVIRONMENT: production
       JOB_AGENT_COOKIE_SECURE: "true"
+      # 生产 Web 不暴露宿主机端口，只接受内部 Caddy/Prometheus 流量；允许 Uvicorn
+      # 使用 Caddy 重写后的 X-Forwarded-For，避免所有访客共享代理容器 IP 限额。
+      FORWARDED_ALLOW_IPS: "*"
       JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}:${JOB_AGENT_POSTGRES_PASSWORD:?set JOB_AGENT_POSTGRES_PASSWORD in .env}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
       JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET: "false"
     ports: !reset []
@@ -104,6 +107,18 @@ services:
           cpus: "1.0"
           memory: 512M
 
+  prometheus:
+    # 生产环境使用独立趋势卷；端口仍只绑定服务器回环地址。
+    volumes: !override
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_prod_data:/prometheus
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
 volumes:
   postgres_prod_data:
     name: job-hunting-agent-production_postgres_prod_data
@@ -115,6 +130,8 @@ volumes:
     name: job-hunting-agent-production_caddy_data
   caddy_config:
     name: job-hunting-agent-production_caddy_config
+  prometheus_prod_data:
+    name: job-hunting-agent-production_prometheus_prod_data
 
 networks:
   default:

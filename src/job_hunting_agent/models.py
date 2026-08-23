@@ -454,8 +454,51 @@ class BalanceLedgerRecord:
     price_per_million_tokens_yuan: float | None
     source_reference: str | None
     summary: str
+    operator_account_id: int | None = None
+    recharge_order_id: int | None = None
     details: dict[str, object] = field(default_factory=dict)
     created_at: str = ""
+
+
+@dataclass
+class RechargeOrderRecord:
+    """一笔用户充值订单；管理员人工补款不会伪装成支付订单。"""
+
+    id: int
+    order_number: str
+    account_id: int
+    created_by_account_id: int | None
+    amount_micro_yuan: int
+    status: str
+    payment_provider: str
+    provider_order_id: str | None
+    idempotency_key: str
+    description: str
+    failure_reason: str | None = None
+    details: dict[str, object] = field(default_factory=dict)
+    created_at: str = ""
+    updated_at: str = ""
+    paid_at: str | None = None
+    cancelled_at: str | None = None
+    refunded_at: str | None = None
+
+
+@dataclass
+class PaymentEventRecord:
+    """支付渠道事件的低敏幂等记录。"""
+
+    id: int
+    recharge_order_id: int
+    payment_provider: str
+    provider_event_id: str
+    event_type: str
+    processing_status: str
+    signature_valid: bool
+    payload_sha256: str
+    error_summary: str | None = None
+    details: dict[str, object] = field(default_factory=dict)
+    received_at: str = ""
+    processed_at: str | None = None
 
 
 @dataclass

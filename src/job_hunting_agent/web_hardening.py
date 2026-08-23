@@ -17,6 +17,11 @@ from fastapi import FastAPI, Request, Response
 from starlette.responses import JSONResponse
 
 from .config import WebSecuritySettings
+from .rate_limiting import (
+    RateLimitBackendUnavailable,
+    RateLimiter,
+    build_rate_limiter,
+)
 
 logger = logging.getLogger("job_hunting_agent.web.access")
 
@@ -26,6 +31,8 @@ CSRF_HEADER_NAME = "X-CSRF-Token"
 CSRF_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 CSRF_EXEMPT_PATHS = {"/api/auth/login", "/api/auth/register"}
+PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+RATE_LIMIT_FAIL_CLOSED_GROUPS = {"auth", "model", "upload", "admin", "write"}
 
 
 def new_csrf_token() -> str:
@@ -59,12 +66,15 @@ def install_web_hardening(
     *,
     settings: WebSecuritySettings,
     session_cookie_name: str,
+    identity_resolver: Callable[[Request], str] | None = None,
+    rate_limiter: RateLimiter | None = None,
 ) -> None:
     """安装 Web 最外层安全与观测中间件。"""
 
-    limiter = InMemoryRateLimiter(settings)
+    limiter = rate_limiter or build_rate_limiter(settings)
     metrics = RequestMetrics()
     web_app.state.request_metrics = metrics
+    web_app.state.rate_limiter = limiter
 
     @web_app.middleware("http")
     async def hardening_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]):
@@ -76,25 +86,50 @@ def install_web_hardening(
         status_code = 500
         outcome = "handled"
         try:
-            retry_after = limiter.check(
-                client_id=client_identity(request),
-                group=rate_limit_group(request),
-            )
-            if retry_after is not None:
+            group = rate_limit_group(request)
+            try:
+                retry_after = await limiter.check(
+                    client_id=(
+                        resolve_client_identity(request, identity_resolver)
+                        if settings.rate_limit_enabled
+                        else client_identity(request)
+                    ),
+                    group=group,
+                )
+            except RateLimitBackendUnavailable:
+                outcome = "rate_limit_backend_unavailable"
+                logger.exception(
+                    "Redis rate limiter unavailable; group=%s request_id=%s",
+                    group,
+                    request_id,
+                )
+                if group in RATE_LIMIT_FAIL_CLOSED_GROUPS:
+                    response = JSONResponse(
+                        {"detail": "请求保护服务暂时不可用，请稍后重试。"},
+                        status_code=503,
+                        headers={"Retry-After": "1"},
+                    )
+                    retry_after = None
+                else:
+                    response = None
+                    retry_after = None
+            if response is None and retry_after is not None:
                 outcome = "rate_limited"
                 response = JSONResponse(
                     {"detail": "请求过于频繁，请稍后再试。"},
                     status_code=429,
                     headers={"Retry-After": str(retry_after)},
                 )
-            elif csrf_failure := validate_csrf_request(
-                request,
-                settings=settings,
-                session_cookie_name=session_cookie_name,
+            elif response is None and (
+                csrf_failure := validate_csrf_request(
+                    request,
+                    settings=settings,
+                    session_cookie_name=session_cookie_name,
+                )
             ):
                 outcome = "csrf_rejected"
                 response = JSONResponse({"detail": csrf_failure}, status_code=403)
-            else:
+            elif response is None:
                 response = await call_next(request)
             status_code = response.status_code
             return response
@@ -118,46 +153,6 @@ def install_web_hardening(
                 outcome=outcome,
             )
             log_access(request, status_code, duration_ms)
-
-
-class InMemoryRateLimiter:
-    """进程内滑动窗口限流器，适合单机早期部署和测试。"""
-
-    def __init__(
-        self,
-        settings: WebSecuritySettings,
-        *,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
-        self.settings = settings
-        self.clock = clock
-        self._lock = threading.Lock()
-        self._buckets: dict[tuple[str, str], deque[float]] = defaultdict(deque)
-
-    def check(self, *, client_id: str, group: str) -> int | None:
-        """返回 None 表示放行；返回秒数表示应拒绝并告知 Retry-After。"""
-
-        if not self.settings.rate_limit_enabled:
-            return None
-        limit = self._limit_for_group(group)
-        window = float(self.settings.rate_limit_window_seconds)
-        now = self.clock()
-        key = (client_id, group)
-        with self._lock:
-            bucket = self._buckets[key]
-            cutoff = now - window
-            while bucket and bucket[0] <= cutoff:
-                bucket.popleft()
-            if len(bucket) >= limit:
-                retry_after = max(1, round(window - (now - bucket[0])))
-                return retry_after
-            bucket.append(now)
-        return None
-
-    def _limit_for_group(self, group: str) -> int:
-        if group == "auth":
-            return self.settings.rate_limit_auth_requests
-        return self.settings.rate_limit_default_requests
 
 
 class RequestMetrics:
@@ -237,10 +232,15 @@ class RequestMetrics:
                 "started_at": self.started_at,
                 "in_flight_requests": self._in_flight,
                 "total_requests": total_requests,
+                "total_duration_ms": self._total_duration_ms,
                 "error_requests": error_requests,
                 "average_duration_ms": average_duration_ms,
                 "max_duration_ms": self._max_duration_ms,
                 "rate_limited_requests": self._outcome_counts.get("rate_limited", 0),
+                "rate_limit_backend_errors": self._outcome_counts.get(
+                    "rate_limit_backend_unavailable",
+                    0,
+                ),
                 "csrf_rejected_requests": self._outcome_counts.get("csrf_rejected", 0),
                 "exception_requests": self._outcome_counts.get("exception", 0),
                 "status_counts": dict(sorted(self._status_counts.items())),
@@ -254,6 +254,134 @@ class RequestMetrics:
                 "outcome_counts": dict(sorted(self._outcome_counts.items())),
                 "recent_errors": list(self._recent_errors),
             }
+
+
+def format_prometheus_request_metrics(
+    snapshot: dict[str, object],
+    concurrency_snapshot: dict[str, object] | None = None,
+) -> str:
+    """把低敏请求和共享租约快照导出为 Prometheus 文本格式。"""
+
+    total_requests = int(snapshot.get("total_requests", 0))
+    total_duration_seconds = float(snapshot.get("total_duration_ms", 0)) / 1000
+    lines = [
+        "# HELP job_agent_http_requests_total Total HTTP requests handled by this Web process.",
+        "# TYPE job_agent_http_requests_total counter",
+        f"job_agent_http_requests_total {total_requests}",
+        "# HELP job_agent_http_requests_in_flight HTTP requests currently being handled.",
+        "# TYPE job_agent_http_requests_in_flight gauge",
+        f'job_agent_http_requests_in_flight {int(snapshot.get("in_flight_requests", 0))}',
+        "# HELP job_agent_http_request_duration_seconds Request duration for this Web process.",
+        "# TYPE job_agent_http_request_duration_seconds summary",
+        f"job_agent_http_request_duration_seconds_sum {_prometheus_number(total_duration_seconds)}",
+        f"job_agent_http_request_duration_seconds_count {total_requests}",
+        "# HELP job_agent_http_request_duration_max_seconds Maximum observed request duration.",
+        "# TYPE job_agent_http_request_duration_max_seconds gauge",
+        f'job_agent_http_request_duration_max_seconds {_prometheus_number(float(snapshot.get("max_duration_ms", 0)) / 1000)}',
+    ]
+    _append_labeled_counter(
+        lines,
+        name="job_agent_http_responses_total",
+        help_text="HTTP responses grouped by status family.",
+        label_name="status_family",
+        values=snapshot.get("status_counts"),
+    )
+    _append_labeled_counter(
+        lines,
+        name="job_agent_http_requests_by_method_total",
+        help_text="HTTP requests grouped by method.",
+        label_name="method",
+        values=snapshot.get("method_counts"),
+    )
+    _append_labeled_counter(
+        lines,
+        name="job_agent_http_endpoint_requests_total",
+        help_text="HTTP requests grouped by low-cardinality route template.",
+        label_name="endpoint",
+        values=snapshot.get("endpoint_counts"),
+    )
+    _append_labeled_counter(
+        lines,
+        name="job_agent_http_outcomes_total",
+        help_text="HTTP requests grouped by middleware outcome.",
+        label_name="outcome",
+        values=snapshot.get("outcome_counts"),
+    )
+    lines.extend(
+        [
+            "# HELP job_agent_security_rejections_total Requests rejected by an application security control.",
+            "# TYPE job_agent_security_rejections_total counter",
+            f'job_agent_security_rejections_total{{reason="rate_limit"}} {int(snapshot.get("rate_limited_requests", 0))}',
+            f'job_agent_security_rejections_total{{reason="csrf"}} {int(snapshot.get("csrf_rejected_requests", 0))}',
+            "# HELP job_agent_rate_limit_backend_errors_total Requests affected by an unavailable rate-limit backend.",
+            "# TYPE job_agent_rate_limit_backend_errors_total counter",
+            f'job_agent_rate_limit_backend_errors_total {int(snapshot.get("rate_limit_backend_errors", 0))}',
+        ]
+    )
+    _append_concurrency_metrics(lines, concurrency_snapshot)
+    return "\n".join(lines) + "\n"
+
+
+def _append_concurrency_metrics(
+    lines: list[str],
+    snapshot: dict[str, object] | None,
+) -> None:
+    """追加模型/截图租约的固定资源标签指标。"""
+
+    lines.extend(
+        [
+            "# HELP job_agent_concurrency_leases_acquired_total Shared lease acquisitions.",
+            "# TYPE job_agent_concurrency_leases_acquired_total counter",
+            "# HELP job_agent_concurrency_leases_rejected_total Shared lease requests rejected by capacity.",
+            "# TYPE job_agent_concurrency_leases_rejected_total counter",
+            "# HELP job_agent_concurrency_backend_errors_total Shared lease backend failures.",
+            "# TYPE job_agent_concurrency_backend_errors_total counter",
+            "# HELP job_agent_concurrency_release_errors_total Shared lease release failures.",
+            "# TYPE job_agent_concurrency_release_errors_total counter",
+            "# HELP job_agent_concurrency_leases_in_flight Shared leases currently held by this Web process.",
+            "# TYPE job_agent_concurrency_leases_in_flight gauge",
+        ]
+    )
+    resources: object = snapshot.get("resources") if isinstance(snapshot, dict) else None
+    if not isinstance(resources, dict):
+        return
+    for resource, raw_values in sorted(resources.items()):
+        if not isinstance(raw_values, dict):
+            continue
+        label = _escape_prometheus_label(str(resource))
+        lines.extend(
+            [
+                f'job_agent_concurrency_leases_acquired_total{{resource="{label}"}} {int(raw_values.get("acquired", 0))}',
+                f'job_agent_concurrency_leases_rejected_total{{resource="{label}"}} {int(raw_values.get("rejected", 0))}',
+                f'job_agent_concurrency_backend_errors_total{{resource="{label}"}} {int(raw_values.get("backend_errors", 0))}',
+                f'job_agent_concurrency_release_errors_total{{resource="{label}"}} {int(raw_values.get("release_errors", 0))}',
+                f'job_agent_concurrency_leases_in_flight{{resource="{label}"}} {int(raw_values.get("in_flight", 0))}',
+            ]
+        )
+
+
+def _append_labeled_counter(
+    lines: list[str],
+    *,
+    name: str,
+    help_text: str,
+    label_name: str,
+    values: object,
+) -> None:
+    lines.extend((f"# HELP {name} {help_text}", f"# TYPE {name} counter"))
+    if not isinstance(values, dict):
+        return
+    for label_value, count in values.items():
+        escaped = _escape_prometheus_label(str(label_value))
+        lines.append(f'{name}{{{label_name}="{escaped}"}} {int(count)}')
+
+
+def _escape_prometheus_label(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def _prometheus_number(value: float) -> str:
+    return format(value, ".12g")
 
 
 def validate_csrf_request(
@@ -328,8 +456,24 @@ def rate_limit_group(request: Request) -> str:
     """将请求归入限流组。"""
 
     path = request.url.path
-    if path in {"/api/auth/login", "/api/auth/register"}:
+    if path.startswith("/api/auth/"):
         return "auth"
+    if path.startswith("/api/admin/"):
+        return "admin"
+    if path in {
+        "/api/jobs/screenshots",
+        "/api/projects/github",
+        "/api/resumes/upload",
+    }:
+        return "upload"
+    if (
+        path in {"/api/chat", "/api/chat/stream", "/api/rag/search"}
+        or path.startswith("/api/matches/")
+        or (path.startswith("/api/resumes/") and path.endswith("/tailor"))
+    ):
+        return "model"
+    if request.method.upper() not in SAFE_METHODS:
+        return "write"
     return "default"
 
 
@@ -354,7 +498,20 @@ def route_template(request: Request) -> str:
 def client_identity(request: Request) -> str:
     """返回不依赖可伪造代理头的本地客户端标识。"""
 
-    return request.client.host if request.client and request.client.host else "unknown"
+    host = request.client.host if request.client and request.client.host else "unknown"
+    return f"ip:{host}"
+
+
+def resolve_client_identity(
+    request: Request,
+    identity_resolver: Callable[[Request], str] | None,
+) -> str:
+    """优先使用已认证账号标识，无法解析时退回可信网络来源。"""
+
+    if identity_resolver is None:
+        return client_identity(request)
+    resolved = identity_resolver(request).strip()
+    return resolved or client_identity(request)
 
 
 def log_access(request: Request, status_code: int, duration_ms: int) -> None:

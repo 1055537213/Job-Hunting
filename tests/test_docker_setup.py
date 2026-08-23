@@ -53,6 +53,11 @@ def test_compose_mounts_env_read_only_and_starts_postgres_before_web():
     assert "redis_data" in compose
     assert "redis:" in compose
     assert "JOB_AGENT_REDIS_URL" in compose
+    assert 'JOB_AGENT_RATE_LIMIT_BACKEND: "redis"' in compose
+    assert "JOB_AGENT_RATE_LIMIT_REDIS_URL" in compose
+    assert 'JOB_AGENT_CONCURRENCY_BACKEND: "redis"' in compose
+    assert compose.count("JOB_AGENT_CONCURRENCY_REDIS_URL") == 2
+    assert "@redis:6379/1" in compose
     assert "worker:" in compose
     assert "job-agent-worker" in compose
     assert "beat:" in compose
@@ -79,6 +84,16 @@ def test_development_compose_mounts_source_and_enables_web_reload():
     assert "/app/src" in development_compose
     assert "--db" not in development_compose
     assert "--rag-dir" not in development_compose
+
+
+def test_scale_validation_overlay_removes_the_fixed_web_host_port():
+    """临时扩容覆盖不得让多个 Web 副本争用宿主机 8000 端口。"""
+
+    scale_compose = (ROOT / "compose.scale-test.yaml").read_text(encoding="utf-8")
+
+    assert "web:" in scale_compose
+    assert "ports: !reset []" in scale_compose
+    assert "8000:8000" not in scale_compose
 
 
 def test_docker_learning_document_explains_stack_and_boundaries():

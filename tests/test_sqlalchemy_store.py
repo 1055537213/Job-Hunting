@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from threading import Barrier
 
 import pytest
 
@@ -14,6 +16,7 @@ from job_hunting_agent.models import (
     UsageEventRecord,
 )
 from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
+from job_hunting_agent.storage import IdempotencyConflictError
 
 
 def ledger_timestamp(index: int) -> str:
@@ -504,4 +507,238 @@ def test_background_task_and_admin_audit_are_committed_atomically(database_url, 
         )
 
     assert store.get_background_task_by_idempotency(actor.id, "probe-once") is None
+    store.close()
+
+
+def test_usage_call_id_rejects_cross_account_reuse(database_url):
+    """全局 call_id 不能被另一个账号复用，否则用量归属和扣费对象会被串改。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    first_account = store.create_account("usage-owner@example.com", "hashed-password")
+    other_account = store.create_account("usage-other@example.com", "hashed-password")
+    event = UsageEventRecord(
+        id=0,
+        account_id=first_account.id,
+        candidate_id=None,
+        session_id=None,
+        root_request_id="usage-owner-request",
+        call_id="globally-unique-call",
+        provider="test-provider",
+        model="test-model",
+        operation="agent_chat",
+        input_tokens=10,
+        output_tokens=5,
+        total_tokens=15,
+        usage_source="provider",
+        status="succeeded",
+        attempt=1,
+        provider_request_id=None,
+        raw_usage={"total_tokens": 15},
+        created_at="2026-08-23T00:00:00+00:00",
+        billable=False,
+        pricing_version="v1",
+    )
+    store.record_usage_event(event)
+
+    with pytest.raises(IdempotencyConflictError, match="另一笔用量记录"):
+        store.record_usage_event(replace(event, account_id=other_account.id))
+
+    assert store.summarize_usage(first_account.id)["event_count"] == 1
+    assert store.summarize_usage(other_account.id)["event_count"] == 0
+    store.close()
+
+
+def test_concurrent_usage_reconciliation_deducts_balance_once(database_url, monkeypatch):
+    """已存在但未扣费的用量被并发重放时，只能产生一笔消费流水。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    account = store.create_account("usage-race@example.com", "hashed-password")
+    store.create_simulated_recharge_order(
+        account.id,
+        1,
+        idempotency_key="usage-race-funding",
+        description="并发扣费测试充值",
+    )
+    event = UsageEventRecord(
+        id=0,
+        account_id=account.id,
+        candidate_id=None,
+        session_id=None,
+        root_request_id="usage-race-request",
+        call_id="usage-race-call",
+        provider="test-provider",
+        model="test-model",
+        operation="agent_chat",
+        input_tokens=24,
+        output_tokens=16,
+        total_tokens=40,
+        usage_source="provider",
+        status="succeeded",
+        attempt=1,
+        provider_request_id=None,
+        raw_usage={"total_tokens": 40},
+        created_at="2026-08-23T00:00:00+00:00",
+        billable=True,
+        pricing_version="v1",
+    )
+    store.record_usage_event(replace(event, billable=False))
+    with store.connect() as conn:
+        conn.execute("UPDATE usage_events SET billable = ? WHERE call_id = ?", (True, event.call_id))
+
+    original_lock = store._lock_account_billing_row
+    lock_barrier = Barrier(2)
+
+    def synchronized_lock(conn, account_id):
+        lock_barrier.wait(timeout=5)
+        return original_lock(conn, account_id)
+
+    monkeypatch.setattr(store, "_lock_account_billing_row", synchronized_lock)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        records = list(executor.map(lambda _: store.record_usage_event(event), range(2)))
+
+    summary = store.get_account_balance_summary(account.id)
+    ledger = store.list_account_balance_ledger(account.id, limit=10)
+    consumption = [entry for entry in ledger if entry.entry_kind == "consumption"]
+    assert records[0].id == records[1].id
+    assert len(consumption) == 1
+    assert summary.balance_micro_yuan == 1_000_000 - (40 * 25)
+    assert summary.total_consumed_micro_yuan == 40 * 25
+    store.close()
+
+
+def test_admin_manual_credit_is_idempotent_and_audited(database_url):
+    """管理员可为任意账号补款，重复请求不重复到账且不伪装成真实充值。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    actor = store.create_account("credit-admin@example.com", "hashed-password", role="admin")
+    target = store.create_account("credit-target@example.com", "hashed-password")
+    store.update_account_status(target.id, "disabled")
+    before = store.get_account_balance_summary(target.id)
+    event = AdminAuditEventRecord(
+        id=0,
+        actor_account_id=actor.id,
+        target_account_id=target.id,
+        action="balance.manual_credit",
+        target_type="account_balance",
+        target_id=str(target.id),
+        outcome="succeeded",
+        summary="管理员人工补款。",
+        request_id="manual-credit-request-1",
+    )
+
+    first = store.credit_account_balance_with_audit(
+        target.id,
+        25,
+        actor_account_id=actor.id,
+        reason="支付异常人工补款",
+        idempotency_key="manual-credit-idempotency-1",
+        audit_event=event,
+    )
+    duplicate = store.credit_account_balance_with_audit(
+        target.id,
+        25,
+        actor_account_id=actor.id,
+        reason="支付异常人工补款",
+        idempotency_key="manual-credit-idempotency-1",
+        audit_event=event,
+    )
+    after = store.get_account_balance_summary(target.id)
+    audit_events = store.list_admin_audit_events(limit=10)
+
+    assert duplicate.id == first.id
+    assert first.entry_kind == "adjustment"
+    assert first.operator_account_id == actor.id
+    assert first.recharge_order_id is None
+    assert first.details["reason"] == "支付异常人工补款"
+    assert after.balance_micro_yuan == before.balance_micro_yuan + 25_000_000
+    assert after.total_recharge_micro_yuan == before.total_recharge_micro_yuan
+    assert [item.action for item in audit_events].count("balance.manual_credit") == 1
+    with pytest.raises(IdempotencyConflictError, match="另一笔管理员补款"):
+        store.credit_account_balance_with_audit(
+            target.id,
+            30,
+            actor_account_id=actor.id,
+            reason="改用不同金额",
+            idempotency_key="manual-credit-idempotency-1",
+            audit_event=event,
+        )
+    store.close()
+
+
+def test_admin_manual_credit_rolls_back_when_audit_fails(database_url, monkeypatch):
+    """管理员补款的审计写入失败时，余额和流水均不得提交。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    actor = store.create_account("credit-rollback-admin@example.com", "hashed-password", role="admin")
+    target = store.create_account("credit-rollback-target@example.com", "hashed-password")
+    before = store.get_account_balance_summary(target.id)
+    event = AdminAuditEventRecord(
+        id=0,
+        actor_account_id=actor.id,
+        target_account_id=target.id,
+        action="balance.manual_credit",
+        target_type="account_balance",
+        target_id=str(target.id),
+        outcome="succeeded",
+        summary="管理员人工补款。",
+    )
+
+    def fail_audit_insert(*_args, **_kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(store, "_insert_admin_audit_event", fail_audit_insert)
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        store.credit_account_balance_with_audit(
+            target.id,
+            10,
+            actor_account_id=actor.id,
+            reason="支付失败补款",
+            idempotency_key="manual-credit-rollback-1",
+            audit_event=event,
+        )
+
+    after = store.get_account_balance_summary(target.id)
+    assert after.balance_micro_yuan == before.balance_micro_yuan
+    assert after.ledger_entry_count == before.ledger_entry_count
+    store.close()
+
+
+def test_simulated_recharge_creates_order_payment_event_and_single_credit(database_url):
+    """开发模拟充值也必须经过订单、支付事件和幂等到账链路。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    account = store.create_account("simulated-order@example.com", "hashed-password")
+    before = store.get_account_balance_summary(account.id)
+
+    first_order, first_entry = store.create_simulated_recharge_order(
+        account.id,
+        12.5,
+        idempotency_key="simulated-recharge-key-1",
+        description="测试模拟充值",
+    )
+    duplicate_order, duplicate_entry = store.create_simulated_recharge_order(
+        account.id,
+        12.5,
+        idempotency_key="simulated-recharge-key-1",
+        description="测试模拟充值",
+    )
+    after = store.get_account_balance_summary(account.id)
+    events = store.list_payment_events(first_order.id)
+
+    assert duplicate_order.id == first_order.id
+    assert duplicate_entry.id == first_entry.id
+    assert first_order.status == "paid"
+    assert first_order.payment_provider == "simulated"
+    assert first_entry.recharge_order_id == first_order.id
+    assert after.balance_micro_yuan == before.balance_micro_yuan + 12_500_000
+    assert after.total_recharge_micro_yuan == before.total_recharge_micro_yuan + 12_500_000
+    assert len(events) == 1
+    assert events[0].processing_status == "processed"
+    assert events[0].signature_valid is True
+    assert len(events[0].payload_sha256) == 64
     store.close()

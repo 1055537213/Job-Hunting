@@ -123,7 +123,11 @@ docker compose logs worker
 
 ```text
 http://127.0.0.1:8000
+http://127.0.0.1:9090
 ```
+
+第二个地址是本地 Prometheus。`/targets` 用于确认 Web 采集目标是否为 `UP`，`/alerts`
+用于查看五条请求告警当前处于 inactive、pending 还是 firing。Alertmanager 暂未启用。
 
 ## 本机直接运行 Python
 
@@ -143,6 +147,9 @@ JOB_AGENT_OBJECT_STORAGE_BUCKET=job-agent-files
 JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY=replace-with-minio-access-key
 JOB_AGENT_OBJECT_STORAGE_SECRET_KEY=replace-with-a-strong-minio-secret
 JOB_AGENT_REDIS_PASSWORD=replace-with-a-strong-redis-password
+# 宿主机 Web 需要共享限流时再开启；单进程开发默认使用 memory。
+JOB_AGENT_RATE_LIMIT_BACKEND=redis
+JOB_AGENT_RATE_LIMIT_REDIS_URL=redis://:replace-with-a-strong-redis-password@127.0.0.1:6379/1
 ```
 
 ```powershell
@@ -151,6 +158,7 @@ E:\Anaconda\envs\langchain1.2\python.exe -m job_hunting_agent.web --env-file .en
 ```
 
 Docker 中的 Web 不使用这个 `127.0.0.1` 地址，Compose 会将其覆盖为 `postgres` 服务名。
+Compose 还会把 Web 限流后端切换为 Redis：数据库 `0` 用于 Celery，数据库 `1` 用于带 TTL 的请求窗口。
 
 ## 常用操作
 
