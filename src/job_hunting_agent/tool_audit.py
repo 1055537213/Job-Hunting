@@ -24,6 +24,7 @@ TOOL_STEP_LABELS = {
     "create_tailored_resume_from_upload": "生成职位定制简历",
     "resume_ocr": "识别扫描版简历",
     "rag_index": "更新 RAG 检索索引",
+    "resume_export": "生成职位定制简历文件",
     "github_project_analysis": "分析 GitHub 项目",
     "system_probe": "检查 Worker 连通性",
     "compose_reply": "整理回复",
@@ -43,6 +44,7 @@ def background_task_tool_name(task_type: str) -> str:
         "github_project_analysis": "github_project_analysis",
         "resume_ocr": "resume_ocr",
         "rag_index": "rag_index",
+        "resume_export": "resume_export",
         "system_probe": "system_probe",
     }
     return aliases.get(task_type, task_type or "background_task")
@@ -82,6 +84,7 @@ def tool_trace_title(tool_names: list[str]) -> str:
         ("analyze_github_project_for_candidate", "分析项目经历"),
         ("github_project_analysis", "分析 GitHub 项目"),
         ("resume_ocr", "识别扫描版简历"),
+        ("resume_export", "生成职位定制简历文件"),
         ("rag_index", "更新 RAG 检索索引"),
         ("confirm_project_card", "确认项目经历"),
         ("match_all_jobs_for_candidate", "职位匹配分析"),

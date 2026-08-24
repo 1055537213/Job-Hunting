@@ -492,6 +492,68 @@ def test_web_upload_enqueues_ocr_for_scanned_pdf_when_worker_is_enabled(tmp_path
     assert queue.enqueued == [payload["task"]["task_key"]]
 
 
+def test_web_tailor_enqueues_resume_export_when_worker_is_enabled(tmp_path) -> None:
+    """队列模式下网页只登记简历导出任务，不在 Web 请求中初始化模型。"""
+
+    class FakeQueue:
+        """记录任务键的最小 Worker 队列替身。"""
+
+        def __init__(self) -> None:
+            self.enqueued: list[str] = []
+
+        def health_check(self) -> None:
+            """测试替身始终可用。"""
+
+        def enqueue(self, task_key: str) -> None:
+            """记录一次任务投递。"""
+
+            self.enqueued.append(task_key)
+
+    queue = FakeQueue()
+    web_app = create_web_app(
+        resume_dir=tmp_path / "resume-files",
+        task_queue=queue,
+        resume_llm_client=StaticLLMClient("Web 不应在请求中调用模型"),
+    )
+    client = TestClient(web_app)
+    register_and_login(client, "async-tailor@example.com")
+    candidate_id = create_profile_over_web(client)
+    job = client.post(
+        "/api/jobs",
+        json={
+            "raw_text": "Python 后端开发工程师\n职位描述：负责 FastAPI 后端接口开发。",
+        },
+    ).json()["job"]
+    upload_response = client.post(
+        "/api/resumes/upload",
+        data={"candidate_id": str(candidate_id)},
+        files={
+            "file": (
+                "resume.docx",
+                build_docx_bytes(
+                    "Python 后端项目经历，负责 FastAPI 接口开发和 PostgreSQL 数据处理。"
+                ),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+    assert upload_response.status_code == 200, upload_response.text
+    uploaded = upload_response.json()["artifact"]
+
+    response = client.post(
+        f"/api/resumes/{uploaded['id']}/tailor",
+        json={"job_id": job["id"], "use_rag": False},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["processing_async"] is True
+    assert payload["task"]["task_type"] == "resume_export"
+    assert payload["task"]["status"] == "queued"
+    assert queue.enqueued[-1] == payload["task"]["task_key"]
+    assert len(queue.enqueued) == 2
+
+
 def test_tailored_resume_creates_docx_and_pdf_without_overwriting_profile_or_source(tmp_path) -> None:
     """职位改写应产出独立草稿和可下载文件，原简历与结构化档案保持不变。"""
 

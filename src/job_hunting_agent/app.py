@@ -79,6 +79,7 @@ from .sqlalchemy_store import SQLAlchemyStore
 from .task_queue import (
     GITHUB_PROJECT_ANALYSIS_TASK_TYPE,
     RAG_INDEX_TASK_TYPE,
+    RESUME_EXPORT_TASK_TYPE,
     RESUME_OCR_TASK_TYPE,
     BackgroundTaskQueue,
     CeleryTaskQueue,
@@ -384,6 +385,47 @@ class JobHuntingApp:
         return self.enqueue_background_task(
             account_id=account_id,
             task_type=GITHUB_PROJECT_ANALYSIS_TASK_TYPE,
+            payload=payload,
+            candidate_id=candidate_id,
+            session_id=session_id,
+            idempotency_key=idempotency_key,
+        )
+
+    def enqueue_resume_export_task(
+        self,
+        *,
+        source_artifact_id: int,
+        job_id: int,
+        account_id: int,
+        candidate_id: int,
+        use_rag: bool = True,
+        session_id: str | None = None,
+        root_request_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> BackgroundTaskRecord:
+        """登记职位定制简历任务，只把受控资源 ID 放入 PostgreSQL payload。"""
+
+        source = self.store.get_resume_artifact(source_artifact_id, account_id=account_id)
+        if source.candidate_id != candidate_id or source.artifact_type != "source":
+            raise ValueError("只能使用当前候选人的原始上传简历生成职位定制版本。")
+        if source.status != "ready":
+            raise ValueError("原始简历仍在 OCR 解析或解析失败，暂时不能生成定制版本。")
+        self.store.get_job(job_id, account_id=account_id)
+        if idempotency_key is None:
+            idempotency_key = (
+                f"resume-export:{candidate_id}:{source_artifact_id}:{job_id}:"
+                f"{int(bool(use_rag))}"
+            )
+        payload: dict[str, object] = {
+            "source_artifact_id": source_artifact_id,
+            "job_id": job_id,
+            "use_rag": bool(use_rag),
+        }
+        if root_request_id:
+            payload["root_request_id"] = str(root_request_id)
+        return self.enqueue_background_task(
+            account_id=account_id,
+            task_type=RESUME_EXPORT_TASK_TYPE,
             payload=payload,
             candidate_id=candidate_id,
             session_id=session_id,
@@ -1038,6 +1080,9 @@ class JobHuntingApp:
         use_rag: bool = True,
         allow_proficiency_upgrade: bool = False,
         account_id: int | None = None,
+        generation_key: str | None = None,
+        session_id: str | None = None,
+        root_request_id: str | None = None,
     ) -> TailoredResumeResult:
         """基于上传简历和职位生成独立草稿、DOCX 与 PDF 文件版本。"""
 
@@ -1048,14 +1093,43 @@ class JobHuntingApp:
             raise ValueError("只能使用当前候选人的原始上传简历生成职位定制版本。")
         if source.status != "ready":
             raise ValueError("原始简历仍在 OCR 解析或解析失败，暂时不能生成定制版本。")
-        source_text = self.store.get_resume_artifact_text(source.id, account_id=account_id)
-        confirmed_project_cards = [
-            record
-            for record in self.store.list_project_cards(candidate_id, account_id=account_id)
-            if record.status == "已确认"
-        ]
+
+        existing_draft = (
+            self.store.get_resume_draft_by_generation_key(
+                generation_key,
+                account_id=account_id,
+            )
+            if generation_key
+            else None
+        )
+        existing_generated_files = {
+            media_type: artifact
+            for media_type in (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "application/pdf",
+            )
+            if generation_key
+            for artifact in [
+                self.store.get_resume_artifact_by_generation_key(
+                    f"{generation_key}:{media_type.rsplit('/', 1)[-1].replace('.', '-')}",
+                    account_id=account_id,
+                )
+            ]
+            if artifact is not None
+        }
+        if existing_draft is not None and len(existing_generated_files) == 2:
+            return TailoredResumeResult(
+                draft=existing_draft,
+                artifacts=list(existing_generated_files.values()),
+            )
+
+        source_text = (
+            self.store.get_resume_artifact_text(source.id, account_id=account_id)
+            if existing_draft is None
+            else ""
+        )
         semantic_evidence: list[str] = []
-        if use_rag:
+        if existing_draft is None and use_rag:
             query = rag_query or f"{job.title}\n{job.description_text}\n{source_text[:2_000]}"
             semantic_evidence = [
                 format_rag_evidence(result)
@@ -1069,24 +1143,38 @@ class JobHuntingApp:
                         "resume_artifact",
                     ],
                     account_id=account_id,
+                    candidate_id=candidate_id,
+                    session_id=session_id,
+                    root_request_id=root_request_id,
                 )
             ]
 
-        draft = build_resume_draft(
-            candidate,
-            job,
-            confirmed_project_cards,
-            llm_client,
-            semantic_evidence,
-            source_resume_text=source_text,
-            allow_proficiency_upgrade=allow_proficiency_upgrade,
-        )
-        draft_record = self.store.save_resume_draft(
-            candidate_id,
-            job_id,
-            draft,
-            account_id=account_id,
-        )
+        if existing_draft is None:
+            confirmed_project_cards = [
+                record
+                for record in self.store.list_project_cards(candidate_id, account_id=account_id)
+                if record.status == "已确认"
+            ]
+            draft = build_resume_draft(
+                candidate,
+                job,
+                confirmed_project_cards,
+                llm_client,
+                semantic_evidence,
+                source_resume_text=source_text,
+                allow_proficiency_upgrade=allow_proficiency_upgrade,
+            )
+            draft_record = self.store.save_resume_draft(
+                candidate_id,
+                job_id,
+                draft,
+                account_id=account_id,
+                generation_key=generation_key,
+            )
+        else:
+            # 任务在文件写入阶段中断后，重试复用已有草稿，不再次调用模型或扣费。
+            draft_record = existing_draft
+            draft = existing_draft.draft
         generated_files = export_tailored_resume_files(
             candidate_name=candidate.name,
             job_title=job.title,
@@ -1096,8 +1184,25 @@ class JobHuntingApp:
 
         saved_files = []
         saved_records: list[ResumeArtifactRecord] = []
+        created_records: list[ResumeArtifactRecord] = []
         try:
             for generated in generated_files:
+                artifact_generation_key = (
+                    f"{generation_key}:{generated.media_type.rsplit('/', 1)[-1].replace('.', '-')}"
+                    if generation_key
+                    else None
+                )
+                existing_artifact = (
+                    self.store.get_resume_artifact_by_generation_key(
+                        artifact_generation_key,
+                        account_id=account_id,
+                    )
+                    if artifact_generation_key
+                    else None
+                )
+                if existing_artifact is not None:
+                    saved_records.append(existing_artifact)
+                    continue
                 stored = self.resume_files.save(
                     account_id=account_id,
                     candidate_id=candidate_id,
@@ -1106,31 +1211,37 @@ class JobHuntingApp:
                     media_type=generated.media_type,
                 )
                 saved_files.append(stored)
-                saved_records.append(
-                    self.store.save_resume_artifact(
-                        account_id=account_id,
-                        candidate_id=candidate_id,
-                        job_id=job_id,
-                        draft_id=draft_record.id,
-                        parent_artifact_id=source.id,
-                        version=draft_record.version,
-                        artifact_type="tailored",
-                        original_filename=source.original_filename,
-                        download_filename=generated.filename,
-                        storage_key=stored.storage_key,
-                        media_type=generated.media_type,
-                        file_size=stored.file_size,
-                        sha256=stored.sha256,
-                        extraction_method="generated",
-                        extracted_text=draft.content,
-                        page_count=None,
-                        register_long_text=False,
-                    )
+                saved_record = self.store.save_resume_artifact(
+                    account_id=account_id,
+                    candidate_id=candidate_id,
+                    job_id=job_id,
+                    draft_id=draft_record.id,
+                    parent_artifact_id=source.id,
+                    version=draft_record.version,
+                    artifact_type="tailored",
+                    original_filename=source.original_filename,
+                    download_filename=generated.filename,
+                    storage_key=stored.storage_key,
+                    media_type=generated.media_type,
+                    file_size=stored.file_size,
+                    sha256=stored.sha256,
+                    extraction_method="generated",
+                    extracted_text=draft.content,
+                    page_count=None,
+                    register_long_text=False,
+                    generation_key=artifact_generation_key,
                 )
+                saved_records.append(saved_record)
+                if artifact_generation_key and saved_record.storage_key != stored.storage_key:
+                    # 并发重试中另一 Worker 先登记了同一个文件，清理本次孤立对象。
+                    self.resume_files.delete(stored.storage_key)
+                    saved_files.pop()
+                else:
+                    created_records.append(saved_record)
         except Exception:
             # 两种导出格式视为一个业务结果；任一失败时补偿删除本批元数据和二进制。
             self.store.delete_resume_artifacts(
-                [record.id for record in saved_records],
+                [record.id for record in created_records],
                 account_id=account_id,
             )
             for stored in saved_files:
@@ -1185,16 +1296,25 @@ class JobHuntingApp:
         top_k: int = 5,
         entity_types: list[str] | None = None,
         account_id: int | None = None,
+        candidate_id: int | None = None,
+        session_id: str | None = None,
+        root_request_id: str | None = None,
     ) -> list[RAGSearchResult]:
         """从当前 RAG 后端检索带来源、账号隔离的证据片段。"""
 
         call_context = self.model_gateway.new_call_context(
             "embedding_query",
             account_id=account_id,
+            candidate_id=candidate_id,
+            session_id=session_id,
+            root_request_id=root_request_id,
         )
         rerank_context = self.model_gateway.new_call_context(
             "rerank_query",
             account_id=account_id,
+            candidate_id=candidate_id,
+            session_id=session_id,
+            root_request_id=root_request_id,
         )
         knowledge_base = self._rag_knowledge_base(
             embeddings=self.model_gateway.embeddings(call_context),

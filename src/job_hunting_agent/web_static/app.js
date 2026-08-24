@@ -257,8 +257,10 @@ if (!window.Vue) {
         // 当前页面正在跟踪的后台 RAG 任务；任务事实仍以 PostgreSQL API 返回值为准。
         backgroundTasks: {},
         ragTaskByArtifact: {},
+        resumeExportTaskByArtifact: {},
         ragTaskPollers: {},
         ragTaskNotified: {},
+        resumeExportTaskNotified: {},
         projectTaskPollers: {},
         projectTaskNotified: {},
         sending: false,
@@ -2890,6 +2892,17 @@ if (!window.Vue) {
 
       /** 把 OCR 或 RAG 后台任务状态转换成页面上的短标签。 */
       ragTaskStatus(artifact) {
+        const exportTaskKey = this.resumeExportTaskByArtifact[artifact?.id];
+        const exportTask = exportTaskKey ? this.backgroundTasks[exportTaskKey] : null;
+        if (exportTask) {
+          return {
+            queued: `定制简历排队中 ${exportTask.progress}%`,
+            running: `定制简历生成中 ${exportTask.progress}%`,
+            succeeded: "定制简历已完成",
+            failed: "定制简历失败",
+            cancelled: "定制简历已取消",
+          }[exportTask.status] || "定制简历状态未知";
+        }
         const taskKey = this.ragTaskByArtifact[artifact?.id];
         const task = taskKey ? this.backgroundTasks[taskKey] : null;
         if (!task) {
@@ -2907,6 +2920,45 @@ if (!window.Vue) {
         }[task.status] || `${taskName} 状态未知`;
       },
 
+      /** 返回当前账号和候选人对应的定制简历任务恢复索引。 */
+      resumeExportTaskStorageKey(candidateId = this.currentProfileId) {
+        return `pendingResumeExportTasks:${this.auth.account?.id || "legacy"}:${candidateId}`;
+      },
+
+      /** 保存定制简历任务键，确保刷新页面后不会丢失生成状态。 */
+      rememberResumeExportTask(taskKey, artifactId, jobId) {
+        if (!taskKey) return;
+        const key = this.resumeExportTaskStorageKey();
+        let entries = [];
+        try {
+          entries = JSON.parse(localStorage.getItem(key) || "[]");
+        } catch (_error) {
+          entries = [];
+        }
+        const next = entries.filter((entry) => entry?.task_key !== taskKey);
+        next.push({
+          task_key: taskKey,
+          artifact_id: Number(artifactId || 0),
+          job_id: Number(jobId || 0),
+        });
+        localStorage.setItem(key, JSON.stringify(next.slice(-20)));
+      },
+
+      /** 定制简历任务结束后从刷新恢复索引中移除任务键。 */
+      forgetResumeExportTask(taskKey, candidateId = this.currentProfileId) {
+        if (!taskKey) return;
+        const key = this.resumeExportTaskStorageKey(candidateId);
+        let entries = [];
+        try {
+          entries = JSON.parse(localStorage.getItem(key) || "[]");
+        } catch (_error) {
+          entries = [];
+        }
+        const next = entries.filter((entry) => entry?.task_key !== taskKey);
+        if (next.length) localStorage.setItem(key, JSON.stringify(next));
+        else localStorage.removeItem(key);
+      },
+
       /** 轮询一个后台任务；OCR 完成后自动继续轮询其创建的 RAG 任务。 */
       async pollBackgroundTask(taskKey, artifactName = "简历", candidateId = this.currentProfileId) {
         if (!taskKey || this.ragTaskPollers[taskKey]) return;
@@ -2917,6 +2969,42 @@ if (!window.Vue) {
             this.backgroundTasks[taskKey] = task;
             if (["succeeded", "failed", "cancelled"].includes(task.status)) {
               delete this.ragTaskPollers[taskKey];
+              const exportEntry = Object.entries(this.resumeExportTaskByArtifact).find(
+                ([_artifactId, key]) => key === taskKey
+              );
+              if (exportEntry) {
+                const exportArtifactId = Number(exportEntry[0]);
+                delete this.resumeExportTaskByArtifact[exportArtifactId];
+                this.forgetResumeExportTask(taskKey, candidateId);
+                if (this.tailoringArtifactId === exportArtifactId) {
+                  this.tailoringArtifactId = 0;
+                }
+                if (this.currentProfileId === Number(candidateId) && !this.resumeExportTaskNotified[taskKey]) {
+                  this.resumeExportTaskNotified[taskKey] = true;
+                  if (task.status === "succeeded") {
+                    await this.loadResumeArtifacts();
+                    const artifactIds = new Set(
+                      (task.result?.artifact_ids || []).map((id) => Number(id))
+                    );
+                    const links = this.resumeArtifacts
+                      .filter((item) => artifactIds.has(Number(item.id)))
+                      .map((item) => `- [下载 ${this.resumeFileExtension(item)}](${item.download_url})`)
+                      .join("\n");
+                    const fallbackWarning = task.result?.llm_discarded
+                      ? "\n\n模型改写未通过真实性检查，当前文件使用了保守回退内容。"
+                      : "";
+                    this.appendAssistant(
+                      `已生成职位定制简历。\n\n${links || "文件已生成，请在简历文件列表中下载。"}${fallbackWarning}`
+                    );
+                  } else {
+                    this.appendAssistant(
+                      `职位定制简历${task.status === "cancelled" ? "已取消" : "生成失败"}：${task.error_summary || "请稍后重试。"}`,
+                      true
+                    );
+                  }
+                }
+                return;
+              }
               this.forgetRagTask(taskKey, candidateId);
               if (task.status === "succeeded" && task.task_type === "resume_ocr") {
                 if (this.currentProfileId === Number(candidateId)) {
@@ -2984,6 +3072,32 @@ if (!window.Vue) {
           if (!entry?.task_key) continue;
           if (entry.artifact_id) this.ragTaskByArtifact[entry.artifact_id] = entry.task_key;
           const artifact = this.resumeArtifacts.find((item) => item.id === Number(entry.artifact_id));
+          this.pollBackgroundTask(
+            entry.task_key,
+            artifact?.download_filename || "简历",
+            this.currentProfileId
+          );
+        }
+      },
+
+      /** 页面刷新或切换档案后恢复仍在排队/执行的定制简历任务。 */
+      resumePendingResumeExportTasks() {
+        if (!this.currentProfileId) return;
+        const key = this.resumeExportTaskStorageKey();
+        let entries = [];
+        try {
+          entries = JSON.parse(localStorage.getItem(key) || "[]");
+        } catch (_error) {
+          entries = [];
+        }
+        for (const entry of entries) {
+          if (!entry?.task_key) continue;
+          const artifactId = Number(entry.artifact_id || 0);
+          if (artifactId) {
+            this.resumeExportTaskByArtifact[artifactId] = entry.task_key;
+            this.tailoringArtifactId = artifactId;
+          }
+          const artifact = this.resumeArtifacts.find((item) => Number(item.id) === artifactId);
           this.pollBackgroundTask(
             entry.task_key,
             artifact?.download_filename || "简历",
@@ -3637,6 +3751,7 @@ if (!window.Vue) {
           }
           this.resumeJobSelections = nextSelections;
           this.resumePendingRagTasks();
+          this.resumePendingResumeExportTasks();
         } catch (error) {
           this.resumeArtifacts = [];
           this.resumeError = error.message || "简历列表加载失败。";
@@ -3678,6 +3793,7 @@ if (!window.Vue) {
 
         this.tailoringArtifactId = artifact.id;
         this.resumeError = "";
+        let processingAsync = false;
         try {
           const data = await this.requestJson(`/api/resumes/${artifact.id}/tailor`, {
             method: "POST",
@@ -3686,6 +3802,18 @@ if (!window.Vue) {
               use_rag: true,
             }),
           });
+          if (data.processing_async && data.task?.task_key) {
+            processingAsync = true;
+            const taskKey = data.task.task_key;
+            this.backgroundTasks[taskKey] = data.task;
+            this.resumeExportTaskByArtifact[artifact.id] = taskKey;
+            this.rememberResumeExportTask(taskKey, artifact.id, jobId);
+            this.appendAssistant(
+              `已提交 **${this.jobTitle(jobId)}** 的职位定制简历生成任务（${data.task.progress || 0}%）。`
+            );
+            await this.pollBackgroundTask(taskKey, artifact.download_filename, this.currentProfileId);
+            return;
+          }
           await this.loadResumeArtifacts();
           const links = (data.artifacts || [])
             .map((item) => `- [下载 ${this.resumeFileExtension(item)}](${item.download_url})`)
@@ -3700,7 +3828,7 @@ if (!window.Vue) {
           this.resumeError = error.message || "职位定制简历生成失败。";
           this.appendAssistant(this.resumeError, true);
         } finally {
-          this.tailoringArtifactId = 0;
+          if (!processingAsync) this.tailoringArtifactId = 0;
         }
       },
 

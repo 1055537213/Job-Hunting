@@ -311,6 +311,8 @@ resume_drafts = sa.Table(
     sa.Column("status", sa.String(64), nullable=False),
     sa.Column("draft_json", json_type, nullable=False),
     sa.Column("created_at", timestamp_type, nullable=False),
+    # Worker 重试时复用已经保存的草稿，避免同一导出任务产生多个版本。
+    sa.Column("generation_key", sa.String(128)),
     sa.UniqueConstraint(
         "candidate_id",
         "job_id",
@@ -318,6 +320,7 @@ resume_drafts = sa.Table(
         name="uq_resume_drafts_candidate_job_version",
     ),
     sa.CheckConstraint("version > 0", name="resume_drafts_version_positive"),
+    sa.UniqueConstraint("generation_key", name="uq_resume_drafts_generation_key"),
 )
 sa.Index("idx_resume_drafts_owner", resume_drafts.c.account_id, resume_drafts.c.candidate_id, resume_drafts.c.id)
 
@@ -362,7 +365,10 @@ resume_artifacts = sa.Table(
     sa.Column("long_text_id", sa.Integer, sa.ForeignKey("long_texts.id", ondelete="SET NULL")),
     sa.Column("created_at", timestamp_type, nullable=False),
     sa.Column("content_fingerprint", sa.String(64)),
+    # 同一后台任务的 DOCX/PDF 各自使用一个键，重试时不会重复登记文件。
+    sa.Column("generation_key", sa.String(128)),
     sa.UniqueConstraint("storage_key", name="uq_resume_artifacts_storage_key"),
+    sa.UniqueConstraint("generation_key", name="uq_resume_artifacts_generation_key"),
     sa.UniqueConstraint(
         "candidate_id",
         "content_fingerprint",

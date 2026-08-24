@@ -4,7 +4,15 @@
 
 一个面向求职准备场景的多账号 Agent 工作台。系统将候选人档案、职位、项目经历、简历文件和对话记忆组织为可追溯事实，并通过 LangChain Agent、RAG 与后台任务完成职位匹配、材料整理和定制简历生成。
 
+> 当前项目处于个人开发者的企业化演进阶段，已具备 Docker Compose、PostgreSQL、pgvector、Redis、Celery、对象存储、计费流水、Prometheus 和 CI 基线。真实支付、恶意文件扫描、集中日志和分布式 Trace 仍属于上线前工作。
+
 ## 1. 项目简介
+
+### 1.1 项目是什么
+
+求职助手 Agent 是一个带有多账号隔离能力的求职材料管理和分析系统。候选人可以在工作台中维护多个候选人档案，导入职位和项目证据，和 Agent 对话更新档案事实，并针对目标职位生成独立的定制简历版本。
+
+### 1.2 项目解决什么问题
 
 求职过程中，个人信息、职位要求、项目经历和简历版本通常分散在不同位置，直接让模型自由生成又容易混入未经确认的内容。本项目解决以下问题：
 
@@ -17,9 +25,11 @@
 
 PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis 只传递任务键。系统不会自动登录 BOSS、抓取隐藏接口、投递简历或发送招聘消息。
 
-## 2. 页面预览
+## 2. 在线演示 / 效果截图
 
-仓库暂未提供公开在线环境。本地启动后可访问：
+### 2.1 在线演示
+
+当前没有公开线上演示环境。启动本地 Docker Compose 后，可以访问以下页面：
 
 | 页面 | 地址 | 用途 |
 | --- | --- | --- |
@@ -29,7 +39,17 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 | 管理后台 | `http://127.0.0.1:8000/admin` | 账号用量、人工补款、余额账本、工具轨迹、请求观测和管理员审计 |
 | Swagger | `http://127.0.0.1:8000/docs` | 交互式 API 文档 |
 
-前端是随 FastAPI 一起发布的 Vue 单页应用，不需要单独启动 Node 开发服务器。
+前端是随 FastAPI 一起发布的 Vue 单页应用，不需要单独启动 Node 开发服务器。仓库暂未提交公开部署截图，页面效果以本地运行结果和上表地址为准。
+
+### 2.2 页面流程
+
+1. 从登录页注册或登录账号。
+2. 进入工作台建立候选人档案。
+3. 通过文本或职位截图导入职位信息。
+4. 导入公开 GitHub 项目或上传原始简历。
+5. 在 Agent 对话中进行职位匹配、档案维护和材料整理。
+6. 生成职位定制简历时查看任务状态，并在完成后下载 DOCX/PDF 文件。
+7. 管理员从后台查看账号余额、Token 用量、工具调用流程、请求指标和审计记录。
 
 ## 3. 功能清单
 
@@ -64,6 +84,7 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 - 结构化事实与长文本索引分离，Embedding 身份变化时不会混用旧向量。
 - 检索先做账号与候选人过滤，再进行余弦相似度召回，可选 Rerank。
 - Celery 任务支持幂等键、原子认领、进度、有限重试、错误摘要和刷新后恢复。
+- 队列开启时定制简历的模型、RAG、DOCX/PDF 生成均在 Worker 中执行；草稿和两个导出文件使用任务级幂等键，重试不会重复扣费或生成版本。
 - Docker Web 使用 Redis 原子滑动窗口共享认证、模型、上传、管理和写请求额度，增加 Web 进程不会重复获得限流配额。
 - Web 与 Worker 使用 Redis 租约共享 Chat、Embedding、Rerank 和截图并发额度，并按账号限制模型占用。
 - 管理后台展示账号余额、消费流水、Token 明细、工具调用流程、请求指标和管理员审计；管理员可为自己或任意账号执行有原因、有操作者记录的人工补款。
@@ -80,7 +101,7 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 | 模型网关 | Chat、Embedding、Rerank adapters | 调用上下文、有限重试、供应商 usage 和幂等计费 |
 | 数据 | PostgreSQL 16、SQLAlchemy、Alembic | 权威事实、事务、约束、账号隔离和版本化迁移 |
 | RAG | pgvector、LangChain Text Splitters | 文本切片、向量索引、余弦召回和可选重排 |
-| 异步任务 | Celery、Redis、Celery Beat | OCR、RAG 索引、GitHub 分析和周期维护 |
+| 异步任务 | Celery、Redis、Celery Beat | OCR、RAG 索引、GitHub 分析、定制简历导出和周期维护 |
 | 文件 | MinIO / S3、python-docx、ReportLab | 原始简历和导出文件的对象存储与生成 |
 | 文档识别 | pdfplumber、PDFium、RapidOCR、ONNX Runtime | DOCX/PDF 解析、扫描件检测和 OCR |
 | 工程 | Docker Compose、Caddy、GitHub Actions | 本地复现、单机生产基线、HTTPS 和持续集成 |
@@ -291,7 +312,7 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 | 项目 | `POST /api/projects/{record_id}/confirm` | 保存用户确认的项目内容 |
 | 项目 | `GET /api/projects`、`DELETE /api/projects/{record_id}` | 列出或级联删除项目证据 |
 | 简历 | `POST /api/resumes/upload` | 上传 DOCX/PDF 原始简历 |
-| 简历 | `POST /api/resumes/{artifact_id}/tailor` | 生成职位定制简历 |
+| 简历 | `POST /api/resumes/{artifact_id}/tailor` | 提交职位定制简历任务；队列开启时返回 `task`，关闭时同步返回文件 |
 | 简历 | `GET /api/resumes/{artifact_id}/download` | 鉴权下载简历文件 |
 | RAG | `GET /api/rag/search` | 账号隔离的检索调试接口 |
 | 余额 | `GET /api/me/balance` | 当前账号余额与分页流水 |
@@ -355,12 +376,12 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 - [x] 完成 Web 多副本流量验证、Caddy 动态后端发现与 Prometheus 多实例采集。
 - [x] 将生产/Compose 的短期 Agent 状态迁移到 PostgreSQL 聊天历史，避免副本切换时依赖单进程内存。
 - [x] 为 Chat、Embedding 和 Rerank 增加超时、有限重试和进程内熔断；熔断期间统一返回可重试的 503。
-- [ ] 将定制简历导出迁移到 Worker，并补充大文件和高并发容量测试。
+- [x] 将定制简历导出迁移到 Worker，并用任务级幂等键保护重试；上线前仍需补充大文件和高并发容量测试。
 - [ ] 建立严格类型检查基线，逐步消化第三方 stub 和内部 Protocol 类型债务。
 - [ ] 完成依赖与镜像漏洞扫描、渗透测试、灾难恢复演练和密钥轮换流程。
 - [ ] 在确定正式 Embedding 模型后评估 pgvector HNSW/IVFFlat 索引参数。
 
-## 11. 联系方式与声明
+## 11. 联系方式 / 声明
 
 - 问题反馈：[GitHub Issues](https://github.com/1055537213/Job-Hunting/issues)
 - 架构边界：[CONTEXT.md](CONTEXT.md)、[DECISION_MAP.md](DECISION_MAP.md) 和 [ADR](docs/adr/)

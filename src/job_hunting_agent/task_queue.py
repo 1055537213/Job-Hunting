@@ -22,6 +22,8 @@ RAG_INDEX_TASK_TYPE = "rag_index"
 RESUME_OCR_TASK_TYPE = "resume_ocr"
 # 公开 GitHub 仓库分析会下载受限归档并生成待确认项目经历卡片。
 GITHUB_PROJECT_ANALYSIS_TASK_TYPE = "github_project_analysis"
+# 定制简历的模型改写和 DOCX/PDF 导出在 Worker 中执行。
+RESUME_EXPORT_TASK_TYPE = "resume_export"
 
 
 class TaskQueueError(RuntimeError):

@@ -18,6 +18,7 @@ from job_hunting_agent.background_tasks import (
     run_registered_task,
 )
 from job_hunting_agent.config import TaskQueueSettings, load_task_queue_settings
+from job_hunting_agent.llm import StaticLLMClient
 from job_hunting_agent.models import (
     CandidateProfileInput,
     RAGIndexStats,
@@ -603,3 +604,110 @@ def test_resume_ocr_task_creates_follow_up_rag_task(
     assert rag_task.payload == {"long_text_ids": [42], "root_request_id": "ocr-request-123"}
     assert len(producer.calls) == 2
     assert all("scan.pdf" not in str(call) for call in producer.calls)
+
+
+def test_resume_export_task_runs_in_worker_and_is_retry_safe(
+    database_url: str,
+    account_id: int,
+    tmp_path: Path,
+) -> None:
+    """定制简历任务只传资源 ID，并在重试时复用同一草稿和两个文件。"""
+
+    producer = FakeCeleryProducer()
+    resume_store = ResumeFileStore(tmp_path / "resumes")
+    app = JobHuntingApp(
+        database_url=database_url,
+        object_storage=resume_store,
+        task_queue=CeleryTaskQueue(
+            TaskQueueSettings(enabled=True, redis_url="redis://:secret@redis:6379/0"),
+            celery_app=producer,
+        ),
+        semantic_matching=False,
+    )
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="导出测试候选人",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={"Python": "项目使用"},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=["Python 后端开发"],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+    job = app.import_job_text(
+        "Python 后端开发工程师\n职位描述：负责 FastAPI 接口开发。",
+        account_id=account_id,
+    )
+    stored = resume_store.save(
+        account_id=account_id,
+        candidate_id=candidate_id,
+        filename="resume.docx",
+        content=b"source resume",
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    source = app.store.save_resume_artifact(
+        account_id=account_id,
+        candidate_id=candidate_id,
+        job_id=None,
+        artifact_type="source",
+        original_filename="resume.docx",
+        download_filename="resume.docx",
+        storage_key=stored.storage_key,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        file_size=stored.file_size,
+        sha256=stored.sha256,
+        extraction_method="docx",
+        extracted_text="Python 与 FastAPI 项目经历",
+        page_count=None,
+    )
+    llm_calls = 0
+
+    def fake_llm(_context):
+        nonlocal llm_calls
+        llm_calls += 1
+        return StaticLLMClient(
+            "# 导出测试候选人\n\n## 求职目标\nPython 后端开发工程师\n\n## 项目经历\n- 使用 Python 与 FastAPI 开发接口。"
+        )
+
+    app.model_gateway.llm_client = fake_llm  # type: ignore[method-assign]
+    task = app.enqueue_resume_export_task(
+        source_artifact_id=source.id,
+        job_id=job.id,
+        account_id=account_id,
+        candidate_id=candidate_id,
+        use_rag=False,
+        root_request_id="resume-export-request-123",
+    )
+
+    completed = run_registered_task(app, task.task_key)
+
+    assert completed["status"] == "succeeded"
+    assert llm_calls == 1
+    saved_task = app.get_background_task(task.task_key, account_id=account_id)
+    assert saved_task.result["artifact_count"] == 2
+    generated = [
+        artifact
+        for artifact in app.list_resume_artifacts(candidate_id, account_id=account_id)
+        if artifact.artifact_type == "tailored"
+    ]
+    assert len(generated) == 2
+    assert len(app.store.list_resume_drafts(candidate_id, account_id=account_id)) == 1
+
+    repeated = app.create_tailored_resume_from_artifact(
+        candidate_id=candidate_id,
+        source_artifact_id=source.id,
+        job_id=job.id,
+        llm_client=StaticLLMClient("should not be called"),
+        use_rag=False,
+        account_id=account_id,
+        generation_key=task.task_key,
+    )
+
+    assert {artifact.id for artifact in repeated.artifacts} == {artifact.id for artifact in generated}
+    assert len(app.store.list_resume_drafts(candidate_id, account_id=account_id)) == 1
+    assert all("source resume" not in str(call) for call in producer.calls)

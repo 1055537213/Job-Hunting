@@ -254,7 +254,7 @@ def test_zero_starting_balance_migration_preserves_user_recharge(temporary_datab
     finally:
         engine.dispose()
 
-    assert version == "20260823_0009"
+        assert version == latest_database_revision()
     assert balance["balance_micro_yuan"] == 20_000_000
     assert balance["total_recharge_micro_yuan"] == 20_000_000
     assert [(row["entry_kind"], row["amount_micro_yuan"]) for row in ledger] == [

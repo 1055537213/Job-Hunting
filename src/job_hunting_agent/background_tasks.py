@@ -1,8 +1,8 @@
 """后台任务执行器与 Celery 注册。
 
 Web 只登记受控资源 ID，Worker 在独立进程中读取 PostgreSQL 事实源并执行耗时操作。
-当前已接入 ``system_probe``、``resume_ocr``、``rag_index`` 和公开 GitHub 项目分析；
-简历导出会继续沿用同一任务边界逐个迁移。
+当前已接入 ``system_probe``、``resume_ocr``、``rag_index``、公开 GitHub 项目分析
+和定制简历导出。
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from .github_project import (
     InvalidGitHubRepositoryUrlError,
     normalize_public_github_repository_url,
 )
+from .llm import LLMRequestError
 from .models import BackgroundTaskRecord
 from .model_resilience import ModelCircuitOpenError, is_transient_model_error
 from .rag import RAGProviderRequestError
@@ -31,6 +32,7 @@ from .task_queue import (
     GITHUB_PROJECT_ANALYSIS_TASK_TYPE,
     OPERATIONAL_LEDGER_RETENTION_TASK_NAME,
     RAG_INDEX_TASK_TYPE,
+    RESUME_EXPORT_TASK_TYPE,
     RESUME_OCR_TASK_TYPE,
 )
 from .tool_audit import (
@@ -211,6 +213,10 @@ def background_task_error_policy(error: Exception, task_type: str) -> tuple[str,
         return INSUFFICIENT_BALANCE_MESSAGE, False
     if isinstance(error, ModelCircuitOpenError):
         return "模型服务暂时不可用，任务将在稍后自动重试。", True
+    if isinstance(error, LLMRequestError):
+        if task_type == RESUME_EXPORT_TASK_TYPE:
+            return "定制简历模型请求暂时失败，任务将在稍后自动重试。", True
+        return "模型请求暂时失败，任务将在稍后自动重试。", True
     if isinstance(error, RAGProviderRequestError):
         if is_transient_model_error(error):
             return "向量模型服务暂时不可用，任务将在稍后自动重试。", True
@@ -219,6 +225,8 @@ def background_task_error_policy(error: Exception, task_type: str) -> tuple[str,
         return "扫描版 PDF OCR 失败，请确认文件清晰且未加密后重试。", True
     if task_type == GITHUB_PROJECT_ANALYSIS_TASK_TYPE:
         return "GitHub 仓库分析失败，请确认仓库公开可访问且未超出分析限制。", True
+    if task_type == RESUME_EXPORT_TASK_TYPE:
+        return "定制简历文件生成失败，任务将在稍后自动重试。", True
     return f"任务执行异常：{type(error).__name__}", True
 
 
@@ -292,6 +300,41 @@ def _github_project_task_payload(record: BackgroundTaskRecord) -> tuple[str, str
             raise NonRetryableTaskError("GitHub 项目分析任务包含无效请求链路 ID。")
         root_request_id = root_request_id.strip()[:128]
     return repository_url, root_request_id
+
+
+def _resume_export_task_payload(
+    record: BackgroundTaskRecord,
+) -> tuple[int, int, bool, str | None]:
+    """校验简历导出任务只携带源简历、职位和链路 ID。"""
+
+    def positive_int(key: str, label: str) -> int:
+        raw_value = record.payload.get(key)
+        if isinstance(raw_value, bool):
+            raise NonRetryableTaskError(f"简历导出任务包含无效{label}。")
+        if isinstance(raw_value, int):
+            value = raw_value
+        elif isinstance(raw_value, str) and raw_value.strip().isdigit():
+            value = int(raw_value.strip())
+        else:
+            raise NonRetryableTaskError(f"简历导出任务缺少有效{label}。")
+        if value <= 0:
+            raise NonRetryableTaskError(f"简历导出任务包含无效{label}。")
+        return value
+
+    use_rag = record.payload.get("use_rag", True)
+    if not isinstance(use_rag, bool):
+        raise NonRetryableTaskError("简历导出任务包含无效 RAG 开关。")
+    root_request_id = record.payload.get("root_request_id")
+    if root_request_id is not None:
+        if not isinstance(root_request_id, str) or not root_request_id.strip():
+            raise NonRetryableTaskError("简历导出任务包含无效请求链路 ID。")
+        root_request_id = root_request_id.strip()[:128]
+    return (
+        positive_int("source_artifact_id", "源简历 ID"),
+        positive_int("job_id", "职位 ID"),
+        use_rag,
+        root_request_id,
+    )
 
 
 def _mark_resume_ocr_artifact_failed(backend: JobHuntingApp, task_key: str) -> None:
@@ -462,6 +505,89 @@ def run_registered_task(
                 "project_card_id": project_card.id,
                 "project_name": project_card.card.project_name,
                 "source_url": project_card.card.source_url,
+            },
+            finish_attempt=True,
+        )
+        return {
+            "task_key": completed.task_key,
+            "status": completed.status,
+            "result": completed.result,
+        }
+
+    if record.task_type == RESUME_EXPORT_TASK_TYPE:
+        source_artifact_id, job_id, use_rag, root_request_id = _resume_export_task_payload(record)
+        if record.candidate_id is None:
+            raise NonRetryableTaskError("简历导出任务缺少候选人归属。")
+        try:
+            source = backend.store.get_resume_artifact(
+                source_artifact_id,
+                account_id=record.account_id,
+            )
+            if source.candidate_id != record.candidate_id or source.artifact_type != "source":
+                raise ValueError("源简历归属不一致。")
+        except (KeyError, ValueError) as error:
+            raise NonRetryableTaskError("简历导出任务引用的原始简历不存在或归属无效。") from error
+
+        # 模型、RAG 和文件生成全部在 Worker 内执行；重试使用 task_key 作为生成幂等键。
+        backend.store.update_background_task_progress(task_key, 10)
+        try:
+            call_context = backend.model_gateway.new_call_context(
+                "resume_document_rewrite",
+                account_id=record.account_id,
+                candidate_id=record.candidate_id,
+                session_id=record.session_id,
+                root_request_id=root_request_id or record.task_key,
+            )
+            llm_client = backend.model_gateway.llm_client(call_context)
+        except ValueError as error:
+            raise NonRetryableTaskError("简历改写模型未就绪，请检查模型配置。") from error
+        try:
+            result = backend.create_tailored_resume_from_artifact(
+                candidate_id=record.candidate_id,
+                source_artifact_id=source.id,
+                job_id=job_id,
+                llm_client=llm_client,
+                use_rag=use_rag,
+                allow_proficiency_upgrade=False,
+                account_id=record.account_id,
+                session_id=record.session_id,
+                root_request_id=root_request_id or record.task_key,
+                generation_key=record.task_key,
+            )
+        except InsufficientBalanceError:
+            # 余额异常由统一策略转换为固定用户提示，不能自动重试扣费。
+            raise
+        except (KeyError, ValueError) as error:
+            # 资源状态或参数错误不会因重试自动恢复。
+            raise NonRetryableTaskError("简历导出任务的资源状态无效，请刷新后重试。") from error
+        backend.store.update_background_task_progress(task_key, 90)
+        artifact_ids = [artifact.id for artifact in result.artifacts]
+        completed = backend.store.complete_background_task(
+            task_key,
+            {
+                "draft_id": result.draft.id,
+                "artifact_ids": artifact_ids,
+                "artifact_count": len(artifact_ids),
+                "source_artifact_id": source.id,
+                "job_id": job_id,
+                "llm_discarded": result.draft.draft.llm_discarded,
+            },
+            clear_idempotency_key=True,
+        )
+        _record_background_task_trace(
+            backend,
+            completed,
+            step_status="completed",
+            trace_status="completed",
+            attempt_status="completed",
+            summary="定制简历 DOCX/PDF 已生成",
+            result={
+                "ok": True,
+                "task_key": completed.task_key,
+                "task_type": completed.task_type,
+                "status": completed.status,
+                "draft_id": result.draft.id,
+                "artifact_ids": artifact_ids,
             },
             finish_attempt=True,
         )

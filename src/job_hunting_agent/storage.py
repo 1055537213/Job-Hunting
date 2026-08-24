@@ -3226,52 +3226,125 @@ class RepositoryStore:
         job_id: int,
         draft: ResumeDraft,
         account_id: int | None = None,
+        generation_key: str | None = None,
     ) -> ResumeDraftRecord:
         """保存一个职位定制简历草稿版本。
 
         草稿版本单独保存，不会更新候选人档案，也不会覆盖历史版本。
         """
 
-        created_at = now_iso()
+        if generation_key:
+            with self.connect() as conn:
+                if account_id is None:
+                    existing = conn.execute(
+                        "SELECT * FROM resume_drafts WHERE generation_key = ?",
+                        (generation_key,),
+                    ).fetchone()
+                else:
+                    existing = conn.execute(
+                        """
+                        SELECT * FROM resume_drafts
+                        WHERE generation_key = ? AND account_id = ?
+                        """,
+                        (generation_key, account_id),
+                    ).fetchone()
+            if existing is not None:
+                existing_record = self._resume_draft_from_row(existing)
+                if (
+                    existing_record.candidate_id != candidate_id
+                    or existing_record.job_id != job_id
+                ):
+                    raise ValueError("简历生成任务幂等键与资源归属不一致。")
+                return existing_record
+
+        try:
+            created_at = now_iso()
+            with self.connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT COALESCE(MAX(version), 0) AS latest_version
+                    FROM resume_drafts
+                    WHERE candidate_id = ? AND job_id = ?
+                    """,
+                    (candidate_id, job_id),
+                ).fetchone()
+                version = int(row["latest_version"]) + 1
+                cursor = conn.execute(
+                    """
+                    INSERT INTO resume_drafts (
+                        account_id, candidate_id, job_id, version, status, draft_json, created_at,
+                        generation_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        account_id,
+                        candidate_id,
+                        job_id,
+                        version,
+                        "需候选人确认",
+                        json.dumps(asdict(draft), ensure_ascii=False),
+                        created_at,
+                        generation_key,
+                    ),
+                )
+                record_id = int(cursor.lastrowid)
+                # 草稿全文进入 long_texts，后续可以用于“比较不同版本”或向量检索，
+                # 但它的 entity_type 明确标记为草稿，不会被当成档案事实。
+                self._add_long_text(
+                    conn,
+                    "resume_draft",
+                    record_id,
+                    f"v{version}",
+                    draft.content,
+                    account_id=account_id,
+                    candidate_id=candidate_id,
+                )
+            return self.get_resume_draft(record_id, account_id=account_id)
+        except Exception as error:
+            if generation_key and is_unique_constraint_violation(
+                error,
+                "uq_resume_drafts_generation_key",
+            ):
+                with self.connect() as conn:
+                    if account_id is None:
+                        existing = conn.execute(
+                            "SELECT * FROM resume_drafts WHERE generation_key = ?",
+                            (generation_key,),
+                        ).fetchone()
+                    else:
+                        existing = conn.execute(
+                            """
+                            SELECT * FROM resume_drafts
+                            WHERE generation_key = ? AND account_id = ?
+                            """,
+                            (generation_key, account_id),
+                        ).fetchone()
+                if existing is not None:
+                    return self._resume_draft_from_row(existing)
+            raise
+
+    def get_resume_draft_by_generation_key(
+        self,
+        generation_key: str,
+        account_id: int | None = None,
+    ) -> ResumeDraftRecord | None:
+        """读取 Worker 导出任务已经保存的草稿，供重试恢复使用。"""
+
         with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT COALESCE(MAX(version), 0) AS latest_version
-                FROM resume_drafts
-                WHERE candidate_id = ? AND job_id = ?
-                """,
-                (candidate_id, job_id),
-            ).fetchone()
-            version = int(row["latest_version"]) + 1
-            cursor = conn.execute(
-                """
-                INSERT INTO resume_drafts (
-                    account_id, candidate_id, job_id, version, status, draft_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    account_id,
-                    candidate_id,
-                    job_id,
-                    version,
-                    "需候选人确认",
-                    json.dumps(asdict(draft), ensure_ascii=False),
-                    created_at,
-                ),
-            )
-            record_id = int(cursor.lastrowid)
-            # 草稿全文进入 long_texts，后续可以用于“比较不同版本”或向量检索，
-            # 但它的 entity_type 明确标记为草稿，不会被当成档案事实。
-            self._add_long_text(
-                conn,
-                "resume_draft",
-                record_id,
-                f"v{version}",
-                draft.content,
-                account_id=account_id,
-                candidate_id=candidate_id,
-            )
-        return self.get_resume_draft(record_id, account_id=account_id)
+            if account_id is None:
+                row = conn.execute(
+                    "SELECT * FROM resume_drafts WHERE generation_key = ?",
+                    (generation_key,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT * FROM resume_drafts
+                    WHERE generation_key = ? AND account_id = ?
+                    """,
+                    (generation_key, account_id),
+                ).fetchone()
+        return self._resume_draft_from_row(row) if row is not None else None
 
     def get_resume_draft(
         self,
@@ -3363,6 +3436,7 @@ class RepositoryStore:
         version: int | None = None,
         status: str = "ready",
         register_long_text: bool = False,
+        generation_key: str | None = None,
     ) -> ResumeArtifactRecord:
         """保存一份简历文件元数据，可选地同时登记 RAG 长文本来源。
 
@@ -3389,6 +3463,19 @@ class RepositoryStore:
             if parent.candidate_id != candidate_id:
                 raise ValueError("派生简历与源简历必须属于同一候选人。")
 
+        if generation_key:
+            existing = self.get_resume_artifact_by_generation_key(
+                generation_key,
+                account_id=account_id,
+            )
+            if existing is not None:
+                if (
+                    existing.candidate_id != candidate_id
+                    or existing.draft_id != draft_id
+                ):
+                    raise ValueError("简历文件生成任务幂等键与资源归属不一致。")
+                return existing
+
         fingerprint = sha256 if artifact_type == "source" else None
         if fingerprint and self.find_resume_source_by_content_fingerprint(account_id, candidate_id, fingerprint) is not None:
             raise DuplicateResourceError("简历")
@@ -3414,8 +3501,8 @@ class RepositoryStore:
                         version, artifact_type, original_filename, download_filename,
                         storage_key, media_type, file_size, sha256, extraction_method,
                         extracted_text, text_length, page_count, status, long_text_id, created_at,
-                        content_fingerprint
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        content_fingerprint, generation_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         account_id,
@@ -3439,6 +3526,7 @@ class RepositoryStore:
                         None,
                         created_at,
                         fingerprint,
+                        generation_key,
                     ),
                 )
                 artifact_id = int(cursor.lastrowid)
@@ -3459,8 +3547,41 @@ class RepositoryStore:
         except Exception as error:
             if is_unique_constraint_violation(error, "uq_resume_artifacts_candidate_content_fingerprint"):
                 raise DuplicateResourceError("简历") from error
+            if generation_key and is_unique_constraint_violation(
+                error,
+                "uq_resume_artifacts_generation_key",
+            ):
+                existing = self.get_resume_artifact_by_generation_key(
+                    generation_key,
+                    account_id=account_id,
+                )
+                if existing is not None:
+                    return existing
             raise
         return self.get_resume_artifact(artifact_id, account_id=account_id)
+
+    def get_resume_artifact_by_generation_key(
+        self,
+        generation_key: str,
+        account_id: int | None = None,
+    ) -> ResumeArtifactRecord | None:
+        """读取 Worker 导出任务已经登记的文件，供重试恢复使用。"""
+
+        with self.connect() as conn:
+            if account_id is None:
+                row = conn.execute(
+                    "SELECT * FROM resume_artifacts WHERE generation_key = ?",
+                    (generation_key,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT * FROM resume_artifacts
+                    WHERE generation_key = ? AND account_id = ?
+                    """,
+                    (generation_key, account_id),
+                ).fetchone()
+        return self._resume_artifact_from_row(row) if row is not None else None
 
     def find_resume_source_by_content_fingerprint(
         self,

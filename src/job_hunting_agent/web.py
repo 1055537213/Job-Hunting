@@ -1629,13 +1629,43 @@ def create_web_app(
         except KeyError as error:
             raise HTTPException(status_code=404, detail="原始简历文件不存在。") from error
 
+        request_id = uuid.uuid4().hex
+        session_id = f"resume-web-{source.candidate_id}"
+        if backend.task_queue_enabled:
+            try:
+                task = backend.enqueue_resume_export_task(
+                    source_artifact_id=source.id,
+                    job_id=payload.job_id,
+                    account_id=account_id or 0,
+                    candidate_id=source.candidate_id,
+                    use_rag=payload.use_rag,
+                    session_id=session_id,
+                    root_request_id=request_id,
+                )
+            except KeyError as error:
+                raise HTTPException(status_code=404, detail="职位、候选人或简历文件不存在。") from error
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+            except TaskQueueError as error:
+                raise HTTPException(
+                    status_code=503,
+                    detail="简历生成任务暂时无法排队，请稍后重试。",
+                    headers={"Retry-After": "3"},
+                ) from error
+            task_root_request_id = task.payload.get("root_request_id")
+            return {
+                "processing_async": True,
+                "artifact_id": source.id,
+                "root_request_id": task_root_request_id or request_id,
+                "task": serialize_background_task(task),
+            }
+
         active_llm = resume_llm_client
         if active_llm is None:
-            request_id = uuid.uuid4().hex
             context = {
                 "candidate_id": source.candidate_id,
                 "account_id": account_id,
-                "session_id": f"resume-web-{source.candidate_id}",
+                "session_id": session_id,
                 "root_request_id": request_id,
                 "use_tool_llm": True,
                 "default_auto_rag": True,
@@ -1663,6 +1693,8 @@ def create_web_app(
                 # 网页按钮始终采用档案熟练度；一次性放宽只允许 Agent 完成风险确认后调用。
                 allow_proficiency_upgrade=False,
                 account_id=account_id,
+                session_id=session_id,
+                root_request_id=request_id,
             )
         except KeyError as error:
             raise HTTPException(status_code=404, detail="职位、候选人或简历文件不存在。") from error
