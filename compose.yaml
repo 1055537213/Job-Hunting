@@ -126,6 +126,8 @@ services:
       # 模型和截图占位与限流共用 Redis DB 1，但使用独立键前缀。
       JOB_AGENT_CONCURRENCY_BACKEND: "redis"
       JOB_AGENT_CONCURRENCY_REDIS_URL: "redis://:${JOB_AGENT_REDIS_PASSWORD:?set JOB_AGENT_REDIS_PASSWORD in .env}@redis:6379/1"
+      # Agent 短期上下文使用 PostgreSQL 聊天历史，避免 Web 副本各自持有 MemorySaver。
+      JOB_AGENT_MEMORY_CHECKPOINT_BACKEND: "database"
     ports:
       # 显式只绑定 IPv4 回环，避免 Windows/Docker 的 IPv6 localhost 转发异常。
       - "127.0.0.1:8000:8000"

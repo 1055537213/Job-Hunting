@@ -22,6 +22,7 @@ from PIL import Image, UnidentifiedImageError
 from .job_parser import validate_job_text
 from .concurrency_control import ConcurrencyControlError
 from .llm import LLMRequestError, extract_message_text
+from .model_resilience import ModelCircuitOpenError
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +115,7 @@ class JobScreenshotExtractor:
                 temperature=0,
                 account_id=context.account_id,
             ).invoke([build_screenshot_message(normalized)])
-        except ConcurrencyControlError:
+        except (ConcurrencyControlError, ModelCircuitOpenError):
             raise
         except Exception as error:
             raise JobScreenshotModelError(

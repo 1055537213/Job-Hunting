@@ -51,6 +51,8 @@ class ModelGatewaySettings:
     chat_max_retries: int = 2
     embedding_max_retries: int = 2
     rerank_max_retries: int = 2
+    chat_circuit_failure_threshold: int = 5
+    chat_circuit_recovery_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -238,6 +240,7 @@ class AgentMemorySettings:
     """
 
     enabled: bool = True
+    checkpoint_backend: str = "database"
     restore_history_limit: int = 200
     restore_trigger_tokens: int = 12000
     restore_keep_messages: int = 24
@@ -394,6 +397,14 @@ def load_model_gateway_settings(
         rerank_max_retries=parse_non_negative_int(
             get("JOB_AGENT_MODEL_GATEWAY_RERANK_MAX_RETRIES", default="2"),
             "JOB_AGENT_MODEL_GATEWAY_RERANK_MAX_RETRIES",
+        ),
+        chat_circuit_failure_threshold=parse_positive_int(
+            get("JOB_AGENT_MODEL_CIRCUIT_FAILURE_THRESHOLD", default="5"),
+            "JOB_AGENT_MODEL_CIRCUIT_FAILURE_THRESHOLD",
+        ),
+        chat_circuit_recovery_seconds=parse_positive_float(
+            get("JOB_AGENT_MODEL_CIRCUIT_RECOVERY_SECONDS", default="30"),
+            "JOB_AGENT_MODEL_CIRCUIT_RECOVERY_SECONDS",
         ),
     )
 
@@ -1218,8 +1229,14 @@ def load_agent_memory_settings(
         return default
 
     enabled = parse_bool(get("JOB_AGENT_MEMORY_ENABLED", default="true"))
+    checkpoint_backend = (
+        get("JOB_AGENT_MEMORY_CHECKPOINT_BACKEND", default="database") or "database"
+    ).strip().lower()
+    if checkpoint_backend not in {"database", "memory"}:
+        raise ValueError("JOB_AGENT_MEMORY_CHECKPOINT_BACKEND 只能是 database 或 memory")
     return AgentMemorySettings(
         enabled=enabled,
+        checkpoint_backend=checkpoint_backend,
         restore_history_limit=parse_positive_int(
             get("JOB_AGENT_MEMORY_RESTORE_HISTORY_LIMIT", default="200"),
             "JOB_AGENT_MEMORY_RESTORE_HISTORY_LIMIT",
@@ -1298,6 +1315,7 @@ def masked_agent_memory_settings(settings: AgentMemorySettings) -> dict[str, obj
 
     return {
         "enabled": settings.enabled,
+        "checkpoint_backend": settings.checkpoint_backend,
         "restore_history_limit": settings.restore_history_limit,
         "restore_trigger_tokens": settings.restore_trigger_tokens,
         "restore_keep_messages": settings.restore_keep_messages,

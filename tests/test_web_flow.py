@@ -733,6 +733,8 @@ def test_web_health_reports_enabled_memory_as_configured(tmp_path):
 
     assert health.status_code == 200
     assert health.json()["memory"]["configured"] is True
+    assert health.json()["memory"]["checkpoint_backend"] == "database"
+    assert health.json()["model_circuit"]["state"] in {"not_started", "closed"}
     assert "billing" in health.json()
     assert isinstance(health.json()["billing"]["configured"], bool)
 

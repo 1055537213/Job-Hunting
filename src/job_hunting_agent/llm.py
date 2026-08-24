@@ -23,6 +23,7 @@ from langchain_openai import ChatOpenAI
 
 from .config import LLMSettings
 from .concurrency_control import ConcurrencyControlError
+from .model_resilience import ModelCircuitOpenError
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,8 @@ class LangChainLLMClient:
 
         try:
             response = self.model.invoke(prompt)
+        except ModelCircuitOpenError:
+            raise
         except ConcurrencyControlError:
             raise
         except Exception as error:

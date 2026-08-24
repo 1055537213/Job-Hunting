@@ -44,6 +44,7 @@ from .config import (
 )
 from .llm import LangChainLLMClient, LLMClient, build_chat_model
 from .models import UsageEventRecord
+from .model_resilience import CircuitBreaker, ModelCircuitCallbackHandler
 from .rag import (
     Reranker,
     RerankResult,
@@ -274,6 +275,7 @@ class ModelGateway:
         self._rerank_settings = rerank_settings
         self._settings = settings
         self.concurrency_controller = concurrency_controller
+        self._chat_circuit_breaker: CircuitBreaker | None = None
 
     @property
     def settings(self) -> ModelGatewaySettings:
@@ -352,20 +354,43 @@ class ModelGateway:
         """
 
         normalize_operation(operation)
-        callbacks = None
+        if self._chat_circuit_breaker is None:
+            gateway_settings = self.settings
+            self._chat_circuit_breaker = CircuitBreaker(
+                failure_threshold=gateway_settings.chat_circuit_failure_threshold,
+                recovery_seconds=gateway_settings.chat_circuit_recovery_seconds,
+            )
+        callbacks = [ModelCircuitCallbackHandler(self._chat_circuit_breaker)]
         if self.concurrency_controller is not None:
-            callbacks = [
+            callbacks.append(
                 ModelConcurrencyCallbackHandler(
                     self.concurrency_controller,
                     account_id=account_id,
                 )
-            ]
+            )
         return build_chat_model(
             self.llm_settings,
             temperature=temperature,
             max_retries=self.settings.chat_max_retries,
             callbacks=callbacks,
         )
+
+    def circuit_snapshot(self) -> dict[str, object]:
+        """返回主聊天模型熔断状态，不触发惰性模型配置加载。"""
+
+        breaker = self._chat_circuit_breaker
+        if breaker is None:
+            return {
+                "state": "not_started",
+                "consecutive_failures": 0,
+                "retry_after_seconds": 0,
+            }
+        snapshot = breaker.snapshot()
+        return {
+            "state": snapshot.state,
+            "consecutive_failures": snapshot.consecutive_failures,
+            "retry_after_seconds": snapshot.retry_after_seconds,
+        }
 
     def llm_client(self, context: ModelCallContext, temperature: float = 0) -> LLMClient:
         """返回适合单次 prompt 场景的业务级 LLM 客户端。"""

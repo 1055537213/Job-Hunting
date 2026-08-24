@@ -233,6 +233,7 @@ def test_load_agent_memory_settings_reads_context_thresholds(tmp_path):
     settings = load_agent_memory_settings(env_file, environ={})
 
     assert settings.enabled is True
+    assert settings.checkpoint_backend == "database"
     assert settings.restore_history_limit == 80
     assert settings.restore_trigger_tokens == 3000
     assert settings.restore_keep_messages == 12
@@ -240,3 +241,24 @@ def test_load_agent_memory_settings_reads_context_thresholds(tmp_path):
     assert settings.summary_trigger_tokens == 4000
     assert settings.summary_keep_messages == 16
     assert settings.summary_trim_tokens == 2000
+
+
+def test_load_agent_memory_settings_accepts_process_memory_backend(tmp_path):
+    """进程内记忆只能通过显式配置启用，供离线测试和本地调试使用。"""
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("JOB_AGENT_MEMORY_CHECKPOINT_BACKEND=memory\n", encoding="utf-8")
+
+    settings = load_agent_memory_settings(env_file, environ={})
+
+    assert settings.checkpoint_backend == "memory"
+
+
+def test_load_agent_memory_settings_rejects_unknown_checkpoint_backend(tmp_path):
+    """未知记忆后端必须在启动配置阶段失败。"""
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("JOB_AGENT_MEMORY_CHECKPOINT_BACKEND=unknown\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="database 或 memory"):
+        load_agent_memory_settings(env_file, environ={})

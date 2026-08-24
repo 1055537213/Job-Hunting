@@ -76,7 +76,8 @@ ModelGateway.embed(operation, texts, context)
   `root_request_id`/`call_id`、供应商 request ID 提取和不含正文的 usage 流水。
 - 已迁移：LangChain Agent 主聊天、工具内单轮 LLM、网页端简历改写、RAG Embedding 和可选 Rerank。
 - 已完成 Web 请求级 Redis 分布式限流，以及 Chat、Embedding、Rerank、截图处理的
-  Redis 全局/单账号共享并发租约；后续补齐熔断、分布式 trace 和供应商故障告警。
+  Redis 全局/单账号共享并发租约；主聊天模型已补齐超时、有限重试和进程内熔断，
+  Embedding/Rerank 的供应商级熔断、分布式 trace 和集中故障告警仍留待后续。
 
 只有出现以下任一条件时才考虑拆成独立服务：多个产品共同使用、需要独立扩缩容、
 供应商路由规则频繁变化，或模型调用故障需要与主业务进程隔离。
@@ -263,7 +264,7 @@ Kubernetes 不是上线前置条件。只有出现以下需求时再进入该阶
   且余额、流水和管理员审计同事务提交。Prometheus 已接入低敏请求指标、15 天趋势和告警规则。
   Caddy 与 Prometheus 均可动态发现多个 Web 副本，仓库提供可自动恢复单实例开发环境的
   双副本验收脚本。
-  尚未实施的是文档导出异步化、Alertmanager 通知与分布式 Trace、真实支付渠道签名回调、
+  尚未实施的是文档导出异步化、Alertmanager 通知与分布式 Trace、Embedding/Rerank 的供应商级熔断、真实支付渠道签名回调、
   退款对账和高可用部署。
 
 后续改造必须按上述阶段逐步提交。当前 pgvector RAG 已进入生产读写路径；测试和 Web 共用

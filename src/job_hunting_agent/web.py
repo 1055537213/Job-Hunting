@@ -99,6 +99,7 @@ from .job_screenshot import (
     JobScreenshotModelError,
 )
 from .llm import LLMClient, LLMRequestError
+from .model_resilience import ModelCircuitOpenError
 from .models import (
     AccountRecord,
     AdminAuditEventRecord,
@@ -667,7 +668,10 @@ def create_web_app(
                 "llm": {"configured": bool(llm_config.get("configured"))},
                 "embedding": {"configured": bool(embedding_config.get("configured"))},
                 "rerank": {"configured": bool(rerank_config.get("configured"))},
-                "memory": {"configured": bool(memory_config.get("enabled"))},
+                "memory": {
+                    "configured": bool(memory_config.get("enabled")),
+                    "checkpoint_backend": memory_config.get("checkpoint_backend"),
+                },
                 "task_queue": {"configured": bool(task_queue_config.get("configured"))},
                 "web_security": {
                     "configured": not bool(web_security_config.get("error")),
@@ -681,6 +685,7 @@ def create_web_app(
                     "configured": not bool(concurrency_config.get("error")),
                     "enabled": bool(concurrency_config.get("enabled")),
                 },
+                "model_circuit": backend.model_gateway.circuit_snapshot(),
             }
         return {
             "status": "ok",
@@ -696,6 +701,7 @@ def create_web_app(
             "web_security": web_security_config,
             "billing": billing_config,
             "concurrency": concurrency_config,
+            "model_circuit": backend.model_gateway.circuit_snapshot(),
             "agent": {
                 "configured": chat_agent is not None,
                 "error": agent_error,
@@ -904,6 +910,12 @@ def create_web_app(
                     status_code=503,
                     detail="并发保护服务暂时不可用，请稍后重试。",
                     headers={"Retry-After": "1"},
+                ) from error
+            except ModelCircuitOpenError as error:
+                raise HTTPException(
+                    status_code=503,
+                    detail=str(error),
+                    headers={"Retry-After": str(error.retry_after_seconds)},
                 ) from error
             except RAGProviderRequestError as error:
                 raise HTTPException(status_code=502, detail=str(error)) from error
@@ -1169,6 +1181,12 @@ def create_web_app(
                 source_url.strip() if source_url and source_url.strip() else None,
                 account_id=account.id,
             )
+        except ModelCircuitOpenError as error:
+            raise HTTPException(
+                status_code=503,
+                detail=str(error),
+                headers={"Retry-After": str(error.retry_after_seconds)},
+            ) from error
         except JobScreenshotModelError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         except JobScreenshotError as error:
@@ -1639,6 +1657,12 @@ def create_web_app(
             raise HTTPException(status_code=404, detail="职位、候选人或简历文件不存在。") from error
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+        except ModelCircuitOpenError as error:
+            raise HTTPException(
+                status_code=503,
+                detail=str(error),
+                headers={"Retry-After": str(error.retry_after_seconds)},
+            ) from error
         except (RAGProviderRequestError, LLMRequestError) as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         return {
@@ -2140,6 +2164,18 @@ def stream_web_chat_events(
                             "profile": asdict(backend.get_candidate_profile(payload.candidate_id, account_id=account_id)),
                         },
                     )
+        except ModelCircuitOpenError as error:
+            fail_task_trace(trace, str(error), trace_started_at)
+            persist_tool_trace(
+                backend,
+                trace,
+                account_id=account_id,
+                candidate_id=payload.candidate_id,
+                session_id=session_id,
+                source="chat",
+            )
+            yield sse_event("task_failed", {"task_trace": serialize_user_task_trace(trace)})
+            yield sse_event("error", {"detail": str(error), "retry_after": error.retry_after_seconds})
         except RAGProviderRequestError as error:
             fail_task_trace(trace, str(error), trace_started_at)
             persist_tool_trace(

@@ -147,13 +147,18 @@ class JobHuntingAgent:
                 self.tool_llm_available = True
         self.memory_settings = memory_settings or load_agent_memory_settings(self.env_path)
         self._restored_sessions: set[tuple[int | None, int | None, str]] = set()
+        checkpointer = (
+            MemorySaver()
+            if self.memory_settings.checkpoint_backend == "memory"
+            else None
+        )
         self.graph = create_agent(
             model=self.model,
             tools=build_job_hunting_tools(app),
             system_prompt=AGENT_SYSTEM_PROMPT,
             middleware=build_memory_middleware(self.model, self.memory_settings),
             context_schema=JobHuntingAgentContext,
-            checkpointer=MemorySaver(),
+            checkpointer=checkpointer,
             name="job_hunting_agent",
         )
 
@@ -362,13 +367,20 @@ class JobHuntingAgent:
     ) -> list[BaseMessage]:
         """从持久化 `chat_messages` 恢复一次历史上下文。
 
-        `MemorySaver` 只在当前进程里有效；服务重启后它是空的。这里在每个
-        `(candidate_id, session_id)` 首次调用时读取数据库历史，把页面上能恢复的
-        对话也恢复到模型上下文里。之后同一进程内交给 LangGraph checkpointer 累积。
+        `database` 后端每轮都读取 PostgreSQL 历史，因此 Web 副本切换后仍能恢复同一
+        会话。`memory` 后端只用于本地测试或明确接受单进程状态的开发场景。
         """
 
         if not self.memory_settings.enabled or candidate_id is None:
             return []
+        if self.memory_settings.checkpoint_backend == "database":
+            records = self.app.list_chat_messages(
+                candidate_id,
+                session_id,
+                limit=self.memory_settings.restore_history_limit,
+                account_id=account_id,
+            )
+            return build_restored_context_messages(records, self.memory_settings)
         session_key = (account_id, candidate_id, session_id)
         if session_key in self._restored_sessions:
             return []

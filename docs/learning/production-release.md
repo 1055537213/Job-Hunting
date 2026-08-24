@@ -16,6 +16,25 @@
 5. 在 MinIO 或托管 S3 中预先创建 bucket，并确认 `JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET=false`。
 6. 确认 Web 使用 `JOB_AGENT_RATE_LIMIT_BACKEND=redis`，并将限流 URL 指向 Redis 独立数据库 1。
 
+7. 确认生产 Web 和 Worker 使用 PostgreSQL 共享 Agent 记忆：
+   `JOB_AGENT_MEMORY_CHECKPOINT_BACKEND=database`。生产禁止使用 `memory`，因为它只保存在
+   单个进程内；当 Web 扩容、重启或请求切换到另一副本时，进程内记忆会导致同一会话上下文不一致。
+
+8. 设置主聊天模型的有限重试和熔断参数。推荐先使用以下基线，再根据真实容量和供应商
+   SLA 调整：
+
+   ```dotenv
+   JOB_AGENT_MODEL_GATEWAY_CHAT_MAX_RETRIES=2
+   JOB_AGENT_MODEL_CIRCUIT_FAILURE_THRESHOLD=5
+   JOB_AGENT_MODEL_CIRCUIT_RECOVERY_SECONDS=30
+   ```
+
+   `CHAT_MAX_RETRIES` 控制一次请求遇到可恢复上游错误时的有限重试次数；连续达到
+   `FAILURE_THRESHOLD` 后，当前 Web 进程会暂时拒绝新的主聊天调用，等待
+   `RECOVERY_SECONDS` 后放行一次探测。超时、连接失败、429 和 5xx 会触发熔断；鉴权失败、
+   参数错误和余额不足不会触发熔断。熔断期间 Web 返回 HTTP 503，并附带 `Retry-After`，
+   客户端应稍后重试。
+
 生产覆盖不会向宿主机发布 Web 端口，只有 Caddy 和内部采集服务可以访问它，因此
 `FORWARDED_ALLOW_IPS=*` 只在该覆盖配置中启用。不要把这个设置复制到直接暴露 Uvicorn 的开发环境。
 

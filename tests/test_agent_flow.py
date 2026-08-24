@@ -558,6 +558,14 @@ def test_langchain_agent_restores_persisted_chat_history_on_startup(tmp_path, ac
         model=model,
         memory_settings=AgentMemorySettings(summary_trigger_tokens=99999, restore_trigger_tokens=99999),
     )
+    second_replica_model = RecordingToolCallingFakeChatModel(
+        responses=[AIMessage(content="第二个 Web 副本也能看到历史。")]
+    )
+    second_replica = JobHuntingAgent(
+        app,
+        model=second_replica_model,
+        memory_settings=AgentMemorySettings(summary_trigger_tokens=99999, restore_trigger_tokens=99999),
+    )
 
     result = agent.chat(
         "我刚才说过哪些技能？",
@@ -572,6 +580,19 @@ def test_langchain_agent_restores_persisted_chat_history_on_startup(tmp_path, ac
     assert "上一轮我说我会 Python 和 RAG" in seen_text
     assert "已记录你的 Python 和 RAG 经历" in seen_text
     assert "我刚才说过哪些技能" in seen_text
+
+    second_replica.chat(
+        "继续回答。",
+        candidate_id=candidate_id,
+        session_id=session_id,
+        use_tool_llm=False,
+        account_id=account_id,
+    )
+    second_replica_seen = "\n".join(
+        message_text(message) for message in second_replica_model.seen_messages[0]
+    )
+    assert "上一轮我说我会 Python 和 RAG" in second_replica_seen
+    assert "已记录你的 Python 和 RAG 经历" in second_replica_seen
 
 
 def test_langchain_agent_compacts_restored_history_before_model_call(tmp_path, account_id):
@@ -682,6 +703,7 @@ def test_langchain_agent_summarizes_running_context_when_it_gets_too_long(tmp_pa
         app,
         model=model,
         memory_settings=AgentMemorySettings(
+            checkpoint_backend="memory",
             restore_trigger_tokens=99999,
             summary_trigger_tokens=1,
             summary_keep_messages=1,

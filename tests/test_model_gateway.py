@@ -28,6 +28,8 @@ def test_gateway_settings_distinguish_runtime_environment_and_retry_policy(tmp_p
                 "JOB_AGENT_MODEL_GATEWAY_CHAT_MAX_RETRIES=0",
                 "JOB_AGENT_MODEL_GATEWAY_EMBEDDING_MAX_RETRIES=3",
                 "JOB_AGENT_MODEL_GATEWAY_RERANK_MAX_RETRIES=4",
+                "JOB_AGENT_MODEL_CIRCUIT_FAILURE_THRESHOLD=7",
+                "JOB_AGENT_MODEL_CIRCUIT_RECOVERY_SECONDS=45",
             ]
         ),
         encoding="utf-8",
@@ -39,6 +41,8 @@ def test_gateway_settings_distinguish_runtime_environment_and_retry_policy(tmp_p
     assert settings.chat_max_retries == 0
     assert settings.embedding_max_retries == 3
     assert settings.rerank_max_retries == 4
+    assert settings.chat_circuit_failure_threshold == 7
+    assert settings.chat_circuit_recovery_seconds == 45
 
 
 def test_gateway_records_idempotent_provider_usage_without_prompt_content(tmp_path, database_url):
