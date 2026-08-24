@@ -20,8 +20,8 @@
    `JOB_AGENT_MEMORY_CHECKPOINT_BACKEND=database`。生产禁止使用 `memory`，因为它只保存在
    单个进程内；当 Web 扩容、重启或请求切换到另一副本时，进程内记忆会导致同一会话上下文不一致。
 
-8. 设置主聊天模型的有限重试和熔断参数。推荐先使用以下基线，再根据真实容量和供应商
-   SLA 调整：
+8. 设置远程模型调用的有限重试和熔断参数。以下配置同时作为 Chat、Embedding 和 Rerank
+   的熔断基线，再根据真实容量和供应商 SLA 调整：
 
    ```dotenv
    JOB_AGENT_MODEL_GATEWAY_CHAT_MAX_RETRIES=2
@@ -29,8 +29,9 @@
    JOB_AGENT_MODEL_CIRCUIT_RECOVERY_SECONDS=30
    ```
 
-   `CHAT_MAX_RETRIES` 控制一次请求遇到可恢复上游错误时的有限重试次数；连续达到
-   `FAILURE_THRESHOLD` 后，当前 Web 进程会暂时拒绝新的主聊天调用，等待
+   `CHAT_MAX_RETRIES` 控制一次聊天请求遇到可恢复上游错误时的有限重试次数；
+   `EMBEDDING_MAX_RETRIES` 和 `RERANK_MAX_RETRIES` 分别控制向量请求和重排请求。
+   连续达到 `FAILURE_THRESHOLD` 后，当前 Web 进程会暂时拒绝对应的远程模型调用，等待
    `RECOVERY_SECONDS` 后放行一次探测。超时、连接失败、429 和 5xx 会触发熔断；鉴权失败、
    参数错误和余额不足不会触发熔断。熔断期间 Web 返回 HTTP 503，并附带 `Retry-After`，
    客户端应稍后重试。

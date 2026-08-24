@@ -276,6 +276,8 @@ class ModelGateway:
         self._settings = settings
         self.concurrency_controller = concurrency_controller
         self._chat_circuit_breaker: CircuitBreaker | None = None
+        self._embedding_circuit_breaker: CircuitBreaker | None = None
+        self._rerank_circuit_breaker: CircuitBreaker | None = None
 
     @property
     def settings(self) -> ModelGatewaySettings:
@@ -376,9 +378,53 @@ class ModelGateway:
         )
 
     def circuit_snapshot(self) -> dict[str, object]:
-        """返回主聊天模型熔断状态，不触发惰性模型配置加载。"""
+        """返回各远程模型熔断状态，不触发惰性模型配置加载。"""
 
-        breaker = self._chat_circuit_breaker
+        snapshots = {
+            "chat": self._circuit_snapshot(self._chat_circuit_breaker),
+            "embedding": self._circuit_snapshot(self._embedding_circuit_breaker),
+            "rerank": self._circuit_snapshot(self._rerank_circuit_breaker),
+        }
+        states = [snapshot["state"] for snapshot in snapshots.values()]
+        if "open" in states:
+            state = "open"
+        elif "half_open" in states:
+            state = "half_open"
+        elif all(item == "not_started" for item in states):
+            state = "not_started"
+        else:
+            state = "closed"
+        return {
+            "state": state,
+            "consecutive_failures": max(
+                int(snapshot["consecutive_failures"]) for snapshot in snapshots.values()
+            ),
+            "retry_after_seconds": max(
+                int(snapshot["retry_after_seconds"]) for snapshot in snapshots.values()
+            ),
+            **snapshots,
+        }
+
+    def _get_embedding_circuit_breaker(self) -> CircuitBreaker:
+        if self._embedding_circuit_breaker is None:
+            gateway_settings = self.settings
+            self._embedding_circuit_breaker = CircuitBreaker(
+                failure_threshold=gateway_settings.chat_circuit_failure_threshold,
+                recovery_seconds=gateway_settings.chat_circuit_recovery_seconds,
+            )
+        return self._embedding_circuit_breaker
+
+    def _get_rerank_circuit_breaker(self) -> CircuitBreaker:
+        if self._rerank_circuit_breaker is None:
+            gateway_settings = self.settings
+            self._rerank_circuit_breaker = CircuitBreaker(
+                failure_threshold=gateway_settings.chat_circuit_failure_threshold,
+                recovery_seconds=gateway_settings.chat_circuit_recovery_seconds,
+            )
+        return self._rerank_circuit_breaker
+
+    @staticmethod
+    def _circuit_snapshot(breaker: CircuitBreaker | None) -> dict[str, int | str]:
         if breaker is None:
             return {
                 "state": "not_started",
@@ -407,16 +453,21 @@ class ModelGateway:
     def embeddings(self, context: ModelCallContext) -> Embeddings:
         """返回带 Gateway 用量回调的 LangChain Embeddings 实现。"""
 
+        embedding_settings = self.embedding_settings
+        circuit_breaker = None
+        if embedding_settings is not None and embedding_settings.api_style != "local_hash":
+            circuit_breaker = self._get_embedding_circuit_breaker()
         embeddings = build_rag_embeddings(
             self.env_path,
-            settings=self.embedding_settings,
+            settings=embedding_settings,
             usage_callback=lambda response: self.record_embedding_response(context, response),
             usage_operation=context.operation,
             max_retries=self.settings.embedding_max_retries,
+            circuit_breaker=circuit_breaker,
         )
-        if self.concurrency_controller is None or self.embedding_settings is None:
+        if self.concurrency_controller is None or embedding_settings is None:
             return embeddings
-        if self.embedding_settings.api_style == "local_hash":
+        if embedding_settings.api_style == "local_hash":
             return embeddings
         return ConcurrencyLimitedEmbeddings(
             embeddings,
@@ -427,11 +478,15 @@ class ModelGateway:
     def reranker(self, context: ModelCallContext) -> Reranker | None:
         """返回带 Gateway 计量回调的可选 Rerank 实现。"""
 
+        rerank_settings = self.rerank_settings
+        if rerank_settings is None:
+            return None
         reranker = build_reranker(
             self.env_path,
-            settings=self.rerank_settings,
+            settings=rerank_settings,
             usage_callback=lambda response: self.record_rerank_response(context, response),
             max_retries=self.settings.rerank_max_retries,
+            circuit_breaker=self._get_rerank_circuit_breaker(),
         )
         if reranker is None or self.concurrency_controller is None:
             return reranker

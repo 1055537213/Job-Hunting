@@ -29,6 +29,11 @@ from .config import (
     load_embedding_settings,
     load_rerank_settings,
 )
+from .model_resilience import (
+    CircuitBreaker,
+    is_transient_model_error,
+    record_model_call_failure,
+)
 from .models import LongTextRecord, RAGSearchResult
 
 logger = logging.getLogger(__name__)
@@ -36,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 class RAGProviderRequestError(RuntimeError):
     """RAG 依赖的远程模型服务请求失败时抛出的统一业务异常。"""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        self.status_code = status_code
+        super().__init__(message)
 
 
 class EmbeddingRequestError(RAGProviderRequestError):
@@ -116,6 +125,7 @@ class OpenAICompatibleEmbeddings(Embeddings):
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         usage_operation: str = "embedding",
         max_retries: int = 2,
+        circuit_breaker: CircuitBreaker | None = None,
     ):
         """保存 embedding 调用配置。"""
 
@@ -130,6 +140,7 @@ class OpenAICompatibleEmbeddings(Embeddings):
         self.usage_operation = usage_operation
         # 由内部 Model Gateway 传入；0 表示失败后不重试。
         self.max_retries = max(0, max_retries)
+        self.circuit_breaker = circuit_breaker
         self.embeddings_url = normalize_embeddings_url(base_url)
 
     @classmethod
@@ -139,6 +150,7 @@ class OpenAICompatibleEmbeddings(Embeddings):
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         usage_operation: str = "embedding",
         max_retries: int = 2,
+        circuit_breaker: CircuitBreaker | None = None,
     ) -> OpenAICompatibleEmbeddings:
         """从统一配置对象创建 embedding 客户端。"""
 
@@ -152,6 +164,7 @@ class OpenAICompatibleEmbeddings(Embeddings):
             usage_callback=usage_callback,
             usage_operation=usage_operation,
             max_retries=max_retries,
+            circuit_breaker=circuit_breaker,
         )
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -183,6 +196,8 @@ class OpenAICompatibleEmbeddings(Embeddings):
             payload["dimensions"] = self.dimensions
         response: dict[str, object] | None = None
         for attempt in range(self.max_retries + 1):
+            if self.circuit_breaker is not None:
+                self.circuit_breaker.before_call()
             try:
                 response = self.transport(
                     self.embeddings_url,
@@ -193,10 +208,16 @@ class OpenAICompatibleEmbeddings(Embeddings):
                     payload,
                     self.timeout_seconds,
                 )
-                break
-            except EmbeddingRequestError:
-                if attempt >= self.max_retries:
+            except Exception as error:  # noqa: BLE001 - 统一转换并分类供应商错误。
+                retryable = is_transient_model_error(error)
+                if self.circuit_breaker is not None:
+                    retryable = record_model_call_failure(self.circuit_breaker, error)
+                if attempt >= self.max_retries or not retryable:
                     raise
+            else:
+                if self.circuit_breaker is not None:
+                    self.circuit_breaker.record_success()
+                break
         if response is None:  # pragma: no cover - 防御性兜底，循环应当已成功或抛异常。
             raise EmbeddingRequestError("Embedding API 未返回响应")
         if self.usage_callback is not None:
@@ -225,6 +246,7 @@ class NativeMultimodalEmbeddings(Embeddings):
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         usage_operation: str = "embedding",
         max_retries: int = 2,
+        circuit_breaker: CircuitBreaker | None = None,
     ):
         """保存 provider-native 向量模型配置，不在对象或日志中输出密钥。"""
 
@@ -237,6 +259,7 @@ class NativeMultimodalEmbeddings(Embeddings):
         self.usage_callback = usage_callback
         self.usage_operation = usage_operation
         self.max_retries = max(0, max_retries)
+        self.circuit_breaker = circuit_breaker
 
     @classmethod
     def from_settings(
@@ -245,6 +268,7 @@ class NativeMultimodalEmbeddings(Embeddings):
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         usage_operation: str = "embedding",
         max_retries: int = 2,
+        circuit_breaker: CircuitBreaker | None = None,
     ) -> NativeMultimodalEmbeddings:
         """从项目 Embedding 配置创建 provider-native 适配器。"""
 
@@ -257,6 +281,7 @@ class NativeMultimodalEmbeddings(Embeddings):
             usage_callback=usage_callback,
             usage_operation=usage_operation,
             max_retries=max_retries,
+            circuit_breaker=circuit_breaker,
         )
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -284,6 +309,8 @@ class NativeMultimodalEmbeddings(Embeddings):
         }
         response: dict[str, object] | None = None
         for attempt in range(self.max_retries + 1):
+            if self.circuit_breaker is not None:
+                self.circuit_breaker.before_call()
             try:
                 response = self.transport(
                     self.endpoint,
@@ -294,10 +321,16 @@ class NativeMultimodalEmbeddings(Embeddings):
                     payload,
                     self.timeout_seconds,
                 )
-                break
-            except EmbeddingRequestError:
-                if attempt >= self.max_retries:
+            except Exception as error:  # noqa: BLE001 - 统一转换并分类供应商错误。
+                retryable = is_transient_model_error(error)
+                if self.circuit_breaker is not None:
+                    retryable = record_model_call_failure(self.circuit_breaker, error)
+                if attempt >= self.max_retries or not retryable:
                     raise
+            else:
+                if self.circuit_breaker is not None:
+                    self.circuit_breaker.record_success()
+                break
         if response is None:  # pragma: no cover - 防御性兜底，循环应当已成功或抛异常。
             raise EmbeddingRequestError("Native Embedding API 未返回响应")
         if self.usage_callback is not None:
@@ -469,6 +502,7 @@ class HttpReranker:
         transport: Callable[[str, dict[str, str], dict[str, object], int], dict[str, object]] | None = None,
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         max_retries: int = 2,
+        circuit_breaker: CircuitBreaker | None = None,
     ):
         """保存 Rerank 调用配置；候选倍数控制向量召回后送入模型的数量。"""
 
@@ -481,6 +515,7 @@ class HttpReranker:
         self.transport = transport or post_rerank_json
         self.usage_callback = usage_callback
         self.max_retries = max(0, max_retries)
+        self.circuit_breaker = circuit_breaker
 
     @classmethod
     def from_settings(
@@ -488,6 +523,7 @@ class HttpReranker:
         settings: RerankSettings,
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         max_retries: int = 2,
+        circuit_breaker: CircuitBreaker | None = None,
     ) -> HttpReranker:
         """从项目 Rerank 配置创建 HTTP 重排适配器。"""
 
@@ -500,6 +536,7 @@ class HttpReranker:
             api_style=settings.api_style,
             usage_callback=usage_callback,
             max_retries=max_retries,
+            circuit_breaker=circuit_breaker,
         )
 
     def rerank(self, query: str, documents: list[str], top_n: int) -> list[RerankResult]:
@@ -529,6 +566,8 @@ class HttpReranker:
             raise RerankRequestError(f"不支持的 Rerank API_STYLE：{self.api_style}")
         response: dict[str, object] | None = None
         for attempt in range(self.max_retries + 1):
+            if self.circuit_breaker is not None:
+                self.circuit_breaker.before_call()
             try:
                 response = self.transport(
                     self.endpoint,
@@ -539,10 +578,16 @@ class HttpReranker:
                     payload,
                     self.timeout_seconds,
                 )
-                break
-            except RerankRequestError:
-                if attempt >= self.max_retries:
+            except Exception as error:  # noqa: BLE001 - 统一转换并分类供应商错误。
+                retryable = is_transient_model_error(error)
+                if self.circuit_breaker is not None:
+                    retryable = record_model_call_failure(self.circuit_breaker, error)
+                if attempt >= self.max_retries or not retryable:
                     raise
+            else:
+                if self.circuit_breaker is not None:
+                    self.circuit_breaker.record_success()
+                break
         if response is None:  # pragma: no cover - 防御性兜底，循环应当已成功或抛异常。
             raise RerankRequestError("Rerank API 未返回响应")
         if self.usage_callback is not None:
@@ -573,7 +618,10 @@ def post_json(
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")
-        raise error_type(f"{operation_name} API HTTP {error.code}: {detail}") from error
+        raise error_type(
+            f"{operation_name} API HTTP {error.code}: {detail}",
+            status_code=error.code,
+        ) from error
     except urllib.error.URLError as error:
         raise error_type(f"{operation_name} API 请求失败：{error.reason}") from error
     except json.JSONDecodeError as error:
@@ -623,6 +671,7 @@ def build_rag_embeddings(
     *,
     settings: EmbeddingSettings | None = None,
     max_retries: int = 2,
+    circuit_breaker: CircuitBreaker | None = None,
 ) -> Embeddings:
     """根据 `.env` 构造 RAG embedding 实现。
 
@@ -641,6 +690,7 @@ def build_rag_embeddings(
             usage_callback=usage_callback,
             usage_operation=usage_operation,
             max_retries=max_retries,
+            circuit_breaker=circuit_breaker,
         )
     if resolved_settings.api_style == "native_multimodal":
         return NativeMultimodalEmbeddings.from_settings(
@@ -648,6 +698,7 @@ def build_rag_embeddings(
             usage_callback=usage_callback,
             usage_operation=usage_operation,
             max_retries=max_retries,
+            circuit_breaker=circuit_breaker,
         )
     raise ValueError(f"暂不支持的 Embedding API_STYLE：{resolved_settings.api_style}")
 
@@ -658,6 +709,7 @@ def build_reranker(
     *,
     settings: RerankSettings | None = None,
     max_retries: int = 2,
+    circuit_breaker: CircuitBreaker | None = None,
 ) -> Reranker | None:
     """根据 `.env` 构造可选 Rerank 适配器；未配置时保持纯向量检索。"""
 
@@ -670,6 +722,7 @@ def build_reranker(
         resolved_settings,
         usage_callback=usage_callback,
         max_retries=max_retries,
+        circuit_breaker=circuit_breaker,
     )
 
 

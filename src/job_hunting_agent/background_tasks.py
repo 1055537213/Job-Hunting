@@ -22,6 +22,8 @@ from .github_project import (
     normalize_public_github_repository_url,
 )
 from .models import BackgroundTaskRecord
+from .model_resilience import ModelCircuitOpenError, is_transient_model_error
+from .rag import RAGProviderRequestError
 from .resume_document import ResumeDocumentError
 from .storage import INSUFFICIENT_BALANCE_MESSAGE, InsufficientBalanceError
 from .task_queue import (
@@ -207,6 +209,12 @@ def background_task_error_policy(error: Exception, task_type: str) -> tuple[str,
 
     if isinstance(error, InsufficientBalanceError):
         return INSUFFICIENT_BALANCE_MESSAGE, False
+    if isinstance(error, ModelCircuitOpenError):
+        return "模型服务暂时不可用，任务将在稍后自动重试。", True
+    if isinstance(error, RAGProviderRequestError):
+        if is_transient_model_error(error):
+            return "向量模型服务暂时不可用，任务将在稍后自动重试。", True
+        return "向量模型请求失败，请检查模型配置或响应格式。", False
     if task_type == RESUME_OCR_TASK_TYPE:
         return "扫描版 PDF OCR 失败，请确认文件清晰且未加密后重试。", True
     if task_type == GITHUB_PROJECT_ANALYSIS_TASK_TYPE:

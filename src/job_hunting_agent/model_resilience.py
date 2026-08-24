@@ -187,6 +187,19 @@ class ModelCircuitCallbackHandler(BaseCallbackHandler):
                 self.breaker.record_success()
 
 
+def record_model_call_failure(breaker: CircuitBreaker, error: BaseException) -> bool:
+    """记录远程模型失败，并返回该错误是否值得自动重试。"""
+
+    transient = is_transient_model_error(error)
+    if transient:
+        breaker.record_failure(error)
+    else:
+        # 鉴权、参数和响应格式错误不应污染熔断计数；如果这是半开探测，
+        # 也要释放探测占位，避免错误配置把服务卡在半开状态。
+        breaker.record_success()
+    return transient
+
+
 def is_transient_model_error(error: BaseException) -> bool:
     """判断是否应计入供应商熔断。
 
@@ -221,6 +234,15 @@ def is_transient_model_error(error: BaseException) -> bool:
                 "badgateway",
                 "gatewaytimeout",
             )
+        ):
+            return True
+        reason = getattr(current, "reason", None)
+        if isinstance(reason, BaseException):
+            current = reason
+            continue
+        if isinstance(reason, str) and any(
+            marker in reason.lower()
+            for marker in ("timeout", "timed out", "connection", "temporarily unavailable")
         ):
             return True
         cause = current.__cause__ or current.__context__

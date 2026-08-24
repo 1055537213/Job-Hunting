@@ -24,6 +24,8 @@ from job_hunting_agent.models import (
     ToolCallTraceRecord,
     UsageEventRecord,
 )
+from job_hunting_agent.model_resilience import ModelCircuitOpenError
+from job_hunting_agent.rag import RAGProviderRequestError
 from job_hunting_agent.resume_document import ResumeFileStore
 from job_hunting_agent.storage import InsufficientBalanceError
 from job_hunting_agent.task_queue import CeleryTaskQueue, TaskQueueError
@@ -53,6 +55,30 @@ def test_insufficient_balance_error_is_actionable_and_non_retryable() -> None:
     )
 
     assert summary == "余额不足，请先充值后重试。"
+    assert retryable is False
+
+
+def test_model_circuit_error_is_safe_and_retryable() -> None:
+    """模型熔断只返回低敏摘要，并允许后台任务退避重试。"""
+
+    summary, retryable = background_task_error_policy(
+        ModelCircuitOpenError(5),
+        "rag_index",
+    )
+
+    assert summary == "模型服务暂时不可用，任务将在稍后自动重试。"
+    assert retryable is True
+
+
+def test_non_transient_rag_error_is_not_retried() -> None:
+    """向量模型鉴权/响应错误应停止自动重试，避免持续打满任务队列。"""
+
+    summary, retryable = background_task_error_policy(
+        RAGProviderRequestError("invalid api key", status_code=401),
+        "rag_index",
+    )
+
+    assert summary == "向量模型请求失败，请检查模型配置或响应格式。"
     assert retryable is False
 
 

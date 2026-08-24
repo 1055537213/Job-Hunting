@@ -370,6 +370,17 @@ def create_web_app(
             headers={"Retry-After": "1"},
         )
 
+    @web_app.exception_handler(ModelCircuitOpenError)
+    async def model_circuit_handler(
+        request: Request,
+        error: ModelCircuitOpenError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": str(error)},
+            headers={"Retry-After": str(error.retry_after_seconds)},
+        )
+
     def rate_limit_identity(request: Request) -> str:
         """把有效登录态映射为账号级限流键，并缓存已读取的 Session。"""
 

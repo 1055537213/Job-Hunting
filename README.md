@@ -354,7 +354,7 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 - [x] 将模型/截图并发名额迁移到 Redis 租约，并同时限制全局和单账号占用。
 - [x] 完成 Web 多副本流量验证、Caddy 动态后端发现与 Prometheus 多实例采集。
 - [x] 将生产/Compose 的短期 Agent 状态迁移到 PostgreSQL 聊天历史，避免副本切换时依赖单进程内存。
-- [x] 为主聊天模型增加超时、有限重试和进程内熔断；熔断期间统一返回可重试的 503。
+- [x] 为 Chat、Embedding 和 Rerank 增加超时、有限重试和进程内熔断；熔断期间统一返回可重试的 503。
 - [ ] 将定制简历导出迁移到 Worker，并补充大文件和高并发容量测试。
 - [ ] 建立严格类型检查基线，逐步消化第三方 stub 和内部 Protocol 类型债务。
 - [ ] 完成依赖与镜像漏洞扫描、渗透测试、灾难恢复演练和密钥轮换流程。

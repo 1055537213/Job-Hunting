@@ -198,7 +198,7 @@ def test_embedding_adapter_retries_transient_gateway_failure_once():
         nonlocal calls
         calls += 1
         if calls == 1:
-            raise EmbeddingRequestError("temporary upstream failure")
+            raise EmbeddingRequestError("temporary upstream failure", status_code=503)
         return {
             "data": [{"index": 0, "embedding": [0.1, 0.2]}],
             "usage": {"prompt_tokens": 4, "total_tokens": 4},
@@ -214,3 +214,44 @@ def test_embedding_adapter_retries_transient_gateway_failure_once():
 
     assert embeddings.embed_query("候选人项目经历") == [0.1, 0.2]
     assert calls == 2
+
+
+def test_gateway_exposes_independent_embedding_and_rerank_circuit_snapshots(tmp_path):
+    """Gateway 应为远程 Embedding/Rerank 创建独立熔断状态。"""
+
+    gateway = ModelGateway(
+        tmp_path / ".env",
+        llm_settings=LLMSettings(
+            provider="relay",
+            model="chat-model",
+            api_key="chat-key",
+            base_url="https://chat.example/v1",
+        ),
+        embedding_settings=EmbeddingSettings(
+            provider="embedding-provider",
+            model="embedding-model",
+            api_key="embedding-key",
+            base_url="https://embedding.example/v1",
+        ),
+        rerank_settings=RerankSettings(
+            provider="rerank-provider",
+            model="rerank-model",
+            api_key="rerank-key",
+            base_url="https://rerank.example/v1",
+        ),
+        settings=ModelGatewaySettings(
+            environment="test",
+            chat_circuit_failure_threshold=1,
+            chat_circuit_recovery_seconds=10,
+        ),
+    )
+    context = gateway.new_call_context("rag_probe", authorize_spend=False)
+
+    gateway.embeddings(context)
+    gateway.reranker(context)
+    snapshot = gateway.circuit_snapshot()
+
+    assert snapshot["state"] == "closed"
+    assert snapshot["embedding"]["state"] == "closed"
+    assert snapshot["rerank"]["state"] == "closed"
+    assert snapshot["chat"]["state"] == "not_started"

@@ -76,8 +76,8 @@ ModelGateway.embed(operation, texts, context)
   `root_request_id`/`call_id`、供应商 request ID 提取和不含正文的 usage 流水。
 - 已迁移：LangChain Agent 主聊天、工具内单轮 LLM、网页端简历改写、RAG Embedding 和可选 Rerank。
 - 已完成 Web 请求级 Redis 分布式限流，以及 Chat、Embedding、Rerank、截图处理的
-  Redis 全局/单账号共享并发租约；主聊天模型已补齐超时、有限重试和进程内熔断，
-  Embedding/Rerank 的供应商级熔断、分布式 trace 和集中故障告警仍留待后续。
+  Redis 全局/单账号共享并发租约；Chat、Embedding、Rerank 均已补齐超时、有限重试和
+  进程内熔断，熔断状态会出现在健康检查中；分布式 trace 和集中故障告警仍留待后续。
 
 只有出现以下任一条件时才考虑拆成独立服务：多个产品共同使用、需要独立扩缩容、
 供应商路由规则频繁变化，或模型调用故障需要与主业务进程隔离。
@@ -108,8 +108,8 @@ ModelGateway.embed(operation, texts, context)
 
 实施状态：核心模型边界已完成。`model_gateway.py` 是当前模块化单体中的唯一模型
 入口，`JOB_AGENT_ENVIRONMENT` 可显式选择 development/test/production，现有业务调用
-已迁移到 Gateway；模型与截图并发已由 Redis 租约跨 Web/Worker 副本共享，熔断仍留待
-后续供应商故障治理阶段实现。
+已迁移到 Gateway；模型与截图并发已由 Redis 租约跨 Web/Worker 副本共享；Chat、Embedding
+和 Rerank 的超时、有限重试、瞬时故障分类和进程内熔断也已统一实现。
 
 ### 阶段 2：PostgreSQL、pgvector 与 Alembic
 

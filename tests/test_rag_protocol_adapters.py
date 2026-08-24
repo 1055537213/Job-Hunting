@@ -5,20 +5,25 @@
 
 from __future__ import annotations
 
+import pytest
+
 from job_hunting_agent.config import (
     load_embedding_settings,
     load_rerank_settings,
     masked_rerank_settings,
 )
 from job_hunting_agent.rag import (
+    EmbeddingRequestError,
     HttpReranker,
     NativeMultimodalEmbeddings,
     OpenAICompatibleEmbeddings,
+    RerankRequestError,
     RerankResult,
     build_rag_embeddings,
     build_reranker,
     rag_embedding_model_name,
 )
+from job_hunting_agent.model_resilience import CircuitBreaker, ModelCircuitOpenError
 
 
 def write_native_env(path) -> None:
@@ -203,3 +208,59 @@ def test_standard_reranker_uses_common_rerank_payload():
         "top_n": 2,
         "return_documents": False,
     }
+
+
+def test_embedding_circuit_breaker_fails_fast_after_transient_provider_error():
+    """Embedding 连续 503 后应快速拒绝新请求，避免重复等待上游超时。"""
+
+    breaker = CircuitBreaker(failure_threshold=1, recovery_seconds=10)
+    calls = 0
+
+    def failing_transport(url, headers, payload, timeout):
+        nonlocal calls
+        calls += 1
+        raise EmbeddingRequestError("embedding unavailable", status_code=503)
+
+    embeddings = OpenAICompatibleEmbeddings(
+        api_key="test-key",
+        base_url="https://embedding.example/v1",
+        model="embedding-model",
+        transport=failing_transport,
+        max_retries=0,
+        circuit_breaker=breaker,
+    )
+
+    with pytest.raises(EmbeddingRequestError):
+        embeddings.embed_query("职位要求")
+    with pytest.raises(ModelCircuitOpenError):
+        embeddings.embed_query("候选人经历")
+
+    assert calls == 1
+    assert breaker.snapshot().state == "open"
+
+
+def test_rerank_auth_error_does_not_open_circuit_or_retry():
+    """Rerank 鉴权失败不是临时故障，不应重试或触发熔断。"""
+
+    breaker = CircuitBreaker(failure_threshold=1, recovery_seconds=10)
+    calls = 0
+
+    def unauthorized_transport(url, headers, payload, timeout):
+        nonlocal calls
+        calls += 1
+        raise RerankRequestError("invalid api key", status_code=401)
+
+    reranker = HttpReranker(
+        api_key="test-key",
+        base_url="https://rerank.example/v1",
+        model="rerank-model",
+        transport=unauthorized_transport,
+        max_retries=2,
+        circuit_breaker=breaker,
+    )
+
+    with pytest.raises(RerankRequestError):
+        reranker.rerank("目标岗位", ["项目经历"], top_n=1)
+
+    assert calls == 1
+    assert breaker.snapshot().state == "closed"
