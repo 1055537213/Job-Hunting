@@ -120,6 +120,7 @@ services:
       JOB_AGENT_TASK_QUEUE_NAME: "${JOB_AGENT_TASK_QUEUE_NAME:-job_agent}"
       JOB_AGENT_TASK_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_TIME_LIMIT_SECONDS:-900}"
       JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS:-840}"
+      JOB_AGENT_TASK_STALE_AFTER_SECONDS: "${JOB_AGENT_TASK_STALE_AFTER_SECONDS:-1800}"
       # 请求窗口由所有 Web 副本共享，避免扩容后每个进程各自获得一整份额度。
       JOB_AGENT_RATE_LIMIT_BACKEND: "redis"
       JOB_AGENT_RATE_LIMIT_REDIS_URL: "redis://:${JOB_AGENT_REDIS_PASSWORD:?set JOB_AGENT_REDIS_PASSWORD in .env}@redis:6379/1"
@@ -151,7 +152,7 @@ services:
       start_period: 20s
 
   worker:
-    # 独立 Celery Worker 已执行 OCR、RAG 索引和 GitHub 项目分析；文档导出后续迁移。
+    # 独立 Celery Worker 执行 OCR、RAG 索引、GitHub 项目分析和定制简历导出。
     build:
       context: .
       dockerfile: Dockerfile
@@ -175,6 +176,7 @@ services:
       JOB_AGENT_TASK_QUEUE_NAME: "${JOB_AGENT_TASK_QUEUE_NAME:-job_agent}"
       JOB_AGENT_TASK_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_TIME_LIMIT_SECONDS:-900}"
       JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS:-840}"
+      JOB_AGENT_TASK_STALE_AFTER_SECONDS: "${JOB_AGENT_TASK_STALE_AFTER_SECONDS:-1800}"
       # Worker 的 Embedding、Rerank 和文本模型调用共享同一组全局/账号并发额度。
       JOB_AGENT_CONCURRENCY_BACKEND: "redis"
       JOB_AGENT_CONCURRENCY_REDIS_URL: "redis://:${JOB_AGENT_REDIS_PASSWORD:?set JOB_AGENT_REDIS_PASSWORD in .env}@redis:6379/1"
@@ -205,6 +207,7 @@ services:
       JOB_AGENT_TASK_QUEUE_NAME: "${JOB_AGENT_TASK_QUEUE_NAME:-job_agent}"
       JOB_AGENT_TASK_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_TIME_LIMIT_SECONDS:-900}"
       JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS: "${JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS:-840}"
+      JOB_AGENT_TASK_STALE_AFTER_SECONDS: "${JOB_AGENT_TASK_STALE_AFTER_SECONDS:-1800}"
     volumes:
       - ./.env:/app/.env:ro
     command: ["job-agent-beat", "--env-file", "/app/.env", "--log-level", "INFO"]

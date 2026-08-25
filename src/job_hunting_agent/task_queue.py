@@ -16,6 +16,10 @@ BACKGROUND_TASK_NAME = "job_hunting_agent.background_tasks.execute_background_ta
 OPERATIONAL_LEDGER_RETENTION_TASK_NAME = (
     "job_hunting_agent.background_tasks.prune_operational_ledgers"
 )
+# 定期回收 Worker 崩溃后停留在 running 的失联任务，并重新投递安全的 task_key。
+STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME = (
+    "job_hunting_agent.background_tasks.recover_stale_background_tasks"
+)
 # RAG 增量索引使用独立任务类型，Web、应用门面和 Worker 共用这个稳定标识。
 RAG_INDEX_TASK_TYPE = "rag_index"
 # 扫描 PDF OCR 先完成正文提取，再由 Worker 创建独立的 RAG 增量索引任务。
@@ -75,7 +79,12 @@ def build_celery_app(settings: TaskQueueSettings) -> Any:
                 "task": OPERATIONAL_LEDGER_RETENTION_TASK_NAME,
                 "schedule": crontab(hour=0, minute=0),
                 "options": {"queue": settings.queue_name},
-            }
+            },
+            "recover-stale-background-tasks": {
+                "task": STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME,
+                "schedule": 60.0,
+                "options": {"queue": settings.queue_name},
+            },
         },
     )
     return app

@@ -376,7 +376,8 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 - [x] 完成 Web 多副本流量验证、Caddy 动态后端发现与 Prometheus 多实例采集。
 - [x] 将生产/Compose 的短期 Agent 状态迁移到 PostgreSQL 聊天历史，避免副本切换时依赖单进程内存。
 - [x] 为 Chat、Embedding 和 Rerank 增加超时、有限重试和进程内熔断；熔断期间统一返回可重试的 503。
-- [x] 将定制简历导出迁移到 Worker，并用任务级幂等键保护重试；上线前仍需补充大文件和高并发容量测试。
+- [x] 将定制简历导出迁移到 Worker，并用任务级幂等键保护重试；Worker 失联任务会由 Beat 回收。
+- [ ] 完成真实 Worker 崩溃恢复、长任务重投递、大文件和高并发容量验收。
 - [ ] 建立严格类型检查基线，逐步消化第三方 stub 和内部 Protocol 类型债务。
 - [ ] 完成依赖与镜像漏洞扫描、渗透测试、灾难恢复演练和密钥轮换流程。
 - [ ] 在确定正式 Embedding 模型后评估 pgvector HNSW/IVFFlat 索引参数。

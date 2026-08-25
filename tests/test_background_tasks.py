@@ -15,6 +15,7 @@ from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.background_tasks import (
     background_task_error_policy,
     purge_old_operational_audit_records,
+    recover_stale_background_tasks,
     run_registered_task,
 )
 from job_hunting_agent.config import TaskQueueSettings, load_task_queue_settings
@@ -111,6 +112,27 @@ def test_task_queue_settings_require_redis_url_when_enabled(tmp_path: Path) -> N
         raise AssertionError("启用后台任务队列却没有拒绝缺失 Redis URL")
 
 
+def test_task_queue_settings_require_stale_window_after_hard_limit(tmp_path: Path) -> None:
+    """失联回收必须晚于 Celery 硬超时，避免误回收仍在执行的任务。"""
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_TASK_QUEUE_ENABLED=true",
+                "JOB_AGENT_REDIS_URL=redis://:secret@redis:6379/0",
+                "JOB_AGENT_TASK_TIME_LIMIT_SECONDS=900",
+                "JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS=840",
+                "JOB_AGENT_TASK_STALE_AFTER_SECONDS=900",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="STALE_AFTER_SECONDS"):
+        load_task_queue_settings(env_file, environ={})
+
+
 def test_celery_queue_sends_only_task_key() -> None:
     """业务队列消息只包含 task_key，不把 payload 正文交给 Redis。"""
 
@@ -203,6 +225,64 @@ def test_duplicate_worker_claim_does_not_execute_task_twice(
     assert completed["status"] == "succeeded"
     assert duplicate_delivery["status"] == "succeeded"
     assert app.get_background_task(task.task_key, account_id=account_id).attempt == 1
+
+
+def test_stale_worker_task_is_requeued_and_redelivered(
+    database_url: str,
+    account_id: int,
+    tmp_path: Path,
+) -> None:
+    """Worker 认领后崩溃时，Beat 回收任务并重新投递同一个 task_key。"""
+
+    producer = FakeCeleryProducer()
+    app = JobHuntingApp(
+        database_url=database_url,
+        object_storage=ResumeFileStore(tmp_path / "resumes"),
+        task_queue=CeleryTaskQueue(
+            TaskQueueSettings(enabled=True, redis_url="redis://:secret@redis:6379/0"),
+            celery_app=producer,
+        ),
+        semantic_matching=False,
+    )
+    task = app.enqueue_background_task(
+        account_id=account_id,
+        task_type="system_probe",
+        max_attempts=2,
+    )
+    claimed = app.store.claim_background_task(task.task_key)
+    assert claimed is not None
+
+    with app.store.connect() as conn:
+        conn.execute(
+            "UPDATE background_tasks SET updated_at = ? WHERE task_key = ?",
+            ("2000-01-01T00:00:00+00:00", task.task_key),
+        )
+
+    counts = recover_stale_background_tasks(app)
+
+    assert counts == {"requeued": 1, "failed": 0}
+    recovered = app.get_background_task(task.task_key, account_id=account_id)
+    assert recovered.status == "queued"
+    assert recovered.attempt == 1
+    assert recovered.started_at is None
+    assert producer.calls[-1]["args"] == [task.task_key]
+
+    second_claim = app.store.claim_background_task(task.task_key)
+    assert second_claim is not None
+    with app.store.connect() as conn:
+        conn.execute(
+            "UPDATE background_tasks SET updated_at = ? WHERE task_key = ?",
+            ("2000-01-01T00:00:00+00:00", task.task_key),
+        )
+
+    final_counts = recover_stale_background_tasks(app)
+
+    assert final_counts == {"requeued": 0, "failed": 1}
+    failed = app.get_background_task(task.task_key, account_id=account_id)
+    assert failed.status == "failed"
+    assert failed.error_summary == "Worker 执行超时或进程失联，已达到最大重试次数。"
+    assert len(producer.calls) == 2
+    assert recover_stale_background_tasks(app) == {"requeued": 0, "failed": 0}
 
 
 def test_failed_idempotent_task_is_restored_and_redelivered(

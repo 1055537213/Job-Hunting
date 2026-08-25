@@ -62,6 +62,7 @@ def test_compose_mounts_env_read_only_and_starts_postgres_before_web():
     assert "job-agent-worker" in compose
     assert "beat:" in compose
     assert "job-agent-beat" in compose
+    assert "JOB_AGENT_TASK_STALE_AFTER_SECONDS" in compose
     assert "prune_operational_ledgers" not in compose
     assert "JOB_AGENT_OBJECT_STORAGE_BACKEND" in compose
     assert "http://minio:9000" in compose

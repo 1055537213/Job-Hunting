@@ -36,6 +36,19 @@
    参数错误和余额不足不会触发熔断。熔断期间 Web 返回 HTTP 503，并附带 `Retry-After`，
    客户端应稍后重试。
 
+9. 保持后台任务失联回收时间大于 Celery 硬超时。例如默认配置为：
+
+   ```dotenv
+   JOB_AGENT_TASK_TIME_LIMIT_SECONDS=900
+   JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS=840
+   JOB_AGENT_TASK_STALE_AFTER_SECONDS=1800
+   ```
+
+   Worker 使用 late acknowledgement 和 `reject_on_worker_lost`；如果 Worker 在任务执行
+   中崩溃，Beat 会回收数据库中超时的 `running` 任务并重新投递同一个 `task_key`。达到
+   `max_attempts` 后任务会进入 `failed`，不会无限重试。该回收机制不替代上线前的真实
+   进程崩溃、消息重投和容量演练。
+
 生产覆盖不会向宿主机发布 Web 端口，只有 Caddy 和内部采集服务可以访问它，因此
 `FORWARDED_ALLOW_IPS=*` 只在该覆盖配置中启用。不要把这个设置复制到直接暴露 Uvicorn 的开发环境。
 

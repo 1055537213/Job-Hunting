@@ -11,7 +11,7 @@ import hashlib
 import json
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Protocol, Self
 from uuid import uuid4
@@ -2239,6 +2239,85 @@ class RepositoryStore:
                 raise KeyError(f"Running background task not found: {task_key}")
         return self.get_background_task(task_key)
 
+    def recover_stale_background_tasks(
+        self,
+        *,
+        stale_after_seconds: int,
+    ) -> list[BackgroundTaskRecord]:
+        """回收 Worker 失联的 running 任务，并按剩余次数重新排队或失败。
+
+        Celery 的 late acknowledgement 能在 Worker 丢失后重新投递消息，但数据库中的
+        状态可能已经被认领为 ``running``。超过硬超时后的任务不会再被普通认领逻辑接受，
+        因此由 Beat 定期依据 ``updated_at`` 做一次数据库原子回收。
+        """
+
+        if stale_after_seconds <= 0:
+            raise ValueError("后台任务失联回收时间必须大于 0 秒。")
+        cutoff = (
+            datetime.now(UTC) - timedelta(seconds=stale_after_seconds)
+        ).isoformat(timespec="seconds")
+        now = now_iso()
+        recovered: list[BackgroundTaskRecord] = []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM background_tasks
+                WHERE status = 'running' AND updated_at < ?
+                ORDER BY updated_at ASC, id ASC
+                """,
+                (cutoff,),
+            ).fetchall()
+            for row in rows:
+                task_key = str(row["task_key"])
+                attempt = int(row["attempt"] or 0)
+                max_attempts = int(row["max_attempts"] or 1)
+                if attempt >= max_attempts:
+                    cursor = conn.execute(
+                        """
+                        UPDATE background_tasks
+                        SET status = 'failed',
+                            error_summary = ?,
+                            finished_at = ?,
+                            updated_at = ?
+                        WHERE task_key = ? AND status = 'running'
+                        """,
+                        (
+                            "Worker 执行超时或进程失联，已达到最大重试次数。",
+                            now,
+                            now,
+                            task_key,
+                        ),
+                    )
+                else:
+                    cursor = conn.execute(
+                        """
+                        UPDATE background_tasks
+                        SET status = 'queued',
+                            progress = 0,
+                            error_summary = ?,
+                            started_at = NULL,
+                            finished_at = NULL,
+                            updated_at = ?
+                        WHERE task_key = ? AND status = 'running'
+                        """,
+                        (
+                            "Worker 执行超时或进程失联，任务已重新排队。",
+                            now,
+                            task_key,
+                        ),
+                    )
+                # 多个 Beat 可能同时运行；只有真正把状态从 running 改掉的实例
+                # 才拥有后续投递权，避免同一失联任务被重复放回队列。
+                if cursor.rowcount != 1:
+                    continue
+                refreshed = conn.execute(
+                    "SELECT * FROM background_tasks WHERE task_key = ?",
+                    (task_key,),
+                ).fetchone()
+                if refreshed is not None:
+                    recovered.append(background_task_from_row(refreshed))
+        return recovered
+
     def release_background_task_idempotency(self, task_key: str) -> None:
         """释放已结束任务的幂等键，但保留任务记录供审计和排查。"""
 
@@ -2259,7 +2338,8 @@ class RepositoryStore:
             cursor = conn.execute(
                 """
                 UPDATE background_tasks
-                SET status = 'queued', error_summary = ?, updated_at = ?
+                SET status = 'queued', error_summary = ?,
+                    started_at = NULL, finished_at = NULL, updated_at = ?
                 WHERE task_key = ? AND status = 'running'
                 """,
                 (trim_task_error(error_summary), now_iso(), task_key),

@@ -142,6 +142,7 @@ class TaskQueueSettings:
     queue_name: str = "job_agent"
     task_time_limit_seconds: int = 900
     task_soft_time_limit_seconds: int = 840
+    task_stale_after_seconds: int = 1800
 
 
 @dataclass(frozen=True)
@@ -746,12 +747,21 @@ def load_task_queue_settings(
         raise ValueError(
             "JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS 必须小于 JOB_AGENT_TASK_TIME_LIMIT_SECONDS。"
         )
+    stale_after = parse_positive_int(
+        get("JOB_AGENT_TASK_STALE_AFTER_SECONDS", "1800"),
+        "JOB_AGENT_TASK_STALE_AFTER_SECONDS",
+    )
+    if stale_after <= time_limit:
+        raise ValueError(
+            "JOB_AGENT_TASK_STALE_AFTER_SECONDS 必须大于 JOB_AGENT_TASK_TIME_LIMIT_SECONDS。"
+        )
     return TaskQueueSettings(
         enabled=True,
         redis_url=redis_url,
         queue_name=queue_name,
         task_time_limit_seconds=time_limit,
         task_soft_time_limit_seconds=soft_time_limit,
+        task_stale_after_seconds=stale_after,
     )
 
 
@@ -769,6 +779,7 @@ def masked_task_queue_settings(settings: TaskQueueSettings) -> dict[str, object]
         "queue_name": settings.queue_name,
         "task_time_limit_seconds": settings.task_time_limit_seconds,
         "task_soft_time_limit_seconds": settings.task_soft_time_limit_seconds,
+        "task_stale_after_seconds": settings.task_stale_after_seconds,
     }
 
 

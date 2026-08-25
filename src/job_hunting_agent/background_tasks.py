@@ -34,6 +34,7 @@ from .task_queue import (
     RAG_INDEX_TASK_TYPE,
     RESUME_EXPORT_TASK_TYPE,
     RESUME_OCR_TASK_TYPE,
+    STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME,
 )
 from .tool_audit import (
     background_task_tool_name,
@@ -200,6 +201,86 @@ def purge_old_operational_audit_records(backend: JobHuntingApp) -> dict[str, int
         "deleted_tool_call_traces": deleted_tool_call_traces,
         "deleted_usage_events": deleted_usage_events,
     }
+
+
+def recover_stale_background_tasks(backend: JobHuntingApp) -> dict[str, int]:
+    """回收 Worker 失联任务，并重新投递仍有重试预算的 task_key。"""
+
+    records = backend.store.recover_stale_background_tasks(
+        stale_after_seconds=backend.task_queue_settings.task_stale_after_seconds,
+    )
+    requeued = 0
+    failed = 0
+    for record in records:
+        if record.status == "queued":
+            requeued += 1
+            _record_background_task_trace(
+                backend,
+                record,
+                step_status="running",
+                trace_status="running",
+                attempt_status="failed",
+                summary="Worker 执行超时或进程失联，任务已重新排队。",
+                result={
+                    "ok": False,
+                    "task_key": record.task_key,
+                    "task_type": record.task_type,
+                    "status": record.status,
+                    "error_summary": record.error_summary,
+                    "retrying": True,
+                },
+                finish_attempt=True,
+            )
+            try:
+                if backend.task_queue is None:
+                    raise RuntimeError("后台任务队列未启用。")
+                backend.task_queue.enqueue(record.task_key)
+            except Exception:
+                # 回收任务已经离开 running，投递失败时明确标记失败，避免留下新的 queued
+                # 孤儿；用户或管理员可以沿用原幂等键再次投递。
+                failed_record = backend.store.fail_queued_background_task(
+                    record.task_key,
+                    "后台任务重新投递失败，请稍后重试。",
+                )
+                _mark_resume_ocr_artifact_failed(backend, failed_record.task_key)
+                _record_background_task_trace(
+                    backend,
+                    failed_record,
+                    step_status="failed",
+                    trace_status="failed",
+                    attempt_status="failed",
+                    summary=failed_record.error_summary,
+                    result={
+                        "ok": False,
+                        "task_key": failed_record.task_key,
+                        "task_type": failed_record.task_type,
+                        "status": failed_record.status,
+                        "error_summary": failed_record.error_summary,
+                    },
+                    finish_attempt=True,
+                )
+                requeued -= 1
+                failed += 1
+        else:
+            failed += 1
+            _mark_resume_ocr_artifact_failed(backend, record.task_key)
+            _record_background_task_trace(
+                backend,
+                record,
+                step_status="failed",
+                trace_status="failed",
+                attempt_status="failed",
+                summary=record.error_summary,
+                result={
+                    "ok": False,
+                    "task_key": record.task_key,
+                    "task_type": record.task_type,
+                    "status": record.status,
+                    "error_summary": record.error_summary,
+                },
+                finish_attempt=True,
+            )
+    return {"requeued": requeued, "failed": failed}
 
 
 class NonRetryableTaskError(RuntimeError):
@@ -691,6 +772,22 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
                 "deleted_count": sum(deleted_counts.values()),
                 **deleted_counts,
             }
+        finally:
+            backend.store.close()
+
+    @celery_app.task(
+        bind=True,
+        name=STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME,
+        ignore_result=True,
+    )
+    def recover_stale_tasks(self: Any) -> dict[str, object]:
+        """周期回收 Worker 崩溃后遗留的 running 任务。"""
+
+        backend = JobHuntingApp(env_path=env_path)
+        try:
+            backend.initialize()
+            counts = recover_stale_background_tasks(backend)
+            return {"status": "succeeded", **counts}
         finally:
             backend.store.close()
 
