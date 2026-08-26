@@ -259,8 +259,9 @@ class RequestMetrics:
 def format_prometheus_request_metrics(
     snapshot: dict[str, object],
     concurrency_snapshot: dict[str, object] | None = None,
+    intent_routing_snapshot: dict[str, object] | None = None,
 ) -> str:
-    """把低敏请求和共享租约快照导出为 Prometheus 文本格式。"""
+    """把低敏请求、共享租约和意图路由快照导出为 Prometheus 文本。"""
 
     total_requests = int(snapshot.get("total_requests", 0))
     total_duration_seconds = float(snapshot.get("total_duration_ms", 0)) / 1000
@@ -319,6 +320,7 @@ def format_prometheus_request_metrics(
         ]
     )
     _append_concurrency_metrics(lines, concurrency_snapshot)
+    _append_intent_routing_metrics(lines, intent_routing_snapshot)
     return "\n".join(lines) + "\n"
 
 
@@ -358,6 +360,62 @@ def _append_concurrency_metrics(
                 f'job_agent_concurrency_leases_in_flight{{resource="{label}"}} {int(raw_values.get("in_flight", 0))}',
             ]
         )
+
+
+def _append_intent_routing_metrics(
+    lines: list[str],
+    snapshot: dict[str, object] | None,
+) -> None:
+    """追加低基数路由计数和小模型判断耗时直方图。"""
+
+    values = snapshot if isinstance(snapshot, dict) else {}
+    lines.extend(
+        [
+            "# HELP job_agent_intent_router_direct_total Agent turns completed through a direct read-only route.",
+            "# TYPE job_agent_intent_router_direct_total counter",
+            f'job_agent_intent_router_direct_total {int(values.get("direct_total", 0))}',
+            "# HELP job_agent_intent_router_fallback_total Agent turns that continued through the main Agent path.",
+            "# TYPE job_agent_intent_router_fallback_total counter",
+            f'job_agent_intent_router_fallback_total {int(values.get("fallback_total", 0))}',
+            "# HELP job_agent_intent_router_timeouts_total Router model decisions stopped by the total deadline.",
+            "# TYPE job_agent_intent_router_timeouts_total counter",
+            f'job_agent_intent_router_timeouts_total {int(values.get("timeout_total", 0))}',
+        ]
+    )
+    _append_labeled_counter(
+        lines,
+        name="job_agent_intent_router_fallback_reasons_total",
+        help_text="Main Agent fallbacks grouped by a fixed low-cardinality reason.",
+        label_name="reason",
+        values=values.get("fallback_reason_counts"),
+    )
+    histogram_name = "job_agent_intent_router_model_duration_seconds"
+    lines.extend(
+        [
+            f"# HELP {histogram_name} End-to-end lightweight router model decision duration.",
+            f"# TYPE {histogram_name} histogram",
+        ]
+    )
+    raw_buckets = values.get("latency_bucket_counts_ms")
+    if isinstance(raw_buckets, dict):
+        numeric_buckets: list[tuple[int, int]] = []
+        for raw_boundary, raw_count in raw_buckets.items():
+            try:
+                numeric_buckets.append((int(raw_boundary), int(raw_count)))
+            except (TypeError, ValueError):
+                continue
+        for boundary_ms, count in sorted(numeric_buckets):
+            boundary_seconds = _prometheus_number(boundary_ms / 1000)
+            lines.append(f'{histogram_name}_bucket{{le="{boundary_seconds}"}} {count}')
+    latency_count = int(values.get("latency_count", 0))
+    latency_sum_seconds = float(values.get("latency_sum_ms", 0)) / 1000
+    lines.extend(
+        [
+            f'{histogram_name}_bucket{{le="+Inf"}} {latency_count}',
+            f"{histogram_name}_sum {_prometheus_number(latency_sum_seconds)}",
+            f"{histogram_name}_count {latency_count}",
+        ]
+    )
 
 
 def _append_labeled_counter(

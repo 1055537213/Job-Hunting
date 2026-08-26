@@ -2091,6 +2091,13 @@ def test_web_chat_can_use_langchain_agent_mode(tmp_path):
     assert stored_routing["decision_source"] == "disabled"
     assert stored_routing["main_agent_used"] is True
     assert {"message", "prompt", "raw_response"}.isdisjoint(stored_routing)
+    prometheus = client.get("/internal/metrics").text
+    assert "job_agent_intent_router_direct_total 0" in prometheus
+    assert "job_agent_intent_router_fallback_total 1" in prometheus
+    assert (
+        'job_agent_intent_router_fallback_reasons_total{reason="router_disabled"} 1'
+        in prometheus
+    )
     public_history = client.get(
         "/api/chat/history",
         params={"candidate_id": candidate_id, "session_id": session_id},

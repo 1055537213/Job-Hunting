@@ -371,6 +371,8 @@ SHA-256。隔离脚本证明恢复机制可执行，但生产 RPO 仍取决于�
 应通过 SSH 端口转发访问；`/internal/metrics` 不会由 Caddy 暴露到公网。告警通知接收方需在
 正式确定邮件、企业微信或其他值班渠道后，通过 Alertmanager 单独接入。Caddy 和 Prometheus
 均通过 Docker DNS 动态发现 Web 副本，Caddy 轮询分发请求，告警按整个 Web 服务聚合。
+轻量意图路由另外导出直达、回退、超时、固定回退原因和模型判断耗时直方图；这些指标不含
+账号、消息、prompt、工具参数或 request ID，可直接按 Web 副本求和并计算 P95。
 
 ## 8. 接口文档
 

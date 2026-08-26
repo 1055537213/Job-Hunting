@@ -39,6 +39,27 @@ DIRECT_TOOL_NAMES = frozenset(
     }
 )
 
+ROUTER_LATENCY_BUCKETS_MS = (50, 100, 250, 500, 1000, 2000, 3000)
+ROUTER_FALLBACK_REASONS = frozenset(
+    {
+        "router_disabled",
+        "empty_message",
+        "ambiguous_reference",
+        "multi_step",
+        "mutation_or_confirmation",
+        "invalid_response",
+        "model_selected_agent",
+        "tool_not_allowed",
+        "low_confidence",
+        "candidate_missing",
+        "query_missing",
+        "router_error",
+        "router_timeout",
+        "router_busy",
+        "direct_execution_error",
+    }
+)
+
 # 这些表达说明当前消息依赖隐含上下文、包含多个步骤，或可能改变业务事实。
 # 命中时不调用轻量模型，直接交给主 Agent，避免把模型自报置信度当成安全依据。
 AMBIGUOUS_REFERENCE_PATTERN = re.compile(
@@ -91,6 +112,66 @@ class IntentRouterTimeoutError(TimeoutError):
 
 class IntentRouterBusyError(RuntimeError):
     """不可取消的同步路由调用已达到有界并发上限。"""
+
+
+class IntentRoutingMetrics:
+    """进程内低基数路由指标；不保存消息、账号或请求标识。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._direct_total = 0
+        self._fallback_total = 0
+        self._timeout_total = 0
+        self._fallback_reason_counts: dict[str, int] = {
+            reason: 0 for reason in sorted(ROUTER_FALLBACK_REASONS)
+        }
+        self._latency_bucket_counts: dict[int, int] = {
+            boundary: 0 for boundary in ROUTER_LATENCY_BUCKETS_MS
+        }
+        self._latency_count = 0
+        self._latency_sum_ms = 0
+
+    def record_decision(
+        self,
+        decision: IntentDecision | None,
+        *,
+        direct_executed: bool,
+    ) -> None:
+        """在最终路由路径确定时记账，不依赖下游主 Agent 是否成功。"""
+
+        model_attempted = bool(decision and decision.model_attempted)
+        reason = normalize_fallback_reason(
+            decision.fallback_reason if decision else "router_disabled"
+        )
+        latency_ms = non_negative_int(decision.latency_ms if decision else 0)
+        with self._lock:
+            if direct_executed:
+                self._direct_total += 1
+            else:
+                self._fallback_total += 1
+                self._fallback_reason_counts[reason] += 1
+                if reason == "router_timeout":
+                    self._timeout_total += 1
+            if model_attempted:
+                self._latency_count += 1
+                self._latency_sum_ms += latency_ms
+                for boundary in ROUTER_LATENCY_BUCKETS_MS:
+                    if latency_ms <= boundary:
+                        self._latency_bucket_counts[boundary] += 1
+
+    def snapshot(self) -> dict[str, object]:
+        """返回 Prometheus 格式化器可安全导出的计数快照。"""
+
+        with self._lock:
+            return {
+                "direct_total": self._direct_total,
+                "fallback_total": self._fallback_total,
+                "timeout_total": self._timeout_total,
+                "fallback_reason_counts": dict(self._fallback_reason_counts),
+                "latency_bucket_counts_ms": dict(self._latency_bucket_counts),
+                "latency_count": self._latency_count,
+                "latency_sum_ms": self._latency_sum_ms,
+            }
 
 
 class IntentRouter:
@@ -374,6 +455,24 @@ def requires_agent_fallback(message: str) -> bool:
     """判断消息是否必须绕过轻量模型进入主 Agent。"""
 
     return agent_fallback_reason(message) is not None
+
+
+def normalize_fallback_reason(value: object) -> str:
+    """把任意兼容路由器原因收束到固定标签集合。"""
+
+    reason = str(value or "router_error")
+    return reason if reason in ROUTER_FALLBACK_REASONS else "router_error"
+
+
+def non_negative_int(value: object) -> int:
+    """把指标输入转换成非负整数，拒绝布尔值冒充耗时。"""
+
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def complete_with_hard_timeout(

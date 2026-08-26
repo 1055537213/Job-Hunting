@@ -167,6 +167,11 @@ target；查询和告警按 `job="job-hunting-agent-web"` 聚合，排障时仍�
 单个副本。该端点只导出总量、路由模板、状态分组、耗时、并发数和安全拦截计数，不导出
 请求正文、查询参数、账号信息、request ID 或最近错误详情。
 
+意图路由通过 `job_agent_intent_router_direct_total`、
+`job_agent_intent_router_fallback_reasons_total`、`job_agent_intent_router_timeouts_total` 和
+`job_agent_intent_router_model_duration_seconds` 观察直达率、回退原因、超时率与耗时分位数。
+标签集合由代码固定，不包含用户消息、账号、prompt、工具参数或 request ID。
+
 Caddy 会对公网 `/internal/*` 请求直接返回 404。Prometheus 页面只监听服务器的
 `127.0.0.1:9090`，可从运维电脑建立 SSH 端口转发后访问：
 

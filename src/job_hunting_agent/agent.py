@@ -44,7 +44,13 @@ from .app import JobHuntingApp
 from .config import DEFAULT_ENV_PATH, AgentMemorySettings, load_agent_memory_settings
 from .conversation_memory import build_restored_context_messages
 from .deduplication import DuplicateResourceError
-from .intent_router import DirectIntentExecutor, IntentDecision, IntentRouter, IntentRouterProtocol
+from .intent_router import (
+    DirectIntentExecutor,
+    IntentDecision,
+    IntentRouter,
+    IntentRouterProtocol,
+    IntentRoutingMetrics,
+)
 from .job_parser import InvalidJobTextError
 from .llm import extract_message_text
 from .models import AgentChatResult, BackgroundTaskRecord
@@ -151,6 +157,7 @@ class JobHuntingAgent:
         self.memory_settings = memory_settings or load_agent_memory_settings(self.env_path)
         self.intent_router = intent_router or IntentRouter(self.model_gateway)
         self.direct_intent_executor = DirectIntentExecutor(app)
+        self.routing_metrics = IntentRoutingMetrics()
         self._restored_sessions: set[tuple[int | None, int | None, str]] = set()
         checkpointer = (
             MemorySaver()
@@ -202,7 +209,9 @@ class JobHuntingAgent:
             turn_started_at=turn_started_at,
         )
         if direct_result is not None:
+            self.routing_metrics.record_decision(route_decision, direct_executed=True)
             return direct_result
+        self.routing_metrics.record_decision(route_decision, direct_executed=False)
         main_agent_started_at = time.monotonic()
         result = self.graph.invoke(
             {"messages": turn_messages},
@@ -234,7 +243,7 @@ class JobHuntingAgent:
             session_id=resolved_session_id,
             root_request_id=root_request_id,
         )
-        return AgentChatResult(
+        chat_result = AgentChatResult(
             reply=extract_final_reply(messages),
             candidate_id=candidate_id,
             session_id=resolved_session_id,
@@ -251,6 +260,7 @@ class JobHuntingAgent:
                 total_latency_ms=elapsed_ms(turn_started_at),
             ),
         )
+        return chat_result
 
     def stream_chat(
         self,
@@ -298,6 +308,7 @@ class JobHuntingAgent:
             turn_started_at=turn_started_at,
         )
         if direct_result is not None:
+            self.routing_metrics.record_decision(route_decision, direct_executed=True)
             yield {"type": "step_started", "name": direct_result.used_tools[0]}
             yield {
                 "type": "step_completed",
@@ -307,6 +318,7 @@ class JobHuntingAgent:
             yield {"type": "token", "content": direct_result.reply}
             yield {"type": "final", "result": direct_result}
             return
+        self.routing_metrics.record_decision(route_decision, direct_executed=False)
         main_agent_started_at = time.monotonic()
         tool_and_final_messages: list[BaseMessage] = []
         streamed_reply_parts: list[str] = []
@@ -395,26 +407,24 @@ class JobHuntingAgent:
             ),
             streamed_usage,
         )
-        yield {
-            "type": "final",
-            "result": AgentChatResult(
-                reply=reply,
-                candidate_id=candidate_id,
-                session_id=resolved_session_id,
-                mode="langchain_agent",
-                used_tools=collect_used_tools(tool_and_final_messages),
-                tool_outputs=collect_tool_outputs(tool_and_final_messages),
-                usage=merge_usage_summaries(route_decision.usage if route_decision else {}, usage),
-                root_request_id=root_request_id,
-                routing=build_routing_summary(
-                    route_decision,
-                    main_agent_used=True,
-                    direct_executed=False,
-                    downstream_latency_ms=elapsed_ms(main_agent_started_at),
-                    total_latency_ms=elapsed_ms(turn_started_at),
-                ),
+        chat_result = AgentChatResult(
+            reply=reply,
+            candidate_id=candidate_id,
+            session_id=resolved_session_id,
+            mode="langchain_agent",
+            used_tools=collect_used_tools(tool_and_final_messages),
+            tool_outputs=collect_tool_outputs(tool_and_final_messages),
+            usage=merge_usage_summaries(route_decision.usage if route_decision else {}, usage),
+            root_request_id=root_request_id,
+            routing=build_routing_summary(
+                route_decision,
+                main_agent_used=True,
+                direct_executed=False,
+                downstream_latency_ms=elapsed_ms(main_agent_started_at),
+                total_latency_ms=elapsed_ms(turn_started_at),
             ),
-        }
+        )
+        yield {"type": "final", "result": chat_result}
 
     def _route_message(
         self,
@@ -438,7 +448,10 @@ class JobHuntingAgent:
                 root_request_id=root_request_id,
             )
         except Exception:  # noqa: BLE001 - 路由器是优化层，失败不能阻塞主 Agent。
-            return None
+            return IntentDecision(
+                decision_source="router_boundary",
+                fallback_reason="router_error",
+            )
 
     def _execute_direct_route(
         self,

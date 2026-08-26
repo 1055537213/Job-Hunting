@@ -15,6 +15,7 @@ from job_hunting_agent.config import IntentRouterSettings, LLMSettings
 from job_hunting_agent.intent_router import (
     IntentDecision,
     IntentRouter,
+    IntentRoutingMetrics,
     agent_fallback_reason,
     parse_intent_decision,
     requires_agent_fallback,
@@ -82,6 +83,13 @@ class ExplodingChatModel(FakeMessagesListChatModel):
         raise AssertionError("高置信度只读路由不应调用主 Agent 模型。")
 
 
+class ToolCallingFakeChatModel(FakeMessagesListChatModel):
+    """允许 create_agent 绑定工具的固定响应模型。"""
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        return self
+
+
 @dataclass
 class StubIntentRouter:
     decision: IntentDecision
@@ -97,6 +105,11 @@ class StubIntentRouter:
         root_request_id: str,
     ) -> IntentDecision:
         return self.decision
+
+
+class ExplodingIntentRouter:
+    def route(self, message: str, **kwargs) -> IntentDecision:
+        raise RuntimeError("router implementation failed")
 
 
 def test_parse_intent_decision_accepts_only_high_confidence_read_route():
@@ -303,6 +316,41 @@ def test_router_hard_timeout_bounds_sync_compatibility_client():
     assert client.finished.wait(timeout=0.5) is True
 
 
+def test_routing_metrics_count_final_paths_reasons_and_model_latency():
+    metrics = IntentRoutingMetrics()
+
+    metrics.record_decision(
+        IntentDecision(model_attempted=True, latency_ms=742),
+        direct_executed=True,
+    )
+    metrics.record_decision(
+        IntentDecision(
+            model_attempted=True,
+            fallback_reason="router_timeout",
+            latency_ms=3000,
+        ),
+        direct_executed=False,
+    )
+    metrics.record_decision(
+        IntentDecision(fallback_reason="user-controlled-secret-value"),
+        direct_executed=False,
+    )
+
+    snapshot = metrics.snapshot()
+
+    assert snapshot["direct_total"] == 1
+    assert snapshot["fallback_total"] == 2
+    assert snapshot["timeout_total"] == 1
+    assert snapshot["fallback_reason_counts"]["router_timeout"] == 1
+    assert snapshot["fallback_reason_counts"]["router_error"] == 1
+    assert "user-controlled-secret-value" not in snapshot["fallback_reason_counts"]
+    assert snapshot["latency_count"] == 2
+    assert snapshot["latency_sum_ms"] == 3742
+    assert snapshot["latency_bucket_counts_ms"][500] == 0
+    assert snapshot["latency_bucket_counts_ms"][1000] == 1
+    assert snapshot["latency_bucket_counts_ms"][3000] == 2
+
+
 def test_agent_direct_route_bypasses_main_model_for_read_only_query(account_id):
     app = JobHuntingApp()
     app.initialize()
@@ -352,3 +400,147 @@ def test_agent_direct_route_bypasses_main_model_for_read_only_query(account_id):
     assert result.routing["main_agent_used"] is False
     assert result.routing["router_latency_ms"] == 12
     assert {"message", "prompt", "raw_response"}.isdisjoint(result.routing)
+    metrics = agent.routing_metrics.snapshot()
+    assert metrics["direct_total"] == 1
+    assert metrics["fallback_total"] == 0
+    assert metrics["latency_count"] == 1
+
+
+def test_agent_stream_direct_route_records_metrics_once(account_id):
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="小林",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={"Python": "项目使用"},
+            preferred_cities=["杭州"],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=["后端开发"],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+    agent = JobHuntingAgent(
+        app,
+        model=ExplodingChatModel(responses=[AIMessage(content="不应调用")]),
+        intent_router=StubIntentRouter(
+            IntentDecision(
+                route="direct_tool",
+                tool_name="get_current_candidate_profile",
+                confidence=0.99,
+                model_attempted=True,
+                decision_source="model",
+                latency_ms=21,
+            )
+        ),
+    )
+
+    events = list(
+        agent.stream_chat(
+            "查看我的档案",
+            candidate_id=candidate_id,
+            session_id="direct-route-stream",
+            use_tool_llm=False,
+            account_id=account_id,
+        )
+    )
+
+    assert events[-1]["type"] == "final"
+    assert events[-1]["result"].mode == "intent_router_direct"
+    metrics = agent.routing_metrics.snapshot()
+    assert metrics["direct_total"] == 1
+    assert metrics["fallback_total"] == 0
+    assert metrics["latency_count"] == 1
+    assert metrics["latency_sum_ms"] == 21
+
+
+def test_router_timeout_metric_survives_main_agent_failure(account_id):
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="小林",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+    agent = JobHuntingAgent(
+        app,
+        model=ExplodingChatModel(responses=[AIMessage(content="不应返回")]),
+        intent_router=StubIntentRouter(
+            IntentDecision(
+                fallback_reason="router_timeout",
+                model_attempted=True,
+                decision_source="model",
+                latency_ms=3000,
+            )
+        ),
+    )
+
+    with pytest.raises(AssertionError, match="不应调用主 Agent 模型"):
+        agent.chat(
+            "列出我已经导入的职位",
+            candidate_id=candidate_id,
+            session_id="timeout-then-main-agent-fails",
+            use_tool_llm=False,
+            account_id=account_id,
+        )
+
+    metrics = agent.routing_metrics.snapshot()
+    assert metrics["direct_total"] == 0
+    assert metrics["fallback_total"] == 1
+    assert metrics["timeout_total"] == 1
+    assert metrics["fallback_reason_counts"]["router_timeout"] == 1
+    assert metrics["latency_count"] == 1
+
+
+def test_router_boundary_exception_is_counted_as_router_error(account_id):
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="小林",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+    agent = JobHuntingAgent(
+        app,
+        model=ToolCallingFakeChatModel(responses=[AIMessage(content="已安全回退。")]),
+        intent_router=ExplodingIntentRouter(),
+    )
+
+    result = agent.chat(
+        "列出我已经导入的职位",
+        candidate_id=candidate_id,
+        session_id="router-boundary-error",
+        use_tool_llm=False,
+        account_id=account_id,
+    )
+
+    assert result.mode == "langchain_agent"
+    assert result.routing["decision_source"] == "router_boundary"
+    assert result.routing["fallback_reason"] == "router_error"
+    metrics = agent.routing_metrics.snapshot()
+    assert metrics["fallback_total"] == 1
+    assert metrics["fallback_reason_counts"]["router_error"] == 1

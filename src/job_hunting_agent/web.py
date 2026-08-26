@@ -1080,6 +1080,11 @@ def create_web_app(
         body = format_prometheus_request_metrics(
             web_app.state.request_metrics.snapshot(),
             concurrency_snapshot,
+            (
+                chat_agent.routing_metrics.snapshot()
+                if chat_agent is not None
+                else None
+            ),
         )
         return Response(content=body, media_type=PROMETHEUS_CONTENT_TYPE)
 
