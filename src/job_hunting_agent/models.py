@@ -592,6 +592,28 @@ class AccountRecord:
 
 
 @dataclass
+class AccountEmailOutboxRecord:
+    """一封账号事务邮件的持久投递状态。"""
+
+    id: int
+    account_id: int
+    action_token_id: int
+    purpose: str
+    recipient_email: str
+    delivery_key: str
+    status: str
+    attempt_count: int
+    max_attempts: int
+    next_attempt_at: str
+    claimed_at: str | None
+    sent_at: str | None
+    last_error_type: str | None
+    last_error_summary: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass
 class AccountBalanceSummary:
     """一个账号的余额与消费汇总。"""
 

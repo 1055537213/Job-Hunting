@@ -1849,6 +1849,41 @@
                   </article>
                 </div>
               </section>
+              <section class="admin-observability-errors" aria-labelledby="accountEmailDeliveryTitle">
+                <div class="admin-observability-section-head">
+                  <div>
+                    <p class="eyebrow">Account Email Delivery</p>
+                    <h3 id="accountEmailDeliveryTitle">账号邮件投递</h3>
+                  </div>
+                  <span>{{ admin.emailOutbox.records.length }} 条最近记录</span>
+                </div>
+                <div class="admin-observability-summary" aria-label="账号邮件投递摘要">
+                  <div class="admin-observability-stat"><span>待投递</span><strong>{{ admin.emailOutbox.summary.pending || 0 }}</strong></div>
+                  <div class="admin-observability-stat"><span>待重试</span><strong>{{ admin.emailOutbox.summary.retrying || 0 }}</strong></div>
+                  <div class="admin-observability-stat"><span>已发送</span><strong>{{ admin.emailOutbox.summary.sent || 0 }}</strong></div>
+                  <div class="admin-observability-stat"><span>失败</span><strong>{{ admin.emailOutbox.summary.failed || 0 }}</strong></div>
+                </div>
+                <div v-if="!admin.emailOutbox.records.length" class="admin-observability-empty">
+                  当前没有账号邮件投递记录。
+                </div>
+                <div v-else class="admin-table-wrap admin-observability-table-wrap">
+                  <table class="admin-table admin-observability-table">
+                    <thead>
+                      <tr><th>收件账号</th><th>用途</th><th>状态</th><th>尝试</th><th>失败摘要</th><th>更新时间</th></tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="record in admin.emailOutbox.records" :key="record.id">
+                        <td>{{ record.recipient_email }}</td>
+                        <td>{{ accountEmailPurposeLabel(record.purpose) }}</td>
+                        <td>{{ accountEmailStatusLabel(record.status) }}</td>
+                        <td>{{ record.attempt_count }} / {{ record.max_attempts }}</td>
+                        <td>{{ record.last_error_summary || "-" }}</td>
+                        <td>{{ formatDate(record.updated_at) }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
             </section>
 
             <section v-else class="panel admin-panel admin-audit-panel">

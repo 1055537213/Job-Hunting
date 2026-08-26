@@ -111,7 +111,7 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 | 模型网关 | Chat、Embedding、Rerank adapters | 调用上下文、有限重试、供应商 usage 和幂等计费 |
 | 数据 | PostgreSQL 16、SQLAlchemy、Alembic | 权威事实、事务、约束、账号隔离和版本化迁移 |
 | RAG | pgvector、Qwen 多模态 Embedding、LangChain Text Splitters | 文本切片、图片向量、跨模态余弦召回和可选重排 |
-| 异步任务 | Celery、Redis、Celery Beat | OCR、文字/视觉 RAG 索引、GitHub/项目整包分析、定制简历导出和周期维护 |
+| 异步任务 | Celery、Redis、Celery Beat | OCR、文字/视觉 RAG 索引、项目分析、简历导出、账号邮件 Outbox 和周期维护 |
 | 文件 | MinIO / S3、python-docx、ReportLab | 统一知识资产版本、项目包、原始简历和导出文件的对象存储与生成 |
 | 文档识别 | pdfplumber、PDFium、RapidOCR、ONNX Runtime | DOCX/PDF 解析、扫描件检测和 OCR |
 | 工程 | Docker Compose、Caddy、GitHub Actions | 本地复现、单机生产基线、HTTPS 和持续集成 |
@@ -125,7 +125,7 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 1. **事实和推断分离**：只有候选人明确提供或确认的内容才能成为简历与匹配证据，职位要求不能反向污染候选人能力。
 2. **结构化库和知识库联动删除**：项目、职位和简历删除沿 PostgreSQL 外键及应用服务边界清理，pgvector 不保留孤立索引。
 3. **多租户隔离贯穿全链路**：数据库查询、对象键、RAG 检索、任务、工具轨迹和账单都携带账号归属。
-4. **后台任务可恢复**：Redis 消息只包含 `task_key`，任务权威状态在 PostgreSQL；幂等键和原子认领防止重复执行。
+4. **后台任务可恢复**：业务消息只包含 `task_key`，账号邮件消息只包含 Outbox ID；任务权威状态在 PostgreSQL，原子认领防止普通重复投递再次执行。
 5. **实时计量和资金闭环**：只使用供应商确认的 Token usage 计费；调用 ID、充值幂等键和数据库行锁防止重复扣费或重复到账，管理员补款与真实支付严格分开。
 6. **安全的外部内容入口**：职位截图仅在识别请求期间使用；GitHub 快照限制归档大小、文件数、解压总量、路径、公开仓库和重定向目标；本地目录使用双端敏感路径拦截及上传前后哈希校验。
 7. **可执行的上线基线**：包含 CI、生产 Compose、HTTPS 反向代理、迁移门禁、备份与恢复脚本及上线前评测入口。
@@ -138,6 +138,7 @@ Job-hunting Agent/
 ├─ src/job_hunting_agent/
 │  ├─ web.py                  # FastAPI 路由、SSE 和页面入口
 │  ├─ account_lifecycle.py    # 一次性令牌、SMTP 邮件和账号找回边界
+│  ├─ account_email_outbox.py # 账号邮件登记、派生链接、重试和幂等投递
 │  ├─ web_hardening.py        # CSRF、限流、安全头、请求 ID 与指标
 │  ├─ rate_limiting.py        # 内存/Redis 滑动窗口与后端故障策略
 │  ├─ concurrency_control.py   # 模型/截图全局与账号级共享并发租约

@@ -162,6 +162,10 @@ if (!window.Vue) {
             by_account: [],
           },
           requestMetrics: {},
+          emailOutbox: {
+            summary: {},
+            records: [],
+          },
           activeDetailTab: "tokens",
           selectedAccountId: 0,
           loadingEvents: false,
@@ -1226,6 +1230,10 @@ if (!window.Vue) {
           this.admin.ledgerPageSize = Number(summary.page_size || ADMIN_LEDGER_PAGE_SIZE);
           this.admin.ledgerMaxPages = Number(summary.max_pages || ADMIN_LEDGER_MAX_PAGES);
           this.admin.requestMetrics = requestMetrics.requests || {};
+          this.admin.emailOutbox = requestMetrics.account_email || {
+            summary: {},
+            records: [],
+          };
           this.admin.loadError = "";
           await this.loadAdminAuditEvents();
 
@@ -1624,6 +1632,26 @@ if (!window.Vue) {
       accountUsage(accountId) {
         const item = this.accountUsageSummary(accountId);
         return item?.billable_tokens || 0;
+      },
+
+      /** 账号事务邮件用途标签。 */
+      accountEmailPurposeLabel(purpose) {
+        return {
+          verify_email: "邮箱验证",
+          reset_password: "重置密码",
+        }[purpose] || purpose || "账号邮件";
+      },
+
+      /** 账号事务邮件投递状态标签。 */
+      accountEmailStatusLabel(status) {
+        return {
+          pending: "待投递",
+          sending: "发送中",
+          retrying: "待重试",
+          sent: "已发送",
+          failed: "失败",
+          cancelled: "已取消",
+        }[status] || status || "未知";
       },
 
       /** 返回指定账号的汇总行，供一级账号项显示 Token 和流水数量。 */

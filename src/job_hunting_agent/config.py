@@ -209,6 +209,14 @@ class AccountLifecycleSettings:
     smtp_password: str | None = None
     smtp_from_email: str | None = None
     smtp_use_starttls: bool = True
+    action_secret: str = "development-only-account-action-secret"
+    email_request_cooldown_seconds: int = 60
+    email_account_hourly_limit: int = 5
+    email_source_hourly_limit: int = 20
+    email_outbox_max_attempts: int = 5
+    email_retry_base_seconds: int = 30
+    email_claim_timeout_seconds: int = 300
+    email_outbox_retention_days: int = 14
     verification_token_ttl_minutes: int = 1440
     password_reset_token_ttl_minutes: int = 30
     terms_version: str = "development"
@@ -1107,6 +1115,41 @@ def load_account_lifecycle_settings(
         smtp_password=get("JOB_AGENT_SMTP_PASSWORD"),
         smtp_from_email=get("JOB_AGENT_SMTP_FROM_EMAIL"),
         smtp_use_starttls=parse_bool(get("JOB_AGENT_SMTP_USE_STARTTLS", "true")),
+        action_secret=(
+            get(
+                "JOB_AGENT_ACCOUNT_ACTION_SECRET",
+                "development-only-account-action-secret",
+            )
+            or "development-only-account-action-secret"
+        ),
+        email_request_cooldown_seconds=parse_positive_int(
+            get("JOB_AGENT_ACCOUNT_EMAIL_COOLDOWN_SECONDS", "60"),
+            "JOB_AGENT_ACCOUNT_EMAIL_COOLDOWN_SECONDS",
+        ),
+        email_account_hourly_limit=parse_positive_int(
+            get("JOB_AGENT_ACCOUNT_EMAIL_HOURLY_LIMIT", "5"),
+            "JOB_AGENT_ACCOUNT_EMAIL_HOURLY_LIMIT",
+        ),
+        email_source_hourly_limit=parse_positive_int(
+            get("JOB_AGENT_ACCOUNT_EMAIL_SOURCE_HOURLY_LIMIT", "20"),
+            "JOB_AGENT_ACCOUNT_EMAIL_SOURCE_HOURLY_LIMIT",
+        ),
+        email_outbox_max_attempts=parse_positive_int(
+            get("JOB_AGENT_ACCOUNT_EMAIL_MAX_ATTEMPTS", "5"),
+            "JOB_AGENT_ACCOUNT_EMAIL_MAX_ATTEMPTS",
+        ),
+        email_retry_base_seconds=parse_positive_int(
+            get("JOB_AGENT_ACCOUNT_EMAIL_RETRY_BASE_SECONDS", "30"),
+            "JOB_AGENT_ACCOUNT_EMAIL_RETRY_BASE_SECONDS",
+        ),
+        email_claim_timeout_seconds=parse_positive_int(
+            get("JOB_AGENT_ACCOUNT_EMAIL_CLAIM_TIMEOUT_SECONDS", "300"),
+            "JOB_AGENT_ACCOUNT_EMAIL_CLAIM_TIMEOUT_SECONDS",
+        ),
+        email_outbox_retention_days=parse_positive_int(
+            get("JOB_AGENT_ACCOUNT_EMAIL_RETENTION_DAYS", "14"),
+            "JOB_AGENT_ACCOUNT_EMAIL_RETENTION_DAYS",
+        ),
         verification_token_ttl_minutes=parse_positive_int(
             get("JOB_AGENT_VERIFICATION_TOKEN_TTL_MINUTES", "1440"),
             "JOB_AGENT_VERIFICATION_TOKEN_TTL_MINUTES",
@@ -1130,6 +1173,13 @@ def load_account_lifecycle_settings(
             raise ValueError("生产环境必须使用 SMTP 发送账号邮件。")
         if not settings.smtp_host or not settings.smtp_from_email:
             raise ValueError("生产环境必须配置 JOB_AGENT_SMTP_HOST 和 JOB_AGENT_SMTP_FROM_EMAIL。")
+        if (
+            len(settings.action_secret) < 32
+            or settings.action_secret == "development-only-account-action-secret"
+        ):
+            raise ValueError("生产环境必须配置至少 32 个字符的 JOB_AGENT_ACCOUNT_ACTION_SECRET。")
+        if not parse_bool(get("JOB_AGENT_TASK_QUEUE_ENABLED", "false")):
+            raise ValueError("生产环境账号邮件必须启用 Celery 后台任务队列。")
     return settings
 
 
@@ -1142,6 +1192,11 @@ def masked_account_lifecycle_settings(settings: AccountLifecycleSettings) -> dic
         "consent_required": settings.consent_required,
         "email_backend": settings.email_backend,
         "smtp_configured": bool(settings.smtp_host and settings.smtp_from_email),
+        "email_delivery": "postgresql_outbox",
+        "email_request_cooldown_seconds": settings.email_request_cooldown_seconds,
+        "email_account_hourly_limit": settings.email_account_hourly_limit,
+        "email_source_hourly_limit": settings.email_source_hourly_limit,
+        "email_outbox_max_attempts": settings.email_outbox_max_attempts,
         "terms_version": settings.terms_version,
         "privacy_version": settings.privacy_version,
     }

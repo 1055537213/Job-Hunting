@@ -29,6 +29,7 @@ from .deduplication import (
 from .job_parser import classify_skill_requirements, parse_job_text, validate_job_text
 from .models import (
     AccountBalanceSummary,
+    AccountEmailOutboxRecord,
     AccountRecord,
     AdminAuditEventRecord,
     AuthSessionRecord,
@@ -88,6 +89,10 @@ class InsufficientBalanceError(ValueError):
 
 class IdempotencyConflictError(ValueError):
     """同一个幂等键被用于不同的资金操作。"""
+
+
+class AccountEmailRequestSuppressed(ValueError):
+    """账号邮件请求命中冷却或小时上限。"""
 
 
 class RepositoryRow(Protocol):
@@ -312,6 +317,358 @@ class RepositoryStore:
                 (account_id, purpose, token_hash, expires_at, created_at, requested_ip),
             )
 
+    def create_account_email_outbox(
+        self,
+        *,
+        account_id: int,
+        purpose: str,
+        recipient_email: str,
+        delivery_key: str,
+        token_hash: str,
+        expires_at: str,
+        request_source_hash: str | None,
+        cooldown_seconds: int,
+        account_hourly_limit: int,
+        source_hourly_limit: int,
+        max_attempts: int,
+    ) -> AccountEmailOutboxRecord:
+        """原子创建一次性令牌和待投递邮件，并执行持久频率限制。"""
+
+        if purpose not in {"verify_email", "reset_password"}:
+            raise ValueError("账号操作令牌类型无效。")
+        now = datetime.now(UTC)
+        created_at = now.isoformat(timespec="seconds")
+        cooldown_start = (now - timedelta(seconds=cooldown_seconds)).isoformat(
+            timespec="seconds"
+        )
+        hour_start = (now - timedelta(hours=1)).isoformat(timespec="seconds")
+        with self.connect() as conn:
+            account = conn.execute(
+                "SELECT id FROM accounts WHERE id = ? AND deleted_at IS NULL FOR UPDATE",
+                (account_id,),
+            ).fetchone()
+            if account is None:
+                raise KeyError(f"Account not found: {account_id}")
+            recent = conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM account_email_outbox
+                WHERE account_id = ? AND purpose = ? AND created_at >= ?
+                """,
+                (account_id, purpose, cooldown_start),
+            ).fetchone()
+            if recent is not None and int(recent["count"]) > 0:
+                raise AccountEmailRequestSuppressed("账号邮件请求过于频繁。")
+            hourly = conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM account_email_outbox
+                WHERE account_id = ? AND created_at >= ?
+                """,
+                (account_id, hour_start),
+            ).fetchone()
+            if hourly is not None and int(hourly["count"]) >= account_hourly_limit:
+                raise AccountEmailRequestSuppressed("账号邮件请求已达到小时上限。")
+            if request_source_hash:
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                    (request_source_hash,),
+                )
+                source_hourly = conn.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM account_email_outbox
+                    WHERE request_source_hash = ? AND created_at >= ?
+                    """,
+                    (request_source_hash, hour_start),
+                ).fetchone()
+                if (
+                    source_hourly is not None
+                    and int(source_hourly["count"]) >= source_hourly_limit
+                ):
+                    raise AccountEmailRequestSuppressed("邮件请求来源已达到小时上限。")
+
+            conn.execute(
+                """
+                UPDATE account_email_outbox
+                SET status = 'cancelled', updated_at = ?
+                WHERE account_id = ? AND purpose = ?
+                  AND status IN ('pending', 'sending', 'retrying')
+                """,
+                (created_at, account_id, purpose),
+            )
+            conn.execute(
+                """
+                UPDATE account_action_tokens SET consumed_at = ?
+                WHERE account_id = ? AND purpose = ? AND consumed_at IS NULL
+                """,
+                (created_at, account_id, purpose),
+            )
+            token_cursor = conn.execute(
+                """
+                INSERT INTO account_action_tokens (
+                    account_id, purpose, token_hash, expires_at,
+                    consumed_at, created_at, requested_ip
+                ) VALUES (?, ?, ?, ?, NULL, ?, NULL)
+                """,
+                (account_id, purpose, token_hash, expires_at, created_at),
+            )
+            cursor = conn.execute(
+                """
+                INSERT INTO account_email_outbox (
+                    account_id, action_token_id, purpose, recipient_email,
+                    delivery_key, request_source_hash, status, attempt_count,
+                    max_attempts, next_attempt_at, claimed_at, sent_at,
+                    last_error_type, last_error_summary, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    account_id,
+                    int(token_cursor.lastrowid),
+                    purpose,
+                    recipient_email,
+                    delivery_key,
+                    request_source_hash,
+                    max_attempts,
+                    created_at,
+                    created_at,
+                    created_at,
+                ),
+            )
+            outbox_id = int(cursor.lastrowid)
+        return self.get_account_email_outbox(outbox_id)
+
+    def get_account_email_outbox(self, outbox_id: int) -> AccountEmailOutboxRecord:
+        """读取一条邮件 Outbox 记录。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM account_email_outbox WHERE id = ?",
+                (outbox_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Account email outbox not found: {outbox_id}")
+        return account_email_outbox_from_row(row)
+
+    def claim_account_email_outbox(
+        self,
+        outbox_id: int,
+        claim_timeout_seconds: int,
+    ) -> AccountEmailOutboxRecord | None:
+        """原子认领到期邮件；重复消息和未到期重试均返回空。"""
+
+        now = datetime.now(UTC)
+        claimed_at = now.isoformat(timespec="seconds")
+        stale_before = (now - timedelta(seconds=claim_timeout_seconds)).isoformat(
+            timespec="seconds"
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE account_email_outbox AS outbox
+                SET status = 'cancelled', claimed_at = NULL, updated_at = ?
+                WHERE outbox.id = ?
+                  AND outbox.status IN ('pending', 'sending', 'retrying')
+                  AND EXISTS (
+                      SELECT 1 FROM account_action_tokens AS token
+                      WHERE token.id = outbox.action_token_id
+                        AND (token.consumed_at IS NOT NULL OR token.expires_at <= ?)
+                  )
+                """,
+                (claimed_at, outbox_id, claimed_at),
+            )
+            row = conn.execute(
+                """
+                UPDATE account_email_outbox
+                SET status = 'sending', attempt_count = attempt_count + 1,
+                    claimed_at = ?, updated_at = ?
+                WHERE id = ? AND attempt_count < max_attempts AND (
+                    (status IN ('pending', 'retrying') AND next_attempt_at <= ?)
+                    OR (status = 'sending' AND claimed_at < ?)
+                )
+                AND EXISTS (
+                    SELECT 1 FROM account_action_tokens AS token
+                    WHERE token.id = account_email_outbox.action_token_id
+                      AND token.consumed_at IS NULL AND token.expires_at > ?
+                )
+                RETURNING *
+                """,
+                (
+                    claimed_at,
+                    claimed_at,
+                    outbox_id,
+                    claimed_at,
+                    stale_before,
+                    claimed_at,
+                ),
+            ).fetchone()
+        return account_email_outbox_from_row(row) if row is not None else None
+
+    def complete_account_email_outbox(self, outbox_id: int) -> AccountEmailOutboxRecord:
+        """把当前认领的邮件标记为已发送。"""
+
+        sent_at = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE account_email_outbox
+                SET status = 'sent', sent_at = ?, claimed_at = NULL,
+                    last_error_type = NULL, last_error_summary = NULL, updated_at = ?
+                WHERE id = ? AND status = 'sending'
+                """,
+                (sent_at, sent_at, outbox_id),
+            )
+        return self.get_account_email_outbox(outbox_id)
+
+    def fail_account_email_outbox(
+        self,
+        outbox_id: int,
+        *,
+        error_type: str,
+        error_summary: str,
+        next_attempt_at: str,
+    ) -> AccountEmailOutboxRecord:
+        """记录低敏失败摘要，并根据剩余预算进入重试或最终失败。"""
+
+        updated_at = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE account_email_outbox
+                SET status = CASE
+                        WHEN attempt_count >= max_attempts THEN 'failed'
+                        ELSE 'retrying'
+                    END,
+                    next_attempt_at = ?, claimed_at = NULL,
+                    last_error_type = ?, last_error_summary = ?, updated_at = ?
+                WHERE id = ? AND status = 'sending'
+                """,
+                (
+                    next_attempt_at,
+                    error_type[:128],
+                    " ".join(error_summary.split())[:500],
+                    updated_at,
+                    outbox_id,
+                ),
+            )
+        return self.get_account_email_outbox(outbox_id)
+
+    def list_due_account_email_outbox(
+        self,
+        claim_timeout_seconds: int,
+        limit: int = 100,
+    ) -> list[AccountEmailOutboxRecord]:
+        """列出待发送、到期重试和失联认领记录。"""
+
+        now = datetime.now(UTC)
+        current = now.isoformat(timespec="seconds")
+        stale_before = (now - timedelta(seconds=claim_timeout_seconds)).isoformat(
+            timespec="seconds"
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE account_email_outbox AS outbox
+                SET status = 'cancelled', claimed_at = NULL, updated_at = ?
+                WHERE outbox.status IN ('pending', 'sending', 'retrying')
+                  AND EXISTS (
+                      SELECT 1 FROM account_action_tokens AS token
+                      WHERE token.id = outbox.action_token_id
+                        AND (token.consumed_at IS NOT NULL OR token.expires_at <= ?)
+                  )
+                """,
+                (current, current),
+            )
+            conn.execute(
+                """
+                UPDATE account_email_outbox
+                SET status = 'failed', claimed_at = NULL,
+                    last_error_type = 'WorkerLostAfterFinalAttempt',
+                    last_error_summary = ?, updated_at = ?
+                WHERE status = 'sending'
+                  AND claimed_at IS NOT NULL AND claimed_at < ?
+                  AND attempt_count >= max_attempts
+                """,
+                (
+                    "Worker 在最后一次投递时失联，投递结果无法确认。",
+                    current,
+                    stale_before,
+                ),
+            )
+            rows = conn.execute(
+                """
+                SELECT * FROM account_email_outbox
+                WHERE attempt_count < max_attempts AND (
+                    (status IN ('pending', 'retrying') AND next_attempt_at <= ?)
+                    OR (status = 'sending' AND claimed_at < ?)
+                )
+                AND EXISTS (
+                    SELECT 1 FROM account_action_tokens AS token
+                    WHERE token.id = account_email_outbox.action_token_id
+                      AND token.consumed_at IS NULL AND token.expires_at > ?
+                )
+                ORDER BY next_attempt_at, id LIMIT ?
+                """,
+                (current, stale_before, current, max(1, min(limit, 500))),
+            ).fetchall()
+        return [account_email_outbox_from_row(row) for row in rows]
+
+    def list_account_email_outbox(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[AccountEmailOutboxRecord]:
+        """管理员按时间倒序查看低敏投递记录。"""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM account_email_outbox
+                ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
+                """,
+                (max(1, min(limit, 200)), max(0, offset)),
+            ).fetchall()
+        return [account_email_outbox_from_row(row) for row in rows]
+
+    def summarize_account_email_outbox(self) -> dict[str, int]:
+        """返回按状态聚合的邮件投递数量。"""
+
+        statuses = ("pending", "sending", "retrying", "sent", "failed", "cancelled")
+        summary = {status: 0 for status in statuses}
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS count FROM account_email_outbox GROUP BY status"
+            ).fetchall()
+        for row in rows:
+            summary[str(row["status"])] = int(row["count"])
+        return summary
+
+    def prune_account_email_outbox(self, retention_days: int) -> int:
+        """删除保留期外的终态邮件记录及其一次性令牌。"""
+
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat(
+            timespec="seconds"
+        )
+        with self.connect() as conn:
+            token_rows = conn.execute(
+                """
+                SELECT action_token_id FROM account_email_outbox
+                WHERE status IN ('sent', 'failed', 'cancelled') AND updated_at < ?
+                """,
+                (cutoff,),
+            ).fetchall()
+            cursor = conn.execute(
+                """
+                DELETE FROM account_email_outbox
+                WHERE status IN ('sent', 'failed', 'cancelled') AND updated_at < ?
+                """,
+                (cutoff,),
+            )
+            for row in token_rows:
+                conn.execute(
+                    "DELETE FROM account_action_tokens WHERE id = ?",
+                    (int(row["action_token_id"]),),
+                )
+        return max(0, int(cursor.rowcount))
+
     def consume_email_verification_token(self, token_hash: str) -> AccountRecord | None:
         """Consume one live verification token and mark its account verified atomically."""
 
@@ -345,6 +702,15 @@ class RepositoryStore:
                 WHERE id = ? AND deleted_at IS NULL
                 """,
                 (consumed_at, consumed_at, account_id),
+            )
+            conn.execute(
+                """
+                UPDATE account_email_outbox
+                SET status = 'cancelled', claimed_at = NULL, updated_at = ?
+                WHERE account_id = ? AND purpose = 'verify_email'
+                  AND status IN ('pending', 'sending', 'retrying')
+                """,
+                (consumed_at, account_id),
             )
         return self.get_account(account_id)
 
@@ -403,6 +769,14 @@ class RepositoryStore:
                 """,
                 (consumed_at, account_id),
             )
+            conn.execute(
+                """
+                UPDATE account_email_outbox
+                SET status = 'cancelled', claimed_at = NULL, updated_at = ?
+                WHERE account_id = ? AND status IN ('pending', 'sending', 'retrying')
+                """,
+                (consumed_at, account_id),
+            )
         return self.get_account(account_id)
 
     def list_account_consents(self, account_id: int) -> list[dict[str, object]]:
@@ -441,12 +815,29 @@ class RepositoryStore:
         if status not in {"active", "disabled"}:
             raise ValueError("账号状态只能是 active 或 disabled。")
         with self.connect() as conn:
+            changed_at = now_iso()
             cursor = conn.execute(
                 "UPDATE accounts SET status = ?, updated_at = ? WHERE id = ?",
-                (status, now_iso(), account_id),
+                (status, changed_at, account_id),
             )
             if cursor.rowcount == 0:
                 raise KeyError(f"Account not found: {account_id}")
+            if status == "disabled":
+                conn.execute(
+                    """
+                    UPDATE account_action_tokens SET consumed_at = ?
+                    WHERE account_id = ? AND consumed_at IS NULL
+                    """,
+                    (changed_at, account_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE account_email_outbox
+                    SET status = 'cancelled', claimed_at = NULL, updated_at = ?
+                    WHERE account_id = ? AND status IN ('pending', 'sending', 'retrying')
+                    """,
+                    (changed_at, account_id),
+                )
         return self.get_account(account_id)
 
     def update_account_status_with_audit(
@@ -479,6 +870,22 @@ class RepositoryStore:
                     """
                     UPDATE auth_sessions SET revoked_at = ?
                     WHERE account_id = ? AND revoked_at IS NULL
+                    """,
+                    (changed_at, account_id),
+                )
+            if status == "disabled":
+                conn.execute(
+                    """
+                    UPDATE account_action_tokens SET consumed_at = ?
+                    WHERE account_id = ? AND consumed_at IS NULL
+                    """,
+                    (changed_at, account_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE account_email_outbox
+                    SET status = 'cancelled', claimed_at = NULL, updated_at = ?
+                    WHERE account_id = ? AND status IN ('pending', 'sending', 'retrying')
                     """,
                     (changed_at, account_id),
                 )
@@ -536,6 +943,14 @@ class RepositoryStore:
                 """
                 UPDATE account_action_tokens SET consumed_at = ?
                 WHERE account_id = ? AND consumed_at IS NULL
+                """,
+                (changed_at, account_id),
+            )
+            conn.execute(
+                """
+                UPDATE account_email_outbox
+                SET status = 'cancelled', claimed_at = NULL, updated_at = ?
+                WHERE account_id = ? AND status IN ('pending', 'sending', 'retrying')
                 """,
                 (changed_at, account_id),
             )
@@ -674,6 +1089,21 @@ class RepositoryStore:
             )
             conn.execute(
                 """
+                UPDATE account_action_tokens SET consumed_at = ?
+                WHERE account_id = ? AND consumed_at IS NULL
+                """,
+                (changed_at, account_id),
+            )
+            conn.execute(
+                """
+                UPDATE account_email_outbox
+                SET status = 'cancelled', claimed_at = NULL, updated_at = ?
+                WHERE account_id = ? AND status IN ('pending', 'sending', 'retrying')
+                """,
+                (changed_at, account_id),
+            )
+            conn.execute(
+                """
                 UPDATE background_tasks
                 SET status = 'cancelled', finished_at = ?, updated_at = ?
                 WHERE account_id = ? AND status = 'queued'
@@ -734,6 +1164,7 @@ class RepositoryStore:
                 "jobs",
                 "candidate_profiles",
                 "auth_sessions",
+                "account_email_outbox",
                 "account_action_tokens",
             ):
                 conn.execute(
@@ -6654,6 +7085,29 @@ def account_from_row(row: RepositoryRow) -> AccountRecord:
             if "deleted_at" in row and row["deleted_at"] is not None
             else None
         ),
+    )
+
+
+def account_email_outbox_from_row(row: RepositoryRow) -> AccountEmailOutboxRecord:
+    """把邮件投递行转换为领域对象。"""
+
+    return AccountEmailOutboxRecord(
+        id=int(row["id"]),
+        account_id=int(row["account_id"]),
+        action_token_id=int(row["action_token_id"]),
+        purpose=str(row["purpose"]),
+        recipient_email=str(row["recipient_email"]),
+        delivery_key=str(row["delivery_key"]),
+        status=str(row["status"]),
+        attempt_count=int(row["attempt_count"]),
+        max_attempts=int(row["max_attempts"]),
+        next_attempt_at=str(row["next_attempt_at"]),
+        claimed_at=row["claimed_at"],
+        sent_at=row["sent_at"],
+        last_error_type=row["last_error_type"],
+        last_error_summary=row["last_error_summary"],
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
     )
 
 

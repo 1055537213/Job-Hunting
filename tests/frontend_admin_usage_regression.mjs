@@ -412,7 +412,22 @@ const adminLoadContext = {
       };
     }
     if (url === "/api/admin/observability/requests") {
-      return { requests: { total_requests: 12, error_requests: 1, average_duration_ms: 8.5 } };
+      return {
+        requests: { total_requests: 12, error_requests: 1, average_duration_ms: 8.5 },
+        account_email: {
+          summary: { pending: 1, retrying: 0, sent: 3, failed: 0 },
+          records: [
+            {
+              id: 9,
+              recipient_email: "a***@example.com",
+              purpose: "verify_email",
+              status: "pending",
+              attempt_count: 0,
+              max_attempts: 5,
+            },
+          ],
+        },
+      };
     }
     throw new Error(`unexpected URL ${url}`);
   },
@@ -445,6 +460,8 @@ assert.deepEqual(adminLoadContext.admin.requestMetrics, {
   error_requests: 1,
   average_duration_ms: 8.5,
 });
+assert.equal(adminLoadContext.admin.emailOutbox.summary.sent, 3);
+assert.equal(adminLoadContext.admin.emailOutbox.records[0].recipient_email, "a***@example.com");
 assert.equal(adminLoadContext.admin.billing.summary.account_count, 1);
 assert.equal(adminLoadContext.admin.billing.by_account[0].state_label, "余额");
 

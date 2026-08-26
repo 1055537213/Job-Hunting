@@ -104,6 +104,14 @@
     JOB_AGENT_CONSENT_REQUIRED=true
     JOB_AGENT_PUBLIC_BASE_URL=https://agent.example.com
     JOB_AGENT_ACCOUNT_EMAIL_BACKEND=smtp
+    JOB_AGENT_ACCOUNT_ACTION_SECRET=<at-least-32-random-characters>
+    JOB_AGENT_ACCOUNT_EMAIL_COOLDOWN_SECONDS=60
+    JOB_AGENT_ACCOUNT_EMAIL_HOURLY_LIMIT=5
+    JOB_AGENT_ACCOUNT_EMAIL_SOURCE_HOURLY_LIMIT=20
+    JOB_AGENT_ACCOUNT_EMAIL_MAX_ATTEMPTS=5
+    JOB_AGENT_ACCOUNT_EMAIL_RETRY_BASE_SECONDS=30
+    JOB_AGENT_ACCOUNT_EMAIL_CLAIM_TIMEOUT_SECONDS=300
+    JOB_AGENT_ACCOUNT_EMAIL_RETENTION_DAYS=14
     JOB_AGENT_SMTP_HOST=smtp.example.com
     JOB_AGENT_SMTP_PORT=587
     JOB_AGENT_SMTP_USERNAME=<production-secret>
@@ -113,9 +121,17 @@
     JOB_AGENT_PRIVACY_VERSION=2026-08-26
     ```
 
+    `JOB_AGENT_ACCOUNT_ACTION_SECRET` 可用
+    `python -c "import secrets; print(secrets.token_urlsafe(48))"` 生成，不能提交到仓库。
+    Web 只把邮件和一次性令牌哈希登记到 PostgreSQL，Celery 消息只携带 Outbox ID；Worker
+    负责 SMTP，失败按指数退避，Beat 每 30 秒补投到期或失联记录。后台“请求观测”页只显示
+    遮盖邮箱、状态、尝试次数和固定失败摘要，终态记录默认保留 14 天。
+
     发布前使用真实收件箱验证注册、重发验证邮件和忘记密码三条链路，并确认一次性链接在
-    使用后或过期后不能再次使用。协议正文和版本号必须由实际运营主体审核，版本更新时只
-    修改版本号不足以替代重新获取用户同意。
+    使用后或过期后不能再次使用。还要临时阻断 SMTP，确认 Web 请求仍能成功返回、记录进入
+    `retrying`，恢复 SMTP 后最终进入 `sent`。SMTP 在“服务端已接收、Worker 尚未写回成功”时
+    无法提供严格的端到端 exactly-once，邮件内容应保持幂等且允许极少量重复送达。协议正文和
+    版本号必须由实际运营主体审核，版本更新时只修改版本号不足以替代重新获取用户同意。
 
 生产覆盖不会向宿主机发布 Web 端口，只有 Caddy 和内部采集服务可以访问它，因此
 `FORWARDED_ALLOW_IPS=*` 只在该覆盖配置中启用。不要把这个设置复制到直接暴露 Uvicorn 的开发环境。

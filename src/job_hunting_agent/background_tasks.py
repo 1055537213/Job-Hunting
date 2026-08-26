@@ -13,8 +13,16 @@ from pathlib import Path
 from typing import Any
 
 from .app import JobHuntingApp
+from .account_email_outbox import AccountEmailOutboxService
+from .account_lifecycle import build_account_email_sender
 from .auth import iso_utc
-from .config import DEFAULT_ENV_PATH
+from .config import (
+    DEFAULT_ENV_PATH,
+    load_account_lifecycle_settings,
+    load_database_settings,
+    load_task_queue_settings,
+    require_postgresql_database_url,
+)
 from .file_scanning import FileInfectedError, FileScannerUnavailableError
 from .github_project import (
     GitHubRepositoryError,
@@ -28,8 +36,11 @@ from .model_resilience import ModelCircuitOpenError, is_transient_model_error
 from .project_archive import ProjectArchiveError
 from .rag import RAGProviderRequestError
 from .resume_document import ResumeDocumentError
+from .sqlalchemy_store import SQLAlchemyStore
 from .storage import INSUFFICIENT_BALANCE_MESSAGE, InsufficientBalanceError
 from .task_queue import (
+    ACCOUNT_EMAIL_DELIVERY_TASK_NAME,
+    ACCOUNT_EMAIL_DISPATCH_TASK_NAME,
     BACKGROUND_TASK_NAME,
     GITHUB_PROJECT_ANALYSIS_TASK_TYPE,
     OPERATIONAL_LEDGER_RETENTION_TASK_NAME,
@@ -201,10 +212,54 @@ def purge_old_operational_audit_records(backend: JobHuntingApp) -> dict[str, int
 
     deleted_tool_call_traces = backend.store.prune_tool_call_traces_to_limit()
     deleted_usage_events = backend.store.prune_usage_events_to_limit()
+    lifecycle_settings = load_account_lifecycle_settings(backend.env_path)
+    deleted_account_emails = backend.store.prune_account_email_outbox(
+        lifecycle_settings.email_outbox_retention_days
+    )
     return {
         "deleted_tool_call_traces": deleted_tool_call_traces,
         "deleted_usage_events": deleted_usage_events,
+        "deleted_account_emails": deleted_account_emails,
     }
+
+
+def dispatch_due_account_emails(
+    store: SQLAlchemyStore,
+    celery_app: Any,
+    env_path: str | Path = DEFAULT_ENV_PATH,
+) -> dict[str, int]:
+    """扫描 PostgreSQL 中的到期邮件，并把低敏 ID 补投到业务队列。"""
+
+    lifecycle_settings = load_account_lifecycle_settings(env_path)
+    task_queue_settings = load_task_queue_settings(env_path)
+    records = store.list_due_account_email_outbox(
+        lifecycle_settings.email_claim_timeout_seconds,
+    )
+    dispatched = 0
+    failed = 0
+    for record in records:
+        try:
+            celery_app.send_task(
+                ACCOUNT_EMAIL_DELIVERY_TASK_NAME,
+                args=[record.id],
+                kwargs={},
+                task_id=f"account-email-{record.id}-{record.attempt_count + 1}",
+                queue=task_queue_settings.queue_name,
+            )
+            dispatched += 1
+        except Exception:  # noqa: BLE001 - 下一轮 Beat 会再次扫描同一数据库记录。
+            failed += 1
+    return {"dispatched": dispatched, "dispatch_failed": failed}
+
+
+def _account_email_store(env_path: str | Path) -> SQLAlchemyStore:
+    """构造邮件任务需要的最小数据库边界，不探测对象存储或模型服务。"""
+
+    store = SQLAlchemyStore(
+        require_postgresql_database_url(load_database_settings(env_path))
+    )
+    store.initialize()
+    return store
 
 
 def recover_stale_background_tasks(backend: JobHuntingApp) -> dict[str, int]:
@@ -1023,6 +1078,48 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
             return {"status": "succeeded", **counts}
         finally:
             backend.store.close()
+
+    @celery_app.task(
+        bind=True,
+        name=ACCOUNT_EMAIL_DISPATCH_TASK_NAME,
+        ignore_result=True,
+    )
+    def dispatch_account_emails(self: Any) -> dict[str, object]:
+        """由 Beat 补投未发送、到期重试和 Worker 失联邮件。"""
+
+        store = _account_email_store(env_path)
+        try:
+            counts = dispatch_due_account_emails(store, celery_app, env_path)
+            return {"status": "succeeded", **counts}
+        finally:
+            store.close()
+
+    @celery_app.task(
+        bind=True,
+        name=ACCOUNT_EMAIL_DELIVERY_TASK_NAME,
+        acks_late=True,
+        reject_on_worker_lost=True,
+        ignore_result=True,
+    )
+    def deliver_account_email(self: Any, outbox_id: int) -> dict[str, object]:
+        """认领并发送一封账号邮件，数据库状态负责重复消息去重。"""
+
+        store = _account_email_store(env_path)
+        try:
+            lifecycle_settings = load_account_lifecycle_settings(env_path)
+            service = AccountEmailOutboxService(
+                store,
+                lifecycle_settings,
+                build_account_email_sender(lifecycle_settings),
+            )
+            record = service.deliver(outbox_id)
+            return {
+                "outbox_id": record.id,
+                "status": record.status,
+                "attempt_count": record.attempt_count,
+            }
+        finally:
+            store.close()
 
     @celery_app.task(
         bind=True,

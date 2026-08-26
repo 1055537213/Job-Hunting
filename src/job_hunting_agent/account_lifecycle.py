@@ -6,7 +6,9 @@ digests so a database disclosure cannot directly verify an email or reset a pass
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import secrets
 import smtplib
 from email.message import EmailMessage
@@ -78,6 +80,26 @@ def action_token_hash(token: str) -> str:
     """Return the persistent digest of an action token."""
 
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def derive_action_token(secret: str, delivery_key: str, purpose: str, account_id: int) -> str:
+    """从服务端密钥和持久派生键重建一次性令牌。"""
+
+    message = f"v1:{purpose}:{account_id}:{delivery_key}".encode("utf-8")
+    digest = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def request_source_hash(secret: str, source: str | None) -> str | None:
+    """生成不可反查的网络来源摘要，用于跨账号邮件频率限制。"""
+
+    if not source:
+        return None
+    return hmac.new(
+        secret.encode("utf-8"),
+        f"request-source:{source}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def account_action_url(base_url: str, parameter: str, token: str) -> str:

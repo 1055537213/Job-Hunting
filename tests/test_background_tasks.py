@@ -31,6 +31,8 @@ from job_hunting_agent.rag import RAGProviderRequestError
 from job_hunting_agent.resume_document import ResumeFileStore
 from job_hunting_agent.storage import InsufficientBalanceError
 from job_hunting_agent.task_queue import (
+    ACCOUNT_EMAIL_DELIVERY_TASK_NAME,
+    CeleryAccountEmailQueue,
     CeleryTaskQueue,
     TaskQueueError,
     build_celery_app,
@@ -125,6 +127,33 @@ def test_celery_beat_maintenance_tasks_use_a_separate_queue() -> None:
         schedule["prune-operational-ledgers-daily"]["options"]["queue"]
         == "business_tasks_maintenance"
     )
+    assert (
+        schedule["dispatch-due-account-emails"]["options"]["queue"]
+        == "business_tasks_maintenance"
+    )
+
+
+def test_account_email_queue_sends_only_outbox_id() -> None:
+    """账号邮件队列不能携带邮箱、操作链接或令牌。"""
+
+    producer = FakeCeleryProducer()
+    settings = TaskQueueSettings(
+        enabled=True,
+        redis_url="redis://:secret@redis:6379/0",
+        queue_name="business_tasks",
+    )
+
+    CeleryAccountEmailQueue(settings, celery_app=producer).enqueue(42)
+
+    assert producer.calls == [
+        {
+            "name": ACCOUNT_EMAIL_DELIVERY_TASK_NAME,
+            "args": [42],
+            "kwargs": {},
+            "task_id": "account-email-42",
+            "queue": "business_tasks",
+        }
+    ]
 
 
 def test_task_queue_settings_require_redis_url_when_enabled(tmp_path: Path) -> None:

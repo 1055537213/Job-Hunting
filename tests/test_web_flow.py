@@ -20,6 +20,7 @@ from langchain_core.messages import AIMessage
 
 from job_hunting_agent.agent import JobHuntingAgent
 from job_hunting_agent.app import JobHuntingApp
+from job_hunting_agent.config import load_account_lifecycle_settings
 from job_hunting_agent.models import (
     CandidateProfileInput,
     CandidateProfilePatch,
@@ -64,6 +65,28 @@ class RecordingAccountEmailSender:
 
     def send_password_reset(self, email: str, action_url: str) -> None:
         self.password_reset_messages.append((email, action_url))
+
+
+class FailingAccountEmailSender(RecordingAccountEmailSender):
+    """模拟 SMTP 持续故障，同时记录真实尝试次数。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    def send_verification(self, email: str, action_url: str) -> None:
+        self.attempts += 1
+        raise ConnectionError("smtp response must not be persisted")
+
+
+class RecordingAccountEmailQueue:
+    """记录待投递邮件 ID，模拟 Web 到 Celery 的低敏队列边界。"""
+
+    def __init__(self) -> None:
+        self.outbox_ids: list[int] = []
+
+    def enqueue(self, outbox_id: int) -> None:
+        self.outbox_ids.append(outbox_id)
 
 
 def login_test_account(
@@ -122,7 +145,7 @@ def test_web_registration_does_not_persist_password_as_display_name():
     assert logged_in.json()["account"]["email"] == "display-name-web-guard@example.com"
 
 
-def test_email_verification_blocks_login_until_one_time_link_is_consumed(tmp_path) -> None:
+def test_email_verification_is_enqueued_and_delivered_once(tmp_path) -> None:
     """需要邮箱验证时，未验证账号不能登录，验证令牌只能使用一次。"""
 
     env_path = tmp_path / ".env"
@@ -140,7 +163,13 @@ def test_email_verification_blocks_login_until_one_time_link_is_consumed(tmp_pat
         encoding="utf-8",
     )
     sender = RecordingAccountEmailSender()
-    client = TestClient(create_web_app(env_file=env_path, account_email_sender=sender))
+    queue = RecordingAccountEmailQueue()
+    web_app = create_web_app(
+        env_file=env_path,
+        account_email_sender=sender,
+        account_email_queue=queue,
+    )
+    client = TestClient(web_app)
 
     registered = client.post(
         "/api/auth/register",
@@ -155,6 +184,15 @@ def test_email_verification_blocks_login_until_one_time_link_is_consumed(tmp_pat
     assert registered.status_code == 200
     assert registered.json()["verification_required"] is True
     assert registered.json()["account"]["email_verified_at"] is None
+    assert sender.verification_messages == []
+    assert len(queue.outbox_ids) == 1
+
+    outbox_id = queue.outbox_ids[0]
+    web_app.state.account_email_outbox.deliver(outbox_id)
+    web_app.state.account_email_outbox.deliver(outbox_id)
+
+    assert web_app.state.backend.store.get_account_email_outbox(outbox_id).status == "sent"
+    assert len(sender.verification_messages) == 1
     assert sender.verification_messages[0][0] == "verify-me@example.com"
     token = parse_qs(urlsplit(sender.verification_messages[0][1]).query)[
         "verify_email_token"
@@ -175,6 +213,159 @@ def test_email_verification_blocks_login_until_one_time_link_is_consumed(tmp_pat
     ).status_code == 200
 
 
+def test_account_email_failure_retries_then_stops_at_budget(tmp_path) -> None:
+    """SMTP 失败按 Outbox 预算退避，最终失败后重复消息不再发送。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "JOB_AGENT_ACCOUNT_EMAIL_MAX_ATTEMPTS=2\n"
+        "JOB_AGENT_ACCOUNT_EMAIL_RETRY_BASE_SECONDS=1\n",
+        encoding="utf-8",
+    )
+    sender = FailingAccountEmailSender()
+    web_app = create_web_app(env_file=env_path, account_email_sender=sender)
+    store = web_app.state.backend.store
+    account = store.create_account(
+        email="smtp-failure@example.com",
+        password_hash="test-only-password-hash",
+    )
+    record = web_app.state.account_email_outbox.enqueue(
+        account,
+        "verify_email",
+        "127.0.0.1",
+    )
+
+    first = web_app.state.account_email_outbox.deliver(record.id)
+    assert first.status == "retrying"
+    assert first.attempt_count == 1
+    assert first.last_error_type == "ConnectionError"
+    assert first.last_error_summary == "邮件服务连接失败。"
+    assert "smtp response" not in first.last_error_summary
+
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE account_email_outbox SET next_attempt_at = created_at WHERE id = ?",
+            (record.id,),
+        )
+    second = web_app.state.account_email_outbox.deliver(record.id)
+    third = web_app.state.account_email_outbox.deliver(record.id)
+
+    assert second.status == third.status == "failed"
+    assert second.attempt_count == 2
+    assert sender.attempts == 2
+
+
+def test_stale_final_account_email_attempt_becomes_terminal_failure(tmp_path) -> None:
+    """最后一次投递时 Worker 失联后，维护扫描应收敛为失败而非永久悬挂。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "JOB_AGENT_ACCOUNT_EMAIL_MAX_ATTEMPTS=1\n",
+        encoding="utf-8",
+    )
+    web_app = create_web_app(env_file=env_path)
+    store = web_app.state.backend.store
+    account = store.create_account(
+        email="stale-final-attempt@example.com",
+        password_hash="test-only-password-hash",
+    )
+    record = web_app.state.account_email_outbox.enqueue(
+        account,
+        "verify_email",
+        "127.0.0.1",
+    )
+    claimed = store.claim_account_email_outbox(record.id, claim_timeout_seconds=60)
+    assert claimed is not None
+    assert claimed.status == "sending"
+    assert claimed.attempt_count == 1
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE account_email_outbox SET claimed_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", record.id),
+        )
+
+    assert store.list_due_account_email_outbox(claim_timeout_seconds=60) == []
+    failed = store.get_account_email_outbox(record.id)
+    assert failed.status == "failed"
+    assert failed.claimed_at is None
+    assert failed.last_error_type == "WorkerLostAfterFinalAttempt"
+    assert failed.last_error_summary == "Worker 在最后一次投递时失联，投递结果无法确认。"
+
+
+def test_password_reset_email_requests_have_persistent_cooldown(tmp_path) -> None:
+    """同一账号在冷却期内重复请求只产生一条邮件记录，响应保持一致。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "JOB_AGENT_ACCOUNT_EMAIL_COOLDOWN_SECONDS=60\n",
+        encoding="utf-8",
+    )
+    queue = RecordingAccountEmailQueue()
+    client = TestClient(create_web_app(env_file=env_path, account_email_queue=queue))
+    email = "cooldown@example.com"
+    assert client.post(
+        "/api/auth/register",
+        json={"email": email, "password": "password-123"},
+    ).status_code == 200
+
+    first = client.post("/api/auth/password-reset/request", json={"email": email})
+    second = client.post("/api/auth/password-reset/request", json={"email": email})
+
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+    assert len(queue.outbox_ids) == 1
+
+
+def test_account_email_source_limit_spans_multiple_accounts(tmp_path) -> None:
+    """同一网络来源不能通过轮换邮箱绕过事务邮件小时上限。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "JOB_AGENT_ACCOUNT_EMAIL_SOURCE_HOURLY_LIMIT=1\n",
+        encoding="utf-8",
+    )
+    queue = RecordingAccountEmailQueue()
+    client = TestClient(create_web_app(env_file=env_path, account_email_queue=queue))
+    for email in ("source-limit-a@example.com", "source-limit-b@example.com"):
+        assert client.post(
+            "/api/auth/register",
+            json={"email": email, "password": "password-123"},
+        ).status_code == 200
+        assert client.post(
+            "/api/auth/password-reset/request",
+            json={"email": email},
+        ).status_code == 200
+
+    assert len(queue.outbox_ids) == 1
+
+
+def test_consumed_account_email_token_cancels_delivery() -> None:
+    """令牌已消费或过期时，迟到的 Worker 消息不能发送无效链接。"""
+
+    sender = RecordingAccountEmailSender()
+    web_app = create_web_app(account_email_sender=sender)
+    store = web_app.state.backend.store
+    account = store.create_account(
+        email="consumed-token@example.com",
+        password_hash="test-only-password-hash",
+    )
+    record = web_app.state.account_email_outbox.enqueue(
+        account,
+        "reset_password",
+        "127.0.0.1",
+    )
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE account_action_tokens SET consumed_at = created_at WHERE id = ?",
+            (record.action_token_id,),
+        )
+
+    result = web_app.state.account_email_outbox.deliver(record.id)
+
+    assert result.status == "cancelled"
+    assert sender.password_reset_messages == []
+
+
 def test_password_reset_is_one_time_and_revokes_existing_sessions(tmp_path) -> None:
     """重置密码不泄露账号存在性，并使旧密码、旧 Session 和令牌全部失效。"""
 
@@ -185,7 +376,13 @@ def test_password_reset_is_one_time_and_revokes_existing_sessions(tmp_path) -> N
         encoding="utf-8",
     )
     sender = RecordingAccountEmailSender()
-    client = TestClient(create_web_app(env_file=env_path, account_email_sender=sender))
+    queue = RecordingAccountEmailQueue()
+    web_app = create_web_app(
+        env_file=env_path,
+        account_email_sender=sender,
+        account_email_queue=queue,
+    )
+    client = TestClient(web_app)
     email = "reset-me@example.com"
     old_password = "password-123"
     new_password = "changed-password-456"
@@ -209,6 +406,8 @@ def test_password_reset_is_one_time_and_revokes_existing_sessions(tmp_path) -> N
 
     assert unknown.status_code == requested.status_code == 200
     assert unknown.json() == requested.json()
+    assert len(queue.outbox_ids) == 1
+    web_app.state.account_email_outbox.deliver(queue.outbox_ids[0])
     assert len(sender.password_reset_messages) == 1
     token = parse_qs(urlsplit(sender.password_reset_messages[0][1]).query)[
         "reset_password_token"
@@ -279,6 +478,11 @@ def test_account_export_change_password_and_anonymized_deletion() -> None:
         json={"email": email, "password": new_password},
     )
     delete_headers = {"X-CSRF-Token": relogin.json()["csrf_token"]}
+    assert client.post(
+        "/api/auth/password-reset/request",
+        json={"email": email},
+    ).status_code == 200
+    assert len(web_app.state.backend.store.list_account_email_outbox()) == 1
 
     deleted = client.post(
         "/api/account/delete",
@@ -287,6 +491,7 @@ def test_account_export_change_password_and_anonymized_deletion() -> None:
     )
 
     assert deleted.status_code == 200
+    assert web_app.state.backend.store.list_account_email_outbox() == []
     assert client.get("/api/auth/me").json()["authenticated"] is False
     store = web_app.state.backend.store
     anonymized = store.get_account(account_id)
@@ -420,6 +625,30 @@ def test_production_rejects_disabled_web_security_controls(
         create_web_app(env_file=env_path)
 
 
+def test_production_account_email_requires_private_action_secret(tmp_path) -> None:
+    """生产账号链接不能使用仓库内的开发派生密钥。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            (
+                "JOB_AGENT_ENVIRONMENT=production",
+                "JOB_AGENT_EMAIL_VERIFICATION_REQUIRED=true",
+                "JOB_AGENT_CONSENT_REQUIRED=true",
+                "JOB_AGENT_PUBLIC_BASE_URL=https://agent.example.com",
+                "JOB_AGENT_ACCOUNT_EMAIL_BACKEND=smtp",
+                "JOB_AGENT_SMTP_HOST=smtp.example.com",
+                "JOB_AGENT_SMTP_FROM_EMAIL=no-reply@example.com",
+                "JOB_AGENT_TASK_QUEUE_ENABLED=true",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="JOB_AGENT_ACCOUNT_ACTION_SECRET"):
+        load_account_lifecycle_settings(env_path, environ={})
+
+
 def test_web_hardening_adds_request_id_security_headers_and_access_log(caplog) -> None:
     """所有 Web 响应都应带请求 ID、安全响应头，并输出不含正文的结构化访问日志。"""
 
@@ -541,7 +770,17 @@ def test_admin_can_read_low_cardinality_request_metrics(tmp_path) -> None:
         ),
         encoding="utf-8",
     )
-    client = TestClient(create_web_app(env_file=env_path))
+    web_app = create_web_app(env_file=env_path)
+    client = TestClient(web_app)
+    target = web_app.state.backend.store.create_account(
+        email="observable-recipient@example.com",
+        password_hash="test-only-password-hash",
+    )
+    outbox = web_app.state.account_email_outbox.enqueue(
+        target,
+        "reset_password",
+        "127.0.0.1",
+    )
     assert client.post(
         "/api/auth/login",
         json={"email": "metrics-admin@example.com", "password": "strong-password-123"},
@@ -559,6 +798,23 @@ def test_admin_can_read_low_cardinality_request_metrics(tmp_path) -> None:
     latest_error = metrics["recent_errors"][0]
     assert latest_error["endpoint"] == "/api/missing"
     assert "secret" not in str(metrics)
+    email_delivery = response.json()["account_email"]
+    assert email_delivery["summary"]["pending"] == 1
+    assert email_delivery["records"][0] == {
+        "id": outbox.id,
+        "account_id": target.id,
+        "purpose": "reset_password",
+        "recipient_email": "o***@example.com",
+        "status": "pending",
+        "attempt_count": 0,
+        "max_attempts": 5,
+        "last_error_type": None,
+        "last_error_summary": None,
+        "created_at": outbox.created_at,
+        "updated_at": outbox.updated_at,
+    }
+    assert "observable-recipient@example.com" not in str(email_delivery)
+    assert outbox.delivery_key not in str(email_delivery)
 
     prometheus = client.get("/internal/metrics")
     assert prometheus.status_code == 200
@@ -592,6 +848,12 @@ def test_admin_account_status_change_is_visible_in_audit_log(tmp_path) -> None:
         "/api/auth/register",
         json={"email": "audit-target@example.com", "password": "password-123"},
     ).json()["account"]
+    target_account = app.state.backend.store.get_account(target["id"])
+    target_email = app.state.account_email_outbox.enqueue(
+        target_account,
+        "reset_password",
+        "127.0.0.1",
+    )
     admin_login = admin_client.post(
         "/api/auth/login",
         json={"email": "audit-admin@example.com", "password": "strong-password-123"},
@@ -617,6 +879,17 @@ def test_admin_account_status_change_is_visible_in_audit_log(tmp_path) -> None:
 
     assert blocked.status_code == 403
     assert response.status_code == 200
+    assert (
+        app.state.backend.store.get_account_email_outbox(target_email.id).status
+        == "cancelled"
+    )
+    with app.state.backend.store.connect() as conn:
+        token_row = conn.execute(
+            "SELECT consumed_at FROM account_action_tokens WHERE id = ?",
+            (target_email.action_token_id,),
+        ).fetchone()
+    assert token_row is not None
+    assert token_row["consumed_at"] is not None
     assert audit.status_code == 200
     event = audit.json()["events"][0]
     assert event["action"] == "account.status_updated"

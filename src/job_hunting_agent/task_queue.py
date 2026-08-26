@@ -12,6 +12,12 @@ from typing import Any, Protocol
 from .config import TaskQueueSettings
 
 BACKGROUND_TASK_NAME = "job_hunting_agent.background_tasks.execute_background_task"
+ACCOUNT_EMAIL_DELIVERY_TASK_NAME = (
+    "job_hunting_agent.background_tasks.deliver_account_email"
+)
+ACCOUNT_EMAIL_DISPATCH_TASK_NAME = (
+    "job_hunting_agent.background_tasks.dispatch_due_account_emails"
+)
 MAINTENANCE_QUEUE_SUFFIX = "_maintenance"
 # Token 和工具调用记录均按账号保留固定分页窗口，Beat 每天触发一次兜底裁剪。
 OPERATIONAL_LEDGER_RETENTION_TASK_NAME = (
@@ -96,6 +102,11 @@ def build_celery_app(settings: TaskQueueSettings) -> Any:
                 "schedule": 60.0,
                 "options": {"queue": maintenance_queue_name(settings.queue_name)},
             },
+            "dispatch-due-account-emails": {
+                "task": ACCOUNT_EMAIL_DISPATCH_TASK_NAME,
+                "schedule": 30.0,
+                "options": {"queue": maintenance_queue_name(settings.queue_name)},
+            },
         },
     )
     return app
@@ -147,3 +158,32 @@ class CeleryTaskQueue:
             )
         except Exception as error:
             raise TaskQueueError("后台任务投递失败。") from error
+
+
+class AccountEmailQueue(Protocol):
+    """Web 投递账号邮件时需要的最小队列协议。"""
+
+    def enqueue(self, outbox_id: int) -> None:
+        """只把 Outbox 整数 ID 交给 Worker。"""
+
+
+class CeleryAccountEmailQueue:
+    """通过 Redis/Celery 投递账号邮件 Outbox ID。"""
+
+    def __init__(self, settings: TaskQueueSettings, celery_app: Any | None = None):
+        self.settings = settings
+        self.app = celery_app or build_celery_app(settings)
+
+    def enqueue(self, outbox_id: int) -> None:
+        if outbox_id <= 0:
+            raise TaskQueueError("邮件 Outbox ID 必须为正整数。")
+        try:
+            self.app.send_task(
+                ACCOUNT_EMAIL_DELIVERY_TASK_NAME,
+                args=[outbox_id],
+                kwargs={},
+                task_id=f"account-email-{outbox_id}",
+                queue=self.settings.queue_name,
+            )
+        except Exception as error:
+            raise TaskQueueError("账号邮件任务投递失败。") from error

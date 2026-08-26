@@ -81,6 +81,69 @@ sa.Index(
 sa.Index("idx_account_action_tokens_expiry", account_action_tokens.c.expires_at)
 
 
+# Web 只登记事务邮件；Worker 根据此表认领、重试和完成投递。
+account_email_outbox = sa.Table(
+    "account_email_outbox",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column(
+        "account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "action_token_id",
+        sa.Integer,
+        sa.ForeignKey("account_action_tokens.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    ),
+    sa.Column("purpose", sa.String(32), nullable=False),
+    sa.Column("recipient_email", sa.String(254), nullable=False),
+    sa.Column("delivery_key", sa.String(64), nullable=False, unique=True),
+    sa.Column("request_source_hash", sa.String(64)),
+    sa.Column("status", sa.String(32), nullable=False),
+    sa.Column("attempt_count", sa.Integer, nullable=False, server_default=sa.text("0")),
+    sa.Column("max_attempts", sa.Integer, nullable=False),
+    sa.Column("next_attempt_at", timestamp_type, nullable=False),
+    sa.Column("claimed_at", timestamp_type),
+    sa.Column("sent_at", timestamp_type),
+    sa.Column("last_error_type", sa.String(128)),
+    sa.Column("last_error_summary", sa.String(500)),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.Column("updated_at", timestamp_type, nullable=False),
+    sa.CheckConstraint(
+        "purpose IN ('verify_email', 'reset_password')",
+        name="account_email_outbox_purpose",
+    ),
+    sa.CheckConstraint(
+        "status IN ('pending', 'sending', 'retrying', 'sent', 'failed', 'cancelled')",
+        name="account_email_outbox_status",
+    ),
+    sa.CheckConstraint(
+        "attempt_count >= 0 AND max_attempts > 0 AND attempt_count <= max_attempts",
+        name="account_email_outbox_attempts",
+    ),
+)
+sa.Index(
+    "idx_account_email_outbox_due",
+    account_email_outbox.c.status,
+    account_email_outbox.c.next_attempt_at,
+    account_email_outbox.c.id,
+)
+sa.Index(
+    "idx_account_email_outbox_account",
+    account_email_outbox.c.account_id,
+    account_email_outbox.c.created_at,
+)
+sa.Index(
+    "idx_account_email_outbox_source",
+    account_email_outbox.c.request_source_hash,
+    account_email_outbox.c.created_at,
+)
+
+
 # 保存用户同意的协议版本，避免只保留一个随版本更新而失真的布尔值。
 account_consents = sa.Table(
     "account_consents",

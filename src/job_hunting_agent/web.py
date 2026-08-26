@@ -20,7 +20,6 @@ import re
 import time
 import uuid
 from dataclasses import asdict
-from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import quote
@@ -42,9 +41,9 @@ from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
 from starlette.concurrency import run_in_threadpool
 
 from .admin_ledger import ADMIN_LEDGER_MAX_PAGES, ADMIN_LEDGER_PAGE_SIZE
+from .account_email_outbox import AccountEmailOutboxService, redact_email
 from .account_lifecycle import (
     AccountEmailSender,
-    account_action_url,
     action_token_hash,
     build_account_email_sender,
     new_action_token,
@@ -134,8 +133,13 @@ from .rag import RAGProviderRequestError
 from .rate_limiting import RateLimiter
 from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
 from .skill_normalization import normalize_skill_mapping
-from .storage import IdempotencyConflictError
-from .task_queue import BackgroundTaskQueue, TaskQueueError
+from .storage import AccountEmailRequestSuppressed, IdempotencyConflictError
+from .task_queue import (
+    AccountEmailQueue,
+    BackgroundTaskQueue,
+    CeleryAccountEmailQueue,
+    TaskQueueError,
+)
 from .tool_audit import (
     background_task_tool_name,
     build_tool_trace_record,
@@ -393,6 +397,7 @@ def create_web_app(
     concurrency_controller: ConcurrencyController | None = None,
     file_scanner: object | None = None,
     account_email_sender: AccountEmailSender | None = None,
+    account_email_queue: AccountEmailQueue | None = None,
 ) -> FastAPI:
     """创建本地 FastAPI 应用。
 
@@ -421,6 +426,14 @@ def create_web_app(
     lifecycle_email_sender = account_email_sender or build_account_email_sender(
         account_lifecycle_settings
     )
+    lifecycle_email_queue = account_email_queue
+    if lifecycle_email_queue is None and backend.task_queue_settings.enabled:
+        lifecycle_email_queue = CeleryAccountEmailQueue(backend.task_queue_settings)
+    account_email_outbox = AccountEmailOutboxService(
+        backend.store,
+        account_lifecycle_settings,
+        lifecycle_email_sender,
+    )
 
     agent_error: str | None = None
     if chat_agent is None:
@@ -432,6 +445,7 @@ def create_web_app(
 
     web_app = FastAPI(title="Job Hunting Agent Web", version="0.1.0")
     web_app.state.backend = backend
+    web_app.state.account_email_outbox = account_email_outbox
 
     @web_app.exception_handler(ConcurrencyLimitExceeded)
     async def concurrency_limit_handler(
@@ -604,26 +618,7 @@ def create_web_app(
         except SQLAlchemyIntegrityError as error:
             raise HTTPException(status_code=409, detail="该邮箱已经注册。") from error
         if account_lifecycle_settings.email_verification_required:
-            raw_token = new_action_token()
-            expires_at = iso_utc(
-                utc_now()
-                + timedelta(minutes=account_lifecycle_settings.verification_token_ttl_minutes)
-            )
-            backend.store.save_account_action_token(
-                account.id,
-                "verify_email",
-                action_token_hash(raw_token),
-                expires_at,
-                request.client.host if request.client else None,
-            )
-            lifecycle_email_sender.send_verification(
-                account.email,
-                account_action_url(
-                    account_lifecycle_settings.public_base_url,
-                    "verify_email_token",
-                    raw_token,
-                ),
-            )
+            enqueue_account_action_email(account, "verify_email", request)
         return {
             "account": asdict(account),
             "verification_required": account_lifecycle_settings.email_verification_required,
@@ -645,38 +640,38 @@ def create_web_app(
         purpose: str,
         request: Request,
     ) -> None:
-        """Create a replacement token and send the corresponding account email."""
+        """兼容内部调用名称，实际只登记 Outbox 并投递低敏 ID。"""
 
-        raw_token = new_action_token()
-        ttl_minutes = (
-            account_lifecycle_settings.verification_token_ttl_minutes
-            if purpose == "verify_email"
-            else account_lifecycle_settings.password_reset_token_ttl_minutes
-        )
-        backend.store.save_account_action_token(
-            account.id,
-            purpose,
-            action_token_hash(raw_token),
-            iso_utc(utc_now() + timedelta(minutes=ttl_minutes)),
-            request.client.host if request.client else None,
-        )
-        if purpose == "verify_email":
-            lifecycle_email_sender.send_verification(
-                account.email,
-                account_action_url(
-                    account_lifecycle_settings.public_base_url,
-                    "verify_email_token",
-                    raw_token,
-                ),
+        enqueue_account_action_email(account, purpose, request)
+
+    def enqueue_account_action_email(
+        account: AccountRecord,
+        purpose: str,
+        request: Request,
+    ) -> None:
+        """登记账号邮件；频率限制不泄露账号是否存在。"""
+
+        try:
+            record = account_email_outbox.enqueue(
+                account,
+                purpose,
+                request.client.host if request.client else None,
             )
-        else:
-            lifecycle_email_sender.send_password_reset(
-                account.email,
-                account_action_url(
-                    account_lifecycle_settings.public_base_url,
-                    "reset_password_token",
-                    raw_token,
-                ),
+        except AccountEmailRequestSuppressed:
+            return
+        if lifecycle_email_queue is None:
+            web_logger.warning(
+                "account email queued without active broker: outbox_id=%s",
+                record.id,
+            )
+            return
+        try:
+            lifecycle_email_queue.enqueue(record.id)
+        except Exception as error:  # noqa: BLE001 - Beat recovers the pending row.
+            web_logger.warning(
+                "account email broker dispatch failed: outbox_id=%s error=%s",
+                record.id,
+                type(error).__name__,
             )
 
     @web_app.post("/api/auth/verification/request")
@@ -2573,7 +2568,29 @@ def create_web_app(
         """管理员查看当前 Web 进程的低敏请求指标。"""
 
         require_admin(request)
-        return {"requests": web_app.state.request_metrics.snapshot()}
+        email_records = backend.store.list_account_email_outbox(limit=20)
+        return {
+            "requests": web_app.state.request_metrics.snapshot(),
+            "account_email": {
+                "summary": backend.store.summarize_account_email_outbox(),
+                "records": [
+                    {
+                        "id": record.id,
+                        "account_id": record.account_id,
+                        "purpose": record.purpose,
+                        "recipient_email": redact_email(record.recipient_email),
+                        "status": record.status,
+                        "attempt_count": record.attempt_count,
+                        "max_attempts": record.max_attempts,
+                        "last_error_type": record.last_error_type,
+                        "last_error_summary": record.last_error_summary,
+                        "created_at": record.created_at,
+                        "updated_at": record.updated_at,
+                    }
+                    for record in email_records
+                ],
+            },
+        }
 
     @web_app.get("/api/admin/audit/events")
     def admin_audit_events(
