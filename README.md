@@ -276,6 +276,17 @@ python -m compileall -q src tests alembic
 Get-ChildItem tests -Filter "frontend_*.mjs" | ForEach-Object { node $_.FullName }
 ```
 
+启用 `JOB_AGENT_INTENT_ROUTER_*` 后，可以单独运行真实小模型路由基准。报告只输出
+样本名、路由结果、回退原因和耗时，不输出 API Key、用户原文或模型原始回复：
+
+```powershell
+python .\scripts\benchmark_intent_router.py
+python .\scripts\benchmark_intent_router.py --json
+```
+
+每轮 Agent 还会把同样的低敏路由观测写入助手消息的内部元数据；普通聊天历史 API
+不会返回该字段，便于后续在管理端聚合延迟、直达率和回退率而不扩大用户数据暴露面。
+
 需要验证真实双 Web 副本、共享 Redis 限流和 Prometheus 多实例采集时执行：
 
 ```powershell

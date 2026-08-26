@@ -569,6 +569,8 @@ class AgentChatResult:
     # 当前轮可从供应商响应中确认的用量摘要；缺失时使用 None/0，不把估算值冒充精确账单。
     usage: dict[str, int | str] = field(default_factory=dict)
     root_request_id: str = ""
+    # 只保存路由决策和耗时等低敏观测，不保存用户消息、提示词或模型原始回复。
+    routing: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass

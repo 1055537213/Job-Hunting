@@ -20,6 +20,7 @@ Web/API
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import asdict
@@ -178,6 +179,7 @@ class JobHuntingAgent:
     ) -> AgentChatResult:
         """执行一轮标准 LangChain Agent 对话。"""
 
+        turn_started_at = time.monotonic()
         resolved_session_id = session_id or default_session_id(candidate_id, account_id)
         root_request_id = root_request_id or uuid.uuid4().hex
         if account_id is not None:
@@ -197,9 +199,11 @@ class JobHuntingAgent:
             account_id=account_id,
             session_id=resolved_session_id,
             root_request_id=root_request_id,
+            turn_started_at=turn_started_at,
         )
         if direct_result is not None:
             return direct_result
+        main_agent_started_at = time.monotonic()
         result = self.graph.invoke(
             {"messages": turn_messages},
             config={
@@ -239,6 +243,13 @@ class JobHuntingAgent:
             tool_outputs=collect_tool_outputs(messages),
             usage=merge_usage_summaries(route_decision.usage if route_decision else {}, usage),
             root_request_id=root_request_id,
+            routing=build_routing_summary(
+                route_decision,
+                main_agent_used=True,
+                direct_executed=False,
+                downstream_latency_ms=elapsed_ms(main_agent_started_at),
+                total_latency_ms=elapsed_ms(turn_started_at),
+            ),
         )
 
     def stream_chat(
@@ -264,6 +275,7 @@ class JobHuntingAgent:
         让前端拿到工具摘要、候选人档案更新和可持久化的完整回复。
         """
 
+        turn_started_at = time.monotonic()
         resolved_session_id = session_id or default_session_id(candidate_id, account_id)
         root_request_id = root_request_id or uuid.uuid4().hex
         if account_id is not None:
@@ -283,6 +295,7 @@ class JobHuntingAgent:
             account_id=account_id,
             session_id=resolved_session_id,
             root_request_id=root_request_id,
+            turn_started_at=turn_started_at,
         )
         if direct_result is not None:
             yield {"type": "step_started", "name": direct_result.used_tools[0]}
@@ -294,6 +307,7 @@ class JobHuntingAgent:
             yield {"type": "token", "content": direct_result.reply}
             yield {"type": "final", "result": direct_result}
             return
+        main_agent_started_at = time.monotonic()
         tool_and_final_messages: list[BaseMessage] = []
         streamed_reply_parts: list[str] = []
         streamed_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -392,6 +406,13 @@ class JobHuntingAgent:
                 tool_outputs=collect_tool_outputs(tool_and_final_messages),
                 usage=merge_usage_summaries(route_decision.usage if route_decision else {}, usage),
                 root_request_id=root_request_id,
+                routing=build_routing_summary(
+                    route_decision,
+                    main_agent_used=True,
+                    direct_executed=False,
+                    downstream_latency_ms=elapsed_ms(main_agent_started_at),
+                    total_latency_ms=elapsed_ms(turn_started_at),
+                ),
             ),
         }
 
@@ -427,11 +448,13 @@ class JobHuntingAgent:
         account_id: int | None,
         session_id: str,
         root_request_id: str,
+        turn_started_at: float,
     ) -> AgentChatResult | None:
         """执行高置信度只读路由；不符合条件时返回 None 进入主 Agent。"""
 
         if route_decision is None or route_decision.route != "direct_tool":
             return None
+        direct_started_at = time.monotonic()
         try:
             reply, tool_outputs = self.direct_intent_executor.execute(
                 route_decision,
@@ -441,6 +464,7 @@ class JobHuntingAgent:
                 root_request_id=root_request_id,
             )
         except Exception:  # noqa: BLE001 - 直接执行失败时回退到原有工具循环。
+            route_decision.fallback_reason = "direct_execution_error"
             return None
         return AgentChatResult(
             reply=reply,
@@ -451,6 +475,13 @@ class JobHuntingAgent:
             tool_outputs=tool_outputs,
             usage=route_decision.usage,
             root_request_id=root_request_id,
+            routing=build_routing_summary(
+                route_decision,
+                main_agent_used=False,
+                direct_executed=True,
+                downstream_latency_ms=elapsed_ms(direct_started_at),
+                total_latency_ms=elapsed_ms(turn_started_at),
+            ),
         )
 
     def build_turn_messages(
@@ -958,6 +989,38 @@ def merge_usage_summaries(
     elif sources:
         result["usage_source"] = next(iter(sources))
     return result
+
+
+def elapsed_ms(started_at: float) -> int:
+    """返回单调时钟测得的非负毫秒耗时。"""
+
+    return max(0, round((time.monotonic() - started_at) * 1000))
+
+
+def build_routing_summary(
+    decision: IntentDecision | None,
+    *,
+    main_agent_used: bool,
+    direct_executed: bool,
+    downstream_latency_ms: int,
+    total_latency_ms: int,
+) -> dict[str, object]:
+    """构造可持久化的低敏路由观测，不包含消息或模型原始输出。"""
+
+    return {
+        "router_active": decision is not None,
+        "model_attempted": bool(decision and decision.model_attempted),
+        "decision_source": decision.decision_source if decision else "disabled",
+        "selected_route": decision.route if decision else "agent",
+        "tool_name": decision.tool_name if decision else None,
+        "confidence": round(decision.confidence, 4) if decision else 0.0,
+        "fallback_reason": decision.fallback_reason if decision else "router_disabled",
+        "router_latency_ms": decision.latency_ms if decision else 0,
+        "main_agent_used": main_agent_used,
+        "direct_executed": direct_executed,
+        "downstream_latency_ms": max(0, downstream_latency_ms),
+        "total_latency_ms": max(0, total_latency_ms),
+    }
 
 
 def default_session_id(candidate_id: int | None, account_id: int | None = None) -> str:

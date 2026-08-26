@@ -1306,6 +1306,7 @@ def create_web_app(
                 {
                     "mode": result.mode,
                     "task_trace": user_task_trace,
+                    "routing": result.routing,
                 },
                 account_id=account_id,
             )
@@ -2786,6 +2787,7 @@ def stream_web_chat_events(
                         {
                             "mode": result.mode,
                             "task_trace": user_task_trace,
+                            "routing": result.routing,
                         },
                         account_id=account_id,
                     )

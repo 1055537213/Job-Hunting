@@ -12,6 +12,7 @@ from job_hunting_agent.config import IntentRouterSettings, LLMSettings
 from job_hunting_agent.intent_router import (
     IntentDecision,
     IntentRouter,
+    agent_fallback_reason,
     parse_intent_decision,
     requires_agent_fallback,
 )
@@ -83,7 +84,9 @@ def test_parse_intent_decision_rejects_mutation_and_low_confidence_routes():
     )
 
     assert mutation.route == "agent"
+    assert mutation.fallback_reason == "tool_not_allowed"
     assert low_confidence.route == "agent"
+    assert low_confidence.fallback_reason == "low_confidence"
 
 
 def test_intent_router_uses_short_history_and_returns_agent_on_invalid_json():
@@ -112,6 +115,9 @@ def test_intent_router_uses_short_history_and_returns_agent_on_invalid_json():
 
     assert decision is not None
     assert decision.route == "agent"
+    assert decision.model_attempted is True
+    assert decision.decision_source == "model"
+    assert decision.fallback_reason == "router_error"
     assert "保留的最近消息" in client.prompts[0]
     assert "旧消息" not in client.prompts[0]
 
@@ -131,6 +137,19 @@ def test_intent_router_uses_short_history_and_returns_agent_on_invalid_json():
 )
 def test_risky_messages_deterministically_fall_back_to_agent(message):
     assert requires_agent_fallback(message) is True
+
+
+@pytest.mark.parametrize(
+    ("message", "reason"),
+    [
+        ("继续刚才的操作", "ambiguous_reference"),
+        ("列出职位，然后帮我改简历", "multi_step"),
+        ("把薪资改成 20K", "mutation_or_confirmation"),
+        ("   ", "empty_message"),
+    ],
+)
+def test_deterministic_gate_reports_low_sensitive_reason(message, reason):
+    assert agent_fallback_reason(message) == reason
 
 
 @pytest.mark.parametrize(
@@ -203,6 +222,9 @@ def test_agent_direct_route_bypasses_main_model_for_read_only_query(account_id):
                 route="direct_tool",
                 tool_name="get_current_candidate_profile",
                 confidence=0.99,
+                model_attempted=True,
+                decision_source="model",
+                latency_ms=12,
             )
         ),
     )
@@ -218,3 +240,8 @@ def test_agent_direct_route_bypasses_main_model_for_read_only_query(account_id):
     assert result.mode == "intent_router_direct"
     assert result.used_tools == ["get_current_candidate_profile"]
     assert result.tool_outputs[0]["data"]["name"] == "小林"
+    assert result.routing["selected_route"] == "direct_tool"
+    assert result.routing["direct_executed"] is True
+    assert result.routing["main_agent_used"] is False
+    assert result.routing["router_latency_ms"] == 12
+    assert {"message", "prompt", "raw_response"}.isdisjoint(result.routing)

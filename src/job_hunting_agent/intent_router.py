@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Protocol, Sequence
 
@@ -56,6 +57,10 @@ class IntentDecision:
     arguments: dict[str, object] = field(default_factory=dict)
     confidence: float = 0.0
     usage: dict[str, int | str] = field(default_factory=dict)
+    model_attempted: bool = False
+    decision_source: str = "disabled"
+    fallback_reason: str | None = None
+    latency_ms: int = 0
 
 
 class IntentRouterProtocol(Protocol):
@@ -107,8 +112,12 @@ class IntentRouter:
 
         if not self.settings.enabled or self.settings.llm is None:
             return None
-        if requires_agent_fallback(message):
-            return IntentDecision()
+        guard_reason = agent_fallback_reason(message)
+        if guard_reason is not None:
+            return IntentDecision(
+                decision_source="guard",
+                fallback_reason=guard_reason,
+            )
 
         usage: dict[str, int | str] = {}
         client = self._llm_client
@@ -126,6 +135,7 @@ class IntentRouter:
                 usage_sink=usage.update,
             )
 
+        started_at = time.monotonic()
         try:
             raw_text = client.complete(
                 build_intent_router_prompt(
@@ -144,7 +154,14 @@ class IntentRouter:
                 candidate_id=candidate_id,
             )
         except Exception:  # noqa: BLE001 - 路由器失败必须回退主 Agent。
-            decision = IntentDecision()
+            decision = IntentDecision(
+                model_attempted=True,
+                decision_source="model",
+                fallback_reason="router_error",
+            )
+        decision.model_attempted = True
+        decision.decision_source = "model"
+        decision.latency_ms = max(0, round((time.monotonic() - started_at) * 1000))
         decision.usage = usage
         return decision
 
@@ -242,6 +259,8 @@ def build_intent_router_prompt(
 
 以下情况必须返回 agent：保存或修改资料、导入职位、生成或改写简历、HR 回复、GitHub 分析、
 涉及确认/真实性边界的请求、多步骤请求、无法从当前消息和历史确定参数的请求。
+职位匹配只读取当前候选人和已导入职位；candidate_id 存在且用户明确要求匹配职位池时，
+应返回 direct_tool 和 match_all_jobs_for_candidate，不要因为“匹配”包含计算而回退 agent。
 
 当前候选人 ID：{candidate_id}
 最近对话：
@@ -270,7 +289,7 @@ def parse_intent_decision(
 
     data = json.loads(_extract_json_object(text))
     if not isinstance(data, dict):
-        return IntentDecision()
+        return IntentDecision(fallback_reason="invalid_response")
     raw_confidence = data.get("confidence", 0.0)
     try:
         confidence = float(raw_confidence)
@@ -281,16 +300,16 @@ def parse_intent_decision(
     arguments = data.get("arguments")
     if not isinstance(arguments, dict):
         arguments = {}
-    if (
-        data.get("route") != "direct_tool"
-        or not isinstance(tool_name, str)
-        or tool_name not in DIRECT_TOOL_NAMES
-        or confidence < confidence_threshold
-        or _requires_candidate(tool_name) and candidate_id is None
-    ):
-        return IntentDecision(confidence=confidence)
+    if data.get("route") != "direct_tool":
+        return IntentDecision(confidence=confidence, fallback_reason="model_selected_agent")
+    if not isinstance(tool_name, str) or tool_name not in DIRECT_TOOL_NAMES:
+        return IntentDecision(confidence=confidence, fallback_reason="tool_not_allowed")
+    if confidence < confidence_threshold:
+        return IntentDecision(confidence=confidence, fallback_reason="low_confidence")
+    if _requires_candidate(tool_name) and candidate_id is None:
+        return IntentDecision(confidence=confidence, fallback_reason="candidate_missing")
     if tool_name == "search_candidate_evidence" and not str(arguments.get("query") or "").strip():
-        return IntentDecision(confidence=confidence)
+        return IntentDecision(confidence=confidence, fallback_reason="query_missing")
     return IntentDecision(
         route="direct_tool",
         tool_name=str(tool_name),
@@ -299,20 +318,27 @@ def parse_intent_decision(
     )
 
 
-def requires_agent_fallback(message: str) -> bool:
-    """对高风险表达做确定性拦截，不让轻量模型直接路由。"""
+def agent_fallback_reason(message: str) -> str | None:
+    """返回确定性回退原因；安全的显式只读消息返回 ``None``。"""
 
     normalized = " ".join(message.split()).strip()
     if not normalized:
-        return True
-    return any(
-        pattern.search(normalized)
-        for pattern in (
-            AMBIGUOUS_REFERENCE_PATTERN,
-            MULTI_STEP_PATTERN,
-            MUTATION_OR_CONFIRMATION_PATTERN,
-        )
+        return "empty_message"
+    checks = (
+        (AMBIGUOUS_REFERENCE_PATTERN, "ambiguous_reference"),
+        (MULTI_STEP_PATTERN, "multi_step"),
+        (MUTATION_OR_CONFIRMATION_PATTERN, "mutation_or_confirmation"),
     )
+    for pattern, reason in checks:
+        if pattern.search(normalized):
+            return reason
+    return None
+
+
+def requires_agent_fallback(message: str) -> bool:
+    """判断消息是否必须绕过轻量模型进入主 Agent。"""
+
+    return agent_fallback_reason(message) is not None
 
 
 def _requires_candidate(tool_name: object) -> bool:

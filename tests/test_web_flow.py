@@ -2080,6 +2080,22 @@ def test_web_chat_can_use_langchain_agent_mode(tmp_path):
     assert chat.json()["mode"] == "langchain_agent"
     assert chat.json()["display_reply"] == "我已经通过 Agent 工具保存了你的资料。"
     assert {"used_tools", "tool_outputs", "usage", "result"}.isdisjoint(chat.json())
+    account_id = client.get("/api/auth/me").json()["account"]["id"]
+    session_id = f"account-{account_id}-candidate-{candidate_id}"
+    stored_messages = agent_backend.list_chat_messages(
+        candidate_id,
+        session_id,
+        account_id=account_id,
+    )
+    stored_routing = stored_messages[-1].metadata["routing"]
+    assert stored_routing["decision_source"] == "disabled"
+    assert stored_routing["main_agent_used"] is True
+    assert {"message", "prompt", "raw_response"}.isdisjoint(stored_routing)
+    public_history = client.get(
+        "/api/chat/history",
+        params={"candidate_id": candidate_id, "session_id": session_id},
+    ).json()["messages"]
+    assert "routing" not in public_history[-1]["metadata"]
 
 
 def test_web_chat_stream_returns_sse_and_saves_history(tmp_path):
