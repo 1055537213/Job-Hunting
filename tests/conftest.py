@@ -58,6 +58,8 @@ def postgres_test_schema() -> Iterator[str]:
     previous_runtime_url = os.environ.get("JOB_AGENT_DATABASE_URL")
     previous_object_storage_backend = os.environ.get("JOB_AGENT_OBJECT_STORAGE_BACKEND")
     previous_csrf_enabled = os.environ.get("JOB_AGENT_CSRF_ENABLED")
+    previous_email_verification_required = os.environ.get("JOB_AGENT_EMAIL_VERIFICATION_REQUIRED")
+    previous_consent_required = os.environ.get("JOB_AGENT_CONSENT_REQUIRED")
     previous_test_starting_balance = os.environ.get("JOB_AGENT_BILLING_STARTING_BALANCE_YUAN")
     previous_intent_router_enabled = os.environ.get("JOB_AGENT_INTENT_ROUTER_ENABLED")
     try:
@@ -77,6 +79,10 @@ def postgres_test_schema() -> Iterator[str]:
         os.environ["JOB_AGENT_OBJECT_STORAGE_BACKEND"] = "local"
         # 业务测试不逐条携带浏览器 CSRF header；CSRF 行为由专门 Web 安全测试覆盖。
         os.environ["JOB_AGENT_CSRF_ENABLED"] = "false"
+        # 测试通过注册后立即登录；邮箱验证与协议确认由专门的生命周期测试用临时 env 文件覆盖，
+        # 不能让开发者本地 `.env` 的生产式开关污染其他 Web 测试。
+        os.environ["JOB_AGENT_EMAIL_VERIFICATION_REQUIRED"] = "false"
+        os.environ["JOB_AGENT_CONSENT_REQUIRED"] = "false"
         # 非计费测试需要可调用模型；显式测试资金不改变生产默认的零初始余额。
         os.environ["JOB_AGENT_BILLING_STARTING_BALANCE_YUAN"] = "100"
         # 单元测试通过假模型或显式 IntentRouterSettings 验证路由行为；不能因开发者
@@ -97,6 +103,14 @@ def postgres_test_schema() -> Iterator[str]:
             os.environ.pop("JOB_AGENT_CSRF_ENABLED", None)
         else:
             os.environ["JOB_AGENT_CSRF_ENABLED"] = previous_csrf_enabled
+        if previous_email_verification_required is None:
+            os.environ.pop("JOB_AGENT_EMAIL_VERIFICATION_REQUIRED", None)
+        else:
+            os.environ["JOB_AGENT_EMAIL_VERIFICATION_REQUIRED"] = previous_email_verification_required
+        if previous_consent_required is None:
+            os.environ.pop("JOB_AGENT_CONSENT_REQUIRED", None)
+        else:
+            os.environ["JOB_AGENT_CONSENT_REQUIRED"] = previous_consent_required
         if previous_test_starting_balance is None:
             os.environ.pop("JOB_AGENT_BILLING_STARTING_BALANCE_YUAN", None)
         else:

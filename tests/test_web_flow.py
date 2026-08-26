@@ -145,9 +145,12 @@ def test_web_registration_does_not_persist_password_as_display_name():
     assert logged_in.json()["account"]["email"] == "display-name-web-guard@example.com"
 
 
-def test_email_verification_is_enqueued_and_delivered_once(tmp_path) -> None:
+def test_email_verification_is_enqueued_and_delivered_once(tmp_path, monkeypatch) -> None:
     """需要邮箱验证时，未验证账号不能登录，验证令牌只能使用一次。"""
 
+    # 全局测试夹具会隔离开发者 `.env` 的生产式开关；本测试显式打开生命周期验证。
+    monkeypatch.setenv("JOB_AGENT_EMAIL_VERIFICATION_REQUIRED", "true")
+    monkeypatch.setenv("JOB_AGENT_CONSENT_REQUIRED", "true")
     env_path = tmp_path / ".env"
     env_path.write_text(
         "\n".join(
