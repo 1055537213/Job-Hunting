@@ -11,7 +11,11 @@ import pytest
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 
-from job_hunting_agent.config import load_agent_memory_settings, load_llm_settings
+from job_hunting_agent.config import (
+    load_agent_memory_settings,
+    load_intent_router_settings,
+    load_llm_settings,
+)
 from job_hunting_agent.llm import (
     LangChainLLMClient,
     build_chat_model,
@@ -49,6 +53,48 @@ def test_load_llm_settings_reads_project_env_and_provider_options(tmp_path):
     assert settings.timeout_seconds == 45
     assert settings.enable_thinking is True
     assert settings.reasoning_effort is None
+
+
+def test_load_intent_router_settings_reads_independent_small_model(tmp_path):
+    """意图路由模型可以独立于主 Agent 配置，并保持关闭时无额外调用。"""
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_LLM_PROVIDER=main-provider",
+                "JOB_AGENT_LLM_API_KEY=sk-main",
+                "JOB_AGENT_LLM_BASE_URL=https://main.example/v1",
+                "JOB_AGENT_INTENT_ROUTER_ENABLED=true",
+                "JOB_AGENT_INTENT_ROUTER_MODEL=small-router",
+                "JOB_AGENT_INTENT_ROUTER_TIMEOUT_SECONDS=7",
+                "JOB_AGENT_INTENT_ROUTER_CONFIDENCE_THRESHOLD=0.85",
+                "JOB_AGENT_INTENT_ROUTER_HISTORY_MESSAGES=4",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_intent_router_settings(env_file, environ={})
+
+    assert settings.enabled is True
+    assert settings.llm is not None
+    assert settings.llm.model == "small-router"
+    assert settings.llm.provider == "main-provider"
+    assert settings.llm.api_key == "sk-main"
+    assert settings.llm.base_url == "https://main.example/v1"
+    assert settings.llm.timeout_seconds == 7
+    assert settings.confidence_threshold == 0.85
+    assert settings.history_messages == 4
+
+
+def test_load_intent_router_settings_is_disabled_by_default(tmp_path):
+    """没有显式启用路由器时，现有 Agent 路径保持不变。"""
+
+    settings = load_intent_router_settings(tmp_path / ".env", environ={})
+
+    assert settings.enabled is False
+    assert settings.llm is None
 
 
 def test_build_chat_model_uses_openai_compatible_langchain_model(tmp_path):

@@ -43,6 +43,7 @@ from .app import JobHuntingApp
 from .config import DEFAULT_ENV_PATH, AgentMemorySettings, load_agent_memory_settings
 from .conversation_memory import build_restored_context_messages
 from .deduplication import DuplicateResourceError
+from .intent_router import DirectIntentExecutor, IntentDecision, IntentRouter, IntentRouterProtocol
 from .job_parser import InvalidJobTextError
 from .llm import extract_message_text
 from .models import AgentChatResult, BackgroundTaskRecord
@@ -120,6 +121,7 @@ class JobHuntingAgent:
         env_path: str | Path = DEFAULT_ENV_PATH,
         model: BaseChatModel | None = None,
         memory_settings: AgentMemorySettings | None = None,
+        intent_router: IntentRouterProtocol | None = None,
     ):
         """创建一个绑定本地应用服务的 LangChain Agent。
 
@@ -146,6 +148,8 @@ class JobHuntingAgent:
             else:
                 self.tool_llm_available = True
         self.memory_settings = memory_settings or load_agent_memory_settings(self.env_path)
+        self.intent_router = intent_router or IntentRouter(self.model_gateway)
+        self.direct_intent_executor = DirectIntentExecutor(app)
         self._restored_sessions: set[tuple[int | None, int | None, str]] = set()
         checkpointer = (
             MemorySaver()
@@ -178,8 +182,26 @@ class JobHuntingAgent:
         root_request_id = root_request_id or uuid.uuid4().hex
         if account_id is not None:
             self.app.store.assert_account_can_spend(account_id)
+        turn_messages = self.build_turn_messages(message, candidate_id, resolved_session_id, account_id)
+        route_decision = self._route_message(
+            message,
+            history=turn_messages[:-1],
+            candidate_id=candidate_id,
+            account_id=account_id,
+            session_id=resolved_session_id,
+            root_request_id=root_request_id,
+        )
+        direct_result = self._execute_direct_route(
+            route_decision,
+            candidate_id=candidate_id,
+            account_id=account_id,
+            session_id=resolved_session_id,
+            root_request_id=root_request_id,
+        )
+        if direct_result is not None:
+            return direct_result
         result = self.graph.invoke(
-            {"messages": self.build_turn_messages(message, candidate_id, resolved_session_id, account_id)},
+            {"messages": turn_messages},
             config={
                 "configurable": {
                     "thread_id": scoped_thread_id(
@@ -215,7 +237,7 @@ class JobHuntingAgent:
             mode="langchain_agent",
             used_tools=collect_used_tools(messages),
             tool_outputs=collect_tool_outputs(messages),
-            usage=usage,
+            usage=merge_usage_summaries(route_decision.usage if route_decision else {}, usage),
             root_request_id=root_request_id,
         )
 
@@ -246,13 +268,39 @@ class JobHuntingAgent:
         root_request_id = root_request_id or uuid.uuid4().hex
         if account_id is not None:
             self.app.store.assert_account_can_spend(account_id)
+        turn_messages = self.build_turn_messages(message, candidate_id, resolved_session_id, account_id)
+        route_decision = self._route_message(
+            message,
+            history=turn_messages[:-1],
+            candidate_id=candidate_id,
+            account_id=account_id,
+            session_id=resolved_session_id,
+            root_request_id=root_request_id,
+        )
+        direct_result = self._execute_direct_route(
+            route_decision,
+            candidate_id=candidate_id,
+            account_id=account_id,
+            session_id=resolved_session_id,
+            root_request_id=root_request_id,
+        )
+        if direct_result is not None:
+            yield {"type": "step_started", "name": direct_result.used_tools[0]}
+            yield {
+                "type": "step_completed",
+                "name": direct_result.used_tools[0],
+                "data": direct_result.tool_outputs[0].get("data"),
+            }
+            yield {"type": "token", "content": direct_result.reply}
+            yield {"type": "final", "result": direct_result}
+            return
         tool_and_final_messages: list[BaseMessage] = []
         streamed_reply_parts: list[str] = []
         streamed_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         active_tool_names: set[str] = set()
 
         for stream_item in self.graph.stream(
-            {"messages": self.build_turn_messages(message, candidate_id, resolved_session_id, account_id)},
+            {"messages": turn_messages},
             config={
                 "configurable": {
                     "thread_id": scoped_thread_id(
@@ -342,10 +390,68 @@ class JobHuntingAgent:
                 mode="langchain_agent",
                 used_tools=collect_used_tools(tool_and_final_messages),
                 tool_outputs=collect_tool_outputs(tool_and_final_messages),
-                usage=usage,
+                usage=merge_usage_summaries(route_decision.usage if route_decision else {}, usage),
                 root_request_id=root_request_id,
             ),
         }
+
+    def _route_message(
+        self,
+        message: str,
+        *,
+        history: list[BaseMessage],
+        candidate_id: int | None,
+        account_id: int | None,
+        session_id: str,
+        root_request_id: str,
+    ) -> IntentDecision | None:
+        """在主 Agent 前尝试轻量路由；路由器异常时保持原有流程。"""
+
+        try:
+            return self.intent_router.route(
+                message,
+                history=history,
+                candidate_id=candidate_id,
+                account_id=account_id,
+                session_id=session_id,
+                root_request_id=root_request_id,
+            )
+        except Exception:  # noqa: BLE001 - 路由器是优化层，失败不能阻塞主 Agent。
+            return None
+
+    def _execute_direct_route(
+        self,
+        route_decision: IntentDecision | None,
+        *,
+        candidate_id: int | None,
+        account_id: int | None,
+        session_id: str,
+        root_request_id: str,
+    ) -> AgentChatResult | None:
+        """执行高置信度只读路由；不符合条件时返回 None 进入主 Agent。"""
+
+        if route_decision is None or route_decision.route != "direct_tool":
+            return None
+        try:
+            reply, tool_outputs = self.direct_intent_executor.execute(
+                route_decision,
+                candidate_id=candidate_id,
+                account_id=account_id,
+                session_id=session_id,
+                root_request_id=root_request_id,
+            )
+        except Exception:  # noqa: BLE001 - 直接执行失败时回退到原有工具循环。
+            return None
+        return AgentChatResult(
+            reply=reply,
+            candidate_id=candidate_id,
+            session_id=session_id,
+            mode="intent_router_direct",
+            used_tools=[str(route_decision.tool_name)],
+            tool_outputs=tool_outputs,
+            usage=route_decision.usage,
+            root_request_id=root_request_id,
+        )
 
     def build_turn_messages(
         self,
@@ -832,6 +938,26 @@ def merge_usage(target: dict[str, int], incoming: dict[str, int]) -> None:
 
     for key in ("input_tokens", "output_tokens", "total_tokens"):
         target[key] = max(target.get(key, 0), incoming.get(key, 0))
+
+
+def merge_usage_summaries(
+    first: dict[str, int | str],
+    second: dict[str, int | str],
+) -> dict[str, int | str]:
+    """合并路由模型和主 Agent 的用量摘要。"""
+
+    result: dict[str, int | str] = {}
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        result[key] = int(first.get(key, 0) or 0) + int(second.get(key, 0) or 0)
+    sources = {str(first.get("usage_source", "")), str(second.get("usage_source", ""))}
+    sources.discard("")
+    if "provider" in sources:
+        result["usage_source"] = "provider"
+    elif "missing" in sources:
+        result["usage_source"] = "missing"
+    elif sources:
+        result["usage_source"] = next(iter(sources))
+    return result
 
 
 def default_session_id(candidate_id: int | None, account_id: int | None = None) -> str:

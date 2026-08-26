@@ -59,6 +59,7 @@ def postgres_test_schema() -> Iterator[str]:
     previous_object_storage_backend = os.environ.get("JOB_AGENT_OBJECT_STORAGE_BACKEND")
     previous_csrf_enabled = os.environ.get("JOB_AGENT_CSRF_ENABLED")
     previous_test_starting_balance = os.environ.get("JOB_AGENT_BILLING_STARTING_BALANCE_YUAN")
+    previous_intent_router_enabled = os.environ.get("JOB_AGENT_INTENT_ROUTER_ENABLED")
     try:
         try:
             with base_engine.begin() as connection:
@@ -78,6 +79,9 @@ def postgres_test_schema() -> Iterator[str]:
         os.environ["JOB_AGENT_CSRF_ENABLED"] = "false"
         # 非计费测试需要可调用模型；显式测试资金不改变生产默认的零初始余额。
         os.environ["JOB_AGENT_BILLING_STARTING_BALANCE_YUAN"] = "100"
+        # 单元测试通过假模型或显式 IntentRouterSettings 验证路由行为；不能因开发者
+        # 本地 `.env` 启用了真实路由模型而产生网络调用、费用或不确定测试结果。
+        os.environ["JOB_AGENT_INTENT_ROUTER_ENABLED"] = "false"
         upgrade_database(database_url)
         yield database_url
     finally:
@@ -97,6 +101,10 @@ def postgres_test_schema() -> Iterator[str]:
             os.environ.pop("JOB_AGENT_BILLING_STARTING_BALANCE_YUAN", None)
         else:
             os.environ["JOB_AGENT_BILLING_STARTING_BALANCE_YUAN"] = previous_test_starting_balance
+        if previous_intent_router_enabled is None:
+            os.environ.pop("JOB_AGENT_INTENT_ROUTER_ENABLED", None)
+        else:
+            os.environ["JOB_AGENT_INTENT_ROUTER_ENABLED"] = previous_intent_router_enabled
         with base_engine.begin() as connection:
             connection.execute(sa.text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         base_engine.dispose()

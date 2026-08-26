@@ -308,6 +308,20 @@ class AgentMemorySettings:
     summary_trim_tokens: int = 6000
 
 
+@dataclass(frozen=True)
+class IntentRouterSettings:
+    """轻量意图路由模型配置。
+
+    路由模型默认关闭，保持现有 Agent 行为不变；只有显式配置独立模型并启用后，
+    才会在主 Agent 前尝试处理高置信度的简单请求。
+    """
+
+    enabled: bool = False
+    llm: LLMSettings | None = None
+    confidence_threshold: float = 0.9
+    history_messages: int = 6
+
+
 def load_dotenv_values(env_path: str | Path = DEFAULT_ENV_PATH) -> dict[str, str]:
     """读取 `.env` 文件并返回键值字典。
 
@@ -395,6 +409,72 @@ def load_llm_settings(
         enable_thinking=enable_thinking,
         thinking=thinking,
         reasoning_effort=reasoning_effort,
+    )
+
+
+def load_intent_router_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> IntentRouterSettings:
+    """加载可选的轻量意图路由模型配置。
+
+    路由模型默认复用主模型的 provider、API key 和 base URL，只覆盖模型名；
+    也支持为路由器配置完全独立的 OpenAI-compatible 端点。
+    """
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(*keys: str, default: str | None = None) -> str | None:
+        """按系统环境变量优先、再到 `.env` 的顺序读取配置。"""
+
+        for key in keys:
+            if environment.get(key):
+                return environment[key]
+            if file_values.get(key):
+                return file_values[key]
+        return default
+
+    enabled = parse_bool(get("JOB_AGENT_INTENT_ROUTER_ENABLED", default="false"))
+    model = get("JOB_AGENT_INTENT_ROUTER_MODEL")
+    if not enabled or not model:
+        return IntentRouterSettings(enabled=False)
+
+    provider = get("JOB_AGENT_INTENT_ROUTER_PROVIDER", "JOB_AGENT_LLM_PROVIDER")
+    api_key = get("JOB_AGENT_INTENT_ROUTER_API_KEY", "JOB_AGENT_LLM_API_KEY", "OPENAI_API_KEY")
+    base_url = get("JOB_AGENT_INTENT_ROUTER_BASE_URL", "JOB_AGENT_LLM_BASE_URL", "OPENAI_BASE_URL")
+    if not provider or not api_key or not base_url:
+        raise ValueError(
+            "意图路由模型配置不完整：请配置 JOB_AGENT_INTENT_ROUTER_PROVIDER、"
+            "JOB_AGENT_INTENT_ROUTER_API_KEY 和 JOB_AGENT_INTENT_ROUTER_BASE_URL，"
+            "或复用 JOB_AGENT_LLM_* 配置。"
+        )
+
+    timeout = int(
+        get("JOB_AGENT_INTENT_ROUTER_TIMEOUT_SECONDS", "JOB_AGENT_LLM_TIMEOUT_SECONDS", default="10")
+        or 10
+    )
+    threshold = float(get("JOB_AGENT_INTENT_ROUTER_CONFIDENCE_THRESHOLD", default="0.9") or 0.9)
+    history_messages = int(get("JOB_AGENT_INTENT_ROUTER_HISTORY_MESSAGES", default="6") or 6)
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("JOB_AGENT_INTENT_ROUTER_CONFIDENCE_THRESHOLD 必须在 0 到 1 之间。")
+    if history_messages < 0 or history_messages > 20:
+        raise ValueError("JOB_AGENT_INTENT_ROUTER_HISTORY_MESSAGES 必须在 0 到 20 之间。")
+
+    return IntentRouterSettings(
+        enabled=True,
+        llm=LLMSettings(
+            provider=provider.lower(),
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            timeout_seconds=timeout,
+            enable_thinking=False,
+            thinking=None,
+            reasoning_effort=None,
+        ),
+        confidence_threshold=threshold,
+        history_messages=history_messages,
     )
 
 

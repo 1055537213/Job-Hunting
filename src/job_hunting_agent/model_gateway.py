@@ -22,7 +22,7 @@ import threading
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.embeddings import Embeddings
@@ -34,10 +34,12 @@ from .concurrency_control import ConcurrencyController, ConcurrencyLease
 from .config import (
     DEFAULT_ENV_PATH,
     EmbeddingSettings,
+    IntentRouterSettings,
     LLMSettings,
     ModelGatewaySettings,
     RerankSettings,
     load_embedding_settings,
+    load_intent_router_settings,
     load_llm_settings,
     load_model_gateway_settings,
     load_rerank_settings,
@@ -276,6 +278,7 @@ class ModelGateway:
         llm_settings: LLMSettings | None = None,
         embedding_settings: EmbeddingSettings | None = None,
         rerank_settings: RerankSettings | None = None,
+        intent_router_settings: IntentRouterSettings | None = None,
         settings: ModelGatewaySettings | None = None,
         concurrency_controller: ConcurrencyController | None = None,
     ):
@@ -290,6 +293,7 @@ class ModelGateway:
         self._llm_settings = llm_settings
         self._embedding_settings = embedding_settings
         self._rerank_settings = rerank_settings
+        self._intent_router_settings = intent_router_settings
         self._settings = settings
         self.concurrency_controller = concurrency_controller
         self._chat_circuit_breaker: CircuitBreaker | None = None
@@ -328,6 +332,14 @@ class ModelGateway:
             self._rerank_settings = load_rerank_settings(self.env_path)
         return self._rerank_settings
 
+    @property
+    def intent_router_settings(self) -> IntentRouterSettings:
+        """按需读取可选的轻量意图路由模型配置。"""
+
+        if self._intent_router_settings is None:
+            self._intent_router_settings = load_intent_router_settings(self.env_path)
+        return self._intent_router_settings
+
     def new_call_context(
         self,
         operation: str,
@@ -365,6 +377,7 @@ class ModelGateway:
         temperature: float = 0,
         *,
         account_id: int | None = None,
+        llm_settings: LLMSettings | None = None,
     ) -> BaseChatModel:
         """构造供 LangChain Agent 使用的聊天模型。
 
@@ -388,7 +401,7 @@ class ModelGateway:
                 )
             )
         return build_chat_model(
-            self.llm_settings,
+            llm_settings or self.llm_settings,
             temperature=temperature,
             max_retries=self.settings.chat_max_retries,
             callbacks=callbacks,
@@ -455,16 +468,29 @@ class ModelGateway:
             "retry_after_seconds": snapshot.retry_after_seconds,
         }
 
-    def llm_client(self, context: ModelCallContext, temperature: float = 0) -> LLMClient:
+    def llm_client(
+        self,
+        context: ModelCallContext,
+        temperature: float = 0,
+        *,
+        llm_settings: LLMSettings | None = None,
+        usage_sink: Callable[[dict[str, int | str]], None] | None = None,
+    ) -> LLMClient:
         """返回适合单次 prompt 场景的业务级 LLM 客户端。"""
+
+        def record_response(response: BaseMessage | object) -> None:
+            result = self.record_chat_response(context, response, llm_settings=llm_settings)
+            if usage_sink is not None:
+                usage_sink(result)
 
         return LangChainLLMClient(
             self.chat_model(
                 context.operation,
                 temperature=temperature,
                 account_id=context.account_id,
+                llm_settings=llm_settings,
             ),
-            usage_callback=lambda message: self.record_chat_response(context, message),
+            usage_callback=record_response,
         )
 
     def embeddings(self, context: ModelCallContext) -> Embeddings:
@@ -517,14 +543,16 @@ class ModelGateway:
         self,
         context: ModelCallContext,
         response: BaseMessage | object,
+        *,
+        llm_settings: LLMSettings | None = None,
     ) -> dict[str, int | str]:
         """记录单次聊天模型响应的供应商 usage。"""
 
         return self.record_usage(
             context,
             extract_chat_usage(response),
-            provider=self._chat_identity()[0],
-            model=self._chat_identity()[1],
+            provider=self._chat_identity(llm_settings)[0],
+            model=self._chat_identity(llm_settings)[1],
             provider_request_id=extract_provider_request_id(response),
         )
 
@@ -681,9 +709,11 @@ class ModelGateway:
             )
         return {**normalized, "usage_source": source}
 
-    def _chat_identity(self) -> tuple[str, str]:
+    def _chat_identity(self, llm_settings: LLMSettings | None = None) -> tuple[str, str]:
         """返回不含密钥的聊天模型计量标签。"""
 
+        if llm_settings is not None:
+            return llm_settings.provider, llm_settings.model
         try:
             settings = self.llm_settings
         except ValueError:
