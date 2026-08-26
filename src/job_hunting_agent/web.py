@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -35,7 +36,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
 from starlette.concurrency import run_in_threadpool
 
@@ -71,9 +72,12 @@ from .config import (
     load_concurrency_settings,
     load_cookie_secure,
     load_database_settings,
+    masked_file_scanning_settings,
+    load_file_scanning_settings,
     load_embedding_settings,
     load_llm_settings,
     load_object_storage_settings,
+    load_project_visual_analysis_settings,
     load_rerank_settings,
     load_task_queue_settings,
     load_web_security_settings,
@@ -83,12 +87,14 @@ from .config import (
     masked_embedding_settings,
     masked_llm_settings,
     masked_object_storage_settings,
+    masked_project_visual_analysis_settings,
     masked_rerank_settings,
     masked_task_queue_settings,
     masked_web_security_settings,
     require_postgresql_database_url,
 )
 from .deduplication import DuplicateResourceError
+from .file_scanning import FileInfectedError, FileScannerUnavailableError
 from .github_project import GitHubRepositoryError
 from .job_parser import InvalidJobTextError
 from .job_screenshot import (
@@ -108,6 +114,11 @@ from .models import (
     ResumeArtifactRecord,
     SkillRequirement,
     ToolCallTraceRecord,
+)
+from .project_evidence import (
+    MAX_MANIFEST_FILES,
+    ProjectEvidenceError,
+    ProjectManifestItem,
 )
 from .rag import RAGProviderRequestError
 from .rate_limiting import RateLimiter
@@ -276,6 +287,29 @@ class GitHubProjectPayload(BaseModel):
     repository_url: str
 
 
+class LocalProjectManifestFilePayload(BaseModel):
+    """One browser-scanned file descriptor; content arrives only after selection."""
+
+    relative_path: str = Field(min_length=1, max_length=2048)
+    file_size: int = Field(ge=0)
+    sha256: str | None = Field(default=None, min_length=64, max_length=64)
+    media_type: str = Field(default="application/octet-stream", max_length=128)
+    last_modified: int | None = Field(default=None, ge=0)
+
+
+class LocalProjectManifestPayload(BaseModel):
+    """Manifest-first local directory collection request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: int
+    project_name: str = Field(min_length=1, max_length=256)
+    files: list[LocalProjectManifestFilePayload] = Field(
+        min_length=1,
+        max_length=MAX_MANIFEST_FILES,
+    )
+
+
 class ProjectCardConfirmationPayload(BaseModel):
     """候选人确认项目卡片时可选提供的本人职责摘要。"""
 
@@ -313,6 +347,7 @@ def create_web_app(
     task_queue: BackgroundTaskQueue | None = None,
     rate_limiter: RateLimiter | None = None,
     concurrency_controller: ConcurrencyController | None = None,
+    file_scanner: object | None = None,
 ) -> FastAPI:
     """创建本地 FastAPI 应用。
 
@@ -330,6 +365,7 @@ def create_web_app(
         database_url=database_url,
         task_queue=task_queue,
         concurrency_controller=concurrency_controller,
+        file_scanner=file_scanner,  # type: ignore[arg-type]
     )
     backend.initialize()
     env_path = Path(env_file)
@@ -672,6 +708,22 @@ def create_web_app(
             )
         except ValueError as error:
             concurrency_config = {"configured": False, "error": str(error)}
+        try:
+            file_scanning_config = masked_file_scanning_settings(
+                load_file_scanning_settings(env_path)
+            )
+            file_scanning_config["configured"] = True
+        except ValueError as error:
+            file_scanning_config = {"configured": False, "error": str(error)}
+        try:
+            project_visual_config = masked_project_visual_analysis_settings(
+                load_project_visual_analysis_settings(env_path)
+            )
+            project_visual_config["configured"] = bool(
+                project_visual_config.get("enabled") and llm_config.get("configured")
+            )
+        except ValueError as error:
+            project_visual_config = {"configured": False, "error": str(error)}
         if account is None or account.role != "admin":
             return {
                 "status": "ok",
@@ -696,6 +748,11 @@ def create_web_app(
                     "configured": not bool(concurrency_config.get("error")),
                     "enabled": bool(concurrency_config.get("enabled")),
                 },
+                "file_scanning": {"configured": bool(file_scanning_config.get("configured"))},
+                "project_visual_analysis": {
+                    "configured": bool(project_visual_config.get("configured")),
+                    "enabled": bool(project_visual_config.get("enabled")),
+                },
                 "model_circuit": backend.model_gateway.circuit_snapshot(),
             }
         return {
@@ -712,6 +769,8 @@ def create_web_app(
             "web_security": web_security_config,
             "billing": billing_config,
             "concurrency": concurrency_config,
+            "file_scanning": file_scanning_config,
+            "project_visual_analysis": project_visual_config,
             "model_circuit": backend.model_gateway.circuit_snapshot(),
             "agent": {
                 "configured": chat_agent is not None,
@@ -1206,6 +1265,10 @@ def create_web_app(
             raise HTTPException(status_code=400, detail=str(error)) from error
         except DuplicateResourceError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+        except FileInfectedError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except FileScannerUnavailableError as error:
+            raise HTTPException(status_code=503, detail=str(error), headers={"Retry-After": "10"}) from error
         finally:
             for screenshot in screenshots:
                 await screenshot.close()
@@ -1361,6 +1424,10 @@ def create_web_app(
             raise HTTPException(status_code=400, detail=str(error)) from error
         except DuplicateResourceError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+        except FileInfectedError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except FileScannerUnavailableError as error:
+            raise HTTPException(status_code=503, detail=str(error), headers={"Retry-After": "10"}) from error
         except TaskQueueError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         return {
@@ -1368,6 +1435,233 @@ def create_web_app(
             "project_card": asdict(project_card),
             "processing_async": False,
         }
+
+    @web_app.post("/api/projects/local/manifest")
+    def create_local_project_manifest(
+        payload: LocalProjectManifestPayload,
+        request: Request,
+    ) -> dict[str, object]:
+        """Accept metadata and hashes only, then return the server-side collection plan."""
+
+        account = current_account(request)
+        assert account is not None
+        get_profile_or_404(backend, payload.candidate_id, account.id)
+        try:
+            session, files = backend.create_local_project_collection(
+                payload.candidate_id,
+                payload.project_name,
+                [
+                    ProjectManifestItem(
+                        relative_path=item.relative_path,
+                        file_size=item.file_size,
+                        sha256=item.sha256,
+                        media_type=item.media_type,
+                        last_modified=item.last_modified,
+                    )
+                    for item in payload.files
+                ],
+                account_id=account.id,
+            )
+        except ProjectEvidenceError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except DuplicateResourceError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {
+            "collection": asdict(session),
+            "files": [asdict(item) for item in files],
+            "selected_files": [
+                asdict(item) for item in files if item.selection_status == "selected"
+            ],
+            "resumed": any(
+                item.selection_status == "analyzed" for item in files
+            ) or session.uploaded_file_count > 0,
+        }
+
+    @web_app.get("/api/projects/local/{collection_id}")
+    def get_local_project_collection(
+        collection_id: int,
+        request: Request,
+    ) -> dict[str, object]:
+        """Return resumable collection progress for the signed-in account."""
+
+        account = current_account(request)
+        assert account is not None
+        try:
+            session = backend.store.get_project_collection(collection_id, account_id=account.id)
+            files = backend.store.list_project_collection_files(collection_id, account_id=account.id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="本地项目采集会话不存在。") from error
+        return {"collection": asdict(session), "files": [asdict(item) for item in files]}
+
+    @web_app.delete("/api/projects/local/{collection_id}")
+    def delete_local_project_collection(
+        collection_id: int,
+        request: Request,
+    ) -> dict[str, object]:
+        """取消未完成的本地目录采集，释放其文本、视觉对象与派生索引。"""
+
+        account = current_account(request)
+        assert account is not None
+        try:
+            result = backend.delete_incomplete_local_project_collection(
+                collection_id,
+                account_id=account.id,
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="本地项目采集会话不存在。") from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"deleted": True, **result}
+
+    @web_app.post("/api/projects/local/{collection_id}/files")
+    async def upload_local_project_files(
+        collection_id: int,
+        request: Request,
+        file_ids: str = Form(...),
+        files: list[UploadFile] = File(...),  # noqa: B008 - FastAPI multipart declaration.
+    ) -> dict[str, object]:
+        """Verify and process one browser batch, then enqueue its incremental RAG update."""
+
+        account = current_account(request)
+        assert account is not None
+        try:
+            parsed_ids = json.loads(file_ids)
+        except json.JSONDecodeError as error:
+            raise HTTPException(status_code=400, detail="项目文件批次标识无效。") from error
+        if not isinstance(parsed_ids, list) or not parsed_ids or len(parsed_ids) != len(files):
+            raise HTTPException(status_code=400, detail="项目文件批次与采集计划不一致。")
+        if len(files) > 5:
+            raise HTTPException(status_code=400, detail="每批最多处理 5 个项目文件。")
+
+        processed = []
+        failures = []
+        for raw_id, upload in zip(parsed_ids, files, strict=True):
+            try:
+                file_id = int(raw_id)
+                planned = backend.store.get_project_collection_file(
+                    file_id,
+                    collection_id=collection_id,
+                    account_id=account.id,
+                )
+                content = await upload.read(planned.file_size + 1)
+                await upload.close()
+                if len(content) > planned.file_size:
+                    raise ValueError("项目文件大小与预扫描清单不一致。")
+                result = await run_in_threadpool(
+                    backend.process_local_project_collection_file,
+                    collection_id,
+                    file_id,
+                    content,
+                    account_id=account.id,
+                )
+                processed.append(result)
+            except FileScannerUnavailableError as error:
+                raise HTTPException(
+                    status_code=503,
+                    detail=str(error),
+                    headers={"Retry-After": "10"},
+                ) from error
+            except (ProjectEvidenceError, FileInfectedError, ValueError, KeyError) as error:
+                try:
+                    failed = backend.store.fail_project_collection_file(
+                        int(raw_id),
+                        collection_id=collection_id,
+                        account_id=account.id,
+                        reason=str(error),
+                    )
+                    failures.append(asdict(failed))
+                except (ValueError, KeyError):
+                    failures.append({"id": raw_id, "selection_reason": str(error)})
+
+        long_text_ids = [int(item.long_text_id) for item in processed if item.long_text_id]
+        collection = backend.store.get_project_collection(
+            collection_id,
+            account_id=account.id,
+        )
+        visual_items = backend.store.list_visual_knowledge_items(
+            account_id=account.id,
+            project_collection_file_ids=[item.id for item in processed],
+        )
+        rag_task = None
+        visual_task = None
+        visual_index = None
+        visual_warning = None
+        if long_text_ids:
+            if backend.task_queue_enabled:
+                id_source = ",".join(str(item.id) for item in processed)
+                rag_task = backend.enqueue_rag_index_task(
+                    long_text_ids=long_text_ids,
+                    account_id=account.id,
+                    candidate_id=collection.candidate_id,
+                    session_id=f"local-project-collection-{collection_id}",
+                    root_request_id=uuid.uuid4().hex,
+                    idempotency_key=(
+                        "local-project-rag:"
+                        f"{collection_id}:{hashlib.sha256(id_source.encode('ascii')).hexdigest()}"
+                    ),
+                )
+            else:
+                backend.index_rag_long_texts(long_text_ids, account_id=account.id)
+        if visual_items and backend.visual_embedding_enabled:
+            visual_id_source = ",".join(str(item.id) for item in visual_items)
+            if backend.task_queue_enabled:
+                visual_task = backend.enqueue_visual_index_task(
+                    visual_item_ids=[item.id for item in visual_items],
+                    account_id=account.id,
+                    candidate_id=collection.candidate_id,
+                    session_id=f"local-project-collection-{collection_id}",
+                    root_request_id=uuid.uuid4().hex,
+                    idempotency_key=(
+                        "local-project-visual:"
+                        f"{collection_id}:{hashlib.sha256(visual_id_source.encode('ascii')).hexdigest()}"
+                    ),
+                )
+            else:
+                try:
+                    visual_index = asdict(
+                        backend.index_visual_knowledge_items(
+                            [item.id for item in visual_items],
+                            account_id=account.id,
+                            candidate_id=collection.candidate_id,
+                            session_id=f"local-project-collection-{collection_id}",
+                        )
+                    )
+                except (RAGProviderRequestError, ValueError) as error:
+                    visual_warning = f"项目证据已保存，但视觉索引失败：{error}"
+        elif visual_items:
+            visual_warning = "项目视觉副本已保存；配置多模态 Embedding 后可建立图片向量。"
+        return {
+            "processed_files": [asdict(item) for item in processed],
+            "failed_files": failures,
+            "rag_task": serialize_background_task(rag_task) if rag_task is not None else None,
+            "visual_task": (
+                serialize_background_task(visual_task)
+                if visual_task is not None
+                else None
+            ),
+            "visual_index": visual_index,
+            "visual_warning": visual_warning,
+        }
+
+    @web_app.post("/api/projects/local/{collection_id}/complete")
+    def complete_local_project_collection(
+        collection_id: int,
+        request: Request,
+    ) -> dict[str, object]:
+        """Create the pending project card after the planned batches finish."""
+
+        account = current_account(request)
+        assert account is not None
+        try:
+            project_card = backend.complete_local_project_collection(
+                collection_id,
+                account_id=account.id,
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="本地项目采集会话不存在。") from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"project_card": asdict(project_card), "processing_async": False}
 
     @web_app.post("/api/projects/{record_id}/confirm")
     def confirm_project_card(
@@ -1446,6 +1740,10 @@ def create_web_app(
             raise HTTPException(status_code=400, detail=str(error)) from error
         except DuplicateResourceError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+        except FileInfectedError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except FileScannerUnavailableError as error:
+            raise HTTPException(status_code=503, detail=str(error), headers={"Retry-After": "10"}) from error
 
         rag_update = None
         rag_warning = None

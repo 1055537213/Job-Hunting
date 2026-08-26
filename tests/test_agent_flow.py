@@ -143,6 +143,61 @@ def test_langchain_agent_can_call_ingest_tool_and_update_profile(tmp_path, accou
     assert any("FastAPI" in item.content for item in rag_results)
 
 
+def test_agent_rag_tool_always_scopes_search_to_current_candidate(account_id, monkeypatch):
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="当前候选人",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+    calls = []
+
+    def record_search(query, top_k=5, entity_types=None, **kwargs):
+        calls.append((query, top_k, entity_types, kwargs))
+        return []
+
+    monkeypatch.setattr(app, "search_rag", record_search)
+    model = ToolCallingFakeChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_candidate_rag",
+                        "name": "search_candidate_evidence",
+                        "args": {"query": "项目证据", "top_k": 3},
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="没有找到相关证据。"),
+        ]
+    )
+
+    JobHuntingAgent(app, model=model).chat(
+        "查找我的项目证据",
+        candidate_id=candidate_id,
+        session_id="candidate-rag-scope",
+        use_tool_llm=False,
+        account_id=account_id,
+    )
+
+    assert calls == [
+        ("项目证据", 3, None, {"account_id": account_id, "candidate_id": candidate_id})
+    ]
+
+
 def test_langchain_agent_context_schema_does_not_emit_serializer_warning(tmp_path, account_id):
     """工具收到运行时上下文时，不应把字典按 None 类型序列化。"""
 

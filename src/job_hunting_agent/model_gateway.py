@@ -201,6 +201,11 @@ class ConcurrencyLimitedEmbeddings(Embeddings):
         self.delegate = delegate
         self.controller = controller
         self.account_id = account_id
+        # 暴露稳定的模型身份，确保文本查询向量与图片索引向量只在同一空间比较。
+        self.model = getattr(delegate, "model", None)
+        self.endpoint = getattr(delegate, "endpoint", None)
+        self.embeddings_url = getattr(delegate, "embeddings_url", None)
+        self.dimensions = getattr(delegate, "dimensions", None)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         lease = self.controller.acquire("model", account_id=self.account_id)
@@ -213,6 +218,18 @@ class ConcurrencyLimitedEmbeddings(Embeddings):
         lease = self.controller.acquire("model", account_id=self.account_id)
         try:
             return self.delegate.embed_query(text)
+        finally:
+            lease.release()
+
+    def embed_images(self, images: list[tuple[bytes, str]]) -> list[list[float]]:
+        """在同一模型并发租约下代理 provider-native 图片向量调用。"""
+
+        embed_images = getattr(self.delegate, "embed_images", None)
+        if not callable(embed_images):
+            raise ValueError("当前 Embedding 配置不支持图片向量。")
+        lease = self.controller.acquire("model", account_id=self.account_id)
+        try:
+            return embed_images(images)
         finally:
             lease.release()
 

@@ -129,6 +129,33 @@ class ObjectStorageSettings:
 
 
 @dataclass(frozen=True)
+class FileScanningSettings:
+    """上传文件安全扫描配置。
+
+    `local` 只用于开发和测试；生产环境必须使用外部 ClamAV/clamd，避免把未扫描
+    文件交给 OCR、解压、模型或 RAG。
+    """
+
+    backend: str = "local"
+    host: str = "127.0.0.1"
+    port: int = 3310
+    timeout_seconds: float = 10.0
+
+
+@dataclass(frozen=True)
+class ProjectVisualAnalysisSettings:
+    """项目图片和复杂 PDF 页面的多模态分析配置。
+
+    视觉分析是本地文本/OCR 解析后的增强层。页数与单次图片数必须保持有界，避免
+    一个大型工业文档把模型上下文、请求时长和用户余额一次性耗尽。
+    """
+
+    enabled: bool = True
+    max_pdf_pages: int = 8
+    max_images_per_call: int = 4
+
+
+@dataclass(frozen=True)
 class TaskQueueSettings:
     """后台任务队列配置。
 
@@ -685,6 +712,97 @@ def load_object_storage_settings(
             get("JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET", "false")
         ),
     )
+
+
+def load_file_scanning_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> FileScanningSettings:
+    """读取上传文件恶意扫描配置，并在生产环境禁止本地伪扫描。"""
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(key: str, default: str | None = None) -> str | None:
+        value = environment.get(key) or file_values.get(key)
+        return value if value not in {None, ""} else default
+
+    runtime_environment = (get("JOB_AGENT_ENVIRONMENT", "development") or "development").lower()
+    if runtime_environment not in {"development", "test", "production"}:
+        raise ValueError("JOB_AGENT_ENVIRONMENT 只能是 development、test 或 production")
+    default_backend = "clamav" if runtime_environment == "production" else "local"
+    backend = (get("JOB_AGENT_FILE_SCAN_BACKEND", default_backend) or default_backend).strip().lower()
+    if backend not in {"local", "clamav"}:
+        raise ValueError("JOB_AGENT_FILE_SCAN_BACKEND 只能是 local 或 clamav")
+    if runtime_environment == "production" and backend != "clamav":
+        raise ValueError("生产环境必须使用 ClamAV 文件安全扫描")
+    return FileScanningSettings(
+        backend=backend,
+        host=(get("JOB_AGENT_FILE_SCAN_HOST", "127.0.0.1") or "127.0.0.1").strip(),
+        port=parse_positive_int(
+            get("JOB_AGENT_FILE_SCAN_PORT", "3310"),
+            "JOB_AGENT_FILE_SCAN_PORT",
+        ),
+        timeout_seconds=parse_positive_float(
+            get("JOB_AGENT_FILE_SCAN_TIMEOUT_SECONDS", "10"),
+            "JOB_AGENT_FILE_SCAN_TIMEOUT_SECONDS",
+        ),
+    )
+
+
+def masked_file_scanning_settings(settings: FileScanningSettings) -> dict[str, object]:
+    """返回健康检查可展示的扫描配置，不回显网络凭据。"""
+
+    return {
+        "backend": settings.backend,
+        "host": settings.host,
+        "port": settings.port,
+        "timeout_seconds": settings.timeout_seconds,
+    }
+
+
+def load_project_visual_analysis_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> ProjectVisualAnalysisSettings:
+    """读取项目视觉分析开关和成本边界。"""
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(key: str, default: str) -> str:
+        value = environment.get(key) or file_values.get(key)
+        return value if value not in {None, ""} else default
+
+    max_pdf_pages = parse_positive_int(
+        get("JOB_AGENT_PROJECT_VISUAL_MAX_PDF_PAGES", "8"),
+        "JOB_AGENT_PROJECT_VISUAL_MAX_PDF_PAGES",
+    )
+    max_images_per_call = parse_positive_int(
+        get("JOB_AGENT_PROJECT_VISUAL_MAX_IMAGES_PER_CALL", "4"),
+        "JOB_AGENT_PROJECT_VISUAL_MAX_IMAGES_PER_CALL",
+    )
+    if max_pdf_pages > 20:
+        raise ValueError("JOB_AGENT_PROJECT_VISUAL_MAX_PDF_PAGES 不能超过 20")
+    if max_images_per_call > 8:
+        raise ValueError("JOB_AGENT_PROJECT_VISUAL_MAX_IMAGES_PER_CALL 不能超过 8")
+    return ProjectVisualAnalysisSettings(
+        enabled=parse_bool(get("JOB_AGENT_PROJECT_VISUAL_ANALYSIS_ENABLED", "true")),
+        max_pdf_pages=max_pdf_pages,
+        max_images_per_call=max_images_per_call,
+    )
+
+
+def masked_project_visual_analysis_settings(
+    settings: ProjectVisualAnalysisSettings,
+) -> dict[str, object]:
+    """返回不含模型密钥的项目视觉分析运行摘要。"""
+
+    return {
+        "enabled": settings.enabled,
+        "max_pdf_pages": settings.max_pdf_pages,
+        "max_images_per_call": settings.max_images_per_call,
+    }
 
 
 def masked_object_storage_settings(settings: ObjectStorageSettings) -> dict[str, object]:

@@ -19,7 +19,7 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.engine import Engine
 
-from .database_schema import rag_chunks
+from .database_schema import long_texts, rag_chunks, visual_knowledge_items
 from .models import LongTextRecord, RAGIndexStats, RAGSearchResult
 from .rag import (
     Reranker,
@@ -31,6 +31,46 @@ from .rag import (
 
 PGVECTOR_COLLECTION_NAME = "rag_chunks"
 PGVECTOR_PERSISTENCE_LABEL = "postgresql+pgvector"
+
+
+def _visual_evidence_text(row: Any) -> str:
+    """把结构化视觉元数据转换成受控检索摘要，不返回整份项目文件。"""
+
+    metadata = row.get("metadata_json")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    finding = metadata.get("visual_finding")
+    finding = finding if isinstance(finding, dict) else {}
+    lines: list[str] = []
+    summary = str(finding.get("summary") or "").strip()
+    if summary:
+        lines.append(f"视觉摘要：{summary[:2_000]}")
+    for label, key in (
+        ("元素关系", "element_relationships"),
+        ("表格", "tables"),
+    ):
+        values = finding.get(key)
+        if isinstance(values, list):
+            lines.extend(
+                f"{label}：{str(value)[:1_000]}"
+                for value in values[:20]
+                if str(value).strip()
+            )
+    parameters = finding.get("parameters")
+    if isinstance(parameters, list):
+        for parameter in parameters[:40]:
+            if not isinstance(parameter, dict):
+                continue
+            fields = [
+                f"{key}={str(parameter.get(key) or '')[:256]}"
+                for key in ("name", "value", "unit", "tolerance", "applies_to")
+                if str(parameter.get(key) or "").strip()
+            ]
+            if fields:
+                lines.append("参数：" + "；".join(fields))
+    if not lines:
+        fallback = str(row.get("text") or "").strip()
+        lines.append(f"视觉来源关联文字：{fallback[:2_000]}")
+    return "\n".join(lines)
 
 
 class PgVectorKnowledgeBase:
@@ -111,8 +151,9 @@ class PgVectorKnowledgeBase:
         top_k: int = 5,
         entity_types: list[str] | None = None,
         account_id: int | None = None,
+        candidate_id: int | None = None,
     ) -> list[RAGSearchResult]:
-        """在 PostgreSQL 内完成账号过滤和余弦距离排序，再可选调用 Rerank。"""
+        """执行文字与视觉双路召回，再把可读证据统一交给可选 Rerank。"""
 
         if not query.strip() or top_k <= 0:
             return []
@@ -149,11 +190,24 @@ class PgVectorKnowledgeBase:
         )
         if account_id is not None:
             statement = statement.where(rag_chunks.c.account_id == account_id)
+        if candidate_id is not None:
+            statement = statement.where(rag_chunks.c.candidate_id == candidate_id)
         normalized_entity_types = [item for item in (entity_types or []) if item]
         if normalized_entity_types:
             statement = statement.where(rag_chunks.c.entity_type.in_(normalized_entity_types))
         with self.engine.connect() as connection:
             rows = connection.execute(statement).mappings().all()
+            visual_rows = connection.execute(
+                self._visual_search_statement(
+                    query_vector,
+                    vector_dimension,
+                    rag_embedding_model_name(embeddings),
+                    candidate_limit,
+                    account_id=account_id,
+                    candidate_id=candidate_id,
+                    entity_types=normalized_entity_types,
+                )
+            ).mappings().all()
         candidates = [
             RAGSearchResult(
                 content=str(row["content"]),
@@ -166,7 +220,85 @@ class PgVectorKnowledgeBase:
             )
             for row in rows
         ]
+        candidates.extend(
+            RAGSearchResult(
+                content=_visual_evidence_text(row),
+                entity_type=str(row["entity_type"]),
+                entity_id=int(row["entity_id"]),
+                source_label=str(row["source_label"]),
+                long_text_id=int(row["long_text_id"]),
+                chunk_index=-1,
+                distance=float(row["distance"]),
+                evidence_kind="visual",
+                visual_item_id=int(row["visual_item_id"]),
+                page_number=(
+                    int(row["page_number"])
+                    if row["page_number"] is not None
+                    else None
+                ),
+            )
+            for row in visual_rows
+        )
+        candidates.sort(key=lambda item: item.distance)
         return rerank_rag_results(query, candidates, top_k, self.reranker)
+
+    @staticmethod
+    def _visual_search_statement(
+        query_vector: list[float],
+        vector_dimension: int,
+        embedding_model: str,
+        candidate_limit: int,
+        *,
+        account_id: int | None,
+        candidate_id: int | None,
+        entity_types: list[str],
+    ) -> sa.Select:
+        """构建与文字查询向量同空间的视觉召回 SQL。"""
+
+        distance = sa.type_coerce(
+            visual_knowledge_items.c.embedding.op("<=>")(
+                sa.bindparam(
+                    "visual_query_embedding",
+                    value=query_vector,
+                    type_=Vector(vector_dimension),
+                )
+            ),
+            sa.Float(),
+        )
+        statement = (
+            sa.select(
+                visual_knowledge_items.c.id.label("visual_item_id"),
+                visual_knowledge_items.c.source_label,
+                visual_knowledge_items.c.page_number,
+                visual_knowledge_items.c.metadata_json,
+                long_texts.c.id.label("long_text_id"),
+                long_texts.c.entity_type,
+                long_texts.c.entity_id,
+                long_texts.c.text,
+                distance.label("distance"),
+            )
+            .select_from(
+                visual_knowledge_items.join(
+                    long_texts,
+                    visual_knowledge_items.c.long_text_id == long_texts.c.id,
+                )
+            )
+            .where(
+                visual_knowledge_items.c.index_status == "indexed",
+                visual_knowledge_items.c.embedding.is_not(None),
+                visual_knowledge_items.c.embedding_dimensions == vector_dimension,
+                visual_knowledge_items.c.embedding_model == embedding_model,
+            )
+            .order_by(distance.asc())
+            .limit(candidate_limit)
+        )
+        if account_id is not None:
+            statement = statement.where(visual_knowledge_items.c.account_id == account_id)
+        if candidate_id is not None:
+            statement = statement.where(visual_knowledge_items.c.candidate_id == candidate_id)
+        if entity_types:
+            statement = statement.where(long_texts.c.entity_type.in_(entity_types))
+        return statement
 
     def _rows_for_documents(self, documents: list[Document]) -> list[dict[str, Any]]:
         """先完成所有 Embedding 调用，再生成可在一个事务中写入的 chunk 行。"""

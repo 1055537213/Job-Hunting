@@ -30,7 +30,12 @@ from job_hunting_agent.model_resilience import ModelCircuitOpenError
 from job_hunting_agent.rag import RAGProviderRequestError
 from job_hunting_agent.resume_document import ResumeFileStore
 from job_hunting_agent.storage import InsufficientBalanceError
-from job_hunting_agent.task_queue import CeleryTaskQueue, TaskQueueError
+from job_hunting_agent.task_queue import (
+    CeleryTaskQueue,
+    TaskQueueError,
+    build_celery_app,
+    maintenance_queue_name,
+)
 from job_hunting_agent.web import load_or_new_tool_trace, new_task_trace, owned_or_new_root_request_id
 
 
@@ -96,6 +101,30 @@ class FailOnceCeleryProducer(FakeCeleryProducer):
             self.failed = True
             raise RuntimeError("redis unavailable")
         super().send_task(name, **kwargs)
+
+
+def test_celery_beat_maintenance_tasks_use_a_separate_queue() -> None:
+    """Beat 维护任务不能和业务任务共用队列，否则单 Worker 故障时无法回收任务。"""
+
+    settings = TaskQueueSettings(
+        enabled=True,
+        redis_url="redis://:secret@redis:6379/0",
+        queue_name="business_tasks",
+    )
+
+    celery_app = build_celery_app(settings)
+    schedule = celery_app.conf.beat_schedule
+
+    assert celery_app.conf.task_default_queue == "business_tasks"
+    assert maintenance_queue_name(settings.queue_name) == "business_tasks_maintenance"
+    assert (
+        schedule["recover-stale-background-tasks"]["options"]["queue"]
+        == "business_tasks_maintenance"
+    )
+    assert (
+        schedule["prune-operational-ledgers-daily"]["options"]["queue"]
+        == "business_tasks_maintenance"
+    )
 
 
 def test_task_queue_settings_require_redis_url_when_enabled(tmp_path: Path) -> None:

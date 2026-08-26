@@ -140,6 +140,45 @@ def test_native_multimodal_embeddings_use_native_payload_and_restore_input_order
         },
     }
 
+
+def test_native_multimodal_embeddings_send_base64_images_as_independent_items():
+    """视觉索引使用 Base64 Data URI，且不把多张图片融合成一个向量。"""
+
+    captured: dict[str, object] = {}
+
+    def fake_transport(url, headers, payload, timeout):
+        captured.update(payload=payload)
+        return {
+            "output": {
+                "embeddings": [
+                    {"index": 1, "type": "vl", "embedding": [0.3, 0.4]},
+                    {"index": 0, "type": "vl", "embedding": [0.1, 0.2]},
+                ]
+            },
+            "usage": {"input_tokens": 2, "image_tokens": 30, "total_tokens": 32},
+        }
+
+    embeddings = NativeMultimodalEmbeddings(
+        api_key="test-key",
+        base_url="https://embedding.example/v1/encode",
+        model="qwen3-vl-embedding",
+        dimensions=1024,
+        transport=fake_transport,
+    )
+
+    vectors = embeddings.embed_images(
+        [(b"first-image", "image/png"), (b"second-image", "image/jpeg")]
+    )
+
+    assert vectors == [[0.1, 0.2], [0.3, 0.4]]
+    payload = captured["payload"]
+    assert payload["model"] == "qwen3-vl-embedding"
+    assert payload["parameters"] == {"dimension": 1024}
+    assert "enable_fusion" not in payload.get("parameters", {})
+    contents = payload["input"]["contents"]
+    assert contents[0]["image"].startswith("data:image/png;base64,")
+    assert contents[1]["image"].startswith("data:image/jpeg;base64,")
+
 def test_native_reranker_uses_query_documents_payload_and_preserves_indexes():
     """native 重排器仅返回候选索引，调用方可复用本地 chunk。"""
 

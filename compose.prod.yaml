@@ -3,6 +3,27 @@
 name: job-hunting-agent-production
 
 services:
+  clamav:
+    # 生产环境的上传文件和 GitHub 归档必须先通过病毒库扫描。
+    image: "${JOB_AGENT_CLAMAV_IMAGE:-clamav/clamav:1.4.6@sha256:761f6c99b8d9134b39431f8c200189cda749b17310091561bfa8b732f32bfada}"
+    restart: unless-stopped
+    expose:
+      - "3310"
+    volumes:
+      - clamav_prod_data:/var/lib/clamav
+    healthcheck:
+      # 官方镜像已在 clamdscan.conf 中配置 daemon 地址；clamdscan 没有 --host 参数。
+      test: ["CMD-SHELL", "clamdscan --ping 1 >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
   postgres:
     environment:
       # 生产环境使用密码认证；不要复用开发库的 trust 配置或数据卷。
@@ -54,9 +75,15 @@ services:
       FORWARDED_ALLOW_IPS: "*"
       JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}:${JOB_AGENT_POSTGRES_PASSWORD:?set JOB_AGENT_POSTGRES_PASSWORD in .env}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
       JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET: "false"
+      JOB_AGENT_FILE_SCAN_BACKEND: clamav
+      JOB_AGENT_FILE_SCAN_HOST: clamav
+      JOB_AGENT_FILE_SCAN_PORT: "3310"
     ports: !reset []
     expose:
       - "8000"
+    depends_on:
+      clamav:
+        condition: service_healthy
     deploy:
       replicas: 1
       resources:
@@ -71,6 +98,12 @@ services:
       JOB_AGENT_ENVIRONMENT: production
       JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}:${JOB_AGENT_POSTGRES_PASSWORD:?set JOB_AGENT_POSTGRES_PASSWORD in .env}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
       JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET: "false"
+      JOB_AGENT_FILE_SCAN_BACKEND: clamav
+      JOB_AGENT_FILE_SCAN_HOST: clamav
+      JOB_AGENT_FILE_SCAN_PORT: "3310"
+    depends_on:
+      clamav:
+        condition: service_healthy
     deploy:
       replicas: 1
       resources:
@@ -132,6 +165,8 @@ volumes:
     name: job-hunting-agent-production_caddy_config
   prometheus_prod_data:
     name: job-hunting-agent-production_prometheus_prod_data
+  clamav_prod_data:
+    name: job-hunting-agent-production_clamav_prod_data
 
 networks:
   default:

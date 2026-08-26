@@ -15,6 +15,7 @@ from job_hunting_agent.background_tasks import run_registered_task
 from job_hunting_agent.config import TaskQueueSettings
 from job_hunting_agent.deduplication import DuplicateResourceError
 from job_hunting_agent.github_project import (
+    FetchedGitHubRepository,
     InvalidGitHubRepositoryUrlError,
     analyze_public_github_repository,
     normalize_public_github_repository_url,
@@ -91,6 +92,8 @@ def build_repository_archive() -> bytes:
 def fake_github_fetch(url: str, _max_bytes: int) -> bytes:
     """按官方 API 与归档 URL 返回受控测试响应。"""
 
+    if "/commits/" in url:
+        return b'{"sha":"0123456789abcdef0123456789abcdef01234567"}'
     if "api.github.com" in url:
         return b'{"default_branch":"main","private":false}'
     return build_repository_archive()
@@ -126,7 +129,7 @@ def test_github_archive_analysis_filters_sensitive_and_unsafe_entries() -> None:
 
     assert card.source_type == "github_public_repository"
     assert card.source_url == "https://github.com/example/sample-repository"
-    assert card.source_ref == "main"
+    assert card.source_ref == "0123456789abcdef0123456789abcdef01234567"
     assert card.read_files == ["README.md", "app.py"]
     assert {"LangChain", "FastAPI", "RAG", "Agent", "Docker"} <= set(card.detected_tech_stack)
     assert card.skipped_summary["sensitive_name"] == 1
@@ -137,26 +140,27 @@ def test_github_archive_analysis_filters_sensitive_and_unsafe_entries() -> None:
 def test_github_project_card_stays_pending_and_does_not_overwrite_profile(
     account_id: int,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """GitHub 代码线索与旧本地分析一样，只能进入待确认项目卡片。"""
 
-    card = ProjectExperienceCard(
-        card_type="待确认项目经历卡片",
-        project_name="sample-repository",
-        read_files=["README.md"],
-        skipped_summary={},
-        detected_tech_stack=["FastAPI"],
-        detected_core_features=["接口/API 服务"],
-        responsibility_draft=["可能负责接口/API 服务设计"],
-        highlight_draft=[],
-        resume_expression_draft=["等待确认"],
-        questions_for_candidate=["你负责什么？"],
-        source_type="github_public_repository",
-        source_url="https://github.com/example/sample-repository",
-        source_ref="main",
+    reference = normalize_public_github_repository_url(
+        "https://github.com/example/sample-repository"
     )
-    monkeypatch.setattr(app_module, "analyze_public_github_repository", lambda _url: card)
-    app = JobHuntingApp(semantic_matching=False)
+    monkeypatch.setattr(
+        app_module,
+        "fetch_public_github_repository_archive",
+        lambda _url: FetchedGitHubRepository(
+            reference=reference,
+            default_branch="main",
+            commit_sha="0123456789abcdef0123456789abcdef01234567",
+            archive_content=build_repository_archive(),
+        ),
+    )
+    app = JobHuntingApp(
+        object_storage=ResumeFileStore(tmp_path / "github-objects"),
+        semantic_matching=False,
+    )
     app.initialize()
     candidate_id = app.save_candidate_profile(candidate_input(), account_id=account_id)
 
@@ -168,32 +172,46 @@ def test_github_project_card_stays_pending_and_does_not_overwrite_profile(
 
     assert record.status == "待确认"
     assert record.card.source_url == "https://github.com/example/sample-repository"
+    assert record.card.source_ref == "0123456789abcdef0123456789abcdef01234567"
+    project_import = app.store.find_project_archive_import_by_project_card(
+        record.id,
+        account_id=account_id,
+    )
+    assert project_import is not None
+    assert project_import.source_type == "github_public_repository"
+    assert app.resume_files.path_for(
+        app.store.get_knowledge_asset_version(
+            project_import.knowledge_asset_version_id,
+            account_id=account_id,
+        ).storage_key
+    ).is_file()
     assert app.get_candidate_profile(candidate_id, account_id=account_id).skills == {"Python": "项目使用"}
 
 
 def test_same_github_repository_can_be_analyzed_for_two_candidates(
     account_id: int,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """共享账号下，项目去重范围应是候选人，而不是整账号。"""
 
-    card = ProjectExperienceCard(
-        card_type="待确认项目经历卡片",
-        project_name="shared-project",
-        read_files=["README.md"],
-        skipped_summary={},
-        detected_tech_stack=["FastAPI"],
-        detected_core_features=["接口/API 服务"],
-        responsibility_draft=["可能负责接口/API 服务设计"],
-        highlight_draft=[],
-        resume_expression_draft=["等待确认"],
-        questions_for_candidate=["你负责什么？"],
-        source_type="github_public_repository",
-        source_url="https://github.com/example/shared-project",
-        source_ref="main",
+    reference = normalize_public_github_repository_url(
+        "https://github.com/example/shared-project"
     )
-    monkeypatch.setattr(app_module, "analyze_public_github_repository", lambda _url: card)
-    app = JobHuntingApp(semantic_matching=False)
+    monkeypatch.setattr(
+        app_module,
+        "fetch_public_github_repository_archive",
+        lambda _url: FetchedGitHubRepository(
+            reference=reference,
+            default_branch="main",
+            commit_sha="0123456789abcdef0123456789abcdef01234567",
+            archive_content=build_repository_archive(),
+        ),
+    )
+    app = JobHuntingApp(
+        object_storage=ResumeFileStore(tmp_path / "shared-github-objects"),
+        semantic_matching=False,
+    )
     app.initialize()
     first_candidate_id = app.save_candidate_profile(candidate_input("候选人甲"), account_id=account_id)
     second_candidate_id = app.save_candidate_profile(candidate_input("候选人乙"), account_id=account_id)
@@ -212,6 +230,69 @@ def test_same_github_repository_can_be_analyzed_for_two_candidates(
     assert first.id != second.id
     assert first.candidate_id == first_candidate_id
     assert second.candidate_id == second_candidate_id
+
+
+def test_github_snapshot_identity_uses_commit_and_content(
+    database_url: str,
+    account_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """同一提交保持幂等，业务内容发生变化的新提交会生成新项目卡版本。"""
+
+    reference = normalize_public_github_repository_url(
+        "https://github.com/example/versioned-project"
+    )
+    snapshots = [
+        ("0" * 40, build_repository_archive()),
+        ("1" * 40, build_repository_archive() + b"changed"),
+    ]
+    current = {"index": 0}
+
+    def fake_snapshot(_url: str) -> FetchedGitHubRepository:
+        commit_sha, archive_content = snapshots[current["index"]]
+        return FetchedGitHubRepository(
+            reference=reference,
+            default_branch="main",
+            commit_sha=commit_sha,
+            archive_content=archive_content,
+        )
+
+    monkeypatch.setattr(app_module, "fetch_public_github_repository_archive", fake_snapshot)
+    app = JobHuntingApp(
+        database_url=database_url,
+        object_storage=ResumeFileStore(tmp_path / "versioned-github"),
+        semantic_matching=False,
+    )
+    candidate_id = app.save_candidate_profile(candidate_input(), account_id=account_id)
+
+    first = app.analyze_github_project_for_candidate(
+        candidate_id,
+        reference.canonical_url,
+        account_id=account_id,
+    )
+    repeated = app.analyze_github_project_for_candidate(
+        candidate_id,
+        reference.canonical_url,
+        account_id=account_id,
+    )
+    current["index"] = 1
+
+    # Build a valid but different ZIP for the second immutable snapshot.
+    changed = BytesIO()
+    with ZipFile(changed, "w") as archive:
+        archive.writestr("sample-repository-main/README.md", "FastAPI version two")
+    snapshots[1] = ("1" * 40, changed.getvalue())
+    second = app.analyze_github_project_for_candidate(
+        candidate_id,
+        reference.canonical_url,
+        account_id=account_id,
+    )
+
+    assert repeated.id == first.id
+    assert second.id != first.id
+    assert first.card.source_ref == "0" * 40
+    assert second.card.source_ref == "1" * 40
 
 
 def test_github_project_worker_reads_only_repository_url(

@@ -1,0 +1,55 @@
+# Isolated production-like ClamAV acceptance overlay. The script supplies a unique
+# Compose project name, so all database, object-storage and signature volumes are disposable.
+services:
+  clamav:
+    image: "${JOB_AGENT_CLAMAV_IMAGE:-clamav/clamav:1.4.6@sha256:761f6c99b8d9134b39431f8c200189cda749b17310091561bfa8b732f32bfada}"
+    restart: "no"
+    expose:
+      - "3310"
+    volumes:
+      - clamav_data:/var/lib/clamav
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --ping 1 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  postgres:
+    restart: "no"
+    ports: !reset []
+
+  minio:
+    restart: "no"
+    ports: !reset []
+
+  redis:
+    restart: "no"
+    ports: !reset []
+
+  migrate:
+    build: !reset null
+    image: "${JOB_AGENT_FILE_SCAN_ACCEPTANCE_IMAGE:-job-hunting-agent:file-scan-acceptance}"
+
+  web:
+    build: !reset null
+    image: "${JOB_AGENT_FILE_SCAN_ACCEPTANCE_IMAGE:-job-hunting-agent:file-scan-acceptance}"
+    restart: "no"
+    environment:
+      JOB_AGENT_ENVIRONMENT: production
+      JOB_AGENT_COOKIE_SECURE: "true"
+      JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET: "true"
+      JOB_AGENT_FILE_SCAN_BACKEND: clamav
+      JOB_AGENT_FILE_SCAN_HOST: clamav
+      JOB_AGENT_FILE_SCAN_PORT: "3310"
+      JOB_AGENT_FILE_SCAN_TIMEOUT_SECONDS: "3"
+    ports: !reset []
+    depends_on:
+      clamav:
+        condition: service_healthy
+
+  prometheus:
+    ports: !reset []
+
+volumes:
+  clamav_data:

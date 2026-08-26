@@ -12,6 +12,7 @@ from typing import Any, Protocol
 from .config import TaskQueueSettings
 
 BACKGROUND_TASK_NAME = "job_hunting_agent.background_tasks.execute_background_task"
+MAINTENANCE_QUEUE_SUFFIX = "_maintenance"
 # Token 和工具调用记录均按账号保留固定分页窗口，Beat 每天触发一次兜底裁剪。
 OPERATIONAL_LEDGER_RETENTION_TASK_NAME = (
     "job_hunting_agent.background_tasks.prune_operational_ledgers"
@@ -20,12 +21,22 @@ OPERATIONAL_LEDGER_RETENTION_TASK_NAME = (
 STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME = (
     "job_hunting_agent.background_tasks.recover_stale_background_tasks"
 )
+
+
+def maintenance_queue_name(queue_name: str) -> str:
+    """返回与业务队列隔离的 Beat 维护队列名称。"""
+
+    return f"{queue_name}{MAINTENANCE_QUEUE_SUFFIX}"
 # RAG 增量索引使用独立任务类型，Web、应用门面和 Worker 共用这个稳定标识。
 RAG_INDEX_TASK_TYPE = "rag_index"
+# 图片和 PDF 视觉页使用独立任务，失败不会回滚已经保存的项目证据。
+VISUAL_INDEX_TASK_TYPE = "visual_index"
 # 扫描 PDF OCR 先完成正文提取，再由 Worker 创建独立的 RAG 增量索引任务。
 RESUME_OCR_TASK_TYPE = "resume_ocr"
 # 公开 GitHub 仓库分析会下载受限归档并生成待确认项目经历卡片。
 GITHUB_PROJECT_ANALYSIS_TASK_TYPE = "github_project_analysis"
+# 用户上传的项目 ZIP 只通过数据库资源 ID 交给 Worker 扫描文件清单和生成项目卡片。
+PROJECT_ARCHIVE_ANALYSIS_TASK_TYPE = "project_archive_analysis"
 # 定制简历的模型改写和 DOCX/PDF 导出在 Worker 中执行。
 RESUME_EXPORT_TASK_TYPE = "resume_export"
 
@@ -78,12 +89,12 @@ def build_celery_app(settings: TaskQueueSettings) -> Any:
             "prune-operational-ledgers-daily": {
                 "task": OPERATIONAL_LEDGER_RETENTION_TASK_NAME,
                 "schedule": crontab(hour=0, minute=0),
-                "options": {"queue": settings.queue_name},
+                "options": {"queue": maintenance_queue_name(settings.queue_name)},
             },
             "recover-stale-background-tasks": {
                 "task": STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME,
                 "schedule": 60.0,
-                "options": {"queue": settings.queue_name},
+                "options": {"queue": maintenance_queue_name(settings.queue_name)},
             },
         },
     )

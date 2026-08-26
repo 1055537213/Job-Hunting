@@ -2,7 +2,7 @@
 
 网页服务不接触用户电脑，因此项目分析只能读取用户主动提供的公开仓库。这里不
 执行仓库代码、不调用 git、不解压到磁盘；只通过 GitHub 官方 API 和 codeload 归档
-读取经过大小、文件数、路径和敏感文件规则限制的文本内容。
+读取经过大小、文件数、路径和敏感文件规则限制的不可变仓库快照。
 """
 
 from __future__ import annotations
@@ -82,8 +82,24 @@ class GitHubRepositoryReference:
 
         return f"https://api.github.com/repos/{self.owner}/{self.repository}"
 
+    def commit_api_url(self, reference: str) -> str:
+        """Return the fixed official endpoint used to resolve a branch to a commit."""
+
+        return f"{self.api_url}/commits/{quote(reference, safe='')}"
+
+
+@dataclass(frozen=True)
+class FetchedGitHubRepository:
+    """An immutable GitHub snapshot ready for scanning and object storage."""
+
+    reference: GitHubRepositoryReference
+    default_branch: str
+    commit_sha: str
+    archive_content: bytes
+
 
 FetchBytes = Callable[[str, int], bytes]
+ScanBytes = Callable[[str, bytes], object]
 
 
 def normalize_public_github_repository_url(value: str) -> GitHubRepositoryReference:
@@ -132,8 +148,29 @@ def analyze_public_github_repository(
     repository_url: str,
     *,
     fetch_bytes: FetchBytes | None = None,
+    scan_bytes: ScanBytes | None = None,
 ) -> ProjectExperienceCard:
     """下载并分析一份公开 GitHub 仓库，返回尚待候选人确认的项目卡片。"""
+
+    fetched = fetch_public_github_repository_archive(
+        repository_url,
+        fetch_bytes=fetch_bytes,
+    )
+    if scan_bytes is not None:
+        scan_bytes(f"{fetched.reference.repository}.zip", fetched.archive_content)
+    return analyze_github_archive(
+        reference=fetched.reference,
+        default_branch=fetched.commit_sha,
+        archive_content=fetched.archive_content,
+    )
+
+
+def fetch_public_github_repository_archive(
+    repository_url: str,
+    *,
+    fetch_bytes: FetchBytes | None = None,
+) -> FetchedGitHubRepository:
+    """Resolve and download one immutable public GitHub repository snapshot."""
 
     reference = normalize_public_github_repository_url(repository_url)
     fetch = fetch_bytes or fetch_github_https_bytes
@@ -143,15 +180,20 @@ def analyze_public_github_repository(
         raise GitHubRepositoryError("GitHub 仓库没有可读取的默认分支。")
     if metadata.get("private") is True:
         raise GitHubRepositoryNotFoundError("当前只支持公开 GitHub 仓库。")
-
+    commit_payload = _read_json_object(
+        fetch(reference.commit_api_url(branch.strip()), MAX_GITHUB_METADATA_BYTES)
+    )
+    commit_sha = str(commit_payload.get("sha") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+        raise GitHubRepositoryError("GitHub 默认分支没有可确认的提交版本。")
     archive_url = (
-        f"https://codeload.github.com/{reference.owner}/{reference.repository}/zip/"
-        f"refs/heads/{quote(branch.strip(), safe='/')}"
+        f"https://codeload.github.com/{reference.owner}/{reference.repository}/zip/{commit_sha}"
     )
     archive_content = fetch(archive_url, MAX_REPOSITORY_ARCHIVE_BYTES)
-    return analyze_github_archive(
+    return FetchedGitHubRepository(
         reference=reference,
         default_branch=branch.strip(),
+        commit_sha=commit_sha,
         archive_content=archive_content,
     )
 
@@ -202,9 +244,21 @@ def _read_repository_metadata(
     """读取并校验官方 API 返回的最小仓库元数据。"""
 
     try:
-        payload = json.loads(fetch(reference.api_url, MAX_GITHUB_METADATA_BYTES).decode("utf-8"))
+        payload = _read_json_object(fetch(reference.api_url, MAX_GITHUB_METADATA_BYTES))
     except GitHubRepositoryError:
         raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GitHubRepositoryError("GitHub 仓库元数据格式无效。") from error
+    if not isinstance(payload, dict):
+        raise GitHubRepositoryError("GitHub 仓库元数据格式无效。")
+    return payload
+
+
+def _read_json_object(content: bytes) -> dict[str, Any]:
+    """Decode a bounded GitHub JSON response and require an object payload."""
+
+    try:
+        payload = json.loads(content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise GitHubRepositoryError("GitHub 仓库元数据格式无效。") from error
     if not isinstance(payload, dict):

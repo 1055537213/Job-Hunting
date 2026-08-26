@@ -40,8 +40,14 @@ from .models import (
     ChatMessageRecord,
     ChatSessionRecord,
     ImportedJob,
+    KnowledgeAssetRecord,
+    KnowledgeAssetVersionRecord,
     LongTextRecord,
     PaymentEventRecord,
+    ProjectArchiveFileRecord,
+    ProjectArchiveImportRecord,
+    ProjectCollectionFileRecord,
+    ProjectCollectionSessionRecord,
     ProjectExperienceCard,
     ProjectExperienceRecord,
     RechargeOrderRecord,
@@ -51,12 +57,25 @@ from .models import (
     SkillRequirement,
     ToolCallTraceRecord,
     UsageEventRecord,
+    VisualKnowledgeItemRecord,
     sanitize_preference_weights,
 )
 from .profile_mutation import apply_candidate_profile_patch
 from .skill_normalization import normalize_skill_mapping
 
-RESUME_ARTIFACT_STATUSES = {"ready", "processing", "failed"}
+RESUME_ARTIFACT_STATUSES = {"ready", "processing", "failed", "scanning", "quarantined"}
+KNOWLEDGE_ASSET_LIFECYCLE_STATUSES = {"active", "archived"}
+KNOWLEDGE_ASSET_PROCESSING_STATUSES = {
+    "uploaded",
+    "scanning",
+    "processing",
+    "ready",
+    "quarantined",
+    "failed",
+}
+KNOWLEDGE_ASSET_SCAN_STATUSES = {"pending", "clean", "infected", "error", "not_required"}
+PROJECT_ARCHIVE_IMPORT_STATUSES = {"uploaded", "processing", "ready", "failed", "quarantined"}
+PROJECT_COLLECTION_STATUSES = {"planned", "uploading", "processing", "ready", "failed", "cancelled"}
 INSUFFICIENT_BALANCE_MESSAGE = "余额不足，请先充值后重试。"
 
 
@@ -2842,6 +2861,40 @@ class RepositoryStore:
                 """,
                 (candidate_id, *owner_parameters),
             ).fetchall()
+            archive_owner_clause = ""
+            if account_id is not None:
+                archive_owner_clause = " AND import.account_id = ?"
+            archive_rows = conn.execute(
+                f"""
+                SELECT version.storage_key
+                FROM project_archive_imports AS import
+                JOIN knowledge_asset_versions AS version
+                  ON version.id = import.knowledge_asset_version_id
+                WHERE import.candidate_id = ?{archive_owner_clause}
+                """,
+                (candidate_id, *owner_parameters),
+            ).fetchall()
+            collection_owner_clause = ""
+            if account_id is not None:
+                collection_owner_clause = " AND session.account_id = ?"
+            collection_rows = conn.execute(
+                f"""
+                SELECT file.storage_key
+                FROM project_collection_files AS file
+                JOIN project_collection_sessions AS session ON session.id = file.collection_id
+                WHERE session.candidate_id = ?{collection_owner_clause}
+                  AND file.storage_key IS NOT NULL
+                """,
+                (candidate_id, *owner_parameters),
+            ).fetchall()
+            visual_rows = conn.execute(
+                f"""
+                SELECT storage_key
+                FROM visual_knowledge_items
+                WHERE candidate_id = ?{owner_clause}
+                """,
+                (candidate_id, *owner_parameters),
+            ).fetchall()
             long_text_rows = conn.execute(
                 f"""
                 SELECT id
@@ -2897,7 +2950,10 @@ class RepositoryStore:
 
         return {
             "candidate_id": candidate_id,
-            "storage_keys": [str(row["storage_key"]) for row in artifact_rows],
+            "storage_keys": [
+                str(row["storage_key"])
+                for row in [*artifact_rows, *archive_rows, *collection_rows, *visual_rows]
+            ],
             "long_text_ids": [int(row["id"]) for row in long_text_rows],
         }
 
@@ -3233,7 +3289,7 @@ class RepositoryStore:
         record_id: int,
         account_id: int | None = None,
     ) -> dict[str, object]:
-        """删除一张项目经历卡片及其确认摘要对应的长文本。"""
+        """删除项目卡片及其全部来源版本、长文本、视觉对象和派生索引。"""
 
         existing = self.get_project_card(record_id, account_id=account_id)
         owner_clause = ""
@@ -3241,22 +3297,107 @@ class RepositoryStore:
         if account_id is not None:
             owner_clause = " AND account_id = ?"
             owner_parameters = (account_id,)
+        archive_owner_clause = ""
+        if account_id is not None:
+            archive_owner_clause = " AND import.account_id = ?"
+        collection_owner_clause = archive_owner_clause.replace("import.", "session.")
 
         with self.connect() as conn:
-            long_text_rows = conn.execute(
+            archive_rows = conn.execute(
+                f"""
+                SELECT import.knowledge_asset_id, version.storage_key
+                FROM project_archive_imports AS import
+                JOIN knowledge_asset_versions AS version
+                  ON version.id = import.knowledge_asset_version_id
+                WHERE import.project_card_id = ?{archive_owner_clause}
+                """,
+                (record_id, *owner_parameters),
+            ).fetchall()
+            archive_evidence_rows = conn.execute(
+                f"""
+                SELECT text.id
+                FROM long_texts AS text
+                JOIN project_archive_files AS file
+                  ON text.entity_type = 'project_archive_file' AND text.entity_id = file.id
+                JOIN project_archive_imports AS import ON import.id = file.project_archive_id
+                WHERE import.project_card_id = ?{archive_owner_clause}
+                """,
+                (record_id, *owner_parameters),
+            ).fetchall()
+            archive_visual_rows = conn.execute(
+                f"""
+                SELECT visual.storage_key
+                FROM visual_knowledge_items AS visual
+                JOIN project_archive_files AS file ON file.id = visual.project_archive_file_id
+                JOIN project_archive_imports AS import ON import.id = file.project_archive_id
+                WHERE import.project_card_id = ?{archive_owner_clause}
+                """,
+                (record_id, *owner_parameters),
+            ).fetchall()
+            collection_rows = conn.execute(
+                f"""
+                SELECT session.id
+                FROM project_collection_sessions AS session
+                WHERE session.project_card_id = ?{collection_owner_clause}
+                """,
+                (record_id, *owner_parameters),
+            ).fetchall()
+            collection_file_rows = conn.execute(
+                f"""
+                SELECT file.long_text_id, file.storage_key, file.knowledge_asset_id
+                FROM project_collection_files AS file
+                JOIN project_collection_sessions AS session ON session.id = file.collection_id
+                WHERE session.project_card_id = ?{collection_owner_clause}
+                """,
+                (record_id, *owner_parameters),
+            ).fetchall()
+            collection_visual_rows = conn.execute(
+                f"""
+                SELECT visual.storage_key
+                FROM visual_knowledge_items AS visual
+                JOIN project_collection_files AS file ON file.id = visual.project_collection_file_id
+                JOIN project_collection_sessions AS session ON session.id = file.collection_id
+                WHERE session.project_card_id = ?{collection_owner_clause}
+                """,
+                (record_id, *owner_parameters),
+            ).fetchall()
+            card_long_text_rows = conn.execute(
                 f"""
                 SELECT id FROM long_texts
                 WHERE entity_type = 'project_experience_card' AND entity_id = ?{owner_clause}
                 """,
                 (record_id, *owner_parameters),
             ).fetchall()
-            conn.execute(
-                f"""
-                DELETE FROM long_texts
-                WHERE entity_type = 'project_experience_card' AND entity_id = ?{owner_clause}
-                """,
-                (record_id, *owner_parameters),
+            long_text_ids = {
+                int(row["id"])
+                for row in [*card_long_text_rows, *archive_evidence_rows]
+            }
+            long_text_ids.update(
+                int(row["long_text_id"])
+                for row in collection_file_rows
+                if row["long_text_id"] is not None
             )
+            if long_text_ids:
+                conn.execute(
+                    f"DELETE FROM long_texts WHERE id IN ({', '.join('?' for _ in long_text_ids)})",
+                    tuple(sorted(long_text_ids)),
+                )
+            for archive_row in archive_rows:
+                conn.execute(
+                    "DELETE FROM knowledge_assets WHERE id = ?",
+                    (int(archive_row["knowledge_asset_id"]),),
+                )
+            for collection_row in collection_rows:
+                conn.execute(
+                    "DELETE FROM project_collection_sessions WHERE id = ?",
+                    (int(collection_row["id"]),),
+                )
+            for row in collection_file_rows:
+                if row["knowledge_asset_id"] is not None:
+                    conn.execute(
+                        "DELETE FROM knowledge_assets WHERE id = ?",
+                        (int(row["knowledge_asset_id"]),),
+                    )
             cursor = conn.execute(
                 f"DELETE FROM project_experience_cards WHERE id = ?{owner_clause}",
                 (record_id, *owner_parameters),
@@ -3267,7 +3408,946 @@ class RepositoryStore:
         return {
             "project_card_id": record_id,
             "candidate_id": existing.candidate_id,
-            "long_text_ids": [int(row["id"]) for row in long_text_rows],
+            "long_text_ids": sorted(long_text_ids),
+            "storage_keys": [
+                *[str(row["storage_key"]) for row in archive_rows],
+                *[str(row["storage_key"]) for row in archive_visual_rows],
+                *[
+                    str(row["storage_key"])
+                    for row in collection_file_rows
+                    if row["storage_key"] is not None
+                ],
+                *[str(row["storage_key"]) for row in collection_visual_rows],
+            ],
+        }
+
+    def register_project_archive_import(
+        self,
+        *,
+        account_id: int,
+        candidate_id: int,
+        original_filename: str,
+        storage_key: str,
+        file_size: int,
+        sha256: str,
+        scan_engine: str | None,
+        source_type: str = "uploaded_project_archive",
+        source_url: str | None = None,
+        source_ref: str | None = None,
+    ) -> ProjectArchiveImportRecord:
+        """原子登记项目 ZIP 的知识资产、首个版本和项目导入业务记录。"""
+
+        self.get_candidate_profile(candidate_id, account_id=account_id)
+        normalized_sha = str(sha256 or "").strip().lower()
+        if len(normalized_sha) != 64 or any(char not in "0123456789abcdef" for char in normalized_sha):
+            raise ValueError("项目 ZIP 摘要格式无效。")
+        if self.find_project_archive_import_by_fingerprint(
+            account_id=account_id,
+            candidate_id=candidate_id,
+            content_fingerprint=normalized_sha,
+        ) is not None:
+            raise DuplicateResourceError("项目压缩包")
+
+        created_at = now_iso()
+        try:
+            with self.connect() as conn:
+                asset_cursor = conn.execute(
+                    """
+                    INSERT INTO knowledge_assets (
+                        account_id, candidate_id, asset_kind, title, lifecycle_status,
+                        metadata_json, created_at, updated_at
+                    ) VALUES (?, ?, 'project_archive', ?, 'active', ?, ?, ?)
+                    """,
+                    (
+                        account_id,
+                        candidate_id,
+                        str(original_filename)[:512],
+                        json.dumps({"business_source": "project_archive_imports"}, ensure_ascii=False),
+                        created_at,
+                        created_at,
+                    ),
+                )
+                asset_id = int(asset_cursor.lastrowid)
+                version_id = self._insert_knowledge_asset_version(
+                    conn,
+                    asset_id=asset_id,
+                    version_number=1,
+                    original_filename=original_filename,
+                    storage_key=storage_key,
+                    media_type="application/zip",
+                    file_size=file_size,
+                    sha256=normalized_sha,
+                    source_kind="upload",
+                    source_url=source_url,
+                    processing_status="uploaded",
+                    scan_status="clean",
+                    scan_engine=scan_engine,
+                    scan_reason=None,
+                    revision_label=source_ref,
+                    metadata={"project_source_type": source_type},
+                    created_at=created_at,
+                )
+                import_cursor = conn.execute(
+                    """
+                    INSERT INTO project_archive_imports (
+                        account_id, candidate_id, knowledge_asset_id,
+                        knowledge_asset_version_id, project_card_id, source_type,
+                        source_url, source_ref, original_filename, content_fingerprint,
+                        status, error_summary, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 'uploaded', NULL, ?, ?)
+                    """,
+                    (
+                        account_id,
+                        candidate_id,
+                        asset_id,
+                        version_id,
+                        source_type,
+                        source_url,
+                        source_ref,
+                        str(original_filename)[:512],
+                        normalized_sha,
+                        created_at,
+                        created_at,
+                    ),
+                )
+                import_id = int(import_cursor.lastrowid)
+        except Exception as error:
+            if is_unique_constraint_violation(error, "uq_project_archive_candidate_content"):
+                raise DuplicateResourceError("项目压缩包") from error
+            raise
+        return self.get_project_archive_import(import_id, account_id=account_id)
+
+    def get_project_archive_import(
+        self,
+        import_id: int,
+        *,
+        account_id: int,
+    ) -> ProjectArchiveImportRecord:
+        """读取当前账号的一次项目整包导入。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM project_archive_imports WHERE id = ? AND account_id = ?",
+                (import_id, account_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Project archive import not found: {import_id}")
+        return self._project_archive_import_from_row(row)
+
+    def find_project_archive_import_by_fingerprint(
+        self,
+        *,
+        account_id: int,
+        candidate_id: int,
+        content_fingerprint: str,
+    ) -> ProjectArchiveImportRecord | None:
+        """按候选人和 ZIP 内容摘要查找重复项目包。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM project_archive_imports
+                WHERE account_id = ? AND candidate_id = ? AND content_fingerprint = ?
+                """,
+                (account_id, candidate_id, str(content_fingerprint).lower()),
+            ).fetchone()
+        return self._project_archive_import_from_row(row) if row is not None else None
+
+    def find_project_archive_import_by_project_card(
+        self,
+        project_card_id: int,
+        *,
+        account_id: int,
+    ) -> ProjectArchiveImportRecord | None:
+        """Find the persisted source archive behind one generated project card."""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM project_archive_imports
+                WHERE project_card_id = ? AND account_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (project_card_id, account_id),
+            ).fetchone()
+        return self._project_archive_import_from_row(row) if row is not None else None
+
+    def mark_project_archive_import(
+        self,
+        import_id: int,
+        *,
+        account_id: int,
+        status: str,
+        error_summary: str | None = None,
+    ) -> ProjectArchiveImportRecord:
+        """同步更新项目导入和知识资产版本的处理状态。"""
+
+        if status not in PROJECT_ARCHIVE_IMPORT_STATUSES:
+            raise ValueError(f"不支持的项目导入状态：{status}")
+        existing = self.get_project_archive_import(import_id, account_id=account_id)
+        updated_at = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE project_archive_imports
+                SET status = ?, error_summary = ?, updated_at = ?
+                WHERE id = ? AND account_id = ?
+                """,
+                (
+                    status,
+                    str(error_summary)[:2000] if error_summary else None,
+                    updated_at,
+                    import_id,
+                    account_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Project archive import not found: {import_id}")
+            conn.execute(
+                "UPDATE knowledge_asset_versions SET processing_status = ? WHERE id = ?",
+                (status, existing.knowledge_asset_version_id),
+            )
+            conn.execute(
+                "UPDATE knowledge_assets SET updated_at = ? WHERE id = ?",
+                (updated_at, existing.knowledge_asset_id),
+            )
+        return self.get_project_archive_import(import_id, account_id=account_id)
+
+    def complete_project_archive_import(
+        self,
+        import_id: int,
+        *,
+        account_id: int,
+        project_card_id: int,
+        files: list[Mapping[str, object]],
+        evidence: list[Mapping[str, object]] | None = None,
+        visual_items: list[Mapping[str, object]] | None = None,
+    ) -> ProjectArchiveImportRecord:
+        """原子保存文件清单、文本证据、视觉资产和待确认项目卡片关联。"""
+
+        existing = self.get_project_archive_import(import_id, account_id=account_id)
+        card = self.get_project_card(project_card_id, account_id=account_id)
+        if card.candidate_id != existing.candidate_id:
+            raise ValueError("项目卡片与项目 ZIP 不属于同一候选人。")
+        evidence_by_path = {
+            str(item["relative_path"]): item
+            for item in (evidence or [])
+        }
+        updated_at = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM long_texts
+                WHERE entity_type = 'project_archive_file'
+                  AND entity_id IN (
+                    SELECT id FROM project_archive_files WHERE project_archive_id = ?
+                  )
+                """,
+                (import_id,),
+            )
+            conn.execute(
+                "DELETE FROM project_archive_files WHERE project_archive_id = ?",
+                (import_id,),
+            )
+            source_rows: dict[str, tuple[int, int | None]] = {}
+            for item in files:
+                metadata = dict(item.get("metadata") or {})
+                relative_path = str(item["relative_path"])
+                evidence_item = evidence_by_path.get(relative_path)
+                cursor = conn.execute(
+                    """
+                    INSERT INTO project_archive_files (
+                        project_archive_id, relative_path, file_kind, media_type,
+                        file_size, compressed_size, sha256, analysis_status,
+                        skip_reason, long_text_id, extraction_method, text_length,
+                        metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                    """,
+                    (
+                        import_id,
+                        str(item["relative_path"])[:2048],
+                        str(item["file_kind"])[:64],
+                        str(item["media_type"])[:128],
+                        int(item["file_size"]),
+                        int(item["compressed_size"]),
+                        str(item["sha256"]) if item.get("sha256") else None,
+                        str(item["analysis_status"])[:32],
+                        str(item["skip_reason"])[:128] if item.get("skip_reason") else None,
+                        (
+                            str(evidence_item.get("extraction_method"))[:64]
+                            if evidence_item is not None
+                            else None
+                        ),
+                        len(str(evidence_item.get("text") or "")) if evidence_item else 0,
+                        json.dumps(metadata, ensure_ascii=False),
+                    ),
+                )
+                file_id = int(cursor.lastrowid)
+                long_text_id: int | None = None
+                if evidence_item is not None and str(evidence_item.get("text") or "").strip():
+                    long_text_id = self._add_long_text(
+                        conn,
+                        "project_archive_file",
+                        file_id,
+                        str(item["relative_path"])[:256],
+                        str(evidence_item["text"]),
+                        account_id=account_id,
+                        candidate_id=existing.candidate_id,
+                    )
+                    conn.execute(
+                        "UPDATE project_archive_files SET long_text_id = ? WHERE id = ?",
+                        (long_text_id, file_id),
+                    )
+                source_rows[relative_path] = (file_id, long_text_id)
+            for visual_item in visual_items or []:
+                relative_path = str(visual_item.get("relative_path") or "")
+                source_row = source_rows.get(relative_path)
+                if source_row is None:
+                    raise ValueError("视觉知识项引用了不存在的项目文件。")
+                self._insert_visual_knowledge_item(
+                    conn,
+                    visual_item,
+                    account_id=account_id,
+                    candidate_id=existing.candidate_id,
+                    project_archive_file_id=source_row[0],
+                    long_text_id=source_row[1],
+                    updated_at=updated_at,
+                )
+            cursor = conn.execute(
+                """
+                UPDATE project_archive_imports
+                SET project_card_id = ?, status = 'ready', error_summary = NULL, updated_at = ?
+                WHERE id = ? AND account_id = ?
+                """,
+                (project_card_id, updated_at, import_id, account_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Project archive import not found: {import_id}")
+            conn.execute(
+                "UPDATE knowledge_asset_versions SET processing_status = 'ready' WHERE id = ?",
+                (existing.knowledge_asset_version_id,),
+            )
+            conn.execute(
+                "UPDATE knowledge_assets SET updated_at = ? WHERE id = ?",
+                (updated_at, existing.knowledge_asset_id),
+            )
+        return self.get_project_archive_import(import_id, account_id=account_id)
+
+    def list_project_archive_files(
+        self,
+        import_id: int,
+        *,
+        account_id: int,
+    ) -> list[ProjectArchiveFileRecord]:
+        """列出当前账号项目 ZIP 的文件路由清单。"""
+
+        self.get_project_archive_import(import_id, account_id=account_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM project_archive_files
+                WHERE project_archive_id = ?
+                ORDER BY id
+                """,
+                (import_id,),
+            ).fetchall()
+        return [self._project_archive_file_from_row(row) for row in rows]
+
+    def create_project_collection(
+        self,
+        *,
+        account_id: int,
+        candidate_id: int,
+        project_name: str,
+        manifest_fingerprint: str,
+        files: list[Mapping[str, object]],
+        source_type: str = "local_directory_collection",
+    ) -> ProjectCollectionSessionRecord:
+        """Persist a backend-approved local directory manifest as one collection session."""
+
+        self.get_candidate_profile(candidate_id, account_id=account_id)
+        normalized_name = str(project_name or "").strip()[:256]
+        if not normalized_name:
+            raise ValueError("项目名称不能为空。")
+        normalized_fingerprint = str(manifest_fingerprint or "").strip().lower()
+        if len(normalized_fingerprint) != 64:
+            raise ValueError("项目清单摘要无效。")
+        existing = self.find_project_collection_by_manifest(
+            account_id=account_id,
+            candidate_id=candidate_id,
+            manifest_fingerprint=normalized_fingerprint,
+        )
+        if existing is not None:
+            return self.resume_project_collection(
+                existing.id,
+                account_id=account_id,
+                project_name=normalized_name,
+            )
+        selected = [item for item in files if item.get("selection_status") == "selected"]
+        created_at = now_iso()
+        try:
+            with self.connect() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO project_collection_sessions (
+                        account_id, candidate_id, project_card_id, project_name,
+                        source_type, manifest_fingerprint, preserve_originals, status,
+                        file_count, selected_file_count, uploaded_file_count,
+                        total_size, selected_size, error_summary, created_at, updated_at
+                    ) VALUES (?, ?, NULL, ?, ?, ?, ?, 'planned', ?, ?, 0, ?, ?, NULL, ?, ?)
+                    """,
+                    (
+                        account_id,
+                        candidate_id,
+                        normalized_name,
+                        str(source_type)[:64],
+                        normalized_fingerprint,
+                        False,
+                        len(files),
+                        len(selected),
+                        sum(int(item["file_size"]) for item in files),
+                        sum(int(item["file_size"]) for item in selected),
+                        created_at,
+                        created_at,
+                    ),
+                )
+                collection_id = int(cursor.lastrowid)
+                for item in files:
+                    conn.execute(
+                        """
+                        INSERT INTO project_collection_files (
+                            collection_id, relative_path, file_kind, media_type,
+                            file_size, client_sha256, server_sha256, selection_status,
+                            selection_reason, extraction_method, text_length, long_text_id,
+                            storage_key, knowledge_asset_id, knowledge_asset_version_id,
+                            metadata_json, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, 0, NULL,
+                                  NULL, NULL, NULL, ?, ?, ?)
+                        """,
+                        (
+                            collection_id,
+                            str(item["relative_path"])[:2048],
+                            str(item["file_kind"])[:64],
+                            str(item["media_type"])[:128],
+                            int(item["file_size"]),
+                            str(item["sha256"]) if item.get("sha256") else None,
+                            str(item["selection_status"])[:32],
+                            str(item["selection_reason"])[:256],
+                            json.dumps(dict(item.get("metadata") or {}), ensure_ascii=False),
+                            created_at,
+                            created_at,
+                        ),
+                    )
+        except Exception as error:
+            if is_unique_constraint_violation(error, "uq_project_collection_candidate_manifest"):
+                # 两个浏览器请求可能并发创建同一份清单。唯一约束胜出后复用事实记录，
+                # 不让网络中断把用户永久锁死在“项目已存在”。
+                existing = self.find_project_collection_by_manifest(
+                    account_id=account_id,
+                    candidate_id=candidate_id,
+                    manifest_fingerprint=normalized_fingerprint,
+                )
+                if existing is not None:
+                    return self.resume_project_collection(
+                        existing.id,
+                        account_id=account_id,
+                        project_name=normalized_name,
+                    )
+                raise DuplicateResourceError("本地项目") from error
+            raise
+        return self.get_project_collection(collection_id, account_id=account_id)
+
+    def find_project_collection_by_manifest(
+        self,
+        *,
+        account_id: int,
+        candidate_id: int,
+        manifest_fingerprint: str,
+    ) -> ProjectCollectionSessionRecord | None:
+        """查找同一候选人的既有目录清单，供中断恢复而不是盲目重复创建。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM project_collection_sessions
+                WHERE account_id = ? AND candidate_id = ? AND manifest_fingerprint = ?
+                """,
+                (account_id, candidate_id, str(manifest_fingerprint).strip().lower()),
+            ).fetchone()
+        return self._project_collection_session_from_row(row) if row is not None else None
+
+    def resume_project_collection(
+        self,
+        collection_id: int,
+        *,
+        account_id: int,
+        project_name: str | None = None,
+    ) -> ProjectCollectionSessionRecord:
+        """恢复未完成采集；已分析文件保持幂等，失败文件回到待上传状态。"""
+
+        existing = self.get_project_collection(collection_id, account_id=account_id)
+        if existing.project_card_id is not None or existing.status == "ready":
+            raise DuplicateResourceError("本地项目")
+        normalized_name = str(project_name or existing.project_name).strip()[:256]
+        if not normalized_name:
+            normalized_name = existing.project_name
+        updated_at = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE project_collection_files
+                SET selection_status = 'selected',
+                    selection_reason = 'supported_and_within_policy',
+                    updated_at = ?
+                WHERE collection_id = ? AND selection_status = 'failed'
+                """,
+                (updated_at, collection_id),
+            )
+            conn.execute(
+                """
+                UPDATE project_collection_sessions
+                SET project_name = ?, status = 'planned', error_summary = NULL,
+                    uploaded_file_count = (
+                        SELECT COUNT(*) FROM project_collection_files
+                        WHERE collection_id = ? AND selection_status = 'analyzed'
+                    ),
+                    updated_at = ?
+                WHERE id = ? AND account_id = ?
+                """,
+                (normalized_name, collection_id, updated_at, collection_id, account_id),
+            )
+        return self.get_project_collection(collection_id, account_id=account_id)
+
+    def get_project_collection(
+        self,
+        collection_id: int,
+        *,
+        account_id: int,
+    ) -> ProjectCollectionSessionRecord:
+        """Read one account-scoped local project collection session."""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM project_collection_sessions WHERE id = ? AND account_id = ?",
+                (collection_id, account_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Project collection not found: {collection_id}")
+        return self._project_collection_session_from_row(row)
+
+    def list_project_collection_files(
+        self,
+        collection_id: int,
+        *,
+        account_id: int,
+    ) -> list[ProjectCollectionFileRecord]:
+        """List the complete collection plan without exposing file contents."""
+
+        self.get_project_collection(collection_id, account_id=account_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM project_collection_files
+                WHERE collection_id = ?
+                ORDER BY id
+                """,
+                (collection_id,),
+            ).fetchall()
+        return [self._project_collection_file_from_row(row) for row in rows]
+
+    def get_project_collection_file(
+        self,
+        file_id: int,
+        *,
+        collection_id: int,
+        account_id: int,
+    ) -> ProjectCollectionFileRecord:
+        """Read one selected file only when its collection belongs to the account."""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT file.*
+                FROM project_collection_files AS file
+                JOIN project_collection_sessions AS session ON session.id = file.collection_id
+                WHERE file.id = ? AND file.collection_id = ? AND session.account_id = ?
+                """,
+                (file_id, collection_id, account_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Project collection file not found: {file_id}")
+        return self._project_collection_file_from_row(row)
+
+    def complete_project_collection_file(
+        self,
+        file_id: int,
+        *,
+        collection_id: int,
+        account_id: int,
+        server_sha256: str,
+        extraction_method: str,
+        extracted_text: str,
+        metadata: Mapping[str, object] | None = None,
+        visual_items: list[Mapping[str, object]] | None = None,
+    ) -> ProjectCollectionFileRecord:
+        """原子保存文本证据和安全视觉副本，不保留本地源文件。"""
+
+        session = self.get_project_collection(collection_id, account_id=account_id)
+        existing = self.get_project_collection_file(
+            file_id,
+            collection_id=collection_id,
+            account_id=account_id,
+        )
+        if existing.selection_status == "analyzed":
+            return existing
+        if existing.selection_status != "selected":
+            raise ValueError("当前文件不在后端采集计划中。")
+        normalized_text = str(extracted_text or "").strip()
+        if not normalized_text:
+            raise ValueError("项目文件没有可保存的提取文字。")
+        digest = str(server_sha256 or "").strip().lower()
+        if digest != existing.client_sha256:
+            raise ValueError("项目文件内容与预扫描清单不一致，请重新选择目录。")
+
+        updated_at = now_iso()
+        with self.connect() as conn:
+            long_text_id = self._add_long_text(
+                conn,
+                "project_collection_file",
+                existing.id,
+                existing.relative_path[:256],
+                normalized_text,
+                account_id=account_id,
+                candidate_id=session.candidate_id,
+            )
+            cursor = conn.execute(
+                """
+                UPDATE project_collection_files
+                SET server_sha256 = ?, selection_status = 'analyzed',
+                    extraction_method = ?, text_length = ?, long_text_id = ?,
+                    metadata_json = ?, updated_at = ?
+                WHERE id = ? AND collection_id = ? AND selection_status = 'selected'
+                """,
+                (
+                    digest,
+                    str(extraction_method)[:64],
+                    len(normalized_text),
+                    long_text_id,
+                    json.dumps(dict(metadata or {}), ensure_ascii=False),
+                    updated_at,
+                    file_id,
+                    collection_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("项目文件已被其他请求处理，请刷新采集计划。")
+            for visual_item in visual_items or []:
+                self._insert_visual_knowledge_item(
+                    conn,
+                    visual_item,
+                    account_id=account_id,
+                    candidate_id=session.candidate_id,
+                    project_collection_file_id=existing.id,
+                    long_text_id=long_text_id,
+                    updated_at=updated_at,
+                )
+            conn.execute(
+                """
+                UPDATE project_collection_sessions
+                SET status = 'uploading',
+                    uploaded_file_count = (
+                        SELECT COUNT(*) FROM project_collection_files
+                        WHERE collection_id = ? AND selection_status = 'analyzed'
+                    ),
+                    updated_at = ?
+                WHERE id = ? AND account_id = ?
+                """,
+                (collection_id, updated_at, collection_id, account_id),
+            )
+        return self.get_project_collection_file(
+            file_id,
+            collection_id=collection_id,
+            account_id=account_id,
+        )
+
+    def list_visual_knowledge_items(
+        self,
+        *,
+        account_id: int,
+        item_ids: list[int] | None = None,
+        candidate_id: int | None = None,
+        index_status: str | None = None,
+        project_archive_file_ids: list[int] | None = None,
+        project_collection_file_ids: list[int] | None = None,
+    ) -> list[VisualKnowledgeItemRecord]:
+        """按账号读取视觉知识项；所有可选过滤都在数据库执行。"""
+
+        conditions = ["account_id = ?"]
+        parameters: list[object] = [account_id]
+        if item_ids is not None:
+            normalized_ids = sorted({int(item_id) for item_id in item_ids if int(item_id) > 0})
+            if not normalized_ids:
+                return []
+            conditions.append(f"id IN ({', '.join('?' for _ in normalized_ids)})")
+            parameters.extend(normalized_ids)
+        if candidate_id is not None:
+            conditions.append("candidate_id = ?")
+            parameters.append(candidate_id)
+        if index_status is not None:
+            if index_status not in {"pending", "indexed", "failed"}:
+                raise ValueError("视觉知识索引状态无效。")
+            conditions.append("index_status = ?")
+            parameters.append(index_status)
+        for column_name, raw_ids in (
+            ("project_archive_file_id", project_archive_file_ids),
+            ("project_collection_file_id", project_collection_file_ids),
+        ):
+            if raw_ids is None:
+                continue
+            normalized_source_ids = sorted(
+                {int(item_id) for item_id in raw_ids if int(item_id) > 0}
+            )
+            if not normalized_source_ids:
+                return []
+            conditions.append(
+                f"{column_name} IN ({', '.join('?' for _ in normalized_source_ids)})"
+            )
+            parameters.extend(normalized_source_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM visual_knowledge_items WHERE {' AND '.join(conditions)} ORDER BY id",
+                tuple(parameters),
+            ).fetchall()
+        return [self._visual_knowledge_item_from_row(row) for row in rows]
+
+    def _insert_visual_knowledge_item(
+        self,
+        conn: Any,
+        item: Mapping[str, object],
+        *,
+        account_id: int,
+        candidate_id: int,
+        project_archive_file_id: int | None = None,
+        project_collection_file_id: int | None = None,
+        long_text_id: int | None,
+        updated_at: str,
+    ) -> int:
+        """校验并插入一个只关联单一来源文件的视觉知识项。"""
+
+        if (project_archive_file_id is None) == (project_collection_file_id is None):
+            raise ValueError("视觉知识项必须且只能关联一个项目文件。")
+        source_id = str(item.get("source_id") or "").strip()
+        source_label = str(item.get("source_label") or "").strip()
+        storage_key = str(item.get("storage_key") or "").strip()
+        digest = str(item.get("sha256") or "").strip().lower()
+        if not source_id or not source_label or not storage_key:
+            raise ValueError("视觉知识项缺少来源或对象存储定位。")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError("视觉知识项摘要无效。")
+        page_number_raw = item.get("page_number")
+        page_number = int(page_number_raw) if page_number_raw is not None else None
+        cursor = conn.execute(
+            """
+            INSERT INTO visual_knowledge_items (
+                account_id, candidate_id, project_archive_file_id,
+                project_collection_file_id, long_text_id, source_id, source_label,
+                page_number, media_type, storage_key, file_size, sha256, width, height,
+                metadata_json, embedding, embedding_model, embedding_dimensions,
+                index_status, index_error_type, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL,
+                      'pending', NULL, ?, ?)
+            """,
+            (
+                account_id,
+                candidate_id,
+                project_archive_file_id,
+                project_collection_file_id,
+                long_text_id,
+                source_id[:128],
+                source_label[:2048],
+                page_number,
+                str(item.get("media_type") or "image/png")[:128],
+                storage_key[:1024],
+                int(item.get("file_size") or 0),
+                digest,
+                int(item.get("width") or 0),
+                int(item.get("height") or 0),
+                json.dumps(dict(item.get("metadata") or {}), ensure_ascii=False),
+                updated_at,
+                updated_at,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def fail_project_collection_file(
+        self,
+        file_id: int,
+        *,
+        collection_id: int,
+        account_id: int,
+        reason: str,
+    ) -> ProjectCollectionFileRecord:
+        """Record a parser failure without losing the rest of the collection plan."""
+
+        self.get_project_collection(collection_id, account_id=account_id)
+        updated_at = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE project_collection_files
+                SET selection_status = 'failed', selection_reason = ?, updated_at = ?
+                WHERE id = ? AND collection_id = ? AND selection_status = 'selected'
+                """,
+                (str(reason)[:256], updated_at, file_id, collection_id),
+            )
+            if cursor.rowcount == 0:
+                return self.get_project_collection_file(
+                    file_id,
+                    collection_id=collection_id,
+                    account_id=account_id,
+                )
+        return self.get_project_collection_file(
+            file_id,
+            collection_id=collection_id,
+            account_id=account_id,
+        )
+
+    def complete_project_collection(
+        self,
+        collection_id: int,
+        *,
+        account_id: int,
+        project_card_id: int,
+    ) -> ProjectCollectionSessionRecord:
+        """Attach the aggregate project card after every selected file was handled."""
+
+        session = self.get_project_collection(collection_id, account_id=account_id)
+        card = self.get_project_card(project_card_id, account_id=account_id)
+        if card.candidate_id != session.candidate_id:
+            raise ValueError("项目卡片与本地采集会话不属于同一候选人。")
+        with self.connect() as conn:
+            pending = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM project_collection_files
+                WHERE collection_id = ? AND selection_status = 'selected'
+                """,
+                (collection_id,),
+            ).fetchone()
+            if pending is not None and int(pending["count"]) > 0:
+                raise ValueError("仍有后端选中的项目文件尚未上传。")
+            analyzed = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM project_collection_files
+                WHERE collection_id = ? AND selection_status = 'analyzed'
+                """,
+                (collection_id,),
+            ).fetchone()
+            if analyzed is None or int(analyzed["count"]) == 0:
+                raise ValueError("没有项目文件成功完成分析。")
+            conn.execute(
+                """
+                UPDATE project_collection_sessions
+                SET project_card_id = ?, status = 'ready', error_summary = NULL,
+                    uploaded_file_count = ?, updated_at = ?
+                WHERE id = ? AND account_id = ?
+                """,
+                (
+                    project_card_id,
+                    int(analyzed["count"]),
+                    now_iso(),
+                    collection_id,
+                    account_id,
+                ),
+            )
+        return self.get_project_collection(collection_id, account_id=account_id)
+
+    def delete_incomplete_project_collection(
+        self,
+        collection_id: int,
+        *,
+        account_id: int,
+    ) -> dict[str, object]:
+        """删除尚未生成项目卡片的采集会话及其文本、视觉对象和向量来源。"""
+
+        session = self.get_project_collection(collection_id, account_id=account_id)
+        if session.project_card_id is not None:
+            raise ValueError("已生成项目卡片的采集会话必须通过项目删除功能清理。")
+        with self.connect() as conn:
+            task_session_id = f"local-project-collection-{collection_id}"
+            running_task = conn.execute(
+                """
+                SELECT task_key FROM background_tasks
+                WHERE account_id = ? AND session_id = ? AND status = 'running'
+                LIMIT 1
+                """,
+                (account_id, task_session_id),
+            ).fetchone()
+            if running_task is not None:
+                raise ValueError("项目索引任务正在完成，请稍后再取消本次采集。")
+            cancelled_at = now_iso()
+            conn.execute(
+                """
+                UPDATE background_tasks
+                SET status = 'cancelled', finished_at = ?, updated_at = ?
+                WHERE account_id = ? AND session_id = ? AND status = 'queued'
+                """,
+                (cancelled_at, cancelled_at, account_id, task_session_id),
+            )
+            file_rows = conn.execute(
+                """
+                SELECT long_text_id, storage_key, knowledge_asset_id
+                FROM project_collection_files
+                WHERE collection_id = ?
+                """,
+                (collection_id,),
+            ).fetchall()
+            visual_rows = conn.execute(
+                """
+                SELECT visual.storage_key
+                FROM visual_knowledge_items AS visual
+                JOIN project_collection_files AS file
+                  ON file.id = visual.project_collection_file_id
+                WHERE file.collection_id = ?
+                """,
+                (collection_id,),
+            ).fetchall()
+            long_text_ids = sorted(
+                int(row["long_text_id"])
+                for row in file_rows
+                if row["long_text_id"] is not None
+            )
+            if long_text_ids:
+                conn.execute(
+                    f"DELETE FROM long_texts WHERE id IN ({', '.join('?' for _ in long_text_ids)})",
+                    tuple(long_text_ids),
+                )
+            cursor = conn.execute(
+                "DELETE FROM project_collection_sessions WHERE id = ? AND account_id = ?",
+                (collection_id, account_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Project collection not found: {collection_id}")
+            for row in file_rows:
+                if row["knowledge_asset_id"] is not None:
+                    conn.execute(
+                        "DELETE FROM knowledge_assets WHERE id = ?",
+                        (int(row["knowledge_asset_id"]),),
+                    )
+        return {
+            "collection_id": collection_id,
+            "candidate_id": session.candidate_id,
+            "long_text_ids": long_text_ids,
+            "storage_keys": [
+                *[
+                    str(row["storage_key"])
+                    for row in file_rows
+                    if row["storage_key"] is not None
+                ],
+                *[str(row["storage_key"]) for row in visual_rows],
+            ],
         }
 
     def get_long_text_for_entity(
@@ -3495,6 +4575,404 @@ class RepositoryStore:
                 ).fetchall()
         return [self._resume_draft_from_row(row) for row in rows]
 
+    def register_knowledge_asset(
+        self,
+        *,
+        account_id: int,
+        candidate_id: int | None,
+        asset_kind: str,
+        title: str,
+        original_filename: str,
+        storage_key: str,
+        media_type: str,
+        file_size: int,
+        sha256: str,
+        source_kind: str = "upload",
+        source_url: str | None = None,
+        processing_status: str = "uploaded",
+        scan_status: str = "pending",
+        scan_engine: str | None = None,
+        scan_reason: str | None = None,
+        revision_label: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+        version_metadata: Mapping[str, object] | None = None,
+    ) -> tuple[KnowledgeAssetRecord, KnowledgeAssetVersionRecord]:
+        """原子登记一份知识资产及其首个不可变文件版本。"""
+
+        normalized_kind = self._validate_knowledge_asset_text(asset_kind, "知识资产类型", 64)
+        normalized_title = self._validate_knowledge_asset_text(title, "知识资产标题", 512)
+        self.get_account(account_id)
+        if candidate_id is not None:
+            self.get_candidate_profile(candidate_id, account_id=account_id)
+        created_at = now_iso()
+        try:
+            with self.connect() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO knowledge_assets (
+                        account_id, candidate_id, asset_kind, title, lifecycle_status,
+                        metadata_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+                    """,
+                    (
+                        account_id,
+                        candidate_id,
+                        normalized_kind,
+                        normalized_title,
+                        json.dumps(dict(metadata or {}), ensure_ascii=False),
+                        created_at,
+                        created_at,
+                    ),
+                )
+                asset_id = int(cursor.lastrowid)
+                version_id = self._insert_knowledge_asset_version(
+                    conn,
+                    asset_id=asset_id,
+                    version_number=1,
+                    original_filename=original_filename,
+                    storage_key=storage_key,
+                    media_type=media_type,
+                    file_size=file_size,
+                    sha256=sha256,
+                    source_kind=source_kind,
+                    source_url=source_url,
+                    processing_status=processing_status,
+                    scan_status=scan_status,
+                    scan_engine=scan_engine,
+                    scan_reason=scan_reason,
+                    revision_label=revision_label,
+                    metadata=version_metadata,
+                    created_at=created_at,
+                )
+        except Exception as error:
+            if is_unique_constraint_violation(
+                error,
+                "uq_knowledge_asset_versions_storage_key",
+            ):
+                raise DuplicateResourceError("知识文件版本") from error
+            raise
+        return (
+            self.get_knowledge_asset(asset_id, account_id=account_id),
+            self.get_knowledge_asset_version(version_id, account_id=account_id),
+        )
+
+    def add_knowledge_asset_version(
+        self,
+        asset_id: int,
+        *,
+        account_id: int,
+        original_filename: str,
+        storage_key: str,
+        media_type: str,
+        file_size: int,
+        sha256: str,
+        source_kind: str = "upload",
+        source_url: str | None = None,
+        processing_status: str = "uploaded",
+        scan_status: str = "pending",
+        scan_engine: str | None = None,
+        scan_reason: str | None = None,
+        revision_label: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> KnowledgeAssetVersionRecord:
+        """为已有资产追加版本，并原子切换唯一的当前版本。"""
+
+        self._validate_knowledge_asset_version(
+            original_filename=original_filename,
+            storage_key=storage_key,
+            media_type=media_type,
+            file_size=file_size,
+            sha256=sha256,
+            source_kind=source_kind,
+            processing_status=processing_status,
+            scan_status=scan_status,
+        )
+        created_at = now_iso()
+        try:
+            with self.connect() as conn:
+                asset_row = conn.execute(
+                    """
+                    SELECT * FROM knowledge_assets
+                    WHERE id = ? AND account_id = ?
+                    FOR UPDATE
+                    """,
+                    (asset_id, account_id),
+                ).fetchone()
+                if asset_row is None:
+                    raise KeyError(f"Knowledge asset not found: {asset_id}")
+                if str(asset_row["lifecycle_status"]) != "active":
+                    raise ValueError("已归档的知识资产不能继续添加版本。")
+                duplicate = conn.execute(
+                    """
+                    SELECT id FROM knowledge_asset_versions
+                    WHERE asset_id = ? AND sha256 = ?
+                    """,
+                    (asset_id, sha256.lower()),
+                ).fetchone()
+                if duplicate is not None:
+                    raise DuplicateResourceError("知识文件版本")
+                latest = conn.execute(
+                    """
+                    SELECT COALESCE(MAX(version_number), 0) AS latest_version
+                    FROM knowledge_asset_versions
+                    WHERE asset_id = ?
+                    """,
+                    (asset_id,),
+                ).fetchone()
+                next_version = int(latest["latest_version"]) + 1
+                conn.execute(
+                    "UPDATE knowledge_asset_versions SET is_current = false WHERE asset_id = ? AND is_current = true",
+                    (asset_id,),
+                )
+                version_id = self._insert_knowledge_asset_version(
+                    conn,
+                    asset_id=asset_id,
+                    version_number=next_version,
+                    original_filename=original_filename,
+                    storage_key=storage_key,
+                    media_type=media_type,
+                    file_size=file_size,
+                    sha256=sha256,
+                    source_kind=source_kind,
+                    source_url=source_url,
+                    processing_status=processing_status,
+                    scan_status=scan_status,
+                    scan_engine=scan_engine,
+                    scan_reason=scan_reason,
+                    revision_label=revision_label,
+                    metadata=metadata,
+                    created_at=created_at,
+                )
+                conn.execute(
+                    "UPDATE knowledge_assets SET updated_at = ? WHERE id = ?",
+                    (created_at, asset_id),
+                )
+        except Exception as error:
+            if is_unique_constraint_violation(
+                error,
+                "uq_knowledge_asset_versions_content",
+            ) or is_unique_constraint_violation(
+                error,
+                "uq_knowledge_asset_versions_storage_key",
+            ):
+                raise DuplicateResourceError("知识文件版本") from error
+            raise
+        return self.get_knowledge_asset_version(version_id, account_id=account_id)
+
+    def get_knowledge_asset(
+        self,
+        asset_id: int,
+        *,
+        account_id: int,
+    ) -> KnowledgeAssetRecord:
+        """读取资产及其当前版本 ID，并强制执行账号隔离。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT asset.*, current_version.id AS current_version_id
+                FROM knowledge_assets AS asset
+                LEFT JOIN knowledge_asset_versions AS current_version
+                  ON current_version.asset_id = asset.id AND current_version.is_current = true
+                WHERE asset.id = ? AND asset.account_id = ?
+                """,
+                (asset_id, account_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Knowledge asset not found: {asset_id}")
+        return self._knowledge_asset_from_row(row)
+
+    def get_knowledge_asset_version(
+        self,
+        version_id: int,
+        *,
+        account_id: int,
+    ) -> KnowledgeAssetVersionRecord:
+        """按版本 ID 读取原件元数据，并通过资产所有权隔离账号。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT version.*
+                FROM knowledge_asset_versions AS version
+                JOIN knowledge_assets AS asset ON asset.id = version.asset_id
+                WHERE version.id = ? AND asset.account_id = ?
+                """,
+                (version_id, account_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Knowledge asset version not found: {version_id}")
+        return self._knowledge_asset_version_from_row(row)
+
+    def list_knowledge_assets(
+        self,
+        *,
+        account_id: int,
+        candidate_id: int | None = None,
+        include_archived: bool = False,
+    ) -> list[KnowledgeAssetRecord]:
+        """列出账号的知识资产；默认隐藏已归档资产。"""
+
+        where = ["asset.account_id = ?"]
+        parameters: list[object] = [account_id]
+        if candidate_id is not None:
+            where.append("asset.candidate_id = ?")
+            parameters.append(candidate_id)
+        if not include_archived:
+            where.append("asset.lifecycle_status = 'active'")
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT asset.*, current_version.id AS current_version_id
+                FROM knowledge_assets AS asset
+                LEFT JOIN knowledge_asset_versions AS current_version
+                  ON current_version.asset_id = asset.id AND current_version.is_current = true
+                WHERE {' AND '.join(where)}
+                ORDER BY asset.id
+                """,
+                tuple(parameters),
+            ).fetchall()
+        return [self._knowledge_asset_from_row(row) for row in rows]
+
+    def list_knowledge_asset_versions(
+        self,
+        asset_id: int,
+        *,
+        account_id: int,
+    ) -> list[KnowledgeAssetVersionRecord]:
+        """按版本号列出一份资产的全部历史原件。"""
+
+        self.get_knowledge_asset(asset_id, account_id=account_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM knowledge_asset_versions
+                WHERE asset_id = ?
+                ORDER BY version_number
+                """,
+                (asset_id,),
+            ).fetchall()
+        return [self._knowledge_asset_version_from_row(row) for row in rows]
+
+    def archive_knowledge_asset(
+        self,
+        asset_id: int,
+        *,
+        account_id: int,
+    ) -> KnowledgeAssetRecord:
+        """归档资产，使其退出默认检索候选集并禁止继续追加版本。"""
+
+        updated_at = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE knowledge_assets
+                SET lifecycle_status = 'archived', updated_at = ?
+                WHERE id = ? AND account_id = ?
+                """,
+                (updated_at, asset_id, account_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Knowledge asset not found: {asset_id}")
+        return self.get_knowledge_asset(asset_id, account_id=account_id)
+
+    def _insert_knowledge_asset_version(
+        self,
+        conn: RepositoryConnection,
+        *,
+        asset_id: int,
+        version_number: int,
+        original_filename: str,
+        storage_key: str,
+        media_type: str,
+        file_size: int,
+        sha256: str,
+        source_kind: str,
+        source_url: str | None,
+        processing_status: str,
+        scan_status: str,
+        scan_engine: str | None,
+        scan_reason: str | None,
+        revision_label: str | None,
+        metadata: Mapping[str, object] | None,
+        created_at: str,
+    ) -> int:
+        """在调用方事务中插入版本，供首版登记和追加版本共用。"""
+
+        self._validate_knowledge_asset_version(
+            original_filename=original_filename,
+            storage_key=storage_key,
+            media_type=media_type,
+            file_size=file_size,
+            sha256=sha256,
+            source_kind=source_kind,
+            processing_status=processing_status,
+            scan_status=scan_status,
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO knowledge_asset_versions (
+                asset_id, version_number, is_current, original_filename, storage_key,
+                media_type, file_size, sha256, source_kind, source_url, revision_label,
+                processing_status, scan_status, scan_engine, scan_reason, metadata_json, created_at
+            ) VALUES (?, ?, true, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                asset_id,
+                version_number,
+                original_filename.strip(),
+                storage_key.strip(),
+                media_type.strip(),
+                file_size,
+                sha256.lower(),
+                source_kind.strip(),
+                source_url.strip() if source_url else None,
+                revision_label.strip()[:128] if revision_label and revision_label.strip() else None,
+                processing_status,
+                scan_status,
+                scan_engine.strip()[:64] if scan_engine and scan_engine.strip() else None,
+                scan_reason.strip()[:500] if scan_reason and scan_reason.strip() else None,
+                json.dumps(dict(metadata or {}), ensure_ascii=False),
+                created_at,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    @staticmethod
+    def _validate_knowledge_asset_text(value: str, label: str, max_length: int) -> str:
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError(f"{label}不能为空。")
+        if len(normalized) > max_length:
+            raise ValueError(f"{label}长度不能超过 {max_length} 个字符。")
+        return normalized
+
+    def _validate_knowledge_asset_version(
+        self,
+        *,
+        original_filename: str,
+        storage_key: str,
+        media_type: str,
+        file_size: int,
+        sha256: str,
+        source_kind: str,
+        processing_status: str,
+        scan_status: str,
+    ) -> None:
+        self._validate_knowledge_asset_text(original_filename, "原始文件名", 512)
+        self._validate_knowledge_asset_text(storage_key, "文件存储键", 1024)
+        self._validate_knowledge_asset_text(media_type, "文件媒体类型", 128)
+        self._validate_knowledge_asset_text(source_kind, "文件来源类型", 32)
+        if file_size < 0:
+            raise ValueError("文件大小不能小于零。")
+        normalized_sha256 = str(sha256 or "").strip().lower()
+        if len(normalized_sha256) != 64 or any(character not in "0123456789abcdef" for character in normalized_sha256):
+            raise ValueError("文件 SHA-256 必须是 64 位十六进制字符串。")
+        if processing_status not in KNOWLEDGE_ASSET_PROCESSING_STATUSES:
+            raise ValueError("知识文件处理状态无效。")
+        if scan_status not in KNOWLEDGE_ASSET_SCAN_STATUSES:
+            raise ValueError("知识文件扫描状态无效。")
+
     def save_resume_artifact(
         self,
         *,
@@ -3517,6 +4995,11 @@ class RepositoryStore:
         status: str = "ready",
         register_long_text: bool = False,
         generation_key: str | None = None,
+        scan_status: str = "clean",
+        scan_engine: str | None = None,
+        scan_reason: str | None = None,
+        knowledge_asset_id: int | None = None,
+        knowledge_asset_version_id: int | None = None,
     ) -> ResumeArtifactRecord:
         """保存一份简历文件元数据，可选地同时登记 RAG 长文本来源。
 
@@ -3527,11 +5010,13 @@ class RepositoryStore:
         if artifact_type not in {"source", "tailored"}:
             raise ValueError("简历文件类型只能是 source 或 tailored。")
         if status not in RESUME_ARTIFACT_STATUSES:
-            raise ValueError("简历文件状态只能是 ready、processing 或 failed。")
+            raise ValueError("简历文件状态无效。")
         if artifact_type == "tailored" and status != "ready":
             raise ValueError("职位定制简历只能保存为 ready 状态。")
         if register_long_text and status != "ready":
             raise ValueError("只有解析完成的简历才能登记 RAG 长文本。")
+        if (knowledge_asset_id is None) != (knowledge_asset_version_id is None):
+            raise ValueError("知识资产和知识资产版本必须同时提供。")
         # 这些读取同时承担所有权校验，防止跨账号拼接候选人、职位、草稿或父文件。
         self.get_candidate_profile(candidate_id, account_id=account_id)
         if job_id is not None:
@@ -3542,6 +5027,28 @@ class RepositoryStore:
             parent = self.get_resume_artifact(parent_artifact_id, account_id=account_id)
             if parent.candidate_id != candidate_id:
                 raise ValueError("派生简历与源简历必须属于同一候选人。")
+        if knowledge_asset_id is not None and knowledge_asset_version_id is not None:
+            if account_id is None:
+                raise ValueError("关联知识资产时必须提供账号 ID。")
+            linked_asset = self.get_knowledge_asset(knowledge_asset_id, account_id=account_id)
+            linked_version = self.get_knowledge_asset_version(
+                knowledge_asset_version_id,
+                account_id=account_id,
+            )
+            if linked_version.asset_id != linked_asset.id:
+                raise ValueError("知识资产版本不属于指定资产。")
+            if linked_asset.lifecycle_status != "active":
+                raise ValueError("已归档的知识资产不能关联新的业务文件。")
+            if linked_asset.candidate_id not in {None, candidate_id}:
+                raise ValueError("简历和知识资产必须属于同一候选人。")
+            if (
+                linked_version.storage_key != storage_key
+                or linked_version.sha256 != sha256.lower()
+                or linked_version.file_size != file_size
+            ):
+                raise ValueError("简历文件与指定知识资产版本的原件元数据不一致。")
+        if artifact_type == "source" and account_id is None:
+            raise ValueError("原始简历必须归属于账号。")
 
         if generation_key:
             existing = self.get_resume_artifact_by_generation_key(
@@ -3574,6 +5081,47 @@ class RepositoryStore:
                         (candidate_id, artifact_type),
                     ).fetchone()
                     actual_version = int(row["latest_version"]) + 1
+                linked_asset_id = knowledge_asset_id
+                linked_version_id = knowledge_asset_version_id
+                created_linked_version = False
+                if artifact_type == "source" and linked_asset_id is None:
+                    asset_cursor = conn.execute(
+                        """
+                        INSERT INTO knowledge_assets (
+                            account_id, candidate_id, asset_kind, title, lifecycle_status,
+                            metadata_json, created_at, updated_at
+                        ) VALUES (?, ?, 'resume', ?, 'active', ?, ?, ?)
+                        """,
+                        (
+                            account_id,
+                            candidate_id,
+                            original_filename,
+                            json.dumps({"business_source": "resume_artifacts"}, ensure_ascii=False),
+                            created_at,
+                            created_at,
+                        ),
+                    )
+                    linked_asset_id = int(asset_cursor.lastrowid)
+                    linked_version_id = self._insert_knowledge_asset_version(
+                        conn,
+                        asset_id=linked_asset_id,
+                        version_number=1,
+                        original_filename=original_filename,
+                        storage_key=storage_key,
+                        media_type=media_type,
+                        file_size=file_size,
+                        sha256=sha256,
+                        source_kind="upload",
+                        source_url=None,
+                        processing_status=status,
+                        scan_status=scan_status,
+                        scan_engine=scan_engine,
+                        scan_reason=scan_reason,
+                        revision_label=str(actual_version),
+                        metadata=None,
+                        created_at=created_at,
+                    )
+                    created_linked_version = True
                 cursor = conn.execute(
                     """
                     INSERT INTO resume_artifacts (
@@ -3581,8 +5129,9 @@ class RepositoryStore:
                         version, artifact_type, original_filename, download_filename,
                         storage_key, media_type, file_size, sha256, extraction_method,
                         extracted_text, text_length, page_count, status, long_text_id, created_at,
-                        content_fingerprint, generation_key
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        content_fingerprint, generation_key, scan_status, scan_engine, scan_reason,
+                        knowledge_asset_id, knowledge_asset_version_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         account_id,
@@ -3607,9 +5156,26 @@ class RepositoryStore:
                         created_at,
                         fingerprint,
                         generation_key,
+                        scan_status,
+                        scan_engine,
+                        scan_reason,
+                        linked_asset_id,
+                        linked_version_id,
                     ),
                 )
                 artifact_id = int(cursor.lastrowid)
+                if created_linked_version and linked_version_id is not None:
+                    conn.execute(
+                        """
+                        UPDATE knowledge_asset_versions
+                        SET metadata_json = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            json.dumps({"resume_artifact_id": artifact_id}, ensure_ascii=False),
+                            linked_version_id,
+                        ),
+                    )
                 if register_long_text:
                     long_text_id = self._add_long_text(
                         conn,
@@ -3638,6 +5204,105 @@ class RepositoryStore:
                 if existing is not None:
                     return existing
             raise
+        return self.get_resume_artifact(artifact_id, account_id=account_id)
+
+    def complete_resume_artifact_scan(
+        self,
+        artifact_id: int,
+        *,
+        next_status: str,
+        extraction_method: str,
+        page_count: int | None,
+        scan_engine: str,
+        account_id: int | None = None,
+    ) -> ResumeArtifactRecord:
+        """把扫描中的原件提升为可解析状态，但不登记任何正文。"""
+
+        if next_status not in {"processing", "ready"}:
+            raise ValueError("文件扫描通过后的状态无效。")
+        owner_clause = ""
+        owner_parameters: tuple[object, ...] = ()
+        if account_id is not None:
+            owner_clause = " AND account_id = ?"
+            owner_parameters = (account_id,)
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE resume_artifacts
+                SET extraction_method = ?, page_count = ?, status = ?,
+                    scan_status = 'clean', scan_engine = ?, scan_reason = NULL
+                WHERE id = ?{owner_clause} AND status = 'scanning'
+                """,
+                (
+                    extraction_method,
+                    page_count,
+                    next_status,
+                    scan_engine,
+                    artifact_id,
+                    *owner_parameters,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("这份简历当前不处于待扫描状态。")
+            conn.execute(
+                """
+                UPDATE knowledge_asset_versions AS version
+                SET processing_status = ?, scan_status = 'clean', scan_engine = ?, scan_reason = NULL
+                FROM resume_artifacts AS artifact
+                WHERE artifact.id = ? AND version.id = artifact.knowledge_asset_version_id
+                """,
+                (next_status, scan_engine, artifact_id),
+            )
+        return self.get_resume_artifact(artifact_id, account_id=account_id)
+
+    def quarantine_resume_artifact(
+        self,
+        artifact_id: int,
+        *,
+        scan_status: str,
+        scan_engine: str,
+        scan_reason: str,
+        account_id: int | None = None,
+    ) -> ResumeArtifactRecord:
+        """把未通过扫描或无法完成扫描的原件锁定在隔离状态。"""
+
+        if scan_status not in {"infected", "error"}:
+            raise ValueError("隔离文件的扫描状态无效。")
+        owner_clause = ""
+        owner_parameters: tuple[object, ...] = ()
+        if account_id is not None:
+            owner_clause = " AND account_id = ?"
+            owner_parameters = (account_id,)
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE resume_artifacts
+                SET status = 'quarantined', extraction_method = 'scan_blocked',
+                    scan_status = ?, scan_engine = ?, scan_reason = ?,
+                    extracted_text = '', text_length = 0, long_text_id = NULL,
+                    content_fingerprint = NULL
+                WHERE id = ?{owner_clause} AND status = 'scanning'
+                """,
+                (
+                    scan_status,
+                    scan_engine,
+                    scan_reason[:500],
+                    artifact_id,
+                    *owner_parameters,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("这份简历当前不处于待扫描状态。")
+            conn.execute(
+                """
+                UPDATE knowledge_asset_versions AS version
+                SET processing_status = 'quarantined', scan_status = ?,
+                    scan_engine = ?, scan_reason = ?
+                FROM resume_artifacts AS artifact
+                WHERE artifact.id = ? AND version.id = artifact.knowledge_asset_version_id
+                """,
+                (scan_status, scan_engine, scan_reason[:500], artifact_id),
+            )
         return self.get_resume_artifact(artifact_id, account_id=account_id)
 
     def get_resume_artifact_by_generation_key(
@@ -3677,6 +5342,7 @@ class RepositoryStore:
                     """
                     SELECT * FROM resume_artifacts
                     WHERE candidate_id = ? AND artifact_type = 'source'
+                      AND (scan_status = 'clean' OR scan_status IS NULL)
                       AND (content_fingerprint = ? OR (content_fingerprint IS NULL AND sha256 = ?))
                     """,
                     (candidate_id, fingerprint, fingerprint),
@@ -3686,6 +5352,7 @@ class RepositoryStore:
                     """
                     SELECT * FROM resume_artifacts
                     WHERE account_id = ? AND candidate_id = ? AND artifact_type = 'source'
+                      AND (scan_status = 'clean' OR scan_status IS NULL)
                       AND (content_fingerprint = ? OR (content_fingerprint IS NULL AND sha256 = ?))
                     """,
                     (account_id, candidate_id, fingerprint, fingerprint),
@@ -3730,14 +5397,15 @@ class RepositoryStore:
             existing_long_text_id = row["long_text_id"]
             if current_status == "ready" and existing_long_text_id is not None:
                 return self.get_resume_artifact(artifact_id, account_id=account_id)
-            if current_status not in {"processing", "ready"}:
+            if current_status not in {"scanning", "processing", "ready"}:
                 raise ValueError("这份简历不处于可完成 OCR 的状态。")
 
             conn.execute(
                 f"""
                 UPDATE resume_artifacts
                 SET extraction_method = ?, extracted_text = ?, text_length = ?,
-                    page_count = ?, status = 'ready'
+                    page_count = ?, status = 'ready', scan_status = 'clean',
+                    scan_reason = NULL
                 WHERE id = ?{owner_clause}
                 """,
                 (
@@ -3748,6 +5416,15 @@ class RepositoryStore:
                     artifact_id,
                     *owner_parameters,
                 ),
+            )
+            conn.execute(
+                """
+                UPDATE knowledge_asset_versions AS version
+                SET processing_status = 'ready', scan_status = 'clean', scan_reason = NULL
+                FROM resume_artifacts AS artifact
+                WHERE artifact.id = ? AND version.id = artifact.knowledge_asset_version_id
+                """,
+                (artifact_id,),
             )
             long_text_id = int(existing_long_text_id) if existing_long_text_id is not None else None
             if long_text_id is None:
@@ -3780,7 +5457,7 @@ class RepositoryStore:
             owner_clause = " AND account_id = ?"
             owner_parameters = (account_id,)
         with self.connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 f"""
                 UPDATE resume_artifacts
                 SET extraction_method = 'ocr_failed', status = 'failed'
@@ -3788,6 +5465,16 @@ class RepositoryStore:
                 """,
                 (artifact_id, *owner_parameters),
             )
+            if cursor.rowcount:
+                conn.execute(
+                    """
+                    UPDATE knowledge_asset_versions AS version
+                    SET processing_status = 'failed'
+                    FROM resume_artifacts AS artifact
+                    WHERE artifact.id = ? AND version.id = artifact.knowledge_asset_version_id
+                    """,
+                    (artifact_id,),
+                )
         return self.get_resume_artifact(artifact_id, account_id=account_id)
 
     def get_resume_artifact(
@@ -3937,6 +5624,45 @@ class RepositoryStore:
             if cursor.rowcount == 0:
                 raise KeyError(f"Resume artifact not found: {artifact_id}")
 
+            deleted_knowledge_asset_id: int | None = None
+            if artifact.knowledge_asset_id is not None:
+                asset_row = conn.execute(
+                    "SELECT metadata_json FROM knowledge_assets WHERE id = ?",
+                    (artifact.knowledge_asset_id,),
+                ).fetchone()
+                asset_metadata = (
+                    _json_object(asset_row["metadata_json"])
+                    if asset_row is not None
+                    else {}
+                )
+                resume_owned_asset = (
+                    asset_metadata.get("business_source") == "resume_artifacts"
+                    or asset_metadata.get("migrated_from") == "resume_artifacts"
+                )
+                remaining_asset_references = conn.execute(
+                    """
+                    SELECT COUNT(*) AS reference_count
+                    FROM resume_artifacts
+                    WHERE knowledge_asset_id = ?
+                    """,
+                    (artifact.knowledge_asset_id,),
+                ).fetchone()
+                if resume_owned_asset and int(remaining_asset_references["reference_count"]) == 0:
+                    asset_owner_clause = ""
+                    asset_owner_parameters: tuple[object, ...] = ()
+                    if account_id is not None:
+                        asset_owner_clause = " AND account_id = ?"
+                        asset_owner_parameters = (account_id,)
+                    deleted_asset = conn.execute(
+                        f"DELETE FROM knowledge_assets WHERE id = ?{asset_owner_clause}",
+                        (
+                            artifact.knowledge_asset_id,
+                            *asset_owner_parameters,
+                        ),
+                    )
+                    if deleted_asset.rowcount:
+                        deleted_knowledge_asset_id = artifact.knowledge_asset_id
+
             conn.execute(
                 f"""
                 DELETE FROM long_texts
@@ -3968,6 +5694,7 @@ class RepositoryStore:
             "storage_keys": [artifact.storage_key],
             "long_text_ids": sorted(long_text_ids),
             "draft_id": artifact.draft_id if should_delete_draft else None,
+            "knowledge_asset_id": deleted_knowledge_asset_id,
         }
 
     def delete_resume_artifacts(
@@ -4043,6 +5770,188 @@ class RepositoryStore:
             confirmed_at=row["confirmed_at"],
         )
 
+    def _project_archive_import_from_row(
+        self,
+        row: RepositoryRow,
+    ) -> ProjectArchiveImportRecord:
+        """把项目整包导入行转换成领域记录。"""
+
+        return ProjectArchiveImportRecord(
+            id=int(row["id"]),
+            account_id=int(row["account_id"]),
+            candidate_id=int(row["candidate_id"]),
+            knowledge_asset_id=int(row["knowledge_asset_id"]),
+            knowledge_asset_version_id=int(row["knowledge_asset_version_id"]),
+            project_card_id=(
+                int(row["project_card_id"]) if row["project_card_id"] is not None else None
+            ),
+            source_type=str(row["source_type"]),
+            source_url=str(row["source_url"]) if row["source_url"] is not None else None,
+            source_ref=str(row["source_ref"]) if row["source_ref"] is not None else None,
+            original_filename=str(row["original_filename"]),
+            content_fingerprint=str(row["content_fingerprint"]),
+            status=str(row["status"]),
+            error_summary=(
+                str(row["error_summary"]) if row["error_summary"] is not None else None
+            ),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def _project_archive_file_from_row(
+        self,
+        row: RepositoryRow,
+    ) -> ProjectArchiveFileRecord:
+        """把项目文件清单行转换成领域记录。"""
+
+        return ProjectArchiveFileRecord(
+            id=int(row["id"]),
+            project_archive_id=int(row["project_archive_id"]),
+            relative_path=str(row["relative_path"]),
+            file_kind=str(row["file_kind"]),
+            media_type=str(row["media_type"]),
+            file_size=int(row["file_size"]),
+            compressed_size=int(row["compressed_size"]),
+            sha256=str(row["sha256"]) if row["sha256"] is not None else None,
+            analysis_status=str(row["analysis_status"]),
+            skip_reason=(
+                str(row["skip_reason"]) if row["skip_reason"] is not None else None
+            ),
+            metadata=_json_object(row["metadata_json"]),
+            long_text_id=(
+                int(row["long_text_id"])
+                if "long_text_id" in row and row["long_text_id"] is not None
+                else None
+            ),
+            extraction_method=(
+                str(row["extraction_method"])
+                if "extraction_method" in row and row["extraction_method"] is not None
+                else None
+            ),
+            text_length=(
+                int(row["text_length"])
+                if "text_length" in row and row["text_length"] is not None
+                else 0
+            ),
+        )
+
+    def _project_collection_session_from_row(
+        self,
+        row: RepositoryRow,
+    ) -> ProjectCollectionSessionRecord:
+        """Convert a local project collection row into a domain record."""
+
+        return ProjectCollectionSessionRecord(
+            id=int(row["id"]),
+            account_id=int(row["account_id"]),
+            candidate_id=int(row["candidate_id"]),
+            project_card_id=(
+                int(row["project_card_id"]) if row["project_card_id"] is not None else None
+            ),
+            project_name=str(row["project_name"]),
+            source_type=str(row["source_type"]),
+            manifest_fingerprint=str(row["manifest_fingerprint"]),
+            status=str(row["status"]),
+            file_count=int(row["file_count"]),
+            selected_file_count=int(row["selected_file_count"]),
+            uploaded_file_count=int(row["uploaded_file_count"]),
+            total_size=int(row["total_size"]),
+            selected_size=int(row["selected_size"]),
+            error_summary=(
+                str(row["error_summary"]) if row["error_summary"] is not None else None
+            ),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def _project_collection_file_from_row(
+        self,
+        row: RepositoryRow,
+    ) -> ProjectCollectionFileRecord:
+        """Convert one planned local file row into a domain record."""
+
+        return ProjectCollectionFileRecord(
+            id=int(row["id"]),
+            collection_id=int(row["collection_id"]),
+            relative_path=str(row["relative_path"]),
+            file_kind=str(row["file_kind"]),
+            media_type=str(row["media_type"]),
+            file_size=int(row["file_size"]),
+            client_sha256=(
+                str(row["client_sha256"]) if row["client_sha256"] is not None else None
+            ),
+            server_sha256=(
+                str(row["server_sha256"]) if row["server_sha256"] is not None else None
+            ),
+            selection_status=str(row["selection_status"]),
+            selection_reason=str(row["selection_reason"]),
+            extraction_method=(
+                str(row["extraction_method"]) if row["extraction_method"] is not None else None
+            ),
+            text_length=int(row["text_length"]),
+            long_text_id=(
+                int(row["long_text_id"]) if row["long_text_id"] is not None else None
+            ),
+            metadata=_json_object(row["metadata_json"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def _visual_knowledge_item_from_row(
+        self,
+        row: RepositoryRow,
+    ) -> VisualKnowledgeItemRecord:
+        """Convert a visual knowledge row without loading its vector or binary body."""
+
+        return VisualKnowledgeItemRecord(
+            id=int(row["id"]),
+            account_id=int(row["account_id"]),
+            candidate_id=int(row["candidate_id"]),
+            project_archive_file_id=(
+                int(row["project_archive_file_id"])
+                if row["project_archive_file_id"] is not None
+                else None
+            ),
+            project_collection_file_id=(
+                int(row["project_collection_file_id"])
+                if row["project_collection_file_id"] is not None
+                else None
+            ),
+            long_text_id=(
+                int(row["long_text_id"]) if row["long_text_id"] is not None else None
+            ),
+            source_id=str(row["source_id"]),
+            source_label=str(row["source_label"]),
+            page_number=(
+                int(row["page_number"]) if row["page_number"] is not None else None
+            ),
+            media_type=str(row["media_type"]),
+            storage_key=str(row["storage_key"]),
+            file_size=int(row["file_size"]),
+            sha256=str(row["sha256"]),
+            width=int(row["width"]),
+            height=int(row["height"]),
+            index_status=str(row["index_status"]),
+            embedding_model=(
+                str(row["embedding_model"])
+                if row["embedding_model"] is not None
+                else None
+            ),
+            embedding_dimensions=(
+                int(row["embedding_dimensions"])
+                if row["embedding_dimensions"] is not None
+                else None
+            ),
+            index_error_type=(
+                str(row["index_error_type"])
+                if row["index_error_type"] is not None
+                else None
+            ),
+            metadata=_json_object(row["metadata_json"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
     def _resume_draft_from_row(self, row: RepositoryRow) -> ResumeDraftRecord:
         """把简历草稿表的一行转换成领域模型。"""
 
@@ -4055,6 +5964,57 @@ class RepositoryStore:
             status=row["status"],
             draft=draft,
             created_at=row["created_at"],
+        )
+
+    def _knowledge_asset_from_row(self, row: RepositoryRow) -> KnowledgeAssetRecord:
+        """把统一知识资产行转换成领域记录。"""
+
+        return KnowledgeAssetRecord(
+            id=int(row["id"]),
+            account_id=int(row["account_id"]),
+            candidate_id=int(row["candidate_id"]) if row["candidate_id"] is not None else None,
+            asset_kind=str(row["asset_kind"]),
+            title=str(row["title"]),
+            lifecycle_status=str(row["lifecycle_status"]),
+            current_version_id=(
+                int(row["current_version_id"])
+                if row.get("current_version_id") is not None
+                else None
+            ),
+            metadata=_json_object(row["metadata_json"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def _knowledge_asset_version_from_row(
+        self,
+        row: RepositoryRow,
+    ) -> KnowledgeAssetVersionRecord:
+        """把不可变知识文件版本行转换成领域记录。"""
+
+        return KnowledgeAssetVersionRecord(
+            id=int(row["id"]),
+            asset_id=int(row["asset_id"]),
+            version_number=int(row["version_number"]),
+            is_current=bool(row["is_current"]),
+            original_filename=str(row["original_filename"]),
+            storage_key=str(row["storage_key"]),
+            media_type=str(row["media_type"]),
+            file_size=int(row["file_size"]),
+            sha256=str(row["sha256"]),
+            source_kind=str(row["source_kind"]),
+            source_url=str(row["source_url"]) if row["source_url"] is not None else None,
+            revision_label=(
+                str(row["revision_label"])
+                if row["revision_label"] is not None
+                else None
+            ),
+            processing_status=str(row["processing_status"]),
+            scan_status=str(row["scan_status"]),
+            scan_engine=str(row["scan_engine"]) if row["scan_engine"] is not None else None,
+            scan_reason=str(row["scan_reason"]) if row["scan_reason"] is not None else None,
+            metadata=_json_object(row["metadata_json"]),
+            created_at=str(row["created_at"]),
         )
 
     def _resume_artifact_from_row(self, row: RepositoryRow) -> ResumeArtifactRecord:
@@ -4085,6 +6045,19 @@ class RepositoryStore:
             status=str(row["status"]),
             long_text_id=int(row["long_text_id"]) if row["long_text_id"] is not None else None,
             created_at=str(row["created_at"]),
+            knowledge_asset_id=(
+                int(row["knowledge_asset_id"])
+                if row.get("knowledge_asset_id") is not None
+                else None
+            ),
+            knowledge_asset_version_id=(
+                int(row["knowledge_asset_version_id"])
+                if row.get("knowledge_asset_version_id") is not None
+                else None
+            ),
+            scan_status=str(row.get("scan_status") or "clean"),
+            scan_engine=(str(row["scan_engine"]) if row.get("scan_engine") else None),
+            scan_reason=(str(row["scan_reason"]) if row.get("scan_reason") else None),
         )
 
     def _chat_message_from_row(self, row: RepositoryRow) -> ChatMessageRecord:

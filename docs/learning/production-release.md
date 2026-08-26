@@ -49,6 +49,53 @@
    `max_attempts` 后任务会进入 `failed`，不会无限重试。该回收机制不替代上线前的真实
    进程崩溃、消息重投和容量演练。
 
+   Beat 的回收和流水裁剪会投递到 `<JOB_AGENT_TASK_QUEUE_NAME>_maintenance`。普通 Worker
+   默认同时消费业务队列和这个维护队列；若单独启动维护 Worker，可使用
+   `job-agent-worker --queue <JOB_AGENT_TASK_QUEUE_NAME>_maintenance`。
+
+10. 配置生产文件安全扫描。生产环境禁止使用本地占位扫描器，Compose 会启动 ClamAV
+   并把 `clamav` 服务作为 Web/Worker 的健康依赖：
+
+   ```dotenv
+   JOB_AGENT_FILE_SCAN_BACKEND=clamav
+   JOB_AGENT_FILE_SCAN_HOST=clamav
+   JOB_AGENT_FILE_SCAN_PORT=3310
+   JOB_AGENT_FILE_SCAN_TIMEOUT_SECONDS=10
+   ```
+
+   简历、职位截图和公开 GitHub ZIP 归档在 OCR、解压、模型或 RAG 之前扫描。扫描通过后，
+   简历记录的 `scan_status` 为 `clean`；感染文件或扫描服务异常会进入 `quarantined`，
+   不会创建长文本、执行 OCR、进入 RAG 或提供下载。`scan_reason` 只保存低敏摘要，不保存
+    文件正文。生产首次发布和病毒库更新后必须使用 EICAR 测试文件验证拦截链路，然后删除
+    隔离对象并检查数据库记录是否仍可按账号归属清理。
+
+   发布到目标服务器前执行独立验收：
+
+   ```powershell
+   .\scripts\validate_file_scanning.ps1
+   ```
+
+   脚本检查 daily 病毒库真实构建时间、正常文件、EICAR、扫描服务停机、恢复和 PostgreSQL +
+   MinIO 清理。详细说明见 [ClamAV 文件扫描验收](file-scanning-acceptance.md)。
+
+11. 若生产环境需要项目图片和 PDF 页参与跨模态召回，Embedding 必须使用原生多模态协议；
+    普通 OpenAI-compatible 文本 Embedding 只会保留文字 RAG：
+
+    ```dotenv
+    JOB_AGENT_EMBEDDING_PROVIDER=dashscope
+    JOB_AGENT_EMBEDDING_API_STYLE=native_multimodal
+    JOB_AGENT_EMBEDDING_MODEL=qwen3-vl-embedding
+    JOB_AGENT_EMBEDDING_API_KEY=<production-secret>
+    JOB_AGENT_EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding
+    JOB_AGENT_EMBEDDING_DIMENSIONS=1024
+    ```
+
+    发布后导入一个包含图片或 PDF 的测试项目，确认 `visual_knowledge_items` 从 `pending` 进入
+    `indexed`，并用只描述视觉内容的文字问题验证能够命中对应图片或 PDF 页。检索会限量重开
+    前两项命中原图进行查询相关复核，因此测试账号还必须有可用余额，并应在 Token/消费流水中
+    看到 `project_visual_reinspection`。测试数据完成后按正常项目删除流程清理，以同时验证对象存储、
+    数据库和向量生命周期。
+
 生产覆盖不会向宿主机发布 Web 端口，只有 Caddy 和内部采集服务可以访问它，因此
 `FORWARDED_ALLOW_IPS=*` 只在该覆盖配置中启用。不要把这个设置复制到直接暴露 Uvicorn 的开发环境。
 
@@ -56,15 +103,24 @@
 
 ## 发布
 
+构建生产镜像前先执行供应链门禁：
+
 ```powershell
-docker build --tag $env:JOB_AGENT_IMAGE .
+.\scripts\security_scan.ps1
+```
+
+确认 `python_gate_passed` 和 `container_gate_passed` 均为 `true`，并将本次 CycloneDX SBOM 与
+发布记录关联。详细策略见 [依赖与容器镜像安全扫描](security-scanning.md)。
+
+```powershell
+docker build --pull --tag $env:JOB_AGENT_IMAGE .
 docker compose -f compose.yaml -f compose.prod.yaml config --quiet
 docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 docker compose -f compose.yaml -f compose.prod.yaml ps
 ```
 
-发布顺序由 Compose 保证：PostgreSQL 健康后执行 Alembic，迁移成功后才启动 Web 和 Worker，
-Web 健康后 Caddy 才接收外部流量。
+发布顺序由 Compose 保证：PostgreSQL 健康后执行 Alembic，ClamAV 健康后才启动 Web 和
+Worker，迁移成功且 Web 健康后 Caddy 才接收外部流量。
 
 ## 指标和告警
 
@@ -114,6 +170,22 @@ docker run --rm --entrypoint /bin/promtool `
 发现两个健康 target。无论通过还是失败，`finally` 都会恢复 `compose.dev.yaml` 的单 Web
 拓扑和 `127.0.0.1:8000`；若恢复步骤警告失败，应立即手动执行开发 Compose 启动命令。
 
+上线前还要执行一次真实 Worker 故障恢复验收：
+
+```powershell
+.\scripts\validate_worker_recovery.ps1
+```
+
+该脚本临时叠加 `compose.acceptance.yaml`，把 Worker 的硬超时设为 30 秒、失联回收窗口
+设为 60 秒，然后创建隔离的 `system_probe` 任务。在任务已经进入 `running` 后强制停止
+Worker，等待 Beat 把任务从 `running` 原子回收为 `queued`，再启动同一个 Worker，检查任务
+最终只成功一次。脚本还会重复提交同一幂等键，并比较 `background_tasks`、Token 用量、余额
+流水、简历文件和工具轨迹数量，确保重复消息不会产生第二份业务副作用。验收账号在结束时
+按账号级外键级联删除；成功或失败都会尝试恢复普通开发拓扑。
+
+这项演练验证的是恢复链路，不等同于真实简历导出压力测试。上线前仍应使用接近生产大小的
+文件和并发量，另外测量大文件、模型超时、Redis 重启以及多个 Worker 同时消费时的 RTO/RPO。
+
 ## 备份
 
 备份脚本会在线导出 PostgreSQL，并在短暂维护窗口中归档 MinIO 数据卷：
@@ -132,6 +204,8 @@ docker run --rm --entrypoint /bin/promtool `
 Redis 不进入备份。它只承载可重建的队列和缓存，任务权威状态在 PostgreSQL 中。
 请求限流窗口同样是带 TTL 的短期保护状态，Redis 恢复后会自动重新建立，不参与业务恢复。
 生产环境应把 `data/backups` 同步到独立存储，并设置保留周期。
+脚本默认操作 `job-hunting-agent-production` 项目；`-ProjectName` 与 `-ComposeFiles` 仅用于
+隔离验收或显式指定的部署拓扑，日常生产备份不需要传入。
 
 ## 恢复演练
 
@@ -141,6 +215,10 @@ Redis 不进入备份。它只承载可重建的队列和缓存，任务权威�
 .\scripts\restore.ps1 -BackupDirectory .\data\backups\20260822-120000 -ConfirmRestore
 ```
 
+恢复脚本要求目录中同时存在 `manifest.json`、`postgres.dump` 和 `minio-data.tar.gz`，并在
+停止任何服务前校验清单版本、固定文件名和两个 SHA-256。任一文件缺失、清单损坏或哈希不符
+都会终止恢复，不会进入数据库与对象卷覆盖步骤。
+
 恢复后脚本会重新执行迁移并启动完整生产拓扑。正式上线前至少完成一次恢复演练，记录：
 
 - RPO：最多允许丢失多久的数据。
@@ -149,3 +227,15 @@ Redis 不进入备份。它只承载可重建的队列和缓存，任务权威�
 - 未完成任务是否按照 PostgreSQL 状态恢复或重新投递。
 
 脚本默认会在完成后重新启动服务；排障时可使用 `-KeepServicesStopped` 保留停机状态。
+
+本地或 CI 前置环境可以执行不触碰开发数据的自动化演练：
+
+```powershell
+.\scripts\validate_backup_restore.ps1
+```
+
+该脚本通过 `compose.recovery-test.yaml` 移除宿主机端口，并为每次执行创建唯一 Compose 项目和
+命名卷。它验证真实 PostgreSQL 记录、真实 MinIO 对象、归档篡改拒绝、备份后数据回滚和当前
+Alembic revision，最后输出 `data/recovery-drills/<run>/recovery-report.json` 并删除隔离卷。
+报告中的 `recovery_time_objective_observed_seconds` 是本机本次演练 RTO；
+`operational_rpo_measured=false` 表示脚本不能代替按正式备份频率计算生产 RPO。

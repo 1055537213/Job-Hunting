@@ -77,7 +77,7 @@ OCRRunner = Callable[[Image.Image], str]
 
 
 class ResumeFileStore:
-    """把简历二进制文件限制在一个明确的存储根目录内。"""
+    """把业务二进制文件限制在一个明确的本地存储根目录内。"""
 
     def __init__(self, root: str | Path):
         """记录并规范化文件根目录，真正写入时才创建子目录。"""
@@ -97,11 +97,13 @@ class ResumeFileStore:
 
         # 本地测试实现不需要使用 MIME 类型；保留参数以满足对象存储统一接口。
         del media_type
-        extension = supported_resume_extension(filename)
+        extension = Path(str(filename or "")).suffix.lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,12}", extension):
+            raise ResumeDocumentError("文件扩展名无效，无法写入对象存储。")
         storage_key = build_storage_key(
             account_id=account_id,
             candidate_id=candidate_id,
-            filename=f"resume{extension}",
+            filename=f"object{extension}",
         )
         target = self.path_for(storage_key)
         target.parent.mkdir(parents=True, exist_ok=True)

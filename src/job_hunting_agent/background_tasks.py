@@ -7,6 +7,7 @@ Web 只登记受控资源 ID，Worker 在独立进程中读取 PostgreSQL 事实
 
 from __future__ import annotations
 
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,7 @@ from typing import Any
 from .app import JobHuntingApp
 from .auth import iso_utc
 from .config import DEFAULT_ENV_PATH
-from .deduplication import DuplicateResourceError, github_project_content_fingerprint
+from .file_scanning import FileInfectedError, FileScannerUnavailableError
 from .github_project import (
     GitHubRepositoryError,
     GitHubRepositoryUnavailableError,
@@ -24,6 +25,7 @@ from .github_project import (
 from .llm import LLMRequestError
 from .models import BackgroundTaskRecord
 from .model_resilience import ModelCircuitOpenError, is_transient_model_error
+from .project_archive import ProjectArchiveError
 from .rag import RAGProviderRequestError
 from .resume_document import ResumeDocumentError
 from .storage import INSUFFICIENT_BALANCE_MESSAGE, InsufficientBalanceError
@@ -31,10 +33,12 @@ from .task_queue import (
     BACKGROUND_TASK_NAME,
     GITHUB_PROJECT_ANALYSIS_TASK_TYPE,
     OPERATIONAL_LEDGER_RETENTION_TASK_NAME,
+    PROJECT_ARCHIVE_ANALYSIS_TASK_TYPE,
     RAG_INDEX_TASK_TYPE,
     RESUME_EXPORT_TASK_TYPE,
     RESUME_OCR_TASK_TYPE,
     STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME,
+    VISUAL_INDEX_TASK_TYPE,
 )
 from .tool_audit import (
     background_task_tool_name,
@@ -292,6 +296,10 @@ def background_task_error_policy(error: Exception, task_type: str) -> tuple[str,
 
     if isinstance(error, InsufficientBalanceError):
         return INSUFFICIENT_BALANCE_MESSAGE, False
+    if isinstance(error, FileInfectedError):
+        return "文件未通过安全扫描，任务已停止。", False
+    if isinstance(error, FileScannerUnavailableError):
+        return "文件安全扫描服务暂时不可用，任务将在稍后自动重试。", True
     if isinstance(error, ModelCircuitOpenError):
         return "模型服务暂时不可用，任务将在稍后自动重试。", True
     if isinstance(error, LLMRequestError):
@@ -341,6 +349,33 @@ def _rag_task_payload(record: BackgroundTaskRecord) -> tuple[list[int], str | No
     return sorted(normalized_ids), root_request_id
 
 
+def _visual_task_payload(record: BackgroundTaskRecord) -> tuple[list[int], str | None]:
+    """校验视觉索引任务 payload，不允许图片正文或对象存储键进入队列。"""
+
+    raw_ids = record.payload.get("visual_item_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise NonRetryableTaskError("视觉索引任务缺少视觉知识项 ID。")
+    normalized_ids: set[int] = set()
+    for raw_id in raw_ids:
+        if isinstance(raw_id, bool):
+            raise NonRetryableTaskError("视觉索引任务包含无效资源 ID。")
+        if isinstance(raw_id, int):
+            item_id = raw_id
+        elif isinstance(raw_id, str) and raw_id.strip().isdigit():
+            item_id = int(raw_id.strip())
+        else:
+            raise NonRetryableTaskError("视觉索引任务包含无效资源 ID。")
+        if item_id <= 0:
+            raise NonRetryableTaskError("视觉索引任务包含无效资源 ID。")
+        normalized_ids.add(item_id)
+    root_request_id = record.payload.get("root_request_id")
+    if root_request_id is not None:
+        if not isinstance(root_request_id, str) or not root_request_id.strip():
+            raise NonRetryableTaskError("视觉索引任务包含无效请求链路 ID。")
+        root_request_id = root_request_id.strip()[:128]
+    return sorted(normalized_ids), root_request_id
+
+
 def _resume_ocr_task_payload(record: BackgroundTaskRecord) -> tuple[int, str | None]:
     """校验 OCR 任务只引用一份待处理简历，不接收文件正文或路径。"""
 
@@ -381,6 +416,23 @@ def _github_project_task_payload(record: BackgroundTaskRecord) -> tuple[str, str
             raise NonRetryableTaskError("GitHub 项目分析任务包含无效请求链路 ID。")
         root_request_id = root_request_id.strip()[:128]
     return repository_url, root_request_id
+
+
+def _project_archive_task_payload(record: BackgroundTaskRecord) -> int:
+    """校验整包项目任务只携带一个正整数资源 ID。"""
+
+    raw_id = record.payload.get("project_archive_id")
+    if isinstance(raw_id, bool):
+        raise NonRetryableTaskError("项目 ZIP 分析任务包含无效资源 ID。")
+    if isinstance(raw_id, int):
+        project_archive_id = raw_id
+    elif isinstance(raw_id, str) and raw_id.strip().isdigit():
+        project_archive_id = int(raw_id.strip())
+    else:
+        raise NonRetryableTaskError("项目 ZIP 分析任务缺少有效资源 ID。")
+    if project_archive_id <= 0:
+        raise NonRetryableTaskError("项目 ZIP 分析任务包含无效资源 ID。")
+    return project_archive_id
 
 
 def _resume_export_task_payload(
@@ -535,7 +587,7 @@ def run_registered_task(
         }
 
     if record.task_type == GITHUB_PROJECT_ANALYSIS_TASK_TYPE:
-        repository_url, _root_request_id = _github_project_task_payload(record)
+        repository_url, root_request_id = _github_project_task_payload(record)
         if record.candidate_id is None:
             raise NonRetryableTaskError("GitHub 项目分析任务缺少候选人归属。")
         # 网络读取和 ZIP 筛选都在 Worker 内执行；任务 payload 中从不保存源码正文。
@@ -546,21 +598,52 @@ def run_registered_task(
                 repository_url,
                 account_id=record.account_id,
             )
-        except DuplicateResourceError as error:
-            # 提交阶段已经去重；若 Worker 重投或与同步入口发生竞态，复用已保存的卡片。
-            existing_card = backend.store.find_project_card_by_content_fingerprint(
-                record.account_id,
-                record.candidate_id,
-                github_project_content_fingerprint(repository_url),
-            )
-            if existing_card is None:
-                raise NonRetryableTaskError(str(error)) from error
-            project_card = existing_card
         except GitHubRepositoryError as error:
             # 链接错误、仓库删除或私有仓库不会因重试而恢复，直接结束任务。
             if isinstance(error, GitHubRepositoryUnavailableError):
                 raise
             raise NonRetryableTaskError("GitHub 仓库不可读取。") from error
+        project_import = backend.store.find_project_archive_import_by_project_card(
+            project_card.id,
+            account_id=record.account_id,
+        )
+        evidence_ids: list[int] = []
+        archive_file_ids: list[int] = []
+        if project_import is not None:
+            archive_files = backend.list_project_archive_files(
+                project_import.id,
+                account_id=record.account_id,
+            )
+            archive_file_ids = [item.id for item in archive_files]
+            evidence_ids = [
+                int(item.long_text_id)
+                for item in archive_files
+                if item.long_text_id is not None
+            ]
+        rag_task = None
+        if evidence_ids:
+            rag_task = backend.enqueue_rag_index_task(
+                long_text_ids=evidence_ids,
+                account_id=record.account_id,
+                candidate_id=record.candidate_id,
+                session_id=record.session_id,
+                root_request_id=root_request_id,
+                idempotency_key=f"project-archive-evidence-rag:{project_import.id}",
+            )
+        visual_task = None
+        visual_items = backend.store.list_visual_knowledge_items(
+            account_id=record.account_id,
+            project_archive_file_ids=archive_file_ids,
+        ) if archive_file_ids else []
+        if visual_items and backend.visual_embedding_enabled:
+            visual_task = backend.enqueue_visual_index_task(
+                visual_item_ids=[item.id for item in visual_items],
+                account_id=record.account_id,
+                candidate_id=record.candidate_id,
+                session_id=record.session_id,
+                root_request_id=root_request_id,
+                idempotency_key=f"project-archive-visual:{project_import.id}",
+            )
         backend.store.update_background_task_progress(task_key, 90)
         completed = backend.store.complete_background_task(
             task_key,
@@ -568,6 +651,8 @@ def run_registered_task(
                 "project_card_id": project_card.id,
                 "project_name": project_card.card.project_name,
                 "source_url": project_card.card.source_url,
+                "rag_task_key": rag_task.task_key if rag_task is not None else None,
+                "visual_task_key": visual_task.task_key if visual_task is not None else None,
             },
             clear_idempotency_key=True,
         )
@@ -586,6 +671,99 @@ def run_registered_task(
                 "project_card_id": project_card.id,
                 "project_name": project_card.card.project_name,
                 "source_url": project_card.card.source_url,
+            },
+            finish_attempt=True,
+        )
+        return {
+            "task_key": completed.task_key,
+            "status": completed.status,
+            "result": completed.result,
+        }
+
+    if record.task_type == PROJECT_ARCHIVE_ANALYSIS_TASK_TYPE:
+        project_archive_id = _project_archive_task_payload(record)
+        if record.candidate_id is None:
+            raise NonRetryableTaskError("项目 ZIP 分析任务缺少候选人归属。")
+        try:
+            project_import = backend.store.get_project_archive_import(
+                project_archive_id,
+                account_id=record.account_id,
+            )
+        except KeyError as error:
+            raise NonRetryableTaskError("项目 ZIP 分析任务引用的资源不存在。") from error
+        if project_import.candidate_id != record.candidate_id:
+            raise NonRetryableTaskError("项目 ZIP 分析任务资源归属无效。")
+        backend.store.update_background_task_progress(task_key, 10)
+        try:
+            project_card = backend.analyze_project_archive_for_candidate(
+                project_archive_id,
+                account_id=record.account_id,
+            )
+        except ProjectArchiveError as error:
+            raise NonRetryableTaskError(str(error)) from error
+        evidence_ids = [
+            int(item.long_text_id)
+            for item in backend.list_project_archive_files(
+                project_archive_id,
+                account_id=record.account_id,
+            )
+            if item.long_text_id is not None
+        ]
+        archive_files = backend.list_project_archive_files(
+            project_archive_id,
+            account_id=record.account_id,
+        )
+        rag_task = None
+        if evidence_ids:
+            rag_task = backend.enqueue_rag_index_task(
+                long_text_ids=evidence_ids,
+                account_id=record.account_id,
+                candidate_id=record.candidate_id,
+                session_id=record.session_id,
+                root_request_id=str(record.payload.get("root_request_id") or "") or None,
+                idempotency_key=f"project-archive-evidence-rag:{project_archive_id}",
+            )
+        visual_items = backend.store.list_visual_knowledge_items(
+            account_id=record.account_id,
+            project_archive_file_ids=[item.id for item in archive_files],
+        )
+        visual_task = None
+        if visual_items and backend.visual_embedding_enabled:
+            visual_task = backend.enqueue_visual_index_task(
+                visual_item_ids=[item.id for item in visual_items],
+                account_id=record.account_id,
+                candidate_id=record.candidate_id,
+                session_id=record.session_id,
+                root_request_id=str(record.payload.get("root_request_id") or "") or None,
+                idempotency_key=f"project-archive-visual:{project_archive_id}",
+            )
+        backend.store.update_background_task_progress(task_key, 90)
+        completed = backend.store.complete_background_task(
+            task_key,
+            {
+                "project_archive_id": project_archive_id,
+                "project_card_id": project_card.id,
+                "project_name": project_card.card.project_name,
+                "source_type": project_card.card.source_type,
+                "rag_task_key": rag_task.task_key if rag_task is not None else None,
+                "visual_task_key": visual_task.task_key if visual_task is not None else None,
+            },
+        )
+        _record_background_task_trace(
+            backend,
+            completed,
+            step_status="completed",
+            trace_status="completed",
+            attempt_status="completed",
+            summary=f"已扫描项目整包并生成经历卡片：{project_card.card.project_name}",
+            result={
+                "ok": True,
+                "task_key": completed.task_key,
+                "task_type": completed.task_type,
+                "status": completed.status,
+                "project_archive_id": project_archive_id,
+                "project_card_id": project_card.id,
+                "project_name": project_card.card.project_name,
             },
             finish_attempt=True,
         )
@@ -678,6 +856,50 @@ def run_registered_task(
             "result": completed.result,
         }
 
+    if record.task_type == VISUAL_INDEX_TASK_TYPE:
+        visual_item_ids, root_request_id = _visual_task_payload(record)
+        backend.store.update_background_task_progress(task_key, 10)
+        try:
+            stats = backend.index_visual_knowledge_items(
+                visual_item_ids,
+                account_id=record.account_id,
+                candidate_id=record.candidate_id,
+                session_id=record.session_id,
+                root_request_id=root_request_id or record.task_key,
+            )
+        except KeyError as error:
+            raise NonRetryableTaskError("视觉知识项已不存在。") from error
+        backend.store.update_background_task_progress(task_key, 90)
+        completed = backend.store.complete_background_task(
+            task_key,
+            {
+                "visual_item_ids": visual_item_ids,
+                "index_stats": asdict(stats),
+            },
+        )
+        _record_background_task_trace(
+            backend,
+            completed,
+            step_status="completed",
+            trace_status="completed",
+            attempt_status="completed",
+            summary=f"已更新 {stats.document_count} 个视觉知识向量",
+            result={
+                "ok": True,
+                "task_key": completed.task_key,
+                "task_type": completed.task_type,
+                "status": completed.status,
+                "visual_item_ids": visual_item_ids,
+                "index_stats": asdict(stats),
+            },
+            finish_attempt=True,
+        )
+        return {
+            "task_key": completed.task_key,
+            "status": completed.status,
+            "result": completed.result,
+        }
+
     if record.task_type == RAG_INDEX_TASK_TYPE:
         long_text_ids, root_request_id = _rag_task_payload(record)
         # Embedding 是耗时和可能失败的外部调用，先反馈已开始再更新到完成前的进度。
@@ -724,6 +946,17 @@ def run_registered_task(
         raise NonRetryableTaskError(f"暂不支持的后台任务类型：{record.task_type}")
 
     # 探针不读取用户数据，只确认 Worker 能够完成一次数据库状态更新。
+    # 仅验收专用 purpose 支持短暂等待，用来稳定复现 Worker 在 running 状态下失联；
+    # 正常管理员探针没有这个字段，且等待时长被限制在较小范围内。
+    if record.payload.get("purpose") == "worker_recovery_acceptance":
+        raw_delay = record.payload.get("delay_seconds", 0)
+        if isinstance(raw_delay, bool) or not isinstance(raw_delay, (int, float)):
+            raise NonRetryableTaskError("Worker 恢复验收探针包含无效等待时长。")
+        delay_seconds = float(raw_delay)
+        if delay_seconds < 0 or delay_seconds > 120:
+            raise NonRetryableTaskError("Worker 恢复验收探针等待时长超出限制。")
+        if delay_seconds:
+            time.sleep(delay_seconds)
     backend.store.update_background_task_progress(task_key, 50)
     completed = backend.store.complete_background_task(
         task_key,

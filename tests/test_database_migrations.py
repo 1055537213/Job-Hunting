@@ -55,6 +55,17 @@ def test_upgrade_database_creates_versioned_postgresql_schema(temporary_database
     upgrade_database(temporary_database_url)
     engine = sa.create_engine(temporary_database_url)
     try:
+        inspector = sa.inspect(engine)
+        archive_unique_constraints = {
+            item["name"] for item in inspector.get_unique_constraints("project_archive_imports")
+        }
+        collection_unique_constraints = {
+            item["name"] for item in inspector.get_unique_constraints("project_collection_sessions")
+        }
+        archive_indexes = {item["name"] for item in inspector.get_indexes("project_archive_imports")}
+        collection_indexes = {
+            item["name"] for item in inspector.get_indexes("project_collection_sessions")
+        }
         with engine.connect() as connection:
             tables = {
                 row[0]
@@ -113,9 +124,12 @@ def test_upgrade_database_creates_versioned_postgresql_schema(temporary_database
         "jobs",
         "long_texts",
         "project_experience_cards",
+        "visual_knowledge_items",
         "rag_chunks",
         "resume_artifacts",
         "resume_drafts",
+        "knowledge_assets",
+        "knowledge_asset_versions",
         "usage_events",
         "tool_call_traces",
         "background_tasks",
@@ -130,6 +144,103 @@ def test_upgrade_database_creates_versioned_postgresql_schema(temporary_database
     assert "content_fingerprint" in candidate_columns
     assert {"content_fingerprint", "import_method", "captured_at"}.issubset(job_columns)
     assert {"operator_account_id", "recharge_order_id"}.issubset(balance_ledger_columns)
+    assert "uq_project_archive_imports_card" not in archive_unique_constraints
+    assert "uq_project_collection_card" not in collection_unique_constraints
+    assert "idx_project_archive_imports_card" in archive_indexes
+    assert "idx_project_collection_card" in collection_indexes
+
+
+def test_knowledge_asset_migration_backfills_existing_source_resumes(temporary_database_url):
+    """升级统一资产表时，历史简历原件应原地关联，不能移动或复制对象。"""
+
+    upgrade_database(temporary_database_url, "20260825_0011")
+    engine = sa.create_engine(temporary_database_url)
+    now = datetime.now(UTC)
+    try:
+        with engine.begin() as connection:
+            account_id = connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO accounts (
+                        email, password_hash, display_name, role, status,
+                        must_change_password, created_at, updated_at
+                    ) VALUES (
+                        'legacy-resume@example.com', 'test-hash', NULL, 'user', 'active',
+                        FALSE, :created_at, :updated_at
+                    ) RETURNING id
+                    """
+                ),
+                {"created_at": now, "updated_at": now},
+            ).scalar_one()
+            candidate_id = connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO candidate_profiles (
+                        account_id, name, status, education, experience_years,
+                        salary_floor_k, expected_salary_k, skills_json,
+                        preferred_cities_json, acceptable_cities_json,
+                        preference_weights_json, target_directions_json, unacceptable_json
+                    ) VALUES (
+                        :account_id, '历史候选人', '在职', '本科', 2,
+                        NULL, NULL, CAST('{}' AS JSONB), CAST('[]' AS JSONB),
+                        CAST('[]' AS JSONB), CAST('{}' AS JSONB),
+                        CAST('[]' AS JSONB), CAST('[]' AS JSONB)
+                    ) RETURNING id
+                    """
+                ),
+                {"account_id": account_id},
+            ).scalar_one()
+            artifact_id = connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO resume_artifacts (
+                        account_id, candidate_id, version, artifact_type,
+                        original_filename, download_filename, storage_key, media_type,
+                        file_size, sha256, extraction_method, extracted_text, text_length,
+                        page_count, status, created_at, scan_status, scan_engine
+                    ) VALUES (
+                        :account_id, :candidate_id, 1, 'source',
+                        'legacy.pdf', 'legacy.pdf', 'resumes/legacy.pdf', 'application/pdf',
+                        1024, :sha256, 'pdf_text', '历史简历正文', 6,
+                        1, 'ready', :created_at, 'clean', 'clamav'
+                    ) RETURNING id
+                    """
+                ),
+                {
+                    "account_id": account_id,
+                    "candidate_id": candidate_id,
+                    "sha256": "f" * 64,
+                    "created_at": now,
+                },
+            ).scalar_one()
+
+        upgrade_database(temporary_database_url)
+        with engine.connect() as connection:
+            linked = connection.execute(
+                sa.text(
+                    """
+                    SELECT artifact.knowledge_asset_id, artifact.knowledge_asset_version_id,
+                           asset.asset_kind, version.version_number, version.storage_key,
+                           version.processing_status, version.scan_status
+                    FROM resume_artifacts AS artifact
+                    JOIN knowledge_assets AS asset ON asset.id = artifact.knowledge_asset_id
+                    JOIN knowledge_asset_versions AS version
+                      ON version.id = artifact.knowledge_asset_version_id
+                    WHERE artifact.id = :artifact_id
+                    """
+                ),
+                {"artifact_id": artifact_id},
+            ).mappings().one()
+    finally:
+        engine.dispose()
+
+    assert linked["knowledge_asset_id"] is not None
+    assert linked["knowledge_asset_version_id"] is not None
+    assert linked["asset_kind"] == "resume"
+    assert linked["version_number"] == 1
+    assert linked["storage_key"] == "resumes/legacy.pdf"
+    assert linked["processing_status"] == "ready"
+    assert linked["scan_status"] == "clean"
 
 
 def test_upgrade_repairs_legacy_0003_without_job_import_provenance(temporary_database_url):

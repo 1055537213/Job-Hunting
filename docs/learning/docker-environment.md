@@ -57,7 +57,8 @@ Dockerfile 会先执行 `pip install -r requirements.lock`，再以 `--no-deps` 
 ## Python 3.12.13 运行时
 
 项目将 Docker 和宿主机开发运行时统一到 Python 3.12.13。Dockerfile 和 Compose 默认使用
-精确的 `python:3.12.13-slim` 标签，而不是会随上游更新的 `python:3.12-slim` 浮动标签。
+`python:3.12.13-slim` 的固定镜像摘要，而不是可移动标签；构建期间会应用 Debian 安全更新，
+最终产物必须通过 `scripts/security_scan.ps1`。
 
 宿主机开发继续使用现有的 `E:\Anaconda\envs\langchain1.2` Conda 环境，不需要替换或迁移
 本地环境。确认解释器版本并安装项目依赖：
@@ -222,7 +223,7 @@ docker compose -f compose.yaml -f compose.dev.yaml restart web
 - `compose.prod.yaml` 使用 SCRAM 密码认证、内部私有端口和 Caddy TLS；生产 `.env` 仍必须由服务器受限目录管理。
 - `.env` 仍只读挂载到容器，不会复制进镜像；不要把真实 API Key、数据库密码或 Session 写入 `compose.yaml`。
 - `JOB_AGENT_DOCKER_BASE_IMAGE`、`JOB_AGENT_POSTGRES_IMAGE`、`JOB_AGENT_MINIO_IMAGE` 和
-  `JOB_AGENT_REDIS_IMAGE` 仅解决镜像下载问题，不应作为生产固定依赖。
+  `JOB_AGENT_REDIS_IMAGE` 仅解决镜像下载问题；覆盖默认摘要后必须重新扫描最终镜像。
 - 当前 Redis/Worker 已完成队列基础设施、系统探针、公开 GitHub 项目分析、扫描 PDF OCR 和简历 RAG 增量索引；
-  单机生产覆盖、HTTPS 反向代理、备份和恢复演练脚本也已有可执行基线。仍未完成的是实际支付接入、
-  外部指标采集与告警、高可用部署，以及把文档导出迁移到 Worker，因此正式上线前仍需完成容量和故障演练。
+  单机生产覆盖、HTTPS 反向代理、Prometheus 指标告警、备份恢复和 Worker 故障演练脚本也已有可执行基线。
+  仍未完成的是实际支付接入、Alertmanager 通知、高可用部署和生产容量验收。

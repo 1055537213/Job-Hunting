@@ -4,7 +4,7 @@
 
 一个面向求职准备场景的多账号 Agent 工作台。系统将候选人档案、职位、项目经历、简历文件和对话记忆组织为可追溯事实，并通过 LangChain Agent、RAG 与后台任务完成职位匹配、材料整理和定制简历生成。
 
-> 当前项目处于个人开发者的企业化演进阶段，已具备 Docker Compose、PostgreSQL、pgvector、Redis、Celery、对象存储、计费流水、Prometheus 和 CI 基线。真实支付、恶意文件扫描、集中日志和分布式 Trace 仍属于上线前工作。
+> 当前项目处于个人开发者的企业化演进阶段，已具备 Docker Compose、PostgreSQL、pgvector、Redis、Celery、对象存储、计费流水、Prometheus 和 CI 基线。上传文件恶意扫描已接入；真实支付、集中日志和分布式 Trace 仍属于上线前工作。
 
 ## 1. 项目简介
 
@@ -18,7 +18,7 @@
 
 - 用结构化档案保存学历、经验、技能熟练度、目标方向、城市和薪资偏好。
 - 审核用户粘贴的职位文本或主动上传的职位截图，拒绝无关内容和重复导入。
-- 分析用户提供的公开 GitHub 仓库，将推断出的技术与职责先交给用户按组确认。
+- 分析公开 GitHub 仓库快照或用户授权的本地项目目录，将推断出的技术与职责先交给用户按组确认。
 - 将确认后的长文本建立账号隔离的 pgvector 索引，为匹配和简历生成提供可追溯证据。
 - 通过 SSE 流式展示 Agent 回复，通过 Celery Worker 执行 OCR、项目分析和 RAG 索引。
 - 记录供应商返回的 Token 用量并实时扣减余额；充值订单、支付事件、管理员补款和资金流水均可追溯。
@@ -46,7 +46,7 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 1. 从登录页注册或登录账号。
 2. 进入工作台建立候选人档案。
 3. 通过文本或职位截图导入职位信息。
-4. 导入公开 GitHub 项目或上传原始简历。
+4. 通过公开 GitHub 链接或授权选择本地项目目录导入项目，也可以上传原始简历。
 5. 在 Agent 对话中进行职位匹配、档案维护和材料整理。
 6. 生成职位定制简历时查看任务状态，并在完成后下载 DOCX/PDF 文件。
 7. 管理员从后台查看账号余额、Token 用量、工具调用流程、请求指标和审计记录。
@@ -74,16 +74,25 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 - 粘贴职位文本导入，或上传职位截图后由多模态模型识别并由本地解析器复审。
 - 职位、候选人、项目和原始简历按各自归属范围进行内容指纹去重。
 - 按学历、经验和明确禁忌做硬筛选，按技能、方向、城市和薪资偏好排序并解释。
-- 分析公开 GitHub 仓库，不执行仓库代码，不读取敏感文件；推断内容必须由用户按组确认。
-- 删除项目时同步删除 PostgreSQL 卡片、长文本事实和对应 pgvector 索引。
+- GitHub 导入解析默认分支的 commit SHA，下载不可变快照，经过恶意文件扫描后保存到对象存储；同一提交幂等复用，新修订单独留存来源记录，分析结果相同则复用项目卡、业务内容变化才生成新卡片。
+- 本地目录导入先由浏览器提交相对路径、大小和 SHA-256 清单，后端生成采集计划后再按最多 5 个文件一批传输；同一清单中断后可从未完成文件继续，也可取消并清理已产生的证据。`.env`、私钥、令牌、证书和依赖/构建目录在浏览器和服务端双重拦截。
+- 单次项目最多选择 `120` 个文件、合计 `256 MiB`，并继续受文件类型数量、单文件大小、PDF 页数、表格行列和图片像素上限约束，避免整包导入无限占用内存和模型预算。
+- 本地目录不保存用户电脑中的文件原件，也不会把整个目录一次性装入内存或对象存储；只保存提取结果、来源定位，以及图片/选中 PDF 页去 EXIF、缩放和重编码后的视觉派生副本。
+- 项目证据按文本/代码、PDF 页面、图片、CSV/XLSX 工作表、DOCX/PPTX 和文本型工程文件分流；图片与有限复杂 PDF 页面会在 OCR 后交给当前多模态模型，按来源 ID 提取元素关系、表格、参数、单位、公差和适用对象。成功文字进入 `long_texts`，视觉派生副本进入 `visual_knowledge_items` 并由独立 Worker 生成图片向量。
+- RAG 使用同一个多模态 Embedding 空间做文字与视觉双路召回；最多取前两项视觉命中重新打开经过校验的原图，让多模态模型按当前问题复核可见证据，而不是只依赖入库时的旧摘要。视觉命中可回溯到具体图片或 PDF 页，项目推断仍必须由用户按组确认。
+- 删除项目或候选人时同步删除项目卡片、项目包、文件清单、对象原件、视觉派生副本、长文本事实和对应 pgvector 索引。
 - 上传 DOCX、文字 PDF 或扫描 PDF；扫描件由 Worker OCR。
+- 原始简历同时登记为统一知识资产和不可变首版；历史简历由 Alembic 原地补登记，文件不会搬迁或复制。
+- 简历、职位截图、GitHub 归档和本地目录选中文件在进入解析、模型或 RAG 前先经过安全扫描；生产使用 ClamAV，未通过或无法扫描的文件不会进入下游处理。
 - 基于职位和已确认候选人证据生成独立 DOCX/PDF 定制简历，不覆盖原始简历。
 
 ### RAG、后台任务与管理
 
 - 结构化事实与长文本索引分离，Embedding 身份变化时不会混用旧向量。
-- 检索先做账号与候选人过滤，再进行余弦相似度召回，可选 Rerank。
+- 检索先做账号、候选人、Embedding 身份和维度过滤，再合并文字切片与图片向量的余弦召回结果，可选 Rerank；Agent 工具与简历生成都显式传递当前候选人 ID。
 - Celery 任务支持幂等键、原子认领、进度、有限重试、错误摘要和刷新后恢复。
+- Beat 的失联回收与流水维护任务使用独立维护队列；普通 Worker 默认同时消费业务队列和维护队列，
+  避免业务 Worker 故障时维护任务被一并阻塞。
 - 队列开启时定制简历的模型、RAG、DOCX/PDF 生成均在 Worker 中执行；草稿和两个导出文件使用任务级幂等键，重试不会重复扣费或生成版本。
 - Docker Web 使用 Redis 原子滑动窗口共享认证、模型、上传、管理和写请求额度，增加 Web 进程不会重复获得限流配额。
 - Web 与 Worker 使用 Redis 租约共享 Chat、Embedding、Rerank 和截图并发额度，并按账号限制模型占用。
@@ -100,14 +109,15 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 | Agent | LangChain、LangGraph、OpenAI-compatible API | 模型适配、工具调用、会话状态和流式 Agent |
 | 模型网关 | Chat、Embedding、Rerank adapters | 调用上下文、有限重试、供应商 usage 和幂等计费 |
 | 数据 | PostgreSQL 16、SQLAlchemy、Alembic | 权威事实、事务、约束、账号隔离和版本化迁移 |
-| RAG | pgvector、LangChain Text Splitters | 文本切片、向量索引、余弦召回和可选重排 |
-| 异步任务 | Celery、Redis、Celery Beat | OCR、RAG 索引、GitHub 分析、定制简历导出和周期维护 |
-| 文件 | MinIO / S3、python-docx、ReportLab | 原始简历和导出文件的对象存储与生成 |
+| RAG | pgvector、Qwen 多模态 Embedding、LangChain Text Splitters | 文本切片、图片向量、跨模态余弦召回和可选重排 |
+| 异步任务 | Celery、Redis、Celery Beat | OCR、文字/视觉 RAG 索引、GitHub/项目整包分析、定制简历导出和周期维护 |
+| 文件 | MinIO / S3、python-docx、ReportLab | 统一知识资产版本、项目包、原始简历和导出文件的对象存储与生成 |
 | 文档识别 | pdfplumber、PDFium、RapidOCR、ONNX Runtime | DOCX/PDF 解析、扫描件检测和 OCR |
 | 工程 | Docker Compose、Caddy、GitHub Actions | 本地复现、单机生产基线、HTTPS 和持续集成 |
-| 质量 | pytest、Ruff、Node 回归脚本 | 业务、迁移、API、前端和发布基线验证 |
+| 质量与安全 | pytest、Ruff、pip-audit、Trivy | 业务回归、依赖漏洞门禁、镜像扫描和 SBOM |
 
-运行时固定为 Python `3.12.x`，Docker 基础镜像当前固定到 `python:3.12.13-slim`。生产依赖与开发质量工具分别锁定在 `requirements.lock` 和 `requirements-dev.lock`。
+运行时固定为 Python `3.12.x`，Docker 基础镜像固定到 Python `3.12.13-slim` 的不可变摘要。
+生产依赖与开发质量工具分别锁定在 `requirements.lock` 和 `requirements-dev.lock`。
 
 ## 5. 项目亮点
 
@@ -116,8 +126,9 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 3. **多租户隔离贯穿全链路**：数据库查询、对象键、RAG 检索、任务、工具轨迹和账单都携带账号归属。
 4. **后台任务可恢复**：Redis 消息只包含 `task_key`，任务权威状态在 PostgreSQL；幂等键和原子认领防止重复执行。
 5. **实时计量和资金闭环**：只使用供应商确认的 Token usage 计费；调用 ID、充值幂等键和数据库行锁防止重复扣费或重复到账，管理员补款与真实支付严格分开。
-6. **安全的外部内容入口**：职位截图仅在识别请求期间使用；GitHub 分析限制公开仓库、文件类型、归档大小和重定向目标。
+6. **安全的外部内容入口**：职位截图仅在识别请求期间使用；GitHub 快照限制归档大小、文件数、解压总量、路径、公开仓库和重定向目标；本地目录使用双端敏感路径拦截及上传前后哈希校验。
 7. **可执行的上线基线**：包含 CI、生产 Compose、HTTPS 反向代理、迁移门禁、备份与恢复脚本及上线前评测入口。
+8. **统一知识资产版本**：逻辑资料与不可变文件版本分离，账号归属、对象键、哈希、修订标签和处理状态集中管理。
 
 ## 6. 目录结构说明
 
@@ -135,9 +146,12 @@ Job-hunting Agent/
 │  ├─ model_gateway.py        # 模型调用、usage、重试与计费边界
 │  ├─ rag.py                  # Embedding、Rerank 和切片协议
 │  ├─ pgvector_rag.py         # pgvector 索引、检索和删除
+│  ├─ pgvector_visual.py      # 视觉对象校验与图片向量写入
 │  ├─ background_tasks.py     # Celery 任务状态机和执行器
 │  ├─ job_screenshot.py       # 职位截图多模态识别
+│  ├─ project_visual.py       # 项目图片/PDF 页级视觉证据
 │  ├─ github_project.py       # 公开仓库安全读取与筛选
+│  ├─ file_scanning.py        # 本地验收扫描与生产 ClamAV 边界
 │  ├─ resume_document.py      # DOCX/PDF 解析与 OCR
 │  ├─ resume_writer.py        # 证据约束的定制简历内容
 │  ├─ resume_exporter.py      # DOCX/PDF 导出
@@ -148,6 +162,10 @@ Job-hunting Agent/
 ├─ scripts/
 │  ├─ enterprise_acceptance.ps1 # 完整本地验收
 │  ├─ validate_multi_replica.ps1 # 双 Web、共享限流和多目标采集验收
+│  ├─ validate_worker_recovery.ps1 # Worker 失联回收、重投递和幂等验收
+│  ├─ validate_backup_restore.ps1 # 隔离 PostgreSQL + MinIO 灾难恢复验收
+│  ├─ security_scan.ps1          # Python 依赖、最终镜像与 SBOM 安全验收
+│  ├─ validate_file_scanning.ps1 # ClamAV、EICAR、停机拒绝和隔离清理验收
 │  ├─ backup.ps1                # PostgreSQL + MinIO 备份
 │  └─ restore.ps1               # 受控恢复演练
 ├─ deploy/                    # Caddy、Prometheus 与生产环境变量模板
@@ -155,6 +173,9 @@ Job-hunting Agent/
 ├─ compose.yaml               # 基础服务拓扑
 ├─ compose.dev.yaml           # 本地源码挂载与热更新
 ├─ compose.scale-test.yaml    # 临时多 Web 副本验收覆盖
+├─ compose.acceptance.yaml    # Worker 故障恢复短时限验收覆盖
+├─ compose.recovery-test.yaml # 无宿主机端口的隔离恢复演练覆盖
+├─ compose.file-scan-test.yaml # 独立 ClamAV 与文件隔离验收覆盖
 ├─ compose.prod.yaml          # 单机生产覆盖配置
 ├─ Dockerfile
 ├─ requirements.lock
@@ -261,6 +282,47 @@ Get-ChildItem tests -Filter "frontend_*.mjs" | ForEach-Object { node $_.FullName
 探测副本，并确认跨副本共享限流和两个 Prometheus target；结束或失败后都会恢复单 Web
 开发拓扑与 `127.0.0.1:8000`。
 
+需要验证 Worker 在执行中被强制停止后，Beat 是否能回收失联任务、重新排队，且幂等请求
+不会生成第二条任务、Token 流水、余额流水或简历文件时执行：
+
+```powershell
+.\scripts\validate_worker_recovery.ps1
+```
+
+该脚本会创建一个带唯一邮箱的隔离验收账号，使用不读取用户数据的 `system_probe`，
+验收结束后通过账号级级联删除清理测试记录。它会临时应用 `compose.acceptance.yaml`，
+将回收窗口压缩到约一分钟；无论成功或失败都会尝试恢复普通开发拓扑。脚本需要 Docker
+Engine 正在运行，并且当前镜像已经存在；代码只通过开发源码挂载更新时不需要重新构建镜像。
+
+需要验证 PostgreSQL 与 MinIO 备份是否真的可以恢复时执行：
+
+```powershell
+.\scripts\validate_backup_restore.ps1
+```
+
+脚本使用唯一 Compose 项目名和独立数据卷，不会停止当前开发服务。它会写入一条数据库记录和
+一个真实 MinIO 对象，生成备份，确认篡改后的归档会在停服前被 SHA-256 校验拒绝，再破坏两端
+数据并执行恢复。最终报告保存在 `data/recovery-drills/<run>/recovery-report.json`，其中包含
+本次观测 RTO；演练结束只清理对应的隔离容器和数据卷。
+
+需要检查锁定依赖、最终 Debian 镜像并生成 CycloneDX SBOM 时执行：
+
+```powershell
+.\scripts\security_scan.ps1
+```
+
+CI 使用相同门禁并上传保留 14 天的 `security-reports`。规则、报告字段和漏洞例外要求见
+[依赖与容器镜像安全扫描](docs/learning/security-scanning.md)。
+
+需要验证真实 ClamAV、病毒库新鲜度、EICAR 隔离、扫描器故障和对象清理时执行：
+
+```powershell
+.\scripts\validate_file_scanning.ps1
+```
+
+脚本使用独立 Compose 项目和临时卷，不接触开发或生产数据；完整规则和报告说明见
+[ClamAV 文件扫描验收](docs/learning/file-scanning-acceptance.md)。
+
 RAG 黄金集准备完成后，将其加入统一验收：
 
 ```powershell
@@ -278,12 +340,16 @@ docker compose -f compose.yaml -f compose.prod.yaml config --quiet
 docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 ```
 
-生产覆盖使用 PostgreSQL SCRAM 密码认证，内部服务不暴露宿主机端口，由 Caddy 提供 HTTPS。上线前至少完成一次：
+生产覆盖使用 PostgreSQL SCRAM 密码认证，内部服务不暴露宿主机端口，由 Caddy 提供 HTTPS。生产 Compose 还会启动独立的 ClamAV 服务，Web 和 Worker 只有在扫描服务健康后才启动。上线前至少完成一次：
 
 ```powershell
 .\scripts\backup.ps1
 .\scripts\restore.ps1 -BackupDirectory <backup-directory> -ConfirmRestore
+.\scripts\validate_backup_restore.ps1
 ```
+
+恢复命令会在停服和覆盖数据之前校验 `manifest.json` 以及 PostgreSQL、MinIO 两个归档的
+SHA-256。隔离脚本证明恢复机制可执行，但生产 RPO 仍取决于正式备份频率和异地副本策略。
 
 生产 Compose 同时启动 Prometheus，默认保留 15 天请求趋势，并加载 Web 不可用、5xx 比例、
 平均耗时、安全拦截和并发请求告警规则。Prometheus 页面只绑定服务器 `127.0.0.1:9090`，
@@ -309,6 +375,10 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 | 职位 | `GET /api/jobs`、`DELETE /api/jobs/{job_id}` | 列出或删除职位 |
 | 匹配 | `GET /api/matches/{candidate_id}` | 返回排序结果和解释 |
 | 项目 | `POST /api/projects/github` | 提交公开 GitHub 项目分析 |
+| 项目 | `POST /api/projects/local/manifest` | 提交本地目录文件清单与哈希，获取后端采集计划 |
+| 项目 | `POST /api/projects/local/{id}/files` | 分批上传采集计划选中的文件并增量写入 RAG |
+| 项目 | `GET/DELETE /api/projects/local/{id}` | 恢复或取消未完成的本地目录采集 |
+| 项目 | `POST /api/projects/local/{id}/complete` | 汇总已解析证据并生成待确认项目卡片 |
 | 项目 | `POST /api/projects/{record_id}/confirm` | 保存用户确认的项目内容 |
 | 项目 | `GET /api/projects`、`DELETE /api/projects/{record_id}` | 列出或级联删除项目证据 |
 | 简历 | `POST /api/resumes/upload` | 上传 DOCX/PDF 原始简历 |
@@ -348,7 +418,7 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 
 ### 删除项目后数据库和知识库会一起删除吗？
 
-会。删除接口校验账号归属后删除项目卡片和关联长文本，pgvector 分块通过数据库级联删除；成功删除后同一 GitHub 仓库可以再次导入。
+会。删除接口校验账号归属后删除项目卡片和关联长文本，pgvector 分块通过数据库级联删除；GitHub 导入还会删除快照、文件清单、知识资产版本和对象原件，本地目录导入会删除文件证据。成功删除后同一来源可以再次导入。
 
 ### 数据库结构应该怎样修改？
 
@@ -369,6 +439,13 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 - [x] 建立充值订单、支付事件、幂等到账和管理员人工补款基础链路。
 - [ ] 接入真实支付渠道、签名 Webhook、退款状态机和渠道对账。
 - [ ] 在上线前建立足量 RAG 黄金测试集，确定 Recall@K、MRR 和禁止召回阈值。
+- [x] 建立统一知识资产和不可变文件版本底座，并迁移现有原始简历关系。
+- [x] 在现有项目导入面板接入本地目录预扫描、后端采集计划和按需分批传输，不新增独立上传入口。
+- [x] GitHub 导入保存 commit 快照和多类型文件清单，并与项目证据解析、删除和 RAG 生命周期贯通。
+- [x] 项目图片与有限复杂 PDF 页面接入多模态模型，保留页级元素关系及结构化参数/公差元数据，失败时回退 OCR。
+- [x] 为项目图片和选中 PDF 页保存安全视觉派生副本，建立图片向量并接入文字+视觉混合召回。
+- [x] 视觉向量命中后限量重开原图，按当前查询执行多模态证据复核。
+- [ ] 接入工业 PDF 表格/图注坐标、二进制 CAD 解析、父子 Chunk 和数值范围检索。
 - [x] 把低敏请求指标接入 Prometheus，配置单机生产告警规则和 15 天趋势保留。
 - [ ] 接入 Alertmanager 通知渠道、OpenTelemetry 分布式 Trace 和集中日志平台。
 - [x] 将 Web 请求限流迁移到 Redis 原子滑动窗口，并明确 Redis 故障时的分组降级策略。
@@ -377,9 +454,14 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 - [x] 将生产/Compose 的短期 Agent 状态迁移到 PostgreSQL 聊天历史，避免副本切换时依赖单进程内存。
 - [x] 为 Chat、Embedding 和 Rerank 增加超时、有限重试和进程内熔断；熔断期间统一返回可重试的 503。
 - [x] 将定制简历导出迁移到 Worker，并用任务级幂等键保护重试；Worker 失联任务会由 Beat 回收。
-- [ ] 完成真实 Worker 崩溃恢复、长任务重投递、大文件和高并发容量验收。
+- [x] 增加真实 Worker 崩溃恢复、长任务重投递和任务级幂等验收脚本；上线前仍需在目标服务器执行并记录结果。
+- [x] 增加隔离 PostgreSQL + MinIO 备份恢复演练、归档防篡改校验和 RTO 报告。
+- [x] 接入 Python 依赖与最终镜像漏洞门禁，固定扫描器摘要并生成 CycloneDX SBOM。
 - [ ] 建立严格类型检查基线，逐步消化第三方 stub 和内部 Protocol 类型债务。
-- [ ] 完成依赖与镜像漏洞扫描、渗透测试、灾难恢复演练和密钥轮换流程。
+- [ ] 完成渗透测试、目标服务器灾难恢复演练和密钥轮换流程。
+- [x] 接入上传文件和 GitHub 归档的扫描隔离状态；生产 Compose 使用 ClamAV，扫描失败禁止进入下游处理。
+- [x] 增加 ClamAV 病毒库新鲜度、EICAR、扫描服务故障恢复和隔离文件删除的独立验收脚本，并在本地 Docker 通过。
+- [ ] 在目标生产服务器再次执行 ClamAV 验收并保存报告。
 - [ ] 在确定正式 Embedding 模型后评估 pgvector HNSW/IVFFlat 索引参数。
 
 ## 11. 联系方式 / 声明

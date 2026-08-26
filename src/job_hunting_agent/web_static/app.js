@@ -211,7 +211,11 @@ if (!window.Vue) {
         resumeJobSelections: {},
         projectCards: [],
         projectReviewSelections: {},
+        projectImportMode: "github",
         githubProjectUrl: "",
+        localProjectDirectoryName: "",
+        localProjectProgress: "",
+        localProjectCollectionId: 0,
         messages: [],
         currentProfileId: Number(localStorage.getItem("currentProfileId") || 0),
         messageInput: "",
@@ -250,6 +254,8 @@ if (!window.Vue) {
         deletingResumeArtifactId: 0,
         resumeError: "",
         submittingGitHubProject: false,
+        submittingLocalProject: false,
+        deletingLocalProjectCollection: false,
         confirmingProjectCardId: 0,
         deletingProjectCardId: 0,
         confirmingTaskApprovalId: 0,
@@ -550,11 +556,14 @@ if (!window.Vue) {
           },
           {
             key: "github-project",
-            title: "分析 GitHub 项目",
-            description: "提交当前候选人的公开仓库链接并生成待确认项目卡片。",
-            shortcut: "GitHub",
+            title: "导入项目",
+            description: "提交公开 GitHub 仓库链接或选择本地项目目录。",
+            shortcut: "GitHub DIR",
             action: "focusGitHubProject",
-            disabled: !this.currentProfileId || this.submittingGitHubProject,
+            disabled:
+              !this.currentProfileId ||
+              this.submittingGitHubProject ||
+              this.submittingLocalProject,
           },
           {
             key: "match",
@@ -1908,8 +1917,9 @@ if (!window.Vue) {
       /** 聚焦公开 GitHub 仓库链接输入框。 */
       focusGitHubProject() {
         this.openWorkspacePanel("github");
+        this.projectImportMode = "github";
         if (!this.currentProfileId) {
-          this.appendAssistant("请先创建或选择候选人档案，再分析 GitHub 项目。", true);
+          this.appendAssistant("请先创建或选择候选人档案，再导入项目。", true);
           return;
         }
         nextTick(() => {
@@ -1979,6 +1989,7 @@ if (!window.Vue) {
           await this.loadResumeArtifacts();
           await this.loadProjectCards();
           this.resumePendingProjectTasks();
+          await this.resumePendingLocalProjectCollection();
           await this.matchJobs(true);
         } finally {
           this.loadingProfiles = false;
@@ -2004,6 +2015,7 @@ if (!window.Vue) {
         await this.loadResumeArtifacts();
         await this.loadProjectCards();
         this.resumePendingProjectTasks();
+        await this.resumePendingLocalProjectCollection();
         await this.matchJobs(true);
       },
 
@@ -2861,7 +2873,7 @@ if (!window.Vue) {
       },
 
       /** 把任务键写入本地索引，供页面刷新后恢复轮询。 */
-      rememberRagTask(taskKey, artifactId) {
+      rememberRagTask(taskKey, artifactId, label = "") {
         if (!taskKey) return;
         const key = this.ragTaskStorageKey();
         let entries = [];
@@ -2871,7 +2883,11 @@ if (!window.Vue) {
           entries = [];
         }
         const next = entries.filter((entry) => entry?.task_key !== taskKey);
-        next.push({ task_key: taskKey, artifact_id: Number(artifactId || 0) });
+        next.push({
+          task_key: taskKey,
+          artifact_id: Number(artifactId || 0),
+          label: String(label || ""),
+        });
         localStorage.setItem(key, JSON.stringify(next.slice(-20)));
       },
 
@@ -3034,12 +3050,20 @@ if (!window.Vue) {
                     this.appendAssistant(`**${artifactName}** 的扫描 PDF OCR 已完成。${ragLine}`);
                   } else {
                     const stats = task.result?.index_stats || {};
+                    const taskLabel = task.task_type === "visual_index"
+                      ? "视觉知识索引"
+                      : "RAG 增量索引";
+                    const unit = task.task_type === "visual_index" ? "个视觉项" : "个文本片段";
                     this.appendAssistant(
-                      `**${artifactName}** 的 RAG 增量索引已完成，共写入 ${stats.chunk_count || 0} 个文本片段。`
+                      `**${artifactName}** 的${taskLabel}已完成，共写入 ${stats.chunk_count || stats.document_count || 0} ${unit}。`
                     );
                   }
                 } else {
-                  const taskLabel = task.task_type === "resume_ocr" ? "扫描 PDF OCR" : "RAG 增量索引";
+                  const taskLabel = task.task_type === "resume_ocr"
+                    ? "扫描 PDF OCR"
+                    : task.task_type === "visual_index"
+                      ? "视觉知识索引"
+                      : "RAG 增量索引";
                   this.appendAssistant(
                     `**${artifactName}** 的${taskLabel}${task.status === "cancelled" ? "已取消" : "失败"}：${task.error_summary || "请稍后重试。"}`,
                     true
@@ -3074,7 +3098,7 @@ if (!window.Vue) {
           const artifact = this.resumeArtifacts.find((item) => item.id === Number(entry.artifact_id));
           this.pollBackgroundTask(
             entry.task_key,
-            artifact?.download_filename || "简历",
+            entry.label || artifact?.download_filename || "简历",
             this.currentProfileId
           );
         }
@@ -3109,6 +3133,56 @@ if (!window.Vue) {
       /** 返回当前账号和候选人对应的 GitHub 项目任务恢复索引。 */
       projectTaskStorageKey(candidateId = this.currentProfileId) {
         return `pendingGitHubProjectTasks:${this.auth.account?.id || "legacy"}:${candidateId}`;
+      },
+
+      /** 返回当前账号和候选人对应的本地目录采集恢复位置。 */
+      localProjectCollectionStorageKey(candidateId = this.currentProfileId) {
+        return `pendingLocalProjectCollection:${this.auth.account?.id || "legacy"}:${candidateId}`;
+      },
+
+      /** 保存未完成采集 ID；原始文件不会被浏览器持久保存。 */
+      rememberLocalProjectCollection(collectionId) {
+        const normalized = Number(collectionId || 0);
+        if (!normalized) return;
+        this.localProjectCollectionId = normalized;
+        localStorage.setItem(this.localProjectCollectionStorageKey(), String(normalized));
+      },
+
+      /** 清理已经完成或由用户取消的本地采集恢复状态。 */
+      forgetLocalProjectCollection(candidateId = this.currentProfileId) {
+        localStorage.removeItem(this.localProjectCollectionStorageKey(candidateId));
+        if (Number(candidateId) === Number(this.currentProfileId)) {
+          this.localProjectCollectionId = 0;
+        }
+      },
+
+      /** 页面刷新后恢复未完成采集摘要，重新选择同一目录即可从剩余文件继续。 */
+      async resumePendingLocalProjectCollection() {
+        if (!this.currentProfileId) return;
+        const collectionId = Number(
+          localStorage.getItem(this.localProjectCollectionStorageKey()) || 0
+        );
+        if (!collectionId) {
+          this.localProjectCollectionId = 0;
+          this.localProjectDirectoryName = "";
+          this.localProjectProgress = "";
+          return;
+        }
+        try {
+          const data = await this.requestJson(
+            `/api/projects/local/${encodeURIComponent(collectionId)}`
+          );
+          const collection = data.collection || {};
+          if (collection.project_card_id || collection.status === "ready") {
+            this.forgetLocalProjectCollection();
+            return;
+          }
+          this.localProjectCollectionId = collectionId;
+          this.localProjectDirectoryName = collection.project_name || "本地项目";
+          this.localProjectProgress = `上次已分析 ${Number(collection.uploaded_file_count || 0)} 个文件，重新选择同一目录可继续`;
+        } catch (_error) {
+          this.forgetLocalProjectCollection();
+        }
       },
 
       /** 记录待完成的项目分析任务，页面刷新后仍可继续从 PostgreSQL 轮询。 */
@@ -3484,6 +3558,23 @@ if (!window.Vue) {
         return `${accepted} 组已确认 · ${pending} 组待处理`;
       },
 
+      /** 把项目整包的文件路由统计转换成紧凑状态摘要。 */
+      projectFileKindSummary(card) {
+        const labels = {
+          source_text: "文本/代码",
+          pdf: "PDF",
+          image: "图片",
+          spreadsheet: "表格",
+          document: "文档",
+          engineering_drawing: "工程图纸",
+          unsupported: "其他",
+        };
+        return Object.entries(card?.discovered_file_kinds || {})
+          .filter(([, count]) => Number(count) > 0)
+          .map(([kind, count]) => `${labels[kind] || kind} ${Number(count)} 个`)
+          .join(" · ");
+      },
+
       /** 把用户确认的项目线索拼成后端可检索的本人贡献摘要。 */
       projectConfirmedSummary(record) {
         const groups = new Map();
@@ -3563,7 +3654,220 @@ if (!window.Vue) {
         }
       },
 
-      /** 轮询一项 GitHub 项目分析任务，完成后刷新项目卡片而非等待聊天刷新。 */
+      /** 在现有项目导入面板内切换公开仓库和本地目录来源。 */
+      setProjectImportMode(mode) {
+        if (!["github", "local"].includes(mode)) return;
+        this.projectImportMode = mode;
+        this.githubProjectError = "";
+        nextTick(() => {
+          if (mode === "github") this.$refs.githubProjectUrl?.focus();
+        });
+      },
+
+      /** Browser and server both block credential-bearing paths before content upload. */
+      isBlockedLocalProjectPath(relativePath) {
+        const normalized = String(relativePath || "").replaceAll("\\", "/");
+        const parts = normalized.split("/").filter(Boolean);
+        const ignoredDirectories = new Set([
+          ".git", ".idea", ".vscode", ".venv", "venv", "env", "__pycache__",
+          ".pytest_cache", "node_modules", "dist", "build", ".cache", "logs",
+        ]);
+        if (parts.slice(0, -1).some((part) => ignoredDirectories.has(part.toLowerCase()))) return true;
+        const sensitive = /(?:^|[._-])(env|secret|credential|password|token|private[_-]?key|id_rsa)(?:$|[._-])/i;
+        if (parts.some((part) => sensitive.test(part))) return true;
+        return /\.(pem|key|p12|pfx|crt|cer)$/i.test(normalized);
+      },
+
+      /** Recursively enumerate the exact directory granted through File System Access API. */
+      async collectLocalDirectoryFiles(directoryHandle, prefix = "") {
+        const files = [];
+        for await (const [name, handle] of directoryHandle.entries()) {
+          const relativePath = prefix ? `${prefix}/${name}` : name;
+          if (this.isBlockedLocalProjectPath(relativePath)) continue;
+          if (handle.kind === "directory") {
+            files.push(...await this.collectLocalDirectoryFiles(handle, relativePath));
+          } else if (handle.kind === "file") {
+            files.push({ file: await handle.getFile(), relativePath });
+          }
+        }
+        return files;
+      },
+
+      /** Compute hashes sequentially so a large directory never occupies duplicate whole-project memory. */
+      async sha256LocalProjectFile(file) {
+        if (!window.crypto?.subtle) {
+          throw new Error("当前浏览器无法计算文件摘要，请使用最新版 Chrome 或 Edge。");
+        }
+        // Files above every server parser limit remain visible in the manifest but are not read or uploaded.
+        if (file.size > 50 * 1024 * 1024) return null;
+        const digest = await window.crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+        return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      },
+
+      /** Open the native directory picker after a direct user click; fall back to webkitdirectory. */
+      async selectAndAnalyzeLocalProject() {
+        this.openWorkspacePanel("github");
+        if (!this.currentProfileId) {
+          this.appendAssistant("请先创建或选择候选人档案，再导入项目。", true);
+          return;
+        }
+        if (this.submittingLocalProject) return;
+        this.githubProjectError = "";
+        if (typeof window.showDirectoryPicker !== "function") {
+          this.$refs.localProjectDirectoryInput?.click();
+          return;
+        }
+        try {
+          const handle = await window.showDirectoryPicker({ mode: "read", id: "job-agent-project" });
+          const entries = await this.collectLocalDirectoryFiles(handle);
+          await this.analyzeLocalProjectEntries(handle.name, entries);
+        } catch (error) {
+          if (error?.name === "AbortError") return;
+          this.githubProjectError = error.message || "无法读取所选项目目录。";
+          this.appendAssistant(this.githubProjectError, true);
+        }
+      },
+
+      /** Directory input fallback for browsers without showDirectoryPicker. */
+      async onLocalProjectDirectoryFallback(event) {
+        const input = event?.target || this.$refs.localProjectDirectoryInput;
+        const selected = Array.from(input?.files || []);
+        if (!selected.length) return;
+        const entries = selected
+          .map((file) => ({
+            file,
+            relativePath: String(file.webkitRelativePath || file.name).split("/").slice(1).join("/") || file.name,
+          }))
+          .filter((item) => !this.isBlockedLocalProjectPath(item.relativePath));
+        const rootName = String(selected[0].webkitRelativePath || "本地项目").split("/")[0] || "本地项目";
+        input.value = "";
+        await this.analyzeLocalProjectEntries(rootName, entries);
+      },
+
+      /** Submit a hash-only manifest, then upload only backend-selected files in small batches. */
+      async analyzeLocalProjectEntries(projectName, entries) {
+        if (!entries.length || this.submittingLocalProject) {
+          this.githubProjectError = "所选目录中没有可扫描文件。";
+          return;
+        }
+        if (entries.length > 20000) {
+          this.githubProjectError = "项目文件数量不能超过 20000 个。";
+          return;
+        }
+        this.submittingLocalProject = true;
+        this.githubProjectError = "";
+        this.localProjectDirectoryName = projectName;
+        try {
+          const manifestFiles = [];
+          for (let index = 0; index < entries.length; index += 1) {
+            const item = entries[index];
+            this.localProjectProgress = `正在预扫描 ${index + 1}/${entries.length}`;
+            manifestFiles.push({
+              relative_path: item.relativePath,
+              file_size: item.file.size,
+              sha256: await this.sha256LocalProjectFile(item.file),
+              media_type: item.file.type || "application/octet-stream",
+              last_modified: item.file.lastModified || null,
+            });
+          }
+          const plan = await this.requestJson("/api/projects/local/manifest", {
+            method: "POST",
+            body: JSON.stringify({
+              candidate_id: this.currentProfileId,
+              project_name: projectName,
+              files: manifestFiles,
+            }),
+          });
+          this.rememberLocalProjectCollection(plan.collection?.id);
+          const localFiles = new Map(entries.map((item) => [item.relativePath, item.file]));
+          const selected = plan.selected_files || [];
+          const batchSize = 3;
+          let uploaded = Number(plan.collection?.uploaded_file_count || 0);
+          let failed = 0;
+          if (plan.resumed) {
+            this.localProjectProgress = `已恢复上次进度，继续分析剩余 ${selected.length} 个文件`;
+          }
+          for (let start = 0; start < selected.length; start += batchSize) {
+            const batch = selected.slice(start, start + batchSize);
+            const form = new FormData();
+            form.append("file_ids", JSON.stringify(batch.map((item) => item.id)));
+            for (const item of batch) {
+              const file = localFiles.get(item.relative_path);
+              if (!file) throw new Error(`本地文件已发生变化：${item.relative_path}`);
+              form.append("files", file, file.name);
+            }
+            this.localProjectProgress = `正在分析 ${Math.min(start + batch.length, selected.length)}/${selected.length}`;
+            const batchResult = await this.requestFormJson(
+              `/api/projects/local/${encodeURIComponent(plan.collection.id)}/files`,
+              form
+            );
+            uploaded += (batchResult.processed_files || []).length;
+            failed += (batchResult.failed_files || []).length;
+            this.trackProjectIndexTask(
+              batchResult.rag_task,
+              `${projectName} 文本证据`,
+              this.currentProfileId
+            );
+            this.trackProjectIndexTask(
+              batchResult.visual_task,
+              `${projectName} 视觉证据`,
+              this.currentProfileId
+            );
+            if (batchResult.visual_warning) {
+              this.githubProjectError = batchResult.visual_warning;
+            }
+          }
+          await this.requestJson(
+            `/api/projects/local/${encodeURIComponent(plan.collection.id)}/complete`,
+            { method: "POST" }
+          );
+          await this.loadProjectCards();
+          this.forgetLocalProjectCollection();
+          this.localProjectProgress = `已分析 ${uploaded} 个文件${failed ? `，${failed} 个未能解析` : ""}`;
+          this.appendAssistant(
+            "本地项目分析已完成，已生成待确认项目经历卡片。请在左侧按组确认属于你的内容。"
+          );
+        } catch (error) {
+          if (this.showDuplicateNotice(error, "项目已存在")) return;
+          this.githubProjectError = error.message || "本地项目分析失败。";
+          this.appendAssistant(this.githubProjectError, true);
+        } finally {
+          this.submittingLocalProject = false;
+        }
+      },
+
+      /** 把项目文本或视觉索引任务纳入刷新可恢复的通用后台任务轮询。 */
+      trackProjectIndexTask(task, label, candidateId = this.currentProfileId) {
+        if (!task?.task_key) return;
+        this.backgroundTasks[task.task_key] = task;
+        this.rememberRagTask(task.task_key, 0, label);
+        this.pollBackgroundTask(task.task_key, label, candidateId);
+      },
+
+      /** 用户主动取消未完成采集，并同步清理数据库、对象存储和派生索引。 */
+      async cancelLocalProjectCollection() {
+        const collectionId = Number(this.localProjectCollectionId || 0);
+        if (!collectionId || this.deletingLocalProjectCollection) return;
+        if (!window.confirm("取消后会删除本次采集已保存的项目证据，确定继续吗？")) return;
+        this.deletingLocalProjectCollection = true;
+        this.githubProjectError = "";
+        try {
+          await this.requestJson(`/api/projects/local/${encodeURIComponent(collectionId)}`, {
+            method: "DELETE",
+          });
+          this.forgetLocalProjectCollection();
+          this.localProjectDirectoryName = "";
+          this.localProjectProgress = "";
+          this.appendAssistant("已取消本次本地项目采集，已上传证据和索引已清理。");
+        } catch (error) {
+          this.githubProjectError = error.message || "取消本地项目采集失败。";
+          this.appendAssistant(this.githubProjectError, true);
+        } finally {
+          this.deletingLocalProjectCollection = false;
+        }
+      },
+
+      /** 轮询一项项目分析任务，完成后刷新项目卡片而非等待聊天刷新。 */
       async pollGitHubProjectTask(taskKey, candidateId = this.currentProfileId) {
         if (!taskKey || this.projectTaskPollers[taskKey]) return;
         const poll = async () => {
@@ -3579,12 +3883,39 @@ if (!window.Vue) {
                 if (!this.projectTaskNotified[taskKey]) {
                   this.projectTaskNotified[taskKey] = true;
                   if (task.status === "succeeded") {
-                    const projectName = task.result?.project_name || "GitHub 项目";
+                    const projectName = task.result?.project_name || "项目";
+                    this.trackProjectIndexTask(
+                      task.result?.rag_task_key
+                        ? {
+                            task_key: task.result.rag_task_key,
+                            task_type: "rag_index",
+                            status: "queued",
+                            progress: 0,
+                          }
+                        : null,
+                      `${projectName} 文本证据`,
+                      candidateId
+                    );
+                    this.trackProjectIndexTask(
+                      task.result?.visual_task_key
+                        ? {
+                            task_key: task.result.visual_task_key,
+                            task_type: "visual_index",
+                            status: "queued",
+                            progress: 0,
+                          }
+                        : null,
+                      `${projectName} 视觉证据`,
+                      candidateId
+                    );
+                    const indexLine = task.result?.rag_task_key || task.result?.visual_task_key
+                      ? "文本或视觉索引仍在后台继续，完成或失败都会单独通知。"
+                      : "证据索引已同步完成。";
                     this.appendAssistant(
-                      `**${projectName}** 已分析完成。我发现了一些可能的技术栈、功能和职责，请在左侧按组确认：属于你的内容点“确认”，不是你开发或不确定的内容点“排除”。`
+                      `**${projectName}** 已分析完成。${indexLine}我发现了一些可能的技术栈、功能和职责，请在左侧按组确认：属于你的内容点“确认”，不是你开发或不确定的内容点“排除”。`
                     );
                   } else {
-                    this.githubProjectError = task.error_summary || "GitHub 项目分析失败，请稍后重试。";
+                    this.githubProjectError = task.error_summary || "项目分析失败，请稍后重试。";
                     this.appendAssistant(this.githubProjectError, true);
                   }
                 }
@@ -3600,7 +3931,7 @@ if (!window.Vue) {
         await poll();
       },
 
-      /** 页面刷新或切换档案后恢复未结束的 GitHub 项目分析任务。 */
+      /** 页面刷新或切换档案后恢复未结束的项目分析任务。 */
       resumePendingProjectTasks() {
         if (!this.currentProfileId) return;
         let taskKeys = [];

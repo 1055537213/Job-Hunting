@@ -28,6 +28,8 @@ jobs:
 
     env:
       JOB_AGENT_TEST_DATABASE_URL: postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent
+      PIP_AUDIT_VERSION: "2.10.1"
+      TRIVY_IMAGE: aquasec/trivy@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
 
     steps:
       - name: Check out repository
@@ -67,6 +69,20 @@ jobs:
             node "$test_file"
           done
 
+      - name: Audit locked Python dependencies
+        id: python_audit
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p security-reports
+          python -m pip install --disable-pip-version-check "pip-audit==$PIP_AUDIT_VERSION"
+          python -m pip_audit \
+            -r requirements.lock \
+            -r requirements-dev.lock \
+            --format json \
+            --output security-reports/python-dependencies.json
+
       - name: Validate development Compose configuration
         env:
           JOB_AGENT_REDIS_PASSWORD: ci-redis-password
@@ -80,4 +96,72 @@ jobs:
           check config /etc/prometheus/prometheus.yml
 
       - name: Build release image
-        run: docker build --tag job-hunting-agent:ci .
+        run: docker build --pull --no-cache --tag job-hunting-agent:ci .
+
+      - name: Record container findings and CycloneDX SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/trivy-cache" security-reports
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
+            -v "$PWD/security-reports:/reports" \
+            "$TRIVY_IMAGE" image \
+            --quiet \
+            --scanners vuln \
+            --pkg-types os \
+            --severity HIGH,CRITICAL \
+            --format json \
+            --output /reports/container-vulnerabilities.json \
+            job-hunting-agent:ci
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
+            -v "$PWD/security-reports:/reports" \
+            "$TRIVY_IMAGE" image \
+            --quiet \
+            --format cyclonedx \
+            --output /reports/image-sbom.cdx.json \
+            job-hunting-agent:ci
+
+      - name: Enforce fixable high and critical container gate
+        id: container_audit
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
+            "$TRIVY_IMAGE" image \
+            --quiet \
+            --scanners vuln \
+            --pkg-types os \
+            --ignore-unfixed \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            job-hunting-agent:ci
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: security-reports
+          path: security-reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce security scan results
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.python_audit.outcome }}" != "success" ]]; then
+            echo "Python dependency audit failed. Review the security-reports artifact."
+            exit 1
+          fi
+          if [[ "${{ steps.container_audit.outcome }}" != "success" ]]; then
+            echo "Container vulnerability gate failed. Review the security-reports artifact."
+            exit 1
+          fi

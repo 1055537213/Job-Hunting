@@ -102,11 +102,12 @@ def github_project_content_fingerprint(repository_url: str) -> str:
 
 
 def project_card_content_fingerprint(card: ProjectExperienceCard) -> str:
-    """为待确认项目卡片生成内容指纹；GitHub 项目优先按仓库来源防重。"""
+    """按可确认业务内容生成卡片指纹，来源修订由导入记录单独追踪。"""
 
-    if card.source_type == "github_public_repository" and card.source_url:
-        return github_project_content_fingerprint(card.source_url)
-    return content_fingerprint(_normalize_json_value(asdict(card)))
+    payload = asdict(card)
+    for provenance_field in ("source_type", "source_url", "source_ref"):
+        payload.pop(provenance_field, None)
+    return content_fingerprint(_normalize_json_value(payload))
 
 
 def is_unique_constraint_violation(error: Exception, constraint_name: str) -> bool:

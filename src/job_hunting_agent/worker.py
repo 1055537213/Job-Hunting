@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .background_tasks import register_background_tasks
 from .config import DEFAULT_ENV_PATH, load_task_queue_settings
-from .task_queue import TaskQueueError, build_celery_app
+from .task_queue import TaskQueueError, build_celery_app, maintenance_queue_name
 
 
 def create_worker_app(env_path: str | Path = DEFAULT_ENV_PATH):
@@ -34,11 +34,22 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument(
+        "--queue",
+        default=None,
+        help="只消费指定队列；默认同时消费业务队列和 Beat 维护队列。",
+    )
     args = parser.parse_args(argv)
     if args.concurrency <= 0:
         raise SystemExit("--concurrency 必须大于 0。")
-
     try:
+        settings = load_task_queue_settings(args.env_file)
+        queue_name = (
+            args.queue
+            or f"{settings.queue_name},{maintenance_queue_name(settings.queue_name)}"
+        ).strip()
+        if not queue_name:
+            raise ValueError("--queue 不能为空。")
         celery_app = create_worker_app(args.env_file)
     except (TaskQueueError, ValueError) as error:
         raise SystemExit(str(error)) from error
@@ -49,6 +60,7 @@ def main(argv: list[str] | None = None) -> None:
             "worker",
             f"--loglevel={args.log_level}",
             f"--concurrency={args.concurrency}",
+            f"--queues={queue_name}",
         ]
     )
 

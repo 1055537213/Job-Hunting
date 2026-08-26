@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>求职助手 Agent</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260823-billing-v1" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260825-project-collection-v3" />
   </head>
   <body>
     <!-- Vue 还没有挂载完成时隐藏模板，避免用户短暂看到未编译的 {{ }}。 -->
@@ -534,14 +534,37 @@
               aria-controls="githubProjectPanelBody"
               @click="toggleWorkspacePanel('github')"
             >
-              <span class="tool-panel-trigger-title">GitHub 项目</span>
+              <span class="tool-panel-trigger-title">项目导入</span>
               <span class="tool-panel-status">{{ projectCards.length }} 个</span>
               <span class="tool-panel-chevron" aria-hidden="true">
                 <svg viewBox="0 0 24 24" focusable="false"><path d="m6 9 6 6 6-6"></path></svg>
               </span>
             </button>
             <div v-show="activeWorkspacePanel === 'github'" id="githubProjectPanelBody" class="tool-panel-body">
-            <form class="form-stack" @submit.prevent="submitGitHubProject">
+            <div class="field-group">
+              <span>导入方式</span>
+              <div class="project-import-mode" role="group" aria-label="项目导入方式">
+                <button
+                  class="project-import-mode-button"
+                  :class="{ 'is-active': projectImportMode === 'github' }"
+                  type="button"
+                  :aria-pressed="String(projectImportMode === 'github')"
+                  @click="setProjectImportMode('github')"
+                >
+                  GitHub 链接
+                </button>
+                <button
+                  class="project-import-mode-button"
+                  :class="{ 'is-active': projectImportMode === 'local' }"
+                  type="button"
+                  :aria-pressed="String(projectImportMode === 'local')"
+                  @click="setProjectImportMode('local')"
+                >
+                  本地目录
+                </button>
+              </div>
+            </div>
+            <form v-if="projectImportMode === 'github'" class="form-stack" @submit.prevent="submitGitHubProject">
               <label class="field-group" for="githubProjectUrl">
                 <span>公开仓库链接</span>
                 <input
@@ -566,6 +589,40 @@
                 {{ submittingGitHubProject ? "提交中" : "分析仓库" }}
               </button>
             </form>
+            <div v-else class="form-stack">
+              <input
+                ref="localProjectDirectoryInput"
+                class="sr-only"
+                type="file"
+                webkitdirectory
+                directory
+                multiple
+                :disabled="submittingLocalProject"
+                @change="onLocalProjectDirectoryFallback"
+              />
+              <div v-if="localProjectDirectoryName || localProjectProgress" class="project-collection-status" aria-live="polite">
+                <strong>{{ localProjectDirectoryName || "本地项目" }}</strong>
+                <span>{{ localProjectProgress }}</span>
+              </div>
+              <button
+                class="primary-button"
+                type="button"
+                :disabled="!currentProfileId || submittingLocalProject"
+                :data-state="submittingLocalProject ? 'loading' : 'idle'"
+                @click="selectAndAnalyzeLocalProject"
+              >
+                {{ submittingLocalProject ? "分析中" : "选择并分析目录" }}
+              </button>
+              <button
+                v-if="localProjectCollectionId"
+                class="danger-button"
+                type="button"
+                :disabled="submittingLocalProject || deletingLocalProjectCollection"
+                @click="cancelLocalProjectCollection"
+              >
+                {{ deletingLocalProjectCollection ? "取消中" : "取消本次采集" }}
+              </button>
+            </div>
             <div
               v-if="githubProjectError"
               id="githubProjectError"
@@ -608,6 +665,9 @@
                 </div>
                 <div v-if="record.card.detected_core_features?.length" class="project-card-meta">
                   {{ record.card.detected_core_features.join(" · ") }}
+                </div>
+                <div v-if="record.card.discovered_file_kinds && Object.keys(record.card.discovered_file_kinds).length" class="project-card-meta">
+                  {{ projectFileKindSummary(record.card) }}
                 </div>
                 <details
                   :key="`${record.id}:${record.status}`"
@@ -1905,6 +1965,6 @@
     <!-- Vue 3 global build 已放入本地静态目录，避免本地页面依赖外部 CDN。 -->
     <script src="/static/vendor/vue.global.prod.js?v=20260731-auth-admin"></script>
     <script src="/static/china_cities.js?v=20260803-cities"></script>
-    <script src="/static/app.js?v=20260823-billing-v1"></script>
+    <script src="/static/app.js?v=20260825-project-collection-v3"></script>
   </body>
 </html>

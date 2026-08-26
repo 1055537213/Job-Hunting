@@ -166,6 +166,19 @@ def build_project_experience_card(
     techs = sorted(tech_evidence)
     features = sorted(feature_evidence)
     responsibilities = responsibility_draft(features)
+    domain_features, domain_responsibilities, domain_highlights = domain_evidence_drafts(
+        selected_files,
+        include_generic_fallback=not features,
+    )
+    features = stable_unique([*features, *domain_features], limit=12)
+    responsibilities = stable_unique(
+        [*responsibilities, *domain_responsibilities],
+        limit=12,
+    )
+    highlights = stable_unique(
+        [*highlight_draft(techs, features), *domain_highlights],
+        limit=12,
+    )
 
     return ProjectExperienceCard(
         card_type="待确认项目经历卡片",
@@ -175,7 +188,7 @@ def build_project_experience_card(
         detected_tech_stack=techs,
         detected_core_features=features,
         responsibility_draft=responsibilities,
-        highlight_draft=highlight_draft(techs, features),
+        highlight_draft=highlights,
         resume_expression_draft=[
             "基于项目证据材料整理技术栈、核心功能和职责草稿，等待候选人确认。",
             "代码中存在某项能力线索，不等于候选人本人负责过该能力。",
@@ -225,7 +238,11 @@ def detection_haystack(path: Path, text: str) -> str:
     """
 
     suffix = path.suffix.lower()
-    if path.name.lower() in IMPORTANT_NAMES or suffix in {".md", ".toml", ".yaml", ".yml", ".json", ".xml"}:
+    if (
+        path.name.lower() in IMPORTANT_NAMES
+        or suffix in {".md", ".toml", ".yaml", ".yml", ".json", ".xml"}
+        or suffix not in SOURCE_SUFFIXES
+    ):
         return f"{path}\n{text}"
     lines = []
     for line in text.splitlines():
@@ -266,3 +283,83 @@ def highlight_draft(techs: list[str], features: list[str]) -> list[str]:
     if "测试/质量验证" in features:
         highlights.append("项目包含测试或质量验证线索")
     return highlights or ["当前亮点需要候选人结合业务目标和成果补充确认"]
+
+
+def domain_evidence_drafts(
+    selected_files: list[tuple[Path, str]],
+    *,
+    include_generic_fallback: bool,
+) -> tuple[list[str], list[str], list[str]]:
+    """把行业无关的视觉/文档证据转成待确认内容，不把线索冒充候选人职责。"""
+
+    summaries: list[str] = []
+    relationships: list[str] = []
+    tables: list[str] = []
+    parameters: list[str] = []
+    generic: list[str] = []
+    for path, text in selected_files:
+        for raw_line in str(text or "").splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip()
+            if not line:
+                continue
+            if line.startswith("摘要："):
+                summaries.append(line.removeprefix("摘要：").strip())
+            elif line.startswith("元素关系："):
+                relationships.append(line.removeprefix("元素关系：").strip())
+            elif line.startswith("表格："):
+                tables.append(line.removeprefix("表格：").strip())
+            elif line.startswith("参数："):
+                parameters.append(line.removeprefix("参数：").strip())
+            elif include_generic_fallback and _is_generic_domain_evidence_line(path, line):
+                generic.append(line)
+
+    feature_items = [
+        *(f"证据摘要：{item}" for item in stable_unique(summaries, limit=6)),
+        *(f"文档证据：{item}" for item in stable_unique(generic, limit=4)),
+    ]
+    responsibility_items = [
+        f"可能参与或负责与“{item}”相关的设计、分析、实施或交付工作"
+        for item in stable_unique([*summaries, *generic], limit=4)
+    ]
+    highlight_items = [
+        *(f"元素关系证据：{item}" for item in stable_unique(relationships, limit=4)),
+        *(f"表格证据：{item}" for item in stable_unique(tables, limit=4)),
+        *(f"精确参数证据：{item}" for item in stable_unique(parameters, limit=8)),
+    ]
+    return feature_items, responsibility_items, highlight_items
+
+
+def _is_generic_domain_evidence_line(path: Path, line: str) -> bool:
+    """选择适合作为跨行业卡片摘要的短句，避开代码、结构标签和机器数据。"""
+
+    if len(line) < 8 or len(line) > 180 or line.startswith(("[", "{", "<", "#")):
+        return False
+    if re.match(
+        r"^(?:import|from|class|def|function|const|let|var|package|using|SELECT|INSERT|UPDATE)\b",
+        line,
+        re.IGNORECASE,
+    ):
+        return False
+    suffix = path.suffix.lower()
+    return suffix in {
+        ".pdf", ".docx", ".pptx", ".csv", ".xlsx", ".png", ".jpg", ".jpeg",
+        ".webp", ".svg", ".dxf", ".dwg", ".step", ".stp", ".iges", ".igs",
+        ".md", ".txt",
+    }
+
+
+def stable_unique(values: list[str], *, limit: int) -> list[str]:
+    """按出现顺序去重并限制卡片体积。"""
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = re.sub(r"\s+", " ", str(value or "")).strip()[:300]
+        key = normalized.casefold()
+        if not normalized or key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+        if len(result) >= limit:
+            break
+    return result

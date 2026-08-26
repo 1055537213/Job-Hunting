@@ -1,0 +1,13 @@
+# Worker 故障恢复验收覆盖配置。
+# 与 compose.yaml 一起使用；只把 Celery 的时间窗口压缩到可测试范围，不用于生产。
+services:
+  worker:
+    environment:
+      JOB_AGENT_TASK_TIME_LIMIT_SECONDS: "30"
+      JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS: "25"
+      JOB_AGENT_TASK_STALE_AFTER_SECONDS: "60"
+  beat:
+    environment:
+      JOB_AGENT_TASK_TIME_LIMIT_SECONDS: "30"
+      JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS: "25"
+      JOB_AGENT_TASK_STALE_AFTER_SECONDS: "60"

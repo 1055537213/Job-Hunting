@@ -1,0 +1,8 @@
+# Isolated backup/restore acceptance overlay. It removes host ports so the drill can run
+# beside the normal development stack under its own Compose project and named volumes.
+services:
+  postgres:
+    ports: !reset []
+
+  minio:
+    ports: !reset []

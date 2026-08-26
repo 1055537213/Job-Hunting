@@ -169,6 +169,49 @@ def test_job_rag_context_cannot_establish_candidate_skills_or_metrics(tmp_path, 
     assert any("未确认技能：FastAPI" in risk for risk in rewritten.authenticity_risks)
 
 
+def test_resume_draft_rag_is_scoped_to_current_candidate(account_id, monkeypatch):
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="简历候选人",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={"Python": "项目使用"},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=["后端开发"],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+    job = app.import_job_text(
+        """
+        Python 后端工程师
+        10-15K
+        杭州
+        1-3年
+        本科
+        职位描述：负责 Python 服务开发。
+        """,
+        account_id=account_id,
+    )
+    calls = []
+
+    def record_search(query, top_k=5, entity_types=None, **kwargs):
+        calls.append((query, top_k, entity_types, kwargs))
+        return []
+
+    monkeypatch.setattr(app, "search_rag", record_search)
+
+    app.create_resume_draft(candidate_id, job.id, account_id=account_id)
+
+    assert len(calls) == 1
+    assert calls[0][3] == {"account_id": account_id, "candidate_id": candidate_id}
+
+
 def test_proficiency_override_requires_explicit_flag_and_keeps_risk(tmp_path, account_id):
     """默认阻止熟练度拔高；明确的一次性覆盖也必须保留真实性风险。"""
 

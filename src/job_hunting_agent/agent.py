@@ -490,6 +490,7 @@ def build_job_hunting_tools(app: JobHuntingApp) -> list[object]:
             top_k,
             entity_types,
             account_id=context.get("account_id"),
+            candidate_id=require_candidate_id(context),
         )
         return dumps_tool_output({"query": query, "results": [asdict(item) for item in results]})
 

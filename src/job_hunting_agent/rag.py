@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -240,6 +241,7 @@ class NativeMultimodalEmbeddings(Embeddings):
         api_key: str,
         base_url: str,
         model: str,
+        dimensions: int | None = None,
         timeout_seconds: int = 60,
         batch_size: int = 16,
         transport: Callable[[str, dict[str, str], dict[str, object], int], dict[str, object]] | None = None,
@@ -253,6 +255,7 @@ class NativeMultimodalEmbeddings(Embeddings):
         self.api_key = api_key
         self.endpoint = normalize_native_endpoint(base_url)
         self.model = model
+        self.dimensions = dimensions
         self.timeout_seconds = timeout_seconds
         self.batch_size = batch_size
         self.transport = transport or post_embeddings_json
@@ -276,6 +279,7 @@ class NativeMultimodalEmbeddings(Embeddings):
             api_key=settings.api_key,
             base_url=settings.base_url,
             model=settings.model,
+            dimensions=settings.dimensions,
             timeout_seconds=settings.timeout_seconds,
             batch_size=settings.batch_size,
             usage_callback=usage_callback,
@@ -299,14 +303,53 @@ class NativeMultimodalEmbeddings(Embeddings):
 
         return self._embed_batch([text])[0]
 
+    def embed_images(
+        self,
+        images: list[tuple[bytes, str]],
+    ) -> list[list[float]]:
+        """为安全重编码后的图片生成独立向量，与文本查询共享语义空间。"""
+
+        if not images:
+            return []
+        contents: list[dict[str, str]] = []
+        for content, media_type in images:
+            if not content:
+                raise ValueError("视觉 Embedding 图片不能为空。")
+            normalized_media_type = str(media_type or "").lower()
+            if normalized_media_type not in {
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+                "image/bmp",
+                "image/tiff",
+            }:
+                raise ValueError("视觉 Embedding 图片格式不受支持。")
+            encoded = base64.b64encode(content).decode("ascii")
+            contents.append(
+                {"image": f"data:{normalized_media_type};base64,{encoded}"}
+            )
+        vectors: list[list[float]] = []
+        # qwen3-vl-embedding 官方单次最多 10 张图片；同时服从本地批量上限。
+        image_batch_size = min(self.batch_size, 10)
+        for start in range(0, len(contents), image_batch_size):
+            vectors.extend(self._embed_contents(contents[start : start + image_batch_size]))
+        return vectors
+
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         """调用 provider-native 多模态接口，并按输入顺序解析向量。"""
+
+        return self._embed_contents([{"text": text} for text in texts])
+
+    def _embed_contents(self, contents: list[dict[str, str]]) -> list[list[float]]:
+        """发送独立文本或图片条目，不启用融合向量模式。"""
 
         payload: dict[str, object] = {
             "model": self.model,
             # provider-native 多模态协议要求把内容放在 input.contents 中。
-            "input": {"contents": [{"text": text} for text in texts]},
+            "input": {"contents": contents},
         }
+        if self.dimensions is not None:
+            payload["parameters"] = {"dimension": self.dimensions}
         response: dict[str, object] | None = None
         for attempt in range(self.max_retries + 1):
             if self.circuit_breaker is not None:

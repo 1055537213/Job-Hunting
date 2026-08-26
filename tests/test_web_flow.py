@@ -452,7 +452,7 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     for page in (login_page, workspace_page, profile_page, admin_page):
         assert page.status_code == 200
         assert page.headers["cache-control"] == "no-store, max-age=0"
-        assert "/static/app.js?v=20260823-billing-v1" in page.text
+        assert "/static/app.js?v=20260825-project-collection-v3" in page.text
     assert "Job Hunting Agent" in home.text
     assert "syncAuthPageClass" in script.text
     assert "FRONTEND_ROUTES" in script.text
@@ -462,8 +462,8 @@ def test_web_home_page_and_assets_are_available(tmp_path):
     assert 'v-if="showProfileSurface"' in home.text
     assert 'v-if="showAdminSurface"' in home.text
     assert 'v-if="showRouteLoading"' in home.text
-    assert '/static/app.js?v=20260823-billing-v1' in home.text
-    assert '/static/styles.css?v=20260823-billing-v1' in home.text
+    assert '/static/app.js?v=20260825-project-collection-v3' in home.text
+    assert '/static/styles.css?v=20260825-project-collection-v3' in home.text
     assert 'class="account-menu-trigger"' in home.text
     assert 'id="workspaceAccountMenu"' in home.text
     assert 'role="menuitem" @click="openProfile"' in home.text
@@ -737,6 +737,7 @@ def test_web_health_reports_enabled_memory_as_configured(tmp_path):
     assert health.json()["model_circuit"]["state"] in {"not_started", "closed"}
     assert "billing" in health.json()
     assert isinstance(health.json()["billing"]["configured"], bool)
+    assert health.json()["project_visual_analysis"]["enabled"] is True
 
 
 def test_web_auth_bootstrap_does_not_surface_probe_errors_in_login_form(tmp_path):
@@ -804,8 +805,8 @@ def test_web_profile_form_uses_city_picker_and_auth_copy(tmp_path):
     assert "省份及直辖市" in home
     assert '<optgroup' not in home
     assert '/static/china_cities.js?v=20260803-cities' in home
-    assert '/static/styles.css?v=20260823-billing-v1' in home
-    assert '/static/app.js?v=20260823-billing-v1' in home
+    assert '/static/styles.css?v=20260825-project-collection-v3' in home
+    assert '/static/app.js?v=20260825-project-collection-v3' in home
     assert "cityGroups: buildSortedCityGroups()" in script
     assert "HOT_CITY_NAMES" in script
     assert "cityPickerOpen: false" in script

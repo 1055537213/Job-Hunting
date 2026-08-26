@@ -164,6 +164,8 @@ class ProjectExperienceCard:
     source_type: str = "local_directory"
     source_url: str | None = None
     source_ref: str | None = None
+    discovered_file_kinds: dict[str, int] = field(default_factory=dict)
+    deferred_files: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -181,6 +183,91 @@ class ProjectExperienceRecord:
     confirmed_summary: str | None
     created_at: str
     confirmed_at: str | None
+
+
+@dataclass
+class ProjectArchiveImportRecord:
+    """一次整包项目导入及其原件、任务状态和最终项目卡片关联。"""
+
+    id: int
+    account_id: int
+    candidate_id: int
+    knowledge_asset_id: int
+    knowledge_asset_version_id: int
+    project_card_id: int | None
+    source_type: str
+    source_url: str | None
+    source_ref: str | None
+    original_filename: str
+    content_fingerprint: str
+    status: str
+    error_summary: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class ProjectArchiveFileRecord:
+    """项目压缩包中的一个受控文件清单项，不包含文件正文。"""
+
+    id: int
+    project_archive_id: int
+    relative_path: str
+    file_kind: str
+    media_type: str
+    file_size: int
+    compressed_size: int
+    sha256: str | None
+    analysis_status: str
+    skip_reason: str | None
+    metadata: dict[str, object]
+    long_text_id: int | None = None
+    extraction_method: str | None = None
+    text_length: int = 0
+
+
+@dataclass
+class ProjectCollectionSessionRecord:
+    """一次浏览器本地目录预扫描、采集和分析会话。"""
+
+    id: int
+    account_id: int
+    candidate_id: int
+    project_card_id: int | None
+    project_name: str
+    source_type: str
+    manifest_fingerprint: str
+    status: str
+    file_count: int
+    selected_file_count: int
+    uploaded_file_count: int
+    total_size: int
+    selected_size: int
+    error_summary: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class ProjectCollectionFileRecord:
+    """本地目录清单中的文件及后端采集计划和提取状态。"""
+
+    id: int
+    collection_id: int
+    relative_path: str
+    file_kind: str
+    media_type: str
+    file_size: int
+    client_sha256: str | None
+    server_sha256: str | None
+    selection_status: str
+    selection_reason: str
+    extraction_method: str | None
+    text_length: int
+    long_text_id: int | None
+    metadata: dict[str, object]
+    created_at: str
+    updated_at: str
 
 
 @dataclass
@@ -219,6 +306,74 @@ class ResumeDraftRecord:
 
 
 @dataclass
+class KnowledgeAssetRecord:
+    """一份可跨解析器、检索器和业务功能复用的知识文件资产。"""
+
+    id: int
+    account_id: int
+    candidate_id: int | None
+    asset_kind: str
+    title: str
+    lifecycle_status: str
+    current_version_id: int | None
+    metadata: dict[str, object]
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class VisualKnowledgeItemRecord:
+    """一张项目图片或 PDF 视觉页的可追溯知识资产。"""
+
+    id: int
+    account_id: int
+    candidate_id: int
+    project_archive_file_id: int | None
+    project_collection_file_id: int | None
+    long_text_id: int | None
+    source_id: str
+    source_label: str
+    page_number: int | None
+    media_type: str
+    storage_key: str
+    file_size: int
+    sha256: str
+    width: int
+    height: int
+    index_status: str
+    embedding_model: str | None
+    embedding_dimensions: int | None
+    index_error_type: str | None
+    metadata: dict[str, object]
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class KnowledgeAssetVersionRecord:
+    """知识文件资产的一份不可变原件版本及其处理状态。"""
+
+    id: int
+    asset_id: int
+    version_number: int
+    is_current: bool
+    original_filename: str
+    storage_key: str
+    media_type: str
+    file_size: int
+    sha256: str
+    source_kind: str
+    source_url: str | None
+    revision_label: str | None
+    processing_status: str
+    scan_status: str
+    scan_engine: str | None
+    scan_reason: str | None
+    metadata: dict[str, object]
+    created_at: str
+
+
+@dataclass
 class ResumeArtifactRecord:
     """一份已上传或已生成的简历文件版本。
 
@@ -246,6 +401,11 @@ class ResumeArtifactRecord:
     status: str
     long_text_id: int | None
     created_at: str
+    knowledge_asset_id: int | None = None
+    knowledge_asset_version_id: int | None = None
+    scan_status: str = "clean"
+    scan_engine: str | None = None
+    scan_reason: str | None = None
 
 
 @dataclass
@@ -322,6 +482,9 @@ class RAGSearchResult:
     long_text_id: int
     chunk_index: int
     distance: float
+    evidence_kind: str = "text"
+    visual_item_id: int | None = None
+    page_number: int | None = None
 
 
 @dataclass

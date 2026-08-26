@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from collections.abc import Iterator
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from langchain_core.embeddings import Embeddings
@@ -23,7 +25,9 @@ from .config import (
     load_billing_settings,
     load_concurrency_settings,
     load_database_settings,
+    load_file_scanning_settings,
     load_object_storage_settings,
+    load_project_visual_analysis_settings,
     load_semantic_matching_enabled,
     load_task_queue_settings,
     require_postgresql_database_url,
@@ -32,9 +36,19 @@ from .conversation_ingestion import decide_conversation_ingestion
 from .deduplication import (
     DuplicateResourceError,
     github_project_content_fingerprint,
+    project_card_content_fingerprint,
+)
+from .file_scanning import (
+    ClamAVScanner,
+    FileInfectedError,
+    FileScanError,
+    FileScanResult,
+    FileScanner,
+    FileScannerUnavailableError,
+    LocalSafetyScanner,
 )
 from .github_project import (
-    analyze_public_github_repository,
+    fetch_public_github_repository_archive,
     normalize_public_github_repository_url,
 )
 from .job_screenshot import JobScreenshot, JobScreenshotExtractor
@@ -50,6 +64,10 @@ from .models import (
     ConversationIngestionResult,
     ImportedJob,
     MatchResult,
+    ProjectArchiveFileRecord,
+    ProjectArchiveImportRecord,
+    ProjectCollectionFileRecord,
+    ProjectCollectionSessionRecord,
     ProjectExperienceCard,
     ProjectExperienceRecord,
     RAGIndexStats,
@@ -61,7 +79,21 @@ from .models import (
 )
 from .object_storage import ObjectNotFoundError, ObjectStorage, S3ObjectStorage
 from .pgvector_rag import PgVectorKnowledgeBase
-from .project_analyzer import analyze_project
+from .pgvector_visual import PgVectorVisualKnowledgeBase
+from .project_archive import (
+    PROJECT_ARCHIVE_MEDIA_TYPE,
+    analyze_project_archive,
+    validate_project_archive_upload,
+)
+from .project_evidence import (
+    ProjectManifestItem,
+    ProjectVisualArtifact,
+    extract_project_evidence,
+    manifest_fingerprint,
+    plan_project_manifest,
+)
+from .project_analyzer import analyze_project, build_project_experience_card
+from .project_visual import ProjectVisualAnalyzer, ProjectVisualInput
 from .rag import Reranker
 from .resume_document import (
     PDF_EXTENSION,
@@ -72,15 +104,18 @@ from .resume_document import (
     media_type_for_filename,
     sanitize_download_filename,
     supported_resume_extension,
+    validate_resume_file_size,
 )
 from .resume_exporter import export_tailored_resume_files
 from .resume_writer import build_resume_draft
 from .sqlalchemy_store import SQLAlchemyStore
 from .task_queue import (
     GITHUB_PROJECT_ANALYSIS_TASK_TYPE,
+    PROJECT_ARCHIVE_ANALYSIS_TASK_TYPE,
     RAG_INDEX_TASK_TYPE,
     RESUME_EXPORT_TASK_TYPE,
     RESUME_OCR_TASK_TYPE,
+    VISUAL_INDEX_TASK_TYPE,
     BackgroundTaskQueue,
     CeleryTaskQueue,
     TaskQueueError,
@@ -103,6 +138,7 @@ class JobHuntingApp:
         object_storage: ObjectStorage | None = None,
         task_queue: BackgroundTaskQueue | None = None,
         concurrency_controller: ConcurrencyController | None = None,
+        file_scanner: FileScanner | None = None,
     ):
         """绑定数据库、项目 `.env`、对象存储和可选后台任务队列。"""
 
@@ -132,6 +168,18 @@ class JobHuntingApp:
             if concurrency_controller is not None
             else build_concurrency_controller(self.concurrency_settings)
         )
+        scanning_settings = load_file_scanning_settings(self.env_path)
+        if file_scanner is not None:
+            self.file_scanner = file_scanner
+        elif scanning_settings.backend == "clamav":
+            self.file_scanner = ClamAVScanner(
+                scanning_settings.host,
+                scanning_settings.port,
+                scanning_settings.timeout_seconds,
+            )
+        else:
+            self.file_scanner = LocalSafetyScanner()
+        self.file_scanning_settings = scanning_settings
         # 所有真实模型/Embedding 调用都通过内部 Gateway 构造和计量；它是惰性加载的，
         # 所以纯本地规则和离线测试不需要在创建 App 时提供 API Key。
         self.model_gateway = ModelGateway(
@@ -140,6 +188,20 @@ class JobHuntingApp:
             concurrency_controller=self.concurrency_controller,
         )
         self.job_screenshot_extractor = JobScreenshotExtractor(self.model_gateway)
+        self.project_visual_analysis_settings = load_project_visual_analysis_settings(
+            self.env_path
+        )
+        self.project_visual_analyzer = (
+            ProjectVisualAnalyzer(
+                self.model_gateway,
+                max_pdf_pages=self.project_visual_analysis_settings.max_pdf_pages,
+                max_images_per_call=(
+                    self.project_visual_analysis_settings.max_images_per_call
+                ),
+            )
+            if self.project_visual_analysis_settings.enabled
+            else None
+        )
         if object_storage is not None:
             # 测试或宿主机集成可以注入一个实现，业务层不关心具体厂商。
             self.resume_files = object_storage
@@ -180,11 +242,28 @@ class JobHuntingApp:
             # 队列启用时启动检查直接失败，避免用户上传后才发现任务无人消费。
             self.task_queue.health_check()
 
+    def scan_uploaded_file(
+        self,
+        filename: str,
+        content: bytes,
+        media_type: str | None = None,
+    ) -> FileScanResult:
+        """在任何解析、解压或模型处理前扫描用户提供的文件。"""
+
+        return self.file_scanner.scan(filename, content, media_type)
+
     @property
     def task_queue_enabled(self) -> bool:
         """返回当前实例是否具备可投递后台任务的队列适配器。"""
 
         return self.task_queue is not None
+
+    @property
+    def visual_embedding_enabled(self) -> bool:
+        """仅 provider-native 多模态 Embedding 能把图片与文本放入同一空间。"""
+
+        settings = self.model_gateway.embedding_settings
+        return settings is not None and settings.api_style == "native_multimodal"
 
     def enqueue_background_task(
         self,
@@ -315,6 +394,62 @@ class JobHuntingApp:
             idempotency_key=idempotency_key,
         )
 
+    def enqueue_visual_index_task(
+        self,
+        *,
+        visual_item_ids: list[int],
+        account_id: int,
+        candidate_id: int,
+        session_id: str | None = None,
+        root_request_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> BackgroundTaskRecord:
+        """登记图片向量任务；队列消息仍只包含数据库任务键。"""
+
+        normalized_ids = self._normalize_positive_resource_ids(
+            visual_item_ids,
+            "视觉知识索引任务",
+        )
+        owned_items = self.store.list_visual_knowledge_items(
+            account_id=account_id,
+            item_ids=normalized_ids,
+            candidate_id=candidate_id,
+        )
+        if {item.id for item in owned_items} != set(normalized_ids):
+            raise ValueError("视觉知识索引任务包含不属于当前账号或候选人的资源。")
+        payload: dict[str, object] = {"visual_item_ids": normalized_ids}
+        if root_request_id:
+            payload["root_request_id"] = str(root_request_id)
+        return self.enqueue_background_task(
+            account_id=account_id,
+            task_type=VISUAL_INDEX_TASK_TYPE,
+            payload=payload,
+            candidate_id=candidate_id,
+            session_id=session_id,
+            idempotency_key=idempotency_key,
+        )
+
+    @staticmethod
+    def _normalize_positive_resource_ids(raw_ids: list[int], label: str) -> list[int]:
+        """拒绝 bool、负数和非数字资源 ID，并稳定去重排序。"""
+
+        normalized: set[int] = set()
+        for raw_id in raw_ids:
+            if isinstance(raw_id, bool):
+                raise TypeError(f"{label}包含无效资源 ID。")
+            if isinstance(raw_id, int):
+                item_id = raw_id
+            elif isinstance(raw_id, str) and raw_id.strip().isdigit():
+                item_id = int(raw_id.strip())
+            else:
+                raise ValueError(f"{label}包含无效资源 ID。")
+            if item_id <= 0:
+                raise ValueError(f"{label}包含无效资源 ID。")
+            normalized.add(item_id)
+        if not normalized:
+            raise ValueError(f"{label}至少需要一个资源 ID。")
+        return sorted(normalized)
+
     def enqueue_resume_ocr_task(
         self,
         *,
@@ -365,8 +500,6 @@ class JobHuntingApp:
         self.store.get_candidate_profile(candidate_id, account_id=account_id)
         reference = normalize_public_github_repository_url(repository_url)
         fingerprint = github_project_content_fingerprint(reference.canonical_url)
-        if self.store.find_project_card_by_content_fingerprint(account_id, candidate_id, fingerprint) is not None:
-            raise DuplicateResourceError("GitHub 项目")
         payload: dict[str, object] = {"repository_url": reference.canonical_url}
         if root_request_id:
             payload["root_request_id"] = str(root_request_id)
@@ -389,6 +522,35 @@ class JobHuntingApp:
             candidate_id=candidate_id,
             session_id=session_id,
             idempotency_key=idempotency_key,
+        )
+
+    def enqueue_project_archive_analysis_task(
+        self,
+        *,
+        project_archive_id: int,
+        account_id: int,
+        candidate_id: int,
+        session_id: str | None = None,
+        root_request_id: str | None = None,
+    ) -> BackgroundTaskRecord:
+        """登记整包项目分析任务，队列 payload 只保存受控项目包 ID。"""
+
+        project_import = self.store.get_project_archive_import(
+            project_archive_id,
+            account_id=account_id,
+        )
+        if project_import.candidate_id != candidate_id:
+            raise ValueError("项目 ZIP 不属于当前候选人。")
+        payload: dict[str, object] = {"project_archive_id": project_import.id}
+        if root_request_id:
+            payload["root_request_id"] = str(root_request_id)
+        return self.enqueue_background_task(
+            account_id=account_id,
+            task_type=PROJECT_ARCHIVE_ANALYSIS_TASK_TYPE,
+            payload=payload,
+            candidate_id=candidate_id,
+            session_id=session_id,
+            idempotency_key=f"project-archive:{project_import.id}",
         )
 
     def enqueue_resume_export_task(
@@ -573,6 +735,15 @@ class JobHuntingApp:
         再等待一次文本模型调用。用户仍可在职位列表中人工调整技能重要性。
         """
 
+        for index, screenshot in enumerate(screenshots, start=1):
+            try:
+                self.scan_uploaded_file(
+                    f"job-screenshot-{index}",
+                    screenshot.content,
+                    screenshot.media_type,
+                )
+            except FileInfectedError:
+                raise FileInfectedError("职位截图未通过安全扫描，未保存任何职位信息。") from None
         raw_text = self.job_screenshot_extractor.extract(screenshots, account_id=account_id)
         return self.import_job_text(
             raw_text,
@@ -671,10 +842,378 @@ class JobHuntingApp:
 
         return analyze_project(project_path)
 
-    def analyze_github_project(self, repository_url: str) -> ProjectExperienceCard:
-        """分析用户主动提供的公开 GitHub 仓库，返回待确认项目经历卡片。"""
+    def upload_project_archive(
+        self,
+        candidate_id: int,
+        filename: str,
+        content: bytes,
+        *,
+        account_id: int,
+        source_type: str = "uploaded_project_archive",
+        source_url: str | None = None,
+        source_ref: str | None = None,
+    ) -> ProjectArchiveImportRecord:
+        """扫描并持久化整包项目原件；任何分析发生前先通过恶意文件检查。"""
 
-        return analyze_public_github_repository(repository_url)
+        self.store.get_candidate_profile(candidate_id, account_id=account_id)
+        normalized_filename = validate_project_archive_upload(filename, content)
+        fingerprint = hashlib.sha256(content).hexdigest()
+        if self.store.find_project_archive_import_by_fingerprint(
+            account_id=account_id,
+            candidate_id=candidate_id,
+            content_fingerprint=fingerprint,
+        ) is not None:
+            raise DuplicateResourceError("项目压缩包")
+        scan_result = self.scan_uploaded_file(
+            normalized_filename,
+            content,
+            PROJECT_ARCHIVE_MEDIA_TYPE,
+        )
+        stored = self.resume_files.save(
+            account_id=account_id,
+            candidate_id=candidate_id,
+            filename=normalized_filename,
+            content=content,
+            media_type=PROJECT_ARCHIVE_MEDIA_TYPE,
+        )
+        try:
+            return self.store.register_project_archive_import(
+                account_id=account_id,
+                candidate_id=candidate_id,
+                original_filename=normalized_filename,
+                storage_key=stored.storage_key,
+                file_size=stored.file_size,
+                sha256=stored.sha256,
+                scan_engine=scan_result.engine,
+                source_type=source_type,
+                source_url=source_url,
+                source_ref=source_ref,
+            )
+        except Exception:
+            self.resume_files.delete(stored.storage_key)
+            raise
+
+    def analyze_project_archive_for_candidate(
+        self,
+        project_archive_id: int,
+        *,
+        account_id: int,
+    ) -> ProjectExperienceRecord:
+        """读取已扫描项目原件，保存文件清单并生成待确认项目经历卡片。"""
+
+        project_import = self.store.get_project_archive_import(
+            project_archive_id,
+            account_id=account_id,
+        )
+        if project_import.project_card_id is not None:
+            return self.store.get_project_card(
+                project_import.project_card_id,
+                account_id=account_id,
+            )
+        version = self.store.get_knowledge_asset_version(
+            project_import.knowledge_asset_version_id,
+            account_id=account_id,
+        )
+        self.store.mark_project_archive_import(
+            project_import.id,
+            account_id=account_id,
+            status="processing",
+        )
+        try:
+            content = self.resume_files.read(version.storage_key)
+            analysis = analyze_project_archive(
+                filename=project_import.original_filename,
+                content=content,
+                source_type=project_import.source_type,
+                source_url=project_import.source_url,
+                source_ref=project_import.source_ref or project_import.content_fingerprint,
+                visual_analyzer=self.project_visual_analyzer,
+                account_id=account_id,
+                candidate_id=project_import.candidate_id,
+            )
+            try:
+                card = self.store.save_project_card(
+                    project_import.candidate_id,
+                    analysis.card,
+                    account_id=account_id,
+                )
+            except DuplicateResourceError:
+                existing_card = self.store.find_project_card_by_content_fingerprint(
+                    account_id,
+                    project_import.candidate_id,
+                    project_card_content_fingerprint(analysis.card),
+                )
+                if existing_card is None:
+                    raise
+                card = existing_card
+            visual_items, visual_storage_keys = self._save_project_visual_artifacts(
+                [
+                    (item.relative_path, item.artifact)
+                    for item in analysis.visual_artifacts
+                ],
+                account_id=account_id,
+                candidate_id=project_import.candidate_id,
+            )
+            try:
+                self.store.complete_project_archive_import(
+                    project_import.id,
+                    account_id=account_id,
+                    project_card_id=card.id,
+                    files=[asdict(item) for item in analysis.files],
+                    evidence=[asdict(item) for item in analysis.evidence],
+                    visual_items=visual_items,
+                )
+            except Exception:
+                for storage_key in visual_storage_keys:
+                    self.resume_files.delete(storage_key)
+                raise
+            return card
+        except Exception as error:
+            self.store.mark_project_archive_import(
+                project_import.id,
+                account_id=account_id,
+                status="failed",
+                error_summary=str(error),
+            )
+            raise
+
+    def list_project_archive_files(
+        self,
+        project_archive_id: int,
+        *,
+        account_id: int,
+    ) -> list[ProjectArchiveFileRecord]:
+        """读取项目文件类型清单，供测试、运维和后续解析器调度使用。"""
+
+        return self.store.list_project_archive_files(
+            project_archive_id,
+            account_id=account_id,
+        )
+
+    def create_local_project_collection(
+        self,
+        candidate_id: int,
+        project_name: str,
+        manifest_items: list[ProjectManifestItem],
+        *,
+        account_id: int,
+    ) -> tuple[ProjectCollectionSessionRecord, list[ProjectCollectionFileRecord]]:
+        """Validate a browser directory manifest and return the backend collection plan."""
+
+        plan = plan_project_manifest(manifest_items)
+        session = self.store.create_project_collection(
+            account_id=account_id,
+            candidate_id=candidate_id,
+            project_name=project_name,
+            manifest_fingerprint=manifest_fingerprint(manifest_items),
+            files=[
+                {
+                    "relative_path": item.item.relative_path,
+                    "file_kind": item.file_kind,
+                    "media_type": item.item.media_type,
+                    "file_size": item.item.file_size,
+                    "sha256": item.item.sha256,
+                    "selection_status": item.selection_status,
+                    "selection_reason": item.selection_reason,
+                    "metadata": {"last_modified": item.item.last_modified},
+                }
+                for item in plan
+            ],
+        )
+        return session, self.store.list_project_collection_files(
+            session.id,
+            account_id=account_id,
+        )
+
+    def process_local_project_collection_file(
+        self,
+        collection_id: int,
+        file_id: int,
+        content: bytes,
+        *,
+        account_id: int,
+    ) -> ProjectCollectionFileRecord:
+        """Verify, scan, extract, and immediately persist one selected local file."""
+
+        planned = self.store.get_project_collection_file(
+            file_id,
+            collection_id=collection_id,
+            account_id=account_id,
+        )
+        collection = self.store.get_project_collection(
+            collection_id,
+            account_id=account_id,
+        )
+        if planned.selection_status == "analyzed":
+            return planned
+        if planned.selection_status != "selected":
+            # 采集计划是服务端安全边界。必须在扫描、解析、OCR 和多模态调用之前拒绝
+            # skipped/failed 文件，不能依赖持久化层最后一道校验。
+            raise ValueError("当前文件不在后端采集计划中。")
+        if collection.status in {"ready", "cancelled"}:
+            raise ValueError("当前项目采集会话已经结束，不能继续上传文件。")
+        if len(content) != planned.file_size:
+            raise ValueError("项目文件大小与预扫描清单不一致，请重新选择目录。")
+        digest = hashlib.sha256(content).hexdigest()
+        if digest != planned.client_sha256:
+            raise ValueError("项目文件内容与预扫描清单不一致，请重新选择目录。")
+        self.scan_uploaded_file(
+            Path(planned.relative_path).name,
+            content,
+            planned.media_type,
+        )
+        extracted = extract_project_evidence(
+            planned.relative_path,
+            content,
+            planned.file_kind,
+            visual_analyzer=self.project_visual_analyzer,
+            account_id=account_id,
+            candidate_id=collection.candidate_id,
+        )
+        visual_items, visual_storage_keys = self._save_project_visual_artifacts(
+            [(planned.relative_path, item) for item in extracted.visual_artifacts],
+            account_id=account_id,
+            candidate_id=collection.candidate_id,
+        )
+        try:
+            return self.store.complete_project_collection_file(
+                file_id,
+                collection_id=collection_id,
+                account_id=account_id,
+                server_sha256=digest,
+                extraction_method=extracted.method,
+                extracted_text=extracted.text,
+                metadata=extracted.metadata,
+                visual_items=visual_items,
+            )
+        except Exception:
+            for storage_key in visual_storage_keys:
+                self.resume_files.delete(storage_key)
+            raise
+
+    def _save_project_visual_artifacts(
+        self,
+        artifacts: list[tuple[str, ProjectVisualArtifact]],
+        *,
+        account_id: int,
+        candidate_id: int,
+    ) -> tuple[list[dict[str, object]], list[str]]:
+        """保存安全视觉副本，并返回不含图片正文的数据库描述。"""
+
+        descriptors: list[dict[str, object]] = []
+        storage_keys: list[str] = []
+        try:
+            for relative_path, artifact in artifacts:
+                suffix = {
+                    "image/jpeg": ".jpg",
+                    "image/webp": ".webp",
+                }.get(artifact.media_type, ".png")
+                stored = self.resume_files.save(
+                    account_id=account_id,
+                    candidate_id=candidate_id,
+                    filename=f"project-visual-{artifact.source_id}{suffix}",
+                    content=artifact.content,
+                    media_type=artifact.media_type,
+                )
+                storage_keys.append(stored.storage_key)
+                descriptors.append(
+                    {
+                        "relative_path": relative_path,
+                        "source_id": artifact.source_id,
+                        "source_label": artifact.source_label,
+                        "page_number": artifact.page_number,
+                        "media_type": artifact.media_type,
+                        "storage_key": stored.storage_key,
+                        "file_size": stored.file_size,
+                        "sha256": stored.sha256,
+                        "width": artifact.width,
+                        "height": artifact.height,
+                        "metadata": artifact.metadata,
+                    }
+                )
+        except Exception:
+            for storage_key in storage_keys:
+                self.resume_files.delete(storage_key)
+            raise
+        return descriptors, storage_keys
+
+    def complete_local_project_collection(
+        self,
+        collection_id: int,
+        *,
+        account_id: int,
+    ) -> ProjectExperienceRecord:
+        """Aggregate extracted file evidence into one pending project experience card."""
+
+        session = self.store.get_project_collection(collection_id, account_id=account_id)
+        if session.project_card_id is not None:
+            return self.store.get_project_card(session.project_card_id, account_id=account_id)
+        files = self.store.list_project_collection_files(collection_id, account_id=account_id)
+        analyzed = [item for item in files if item.selection_status == "analyzed" and item.long_text_id]
+        long_texts = self.store.get_long_texts_by_ids(
+            [int(item.long_text_id) for item in analyzed if item.long_text_id is not None],
+            account_id=account_id,
+        )
+        text_by_id = {item.id: item.text for item in long_texts}
+        selected_text = [
+            (Path(item.relative_path), text_by_id[int(item.long_text_id)])
+            for item in analyzed
+            if item.long_text_id is not None and int(item.long_text_id) in text_by_id
+        ]
+        if not selected_text:
+            raise ValueError("没有项目文件成功完成分析。")
+        card = build_project_experience_card(
+            project_name=session.project_name,
+            selected_files=selected_text,
+            skipped_summary=Counter(
+                item.selection_reason for item in files if item.selection_status != "analyzed"
+            ),
+            source_type=session.source_type,
+            source_ref=session.manifest_fingerprint,
+        )
+        card.discovered_file_kinds = dict(Counter(item.file_kind for item in files))
+        card.deferred_files = [
+            item.relative_path
+            for item in files
+            if item.selection_status in {"selected", "failed"}
+            or item.metadata.get("visual_analysis_status") in {"failed", "partial"}
+        ][:100]
+        try:
+            saved = self.store.save_project_card(
+                session.candidate_id,
+                card,
+                account_id=account_id,
+            )
+        except DuplicateResourceError:
+            saved = self.store.find_project_card_by_content_fingerprint(
+                account_id,
+                session.candidate_id,
+                project_card_content_fingerprint(card),
+            )
+            if saved is None:
+                raise
+        self.store.complete_project_collection(
+            collection_id,
+            account_id=account_id,
+            project_card_id=saved.id,
+        )
+        return saved
+
+    def delete_incomplete_local_project_collection(
+        self,
+        collection_id: int,
+        *,
+        account_id: int,
+    ) -> dict[str, object]:
+        """取消未完成的本地项目采集，并回收已经产生的派生证据。"""
+
+        result = self.store.delete_incomplete_project_collection(
+            collection_id,
+            account_id=account_id,
+        )
+        for storage_key in result.get("storage_keys", []):
+            self.resume_files.delete(str(storage_key))
+        return self._finish_deletion_cleanup(result)
 
     def analyze_project_for_candidate(
         self,
@@ -698,15 +1237,49 @@ class JobHuntingApp:
         repository_url: str,
         account_id: int | None = None,
     ) -> ProjectExperienceRecord:
-        """分析公开 GitHub 仓库并保存为待确认项目经历卡片。"""
+        """持久化公开 GitHub 的不可变快照并复用项目整包分析管线。"""
 
+        if account_id is None:
+            raise ValueError("GitHub 项目分析必须指定账号归属。")
         self.store.get_candidate_profile(candidate_id, account_id=account_id)
-        reference = normalize_public_github_repository_url(repository_url)
-        fingerprint = github_project_content_fingerprint(reference.canonical_url)
-        if self.store.find_project_card_by_content_fingerprint(account_id, candidate_id, fingerprint) is not None:
-            raise DuplicateResourceError("GitHub 项目")
-        card = analyze_public_github_repository(reference.canonical_url)
-        return self.store.save_project_card(candidate_id, card, account_id=account_id)
+        fetched = fetch_public_github_repository_archive(repository_url)
+        content_fingerprint = hashlib.sha256(fetched.archive_content).hexdigest()
+        existing = self.store.find_project_archive_import_by_fingerprint(
+            account_id=account_id,
+            candidate_id=candidate_id,
+            content_fingerprint=content_fingerprint,
+        )
+        if existing is not None:
+            if existing.project_card_id is not None:
+                return self.store.get_project_card(existing.project_card_id, account_id=account_id)
+            return self.analyze_project_archive_for_candidate(existing.id, account_id=account_id)
+        try:
+            project_import = self.upload_project_archive(
+                candidate_id,
+                f"{fetched.reference.repository}-{fetched.commit_sha[:12]}.zip",
+                fetched.archive_content,
+                account_id=account_id,
+                source_type="github_public_repository",
+                source_url=fetched.reference.canonical_url,
+                source_ref=fetched.commit_sha,
+            )
+        except DuplicateResourceError:
+            project_import = self.store.find_project_archive_import_by_fingerprint(
+                account_id=account_id,
+                candidate_id=candidate_id,
+                content_fingerprint=content_fingerprint,
+            )
+            if project_import is None:
+                raise
+            if project_import.project_card_id is not None:
+                return self.store.get_project_card(
+                    project_import.project_card_id,
+                    account_id=account_id,
+                )
+        return self.analyze_project_archive_for_candidate(
+            project_import.id,
+            account_id=account_id,
+        )
 
     def confirm_project_card(
         self,
@@ -726,6 +1299,8 @@ class JobHuntingApp:
         """删除一张项目经历卡片及其确认摘要，并同步回收 RAG 证据。"""
 
         result = self.store.delete_project_card(record_id, account_id=account_id)
+        for storage_key in result.get("storage_keys", []):
+            self.resume_files.delete(str(storage_key))
         return self._finish_deletion_cleanup(result)
 
     def confirm_project_card_and_enqueue_rag(
@@ -855,6 +1430,7 @@ class JobHuntingApp:
                     top_k=5,
                     entity_types=["candidate_profile", "job", "project_experience_card"],
                     account_id=account_id,
+                    candidate_id=candidate_id,
                 )
             ]
         draft = build_resume_draft(candidate, job, confirmed_project_cards, llm_client, semantic_evidence)
@@ -892,6 +1468,7 @@ class JobHuntingApp:
         content_sha256 = hashlib.sha256(content).hexdigest()
         if self.store.find_resume_source_by_content_fingerprint(account_id, candidate_id, content_sha256) is not None:
             raise DuplicateResourceError("简历")
+        validate_resume_file_size(content)
         pending_ocr = False
 
         def extract_pdf_with_lease() -> ResumeExtraction:
@@ -906,27 +1483,6 @@ class JobHuntingApp:
             finally:
                 lease.release()
 
-        if defer_ocr and extension == PDF_EXTENSION:
-            inspection = inspect_pdf_for_ocr(content)
-            pending_ocr = bool(inspection.pages_needing_ocr)
-            if pending_ocr:
-                extraction_method = "pending_ocr"
-                extracted_text = ""
-                page_count = inspection.page_count
-            else:
-                extraction = extract_pdf_with_lease()
-                extraction_method = extraction.method
-                extracted_text = extraction.text
-                page_count = extraction.page_count
-        else:
-            extraction = (
-                extract_pdf_with_lease()
-                if extension == PDF_EXTENSION
-                else extract_resume_document(clean_filename, content)
-            )
-            extraction_method = extraction.method
-            extracted_text = extraction.text
-            page_count = extraction.page_count
         stored = self.resume_files.save(
             account_id=account_id,
             candidate_id=candidate_id,
@@ -934,8 +1490,9 @@ class JobHuntingApp:
             content=content,
             media_type=media_type_for_filename(clean_filename),
         )
+        artifact: ResumeArtifactRecord | None = None
         try:
-            return self.store.save_resume_artifact(
+            artifact = self.store.save_resume_artifact(
                 account_id=account_id,
                 candidate_id=candidate_id,
                 artifact_type="source",
@@ -945,16 +1502,109 @@ class JobHuntingApp:
                 media_type=media_type_for_filename(clean_filename),
                 file_size=stored.file_size,
                 sha256=stored.sha256,
-                extraction_method=extraction_method,
-                extracted_text=extracted_text,
-                page_count=page_count,
-                status="processing" if pending_ocr else "ready",
-                register_long_text=not pending_ocr,
+                extraction_method="scan_pending",
+                extracted_text="",
+                page_count=None,
+                status="scanning",
+                register_long_text=False,
+                scan_status="pending",
             )
         except Exception:
             # 数据库保存失败时删除刚写入的文件，保持两个存储边界一致。
             self.resume_files.delete(stored.storage_key)
             raise
+
+        try:
+            scan_result = self.scan_uploaded_file(
+                clean_filename,
+                content,
+                media_type_for_filename(clean_filename),
+            )
+        except FileInfectedError as error:
+            self.store.quarantine_resume_artifact(
+                artifact.id,
+                scan_status="infected",
+                scan_engine=getattr(self.file_scanner, "engine", "unknown"),
+                scan_reason=str(error),
+                account_id=account_id,
+            )
+            raise
+        except FileScannerUnavailableError as error:
+            self.store.quarantine_resume_artifact(
+                artifact.id,
+                scan_status="error",
+                scan_engine=getattr(self.file_scanner, "engine", "unknown"),
+                scan_reason=str(error),
+                account_id=account_id,
+            )
+            raise
+        except FileScanError:
+            self.store.quarantine_resume_artifact(
+                artifact.id,
+                scan_status="error",
+                scan_engine=getattr(self.file_scanner, "engine", "unknown"),
+                scan_reason="文件安全扫描失败。",
+                account_id=account_id,
+            )
+            raise
+
+        try:
+            if defer_ocr and extension == PDF_EXTENSION:
+                inspection = inspect_pdf_for_ocr(content)
+                pending_ocr = bool(inspection.pages_needing_ocr)
+                if pending_ocr:
+                    artifact = self.store.complete_resume_artifact_scan(
+                        artifact.id,
+                        next_status="processing",
+                        extraction_method="pending_ocr",
+                        page_count=inspection.page_count,
+                        scan_engine=scan_result.engine,
+                        account_id=account_id,
+                    )
+                else:
+                    extraction = extract_pdf_with_lease()
+                    artifact = self.store.complete_resume_artifact_scan(
+                        artifact.id,
+                        next_status="ready",
+                        extraction_method=extraction.method,
+                        page_count=extraction.page_count,
+                        scan_engine=scan_result.engine,
+                        account_id=account_id,
+                    )
+                    artifact = self.store.complete_resume_artifact_extraction(
+                        artifact.id,
+                        extraction_method=extraction.method,
+                        extracted_text=extraction.text,
+                        page_count=extraction.page_count,
+                        account_id=account_id,
+                    )
+            else:
+                extraction = (
+                    extract_pdf_with_lease()
+                    if extension == PDF_EXTENSION
+                    else extract_resume_document(clean_filename, content)
+                )
+                artifact = self.store.complete_resume_artifact_scan(
+                    artifact.id,
+                    next_status="ready",
+                    extraction_method=extraction.method,
+                    page_count=extraction.page_count,
+                    scan_engine=scan_result.engine,
+                    account_id=account_id,
+                )
+                artifact = self.store.complete_resume_artifact_extraction(
+                    artifact.id,
+                    extraction_method=extraction.method,
+                    extracted_text=extraction.text,
+                    page_count=extraction.page_count,
+                    account_id=account_id,
+                )
+        except Exception:
+            result = self.store.delete_resume_artifact(artifact.id, account_id=account_id)
+            for storage_key in result.get("storage_keys", []):
+                self.resume_files.delete(str(storage_key))
+            raise
+        return artifact
 
     def process_resume_ocr_artifact(
         self,
@@ -970,6 +1620,8 @@ class JobHuntingApp:
             raise ValueError("OCR 任务中的简历不属于当前候选人。")
         if artifact.artifact_type != "source" or artifact.media_type != "application/pdf":
             raise ValueError("OCR 任务只能处理原始 PDF 简历。")
+        if artifact.scan_status != "clean":
+            raise ValueError("简历尚未通过安全扫描，不能执行 OCR。")
         # OCR 任务重投时不重复读取或重建长文本，直接复用已经完成的事实记录。
         if artifact.status == "ready" and artifact.long_text_id is not None:
             return artifact
@@ -1052,6 +1704,8 @@ class JobHuntingApp:
     def read_resume_file(self, artifact: ResumeArtifactRecord) -> bytes:
         """按数据库中的对象键读取简历正文，统一兼容本地和 S3 存储。"""
 
+        if artifact.status in {"scanning", "quarantined"} or artifact.scan_status != "clean":
+            raise KeyError(artifact.id)
         try:
             return self.resume_files.read(artifact.storage_key)
         except ObjectNotFoundError as error:
@@ -1064,6 +1718,8 @@ class JobHuntingApp:
     ) -> Iterator[bytes]:
         """按对象存储分块读取简历，供 Web 鉴权代理避免一次性加载大文件。"""
 
+        if artifact.status in {"scanning", "quarantined"} or artifact.scan_status != "clean":
+            raise KeyError(artifact.id)
         try:
             return self.resume_files.stream(artifact.storage_key, chunk_size)
         except ObjectNotFoundError as error:
@@ -1290,6 +1946,42 @@ class JobHuntingApp:
         )
         return knowledge_base.index_long_texts(self.store.get_long_texts_by_ids(long_text_ids, account_id=account_id), account_id=account_id)
 
+    def index_visual_knowledge_items(
+        self,
+        visual_item_ids: list[int],
+        *,
+        account_id: int,
+        candidate_id: int | None = None,
+        session_id: str | None = None,
+        root_request_id: str | None = None,
+    ) -> RAGIndexStats:
+        """读取对象存储中的安全视觉副本并增量写入图片向量。"""
+
+        normalized_ids = self._normalize_positive_resource_ids(
+            visual_item_ids,
+            "视觉知识索引",
+        )
+        items = self.store.list_visual_knowledge_items(
+            account_id=account_id,
+            item_ids=normalized_ids,
+            candidate_id=candidate_id,
+        )
+        if {item.id for item in items} != set(normalized_ids):
+            raise KeyError("视觉知识项不存在或不属于当前账号。")
+        context = self.model_gateway.new_call_context(
+            "visual_embedding_index",
+            account_id=account_id,
+            candidate_id=candidate_id,
+            session_id=session_id,
+            root_request_id=root_request_id,
+        )
+        knowledge_base = PgVectorVisualKnowledgeBase(
+            self.store.engine,
+            self.resume_files,
+            self.model_gateway.embeddings(context),
+        )
+        return knowledge_base.index_items(items, account_id=account_id)
+
     def search_rag(
         self,
         query: str,
@@ -1320,7 +2012,108 @@ class JobHuntingApp:
             embeddings=self.model_gateway.embeddings(call_context),
             reranker=self.model_gateway.reranker(rerank_context),
         )
-        return knowledge_base.search(query, top_k, entity_types, account_id=account_id)
+        results = knowledge_base.search(
+            query,
+            top_k,
+            entity_types,
+            account_id=account_id,
+            candidate_id=candidate_id,
+        )
+        return self._reinspect_visual_search_results(
+            query,
+            results,
+            account_id=account_id,
+            candidate_id=candidate_id,
+        )
+
+    def _reinspect_visual_search_results(
+        self,
+        query: str,
+        results: list[RAGSearchResult],
+        *,
+        account_id: int | None,
+        candidate_id: int | None,
+    ) -> list[RAGSearchResult]:
+        """限量重开召回原图，让回答使用与当前问题相关的可见证据。"""
+
+        analyzer = self.project_visual_analyzer
+        analyze_for_query = getattr(analyzer, "analyze_for_query", None)
+        if account_id is None or candidate_id is None or not callable(analyze_for_query):
+            return results
+        visual_ids = list(
+            dict.fromkeys(
+                int(item.visual_item_id)
+                for item in results
+                if item.evidence_kind == "visual" and item.visual_item_id is not None
+            )
+        )[:2]
+        if not visual_ids:
+            return results
+        try:
+            records = self.store.list_visual_knowledge_items(
+                account_id=account_id,
+                item_ids=visual_ids,
+                candidate_id=candidate_id,
+                index_status="indexed",
+            )
+            by_id = {item.id: item for item in records}
+            inputs: list[ProjectVisualInput] = []
+            source_to_id: dict[str, int] = {}
+            for visual_id in visual_ids:
+                record = by_id.get(visual_id)
+                if record is None:
+                    continue
+                content = self.resume_files.read(record.storage_key)
+                if len(content) != record.file_size:
+                    continue
+                if hashlib.sha256(content).hexdigest() != record.sha256:
+                    continue
+                source_id = f"visual-item-{record.id}"
+                source_to_id[source_id] = record.id
+                indexed_summary = next(
+                    (
+                        item.content
+                        for item in results
+                        if item.visual_item_id == record.id
+                    ),
+                    "",
+                )
+                inputs.append(
+                    ProjectVisualInput(
+                        source_id=source_id,
+                        source_label=record.source_label,
+                        content=content,
+                        extracted_text=indexed_summary,
+                    )
+                )
+            if not inputs:
+                return results
+            verification = analyze_for_query(
+                inputs,
+                query,
+                account_id=account_id,
+                candidate_id=candidate_id,
+            )
+        except Exception:  # noqa: BLE001 - 原图复核失败时保留已召回的持久化摘要。
+            return results
+        verified_by_id = {
+            source_to_id[source_id]: finding
+            for source_id, finding in verification.findings.items()
+            if source_id in source_to_id
+        }
+        return [
+            replace(
+                item,
+                content=(
+                    f"{item.content}\n[原图复核，优先于入库摘要]\n"
+                    f"{verified_by_id[int(item.visual_item_id)].as_text()}"
+                ),
+            )
+            if item.visual_item_id is not None
+            and int(item.visual_item_id) in verified_by_id
+            else item
+            for item in results
+        ]
 
     def _uses_pgvector_rag(self) -> bool:
         """返回当前仓储是否使用 PostgreSQL 方言。"""
@@ -1341,7 +2134,12 @@ class JobHuntingApp:
 def format_rag_evidence(result: RAGSearchResult) -> str:
     """把 RAG 检索结果格式化成简历草稿可引用的证据条目。"""
 
+    location = (
+        f"visual#{result.visual_item_id}"
+        if result.evidence_kind == "visual"
+        else f"chunk{result.chunk_index}"
+    )
     return (
         f"RAG 检索证据[{result.entity_type}#{result.entity_id}/"
-        f"{result.source_label}/chunk{result.chunk_index}]：{result.content}"
+        f"{result.source_label}/{location}]：{result.content}"
     )

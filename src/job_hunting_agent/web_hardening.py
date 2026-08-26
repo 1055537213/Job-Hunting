@@ -462,6 +462,7 @@ def rate_limit_group(request: Request) -> str:
         return "admin"
     if path in {
         "/api/jobs/screenshots",
+        "/api/projects/local",
         "/api/projects/github",
         "/api/resumes/upload",
     }:

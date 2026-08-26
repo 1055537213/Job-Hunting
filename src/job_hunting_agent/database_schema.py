@@ -325,6 +325,402 @@ resume_drafts = sa.Table(
 sa.Index("idx_resume_drafts_owner", resume_drafts.c.account_id, resume_drafts.c.candidate_id, resume_drafts.c.id)
 
 
+# 统一知识资产把“文件是什么”与具体业务用途分离；原件版本只追加，不原地覆盖。
+knowledge_assets = sa.Table(
+    "knowledge_assets",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column(
+        "account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "candidate_id",
+        sa.Integer,
+        sa.ForeignKey("candidate_profiles.id", ondelete="CASCADE"),
+    ),
+    sa.Column("asset_kind", sa.String(64), nullable=False),
+    sa.Column("title", sa.String(512), nullable=False),
+    sa.Column("lifecycle_status", sa.String(32), nullable=False, server_default=sa.text("'active'")),
+    sa.Column("metadata_json", json_type, nullable=False, server_default=sa.text("'{}'")),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.Column("updated_at", timestamp_type, nullable=False),
+    sa.CheckConstraint(
+        "lifecycle_status IN ('active', 'archived')",
+        name="knowledge_assets_lifecycle_status",
+    ),
+)
+sa.Index(
+    "idx_knowledge_assets_owner",
+    knowledge_assets.c.account_id,
+    knowledge_assets.c.candidate_id,
+    knowledge_assets.c.id,
+)
+
+
+knowledge_asset_versions = sa.Table(
+    "knowledge_asset_versions",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column(
+        "asset_id",
+        sa.Integer,
+        sa.ForeignKey("knowledge_assets.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("version_number", sa.Integer, nullable=False),
+    sa.Column("is_current", sa.Boolean, nullable=False, server_default=sa.true()),
+    sa.Column("original_filename", sa.String(512), nullable=False),
+    sa.Column("storage_key", sa.String(1024), nullable=False),
+    sa.Column("media_type", sa.String(128), nullable=False),
+    sa.Column("file_size", sa.BigInteger, nullable=False),
+    sa.Column("sha256", sa.String(64), nullable=False),
+    sa.Column("source_kind", sa.String(32), nullable=False, server_default=sa.text("'upload'")),
+    sa.Column("source_url", sa.Text),
+    sa.Column("revision_label", sa.String(128)),
+    sa.Column("processing_status", sa.String(32), nullable=False, server_default=sa.text("'uploaded'")),
+    sa.Column("scan_status", sa.String(32), nullable=False, server_default=sa.text("'pending'")),
+    sa.Column("scan_engine", sa.String(64)),
+    sa.Column("scan_reason", sa.Text),
+    sa.Column("metadata_json", json_type, nullable=False, server_default=sa.text("'{}'")),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.UniqueConstraint("asset_id", "version_number", name="uq_knowledge_asset_versions_number"),
+    sa.UniqueConstraint("asset_id", "sha256", name="uq_knowledge_asset_versions_content"),
+    sa.UniqueConstraint("storage_key", name="uq_knowledge_asset_versions_storage_key"),
+    sa.CheckConstraint("version_number > 0", name="knowledge_asset_versions_number_positive"),
+    sa.CheckConstraint("file_size >= 0", name="knowledge_asset_versions_file_size_non_negative"),
+    sa.CheckConstraint(
+        "processing_status IN ('uploaded', 'scanning', 'processing', 'ready', 'quarantined', 'failed')",
+        name="knowledge_asset_versions_processing_status",
+    ),
+    sa.CheckConstraint(
+        "scan_status IN ('pending', 'clean', 'infected', 'error', 'not_required')",
+        name="knowledge_asset_versions_scan_status",
+    ),
+)
+sa.Index(
+    "idx_knowledge_asset_versions_asset",
+    knowledge_asset_versions.c.asset_id,
+    knowledge_asset_versions.c.version_number,
+)
+sa.Index(
+    "uq_knowledge_asset_versions_current",
+    knowledge_asset_versions.c.asset_id,
+    unique=True,
+    postgresql_where=knowledge_asset_versions.c.is_current.is_(True),
+)
+
+
+# 项目整包原件复用统一知识资产；这张表只保存业务处理状态和最终项目卡片关联。
+project_archive_imports = sa.Table(
+    "project_archive_imports",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column(
+        "account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "candidate_id",
+        sa.Integer,
+        sa.ForeignKey("candidate_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "knowledge_asset_id",
+        sa.Integer,
+        sa.ForeignKey("knowledge_assets.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    ),
+    sa.Column(
+        "knowledge_asset_version_id",
+        sa.Integer,
+        sa.ForeignKey("knowledge_asset_versions.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    ),
+    sa.Column(
+        "project_card_id",
+        sa.Integer,
+        sa.ForeignKey("project_experience_cards.id", ondelete="SET NULL"),
+    ),
+    sa.Column("source_type", sa.String(64), nullable=False),
+    sa.Column("source_url", sa.Text),
+    sa.Column("source_ref", sa.String(255)),
+    sa.Column("original_filename", sa.String(512), nullable=False),
+    sa.Column("content_fingerprint", sa.String(64), nullable=False),
+    sa.Column("status", sa.String(32), nullable=False),
+    sa.Column("error_summary", sa.Text),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.Column("updated_at", timestamp_type, nullable=False),
+    sa.UniqueConstraint(
+        "candidate_id",
+        "content_fingerprint",
+        name="uq_project_archive_candidate_content",
+    ),
+    sa.CheckConstraint(
+        "status IN ('uploaded', 'processing', 'ready', 'failed', 'quarantined')",
+        name="project_archive_imports_status",
+    ),
+)
+sa.Index(
+    "idx_project_archive_imports_owner",
+    project_archive_imports.c.account_id,
+    project_archive_imports.c.candidate_id,
+    project_archive_imports.c.id,
+)
+sa.Index("idx_project_archive_imports_card", project_archive_imports.c.project_card_id)
+
+
+# 文件清单保留项目内部路径和解析路由，不把二进制正文塞入 PostgreSQL。
+project_archive_files = sa.Table(
+    "project_archive_files",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column(
+        "project_archive_id",
+        sa.Integer,
+        sa.ForeignKey("project_archive_imports.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("relative_path", sa.String(2048), nullable=False),
+    sa.Column("file_kind", sa.String(64), nullable=False),
+    sa.Column("media_type", sa.String(128), nullable=False),
+    sa.Column("file_size", sa.BigInteger, nullable=False),
+    sa.Column("compressed_size", sa.BigInteger, nullable=False),
+    sa.Column("sha256", sa.String(64)),
+    sa.Column("analysis_status", sa.String(32), nullable=False),
+    sa.Column("skip_reason", sa.String(128)),
+    sa.Column("long_text_id", sa.Integer, sa.ForeignKey("long_texts.id", ondelete="SET NULL")),
+    sa.Column("extraction_method", sa.String(64)),
+    sa.Column("text_length", sa.Integer, nullable=False, server_default=sa.text("0")),
+    sa.Column("metadata_json", json_type, nullable=False, server_default=sa.text("'{}'")),
+    sa.UniqueConstraint(
+        "project_archive_id",
+        "relative_path",
+        name="uq_project_archive_files_path",
+    ),
+    sa.CheckConstraint("file_size >= 0", name="project_archive_files_size_non_negative"),
+    sa.CheckConstraint(
+        "compressed_size >= 0",
+        name="project_archive_files_compressed_size_non_negative",
+    ),
+    sa.CheckConstraint(
+        "analysis_status IN ('analyzed', 'pending_parser', 'skipped', 'unsupported', 'failed')",
+        name="project_archive_files_analysis_status",
+    ),
+    sa.CheckConstraint("text_length >= 0", name="project_archive_files_text_length"),
+)
+
+
+# 浏览器先提交目录清单，后端生成采集计划；只有选中的文件才分批上传。
+project_collection_sessions = sa.Table(
+    "project_collection_sessions",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column(
+        "account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "candidate_id",
+        sa.Integer,
+        sa.ForeignKey("candidate_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "project_card_id",
+        sa.Integer,
+        sa.ForeignKey("project_experience_cards.id", ondelete="SET NULL"),
+    ),
+    sa.Column("project_name", sa.String(256), nullable=False),
+    sa.Column("source_type", sa.String(64), nullable=False),
+    sa.Column("manifest_fingerprint", sa.String(64), nullable=False),
+    sa.Column("preserve_originals", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("status", sa.String(32), nullable=False),
+    sa.Column("file_count", sa.Integer, nullable=False),
+    sa.Column("selected_file_count", sa.Integer, nullable=False),
+    sa.Column("uploaded_file_count", sa.Integer, nullable=False, server_default=sa.text("0")),
+    sa.Column("total_size", sa.BigInteger, nullable=False),
+    sa.Column("selected_size", sa.BigInteger, nullable=False),
+    sa.Column("error_summary", sa.Text),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.Column("updated_at", timestamp_type, nullable=False),
+    sa.UniqueConstraint(
+        "candidate_id",
+        "manifest_fingerprint",
+        name="uq_project_collection_candidate_manifest",
+    ),
+    sa.CheckConstraint("file_count >= 0", name="project_collection_file_count"),
+    sa.CheckConstraint("selected_file_count >= 0", name="project_collection_selected_count"),
+    sa.CheckConstraint("uploaded_file_count >= 0", name="project_collection_uploaded_count"),
+    sa.CheckConstraint("total_size >= 0", name="project_collection_total_size"),
+    sa.CheckConstraint("selected_size >= 0", name="project_collection_selected_size"),
+    sa.CheckConstraint(
+        "status IN ('planned', 'uploading', 'processing', 'ready', 'failed', 'cancelled')",
+        name="project_collection_status",
+    ),
+)
+sa.Index(
+    "idx_project_collection_owner",
+    project_collection_sessions.c.account_id,
+    project_collection_sessions.c.candidate_id,
+    project_collection_sessions.c.id,
+)
+sa.Index("idx_project_collection_card", project_collection_sessions.c.project_card_id)
+
+
+project_collection_files = sa.Table(
+    "project_collection_files",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column(
+        "collection_id",
+        sa.Integer,
+        sa.ForeignKey("project_collection_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("relative_path", sa.String(2048), nullable=False),
+    sa.Column("file_kind", sa.String(64), nullable=False),
+    sa.Column("media_type", sa.String(128), nullable=False),
+    sa.Column("file_size", sa.BigInteger, nullable=False),
+    sa.Column("client_sha256", sa.String(64)),
+    sa.Column("server_sha256", sa.String(64)),
+    sa.Column("selection_status", sa.String(32), nullable=False),
+    sa.Column("selection_reason", sa.String(256), nullable=False),
+    sa.Column("extraction_method", sa.String(64)),
+    sa.Column("text_length", sa.Integer, nullable=False, server_default=sa.text("0")),
+    sa.Column("long_text_id", sa.Integer, sa.ForeignKey("long_texts.id", ondelete="SET NULL")),
+    sa.Column("storage_key", sa.String(1024)),
+    sa.Column("knowledge_asset_id", sa.Integer, sa.ForeignKey("knowledge_assets.id", ondelete="SET NULL")),
+    sa.Column(
+        "knowledge_asset_version_id",
+        sa.Integer,
+        sa.ForeignKey("knowledge_asset_versions.id", ondelete="SET NULL"),
+    ),
+    sa.Column("metadata_json", json_type, nullable=False, server_default=sa.text("'{}'")),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.Column("updated_at", timestamp_type, nullable=False),
+    sa.UniqueConstraint(
+        "collection_id",
+        "relative_path",
+        name="uq_project_collection_files_path",
+    ),
+    sa.CheckConstraint("file_size >= 0", name="project_collection_files_size"),
+    sa.CheckConstraint("text_length >= 0", name="project_collection_files_text"),
+    sa.CheckConstraint(
+        "selection_status IN ('selected', 'skipped', 'uploaded', 'analyzed', 'failed')",
+        name="project_collection_files_status",
+    ),
+)
+sa.Index(
+    "idx_project_collection_files_session",
+    project_collection_files.c.collection_id,
+    project_collection_files.c.selection_status,
+    project_collection_files.c.id,
+)
+sa.Index(
+    "idx_project_archive_files_import",
+    project_archive_files.c.project_archive_id,
+    project_archive_files.c.id,
+)
+
+
+# 视觉知识项保存安全重编码后的图片/PDF 页定位和图像向量；二进制位于对象存储。
+visual_knowledge_items = sa.Table(
+    "visual_knowledge_items",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column(
+        "account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "candidate_id",
+        sa.Integer,
+        sa.ForeignKey("candidate_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "project_archive_file_id",
+        sa.Integer,
+        sa.ForeignKey("project_archive_files.id", ondelete="CASCADE"),
+    ),
+    sa.Column(
+        "project_collection_file_id",
+        sa.Integer,
+        sa.ForeignKey("project_collection_files.id", ondelete="CASCADE"),
+    ),
+    sa.Column(
+        "long_text_id",
+        sa.Integer,
+        sa.ForeignKey("long_texts.id", ondelete="SET NULL"),
+    ),
+    sa.Column("source_id", sa.String(128), nullable=False),
+    sa.Column("source_label", sa.String(2048), nullable=False),
+    sa.Column("page_number", sa.Integer),
+    sa.Column("media_type", sa.String(128), nullable=False),
+    sa.Column("storage_key", sa.String(1024), nullable=False, unique=True),
+    sa.Column("file_size", sa.BigInteger, nullable=False),
+    sa.Column("sha256", sa.String(64), nullable=False),
+    sa.Column("width", sa.Integer, nullable=False),
+    sa.Column("height", sa.Integer, nullable=False),
+    sa.Column("metadata_json", json_type, nullable=False, server_default=sa.text("'{}'")),
+    sa.Column("embedding", vector_type),
+    sa.Column("embedding_model", sa.String(256)),
+    sa.Column("embedding_dimensions", sa.Integer),
+    sa.Column("index_status", sa.String(32), nullable=False, server_default=sa.text("'pending'")),
+    sa.Column("index_error_type", sa.String(128)),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.Column("updated_at", timestamp_type, nullable=False),
+    sa.CheckConstraint(
+        "(project_archive_file_id IS NOT NULL AND project_collection_file_id IS NULL) "
+        "OR (project_archive_file_id IS NULL AND project_collection_file_id IS NOT NULL)",
+        name="visual_knowledge_items_one_source",
+    ),
+    sa.CheckConstraint("page_number IS NULL OR page_number > 0", name="visual_knowledge_items_page"),
+    sa.CheckConstraint("file_size > 0", name="visual_knowledge_items_file_size"),
+    sa.CheckConstraint("width > 0 AND height > 0", name="visual_knowledge_items_dimensions"),
+    sa.CheckConstraint(
+        "embedding_dimensions IS NULL OR embedding_dimensions > 0",
+        name="visual_knowledge_items_embedding_dimensions",
+    ),
+    sa.CheckConstraint(
+        "index_status IN ('pending', 'indexed', 'failed')",
+        name="visual_knowledge_items_status",
+    ),
+)
+sa.Index(
+    "idx_visual_knowledge_items_owner",
+    visual_knowledge_items.c.account_id,
+    visual_knowledge_items.c.candidate_id,
+    visual_knowledge_items.c.id,
+)
+sa.Index(
+    "uq_visual_knowledge_archive_source",
+    visual_knowledge_items.c.project_archive_file_id,
+    visual_knowledge_items.c.source_id,
+    unique=True,
+    postgresql_where=visual_knowledge_items.c.project_archive_file_id.is_not(None),
+)
+sa.Index(
+    "uq_visual_knowledge_collection_source",
+    visual_knowledge_items.c.project_collection_file_id,
+    visual_knowledge_items.c.source_id,
+    unique=True,
+    postgresql_where=visual_knowledge_items.c.project_collection_file_id.is_not(None),
+)
+
+
 # 二进制简历文件放在文件存储中；这张表只保留可鉴权、可校验的元数据和文本提取结果。
 resume_artifacts = sa.Table(
     "resume_artifacts",
@@ -363,6 +759,12 @@ resume_artifacts = sa.Table(
     sa.Column("page_count", sa.Integer),
     sa.Column("status", sa.String(32), nullable=False),
     sa.Column("long_text_id", sa.Integer, sa.ForeignKey("long_texts.id", ondelete="SET NULL")),
+    sa.Column("knowledge_asset_id", sa.Integer, sa.ForeignKey("knowledge_assets.id", ondelete="SET NULL")),
+    sa.Column(
+        "knowledge_asset_version_id",
+        sa.Integer,
+        sa.ForeignKey("knowledge_asset_versions.id", ondelete="SET NULL"),
+    ),
     sa.Column("created_at", timestamp_type, nullable=False),
     sa.Column("content_fingerprint", sa.String(64)),
     # 同一后台任务的 DOCX/PDF 各自使用一个键，重试时不会重复登记文件。
@@ -389,6 +791,11 @@ sa.Index(
     "idx_resume_artifacts_parent",
     resume_artifacts.c.parent_artifact_id,
     resume_artifacts.c.draft_id,
+)
+sa.Index(
+    "idx_resume_artifacts_knowledge_asset",
+    resume_artifacts.c.knowledge_asset_id,
+    resume_artifacts.c.knowledge_asset_version_id,
 )
 
 

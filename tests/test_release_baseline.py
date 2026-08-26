@@ -23,9 +23,85 @@ def test_ci_runs_quality_checks_and_builds_release_image():
         "docker compose --env-file .env.example -f compose.yaml config --quiet",
         "prom/prometheus:v3.13.1",
         "check config /etc/prometheus/prometheus.yml",
-        "docker build --tag job-hunting-agent:ci .",
+        "docker build --pull --no-cache --tag job-hunting-agent:ci .",
+        'PIP_AUDIT_VERSION: "2.10.1"',
+        "python -m pip_audit",
+        "--pkg-types os",
+        "--ignore-unfixed",
+        "--format cyclonedx",
+        "container-vulnerabilities.json",
+        "image-sbom.cdx.json",
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
     ):
         assert required in workflow
+
+
+def test_supply_chain_security_gate_is_pinned_and_reproducible():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    script = (ROOT / "scripts" / "security_scan.ps1").read_text(encoding="utf-8")
+    guide = (ROOT / "docs" / "learning" / "security-scanning.md").read_text(
+        encoding="utf-8"
+    )
+    python_image = (
+        "python:3.12.13-slim@sha256:"
+        "229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36"
+    )
+    trivy_image = (
+        "aquasec/trivy@sha256:"
+        "62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"
+    )
+
+    assert f"ARG BASE_IMAGE={python_image}" in dockerfile
+    assert "apt-get upgrade -y" in dockerfile
+    assert compose.count(python_image) == 4
+    assert '$pipAuditVersion = "2.10.1"' in script
+    assert f'$trivyImage = "{trivy_image}"' in script
+    assert "/workspace/requirements.lock:ro" in script
+    assert "/workspace/requirements-dev.lock:ro" in script
+    assert '"build",' in script
+    assert '"--pull",' in script
+    assert '"--no-cache",' in script
+    assert '"--pkg-types", "os"' in script
+    assert '"--ignore-unfixed"' in script
+    assert '"image-sbom.cdx.json"' in script
+    assert '"security-summary.json"' in script
+    assert not (ROOT / ".trivyignore").exists()
+    assert "没有 `package.json`" in guide
+    assert "明确到期时间" in guide
+
+
+def test_clamav_acceptance_is_isolated_and_fails_closed():
+    production = (ROOT / "compose.prod.yaml").read_text(encoding="utf-8")
+    overlay = (ROOT / "compose.file-scan-test.yaml").read_text(encoding="utf-8")
+    script = (ROOT / "scripts" / "validate_file_scanning.ps1").read_text(
+        encoding="utf-8"
+    )
+    guide = (
+        ROOT / "docs" / "learning" / "file-scanning-acceptance.md"
+    ).read_text(encoding="utf-8")
+    clamav_image = (
+        "clamav/clamav:1.4.6@sha256:"
+        "761f6c99b8d9134b39431f8c200189cda749b17310091561bfa8b732f32bfada"
+    )
+
+    assert clamav_image in production
+    assert clamav_image in overlay
+    assert "clamdscan --ping 1 >/dev/null" in production
+    assert "--host 127.0.0.1" not in production
+    assert 'memory: 4G' in production
+    assert overlay.count("ports: !reset []") == 5
+    assert "JOB_AGENT_ENVIRONMENT: production" in overlay
+    assert "JOB_AGENT_FILE_SCAN_BACKEND: clamav" in overlay
+    assert "sigtool --info" in script
+    assert "Build time:" in script
+    assert "EICAR-STANDARD-ANTIVIRUS-TEST-FILE" in script
+    assert '@("stop", "clamav")' in script
+    assert '@("start", "clamav")' in script
+    assert '"--reload"' in script
+    assert "remaining_objects" in script
+    assert "database_and_object_cleanup_passed" in script
+    assert "down -v" in guide
 
 
 def test_production_compose_does_not_expose_internal_services():
@@ -115,18 +191,56 @@ def test_multi_replica_validation_is_repeatable_and_restores_development():
     assert '"--scale", "web=1"' in script
 
 
+def test_worker_recovery_acceptance_is_present_and_isolated():
+    overlay = (ROOT / "compose.acceptance.yaml").read_text(encoding="utf-8")
+    script = (ROOT / "scripts" / "validate_worker_recovery.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'JOB_AGENT_TASK_TIME_LIMIT_SECONDS: "30"' in overlay
+    assert 'JOB_AGENT_TASK_SOFT_TIME_LIMIT_SECONDS: "25"' in overlay
+    assert 'JOB_AGENT_TASK_STALE_AFTER_SECONDS: "60"' in overlay
+    assert '"run", "--rm", "migrate"' in script
+    assert "worker_recovery_acceptance" in script
+    assert '"--queue", $MaintenanceQueue' in script
+    assert '"kill", "--signal", "KILL"' in script
+    assert "Beat stale-task recovery: PASS" in script
+    assert "JOB_AGENT_ACCEPTANCE_IDEMPOTENCY_KEY" in script
+    assert "account_balance_ledger" in script
+    assert "resume_artifacts" in script
+    assert "Automatic topology restore failed" in script
+
+
 def test_backup_and_restore_scripts_require_safe_operational_guards():
     backup = (ROOT / "scripts" / "backup.ps1").read_text(encoding="utf-8")
     restore = (ROOT / "scripts" / "restore.ps1").read_text(encoding="utf-8")
+    drill = (ROOT / "scripts" / "validate_backup_restore.ps1").read_text(
+        encoding="utf-8"
+    )
+    overlay = (ROOT / "compose.recovery-test.yaml").read_text(encoding="utf-8")
     guide = (ROOT / "docs" / "learning" / "production-release.md").read_text(encoding="utf-8")
 
     assert "pg_dump" in backup
     assert "minio-data.tar.gz" in backup
     assert "manifest.json" in backup
     assert "Redis is a rebuildable broker/cache" in backup
+    assert '[string]$ProjectName = "job-hunting-agent-production"' in backup
+    assert '[string[]]$ComposeFiles = @()' in backup
+    assert "Get-MinioVolumeName" in backup
     assert "[switch]$ConfirmRestore" in restore
     assert "Restore is destructive" in restore
     assert "pg_restore" in restore
+    assert "Get-FileHash -Algorithm SHA256" in restore
+    assert "Backup manifest and SHA-256 verification: PASS" in restore
+    assert restore.index("Get-FileHash -Algorithm SHA256") < restore.index(
+        "Stop-AvailableServices -Services"
+    )
+    assert "ports: !reset []" in overlay
+    assert '"down", "-v", "--remove-orphans"' in drill
+    assert "manifest_tamper_rejected" in drill
+    assert "post_backup_database_change_removed" in drill
+    assert "post_backup_object_removed" in drill
+    assert "recovery_time_objective_observed_seconds" in drill
     assert "docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build" in guide
     assert "RPO" in guide
     assert "RTO" in guide

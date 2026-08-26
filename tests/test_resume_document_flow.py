@@ -19,6 +19,11 @@ from job_hunting_agent import app as app_module
 from job_hunting_agent import resume_document
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.deduplication import DuplicateResourceError
+from job_hunting_agent.file_scanning import (
+    FileInfectedError,
+    FileScannerUnavailableError,
+    LocalSafetyScanner,
+)
 from job_hunting_agent.llm import StaticLLMClient
 from job_hunting_agent.models import CandidateProfileInput
 from job_hunting_agent.resume_document import (
@@ -267,6 +272,88 @@ def test_app_rejects_duplicate_resume_bytes_for_the_same_candidate(tmp_path) -> 
         )
 
     assert [item.id for item in app.list_resume_artifacts(candidate_id, account_id=account.id)] == [first.id]
+
+
+def test_infected_resume_is_quarantined_before_document_parsing(tmp_path) -> None:
+    """恶意文件只进入隔离状态，不能进入正文、RAG 或下载链路。"""
+
+    app = JobHuntingApp(
+        resume_dir=tmp_path / "resume-files",
+        file_scanner=LocalSafetyScanner(),
+    )
+    app.initialize()
+    account = app.auth.register("infected-resume@example.com", "password-123")
+    candidate_id = app.save_candidate_profile(profile_input(), account_id=account.id)
+
+    with pytest.raises(FileInfectedError):
+        app.upload_resume_document(
+            candidate_id,
+            "resume.docx",
+            LocalSafetyScanner.EICAR_MARKER,
+            account_id=account.id,
+        )
+
+    artifacts = app.list_resume_artifacts(candidate_id, account_id=account.id)
+    assert len(artifacts) == 1
+    assert artifacts[0].status == "quarantined"
+    assert artifacts[0].scan_status == "infected"
+    assert artifacts[0].long_text_id is None
+    with pytest.raises(KeyError):
+        app.read_resume_file(artifacts[0])
+
+    # 隔离记录不应永久阻止用户重新上传同名内容进行重新扫描。
+    with pytest.raises(FileInfectedError):
+        app.upload_resume_document(
+            candidate_id,
+            "resume-again.docx",
+            LocalSafetyScanner.EICAR_MARKER,
+            account_id=account.id,
+        )
+    assert len(app.list_resume_artifacts(candidate_id, account_id=account.id)) == 2
+
+
+def test_scanner_outage_quarantines_resume_until_user_deletes_it(tmp_path) -> None:
+    """Scanner outages fail closed and deletion removes the retained object."""
+
+    class UnavailableScanner:
+        engine = "clamav"
+
+        def scan(self, filename: str, content: bytes, media_type: str | None = None):
+            del filename, content, media_type
+            raise FileScannerUnavailableError("文件安全扫描服务暂时不可用。")
+
+    app = JobHuntingApp(
+        resume_dir=tmp_path / "resume-files",
+        file_scanner=UnavailableScanner(),
+    )
+    app.initialize()
+    account = app.auth.register("scan-outage@example.com", "password-123")
+    candidate_id = app.save_candidate_profile(profile_input(), account_id=account.id)
+    content = build_docx_bytes("Scanner outage acceptance")
+
+    with pytest.raises(FileScannerUnavailableError, match="暂时不可用"):
+        app.upload_resume_document(
+            candidate_id,
+            "resume.docx",
+            content,
+            account_id=account.id,
+        )
+
+    artifact = app.list_resume_artifacts(candidate_id, account_id=account.id)[0]
+    retained_path = app.resume_file_path(artifact)
+    assert artifact.status == "quarantined"
+    assert artifact.scan_status == "error"
+    assert artifact.scan_engine == "clamav"
+    assert artifact.long_text_id is None
+    assert retained_path.exists()
+    with pytest.raises(KeyError):
+        app.read_resume_file(artifact)
+
+    app.delete_resume_artifact(artifact.id, account_id=account.id)
+
+    assert not retained_path.exists()
+    with pytest.raises(KeyError):
+        app.get_resume_artifact(artifact.id, account_id=account.id)
 
 
 def test_same_resume_bytes_can_belong_to_another_candidate_in_shared_account(tmp_path) -> None:
