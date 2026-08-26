@@ -408,7 +408,8 @@ finally {
         Write-Host "==> Restoring the normal single-Web development topology"
         try {
             Invoke-Compose -Files $NormalComposeFiles -Arguments @(
-                "up", "-d", "--no-build", "--scale", "web=1", "web", "worker", "beat"
+                "up", "-d", "--no-build", "--force-recreate", "--scale", "web=1",
+                "web", "worker", "beat"
             )
         }
         catch {

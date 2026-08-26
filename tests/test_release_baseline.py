@@ -208,6 +208,7 @@ def test_worker_recovery_acceptance_is_present_and_isolated():
     assert "JOB_AGENT_ACCEPTANCE_IDEMPOTENCY_KEY" in script
     assert "account_balance_ledger" in script
     assert "resume_artifacts" in script
+    assert '"--force-recreate", "--scale", "web=1"' in script
     assert "Automatic topology restore failed" in script
 
 
