@@ -113,6 +113,8 @@ def run_benchmark(env_file: Path) -> dict[str, object]:
             actual_tool = None
             result = {
                 "name": case.name,
+                "expected_route": case.expected_route,
+                "expected_tool": case.expected_tool,
                 "passed": False,
                 "actual_route": actual_route,
                 "actual_tool": actual_tool,
@@ -131,6 +133,8 @@ def run_benchmark(env_file: Path) -> dict[str, object]:
             )
             result = {
                 "name": case.name,
+                "expected_route": case.expected_route,
+                "expected_tool": case.expected_tool,
                 "passed": passed,
                 "actual_route": actual_route,
                 "actual_tool": actual_tool,
@@ -144,6 +148,15 @@ def run_benchmark(env_file: Path) -> dict[str, object]:
         results.append(result)
 
     passed_count = sum(bool(item["passed"]) for item in results)
+    expected_direct = [item for item in results if item["expected_route"] == "direct_tool"]
+    direct_hits = sum(bool(item["passed"]) for item in expected_direct)
+    safe_fallbacks = sum(
+        item["expected_route"] == "direct_tool" and item["actual_route"] == "agent"
+        for item in results
+    )
+    unsafe_misroutes = sum(
+        item["actual_route"] == "direct_tool" and not item["passed"] for item in results
+    )
     model_latencies = [
         int(item["router_latency_ms"])
         for item in results
@@ -159,6 +172,9 @@ def run_benchmark(env_file: Path) -> dict[str, object]:
             "cases": len(results),
             "passed": passed_count,
             "accuracy": round(passed_count / len(results), 4),
+            "direct_hit_rate": round(direct_hits / len(expected_direct), 4),
+            "safe_fallbacks": safe_fallbacks,
+            "unsafe_misroutes": unsafe_misroutes,
             "model_attempts": len(model_latencies),
             "guarded_without_model": sum(
                 item["decision_source"] == "guard" for item in results
@@ -188,6 +204,9 @@ def print_human_report(report: dict[str, object]) -> None:
         "Intent router benchmark: "
         f"{summary['passed']}/{summary['cases']} passed, "
         f"accuracy={summary['accuracy']}, "
+        f"direct_hit_rate={summary['direct_hit_rate']}, "
+        f"safe_fallbacks={summary['safe_fallbacks']}, "
+        f"unsafe_misroutes={summary['unsafe_misroutes']}, "
         f"model_attempts={summary['model_attempts']}, "
         f"guarded_without_model={summary['guarded_without_model']}, "
         f"avg_model_latency={summary['average_model_latency_ms']}ms, "

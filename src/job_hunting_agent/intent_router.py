@@ -7,9 +7,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import threading
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Protocol, Sequence
 
@@ -20,6 +23,10 @@ from .llm import LLMClient
 from .model_gateway import ModelGateway
 
 RouteKind = Literal["direct_tool", "agent"]
+
+# 生产 LangChain 客户端走可取消的异步 HTTP；这个上限只保护同步测试替身或自定义
+# 客户端，避免超时后仍在运行的不可取消线程无限堆积。
+_SYNC_ROUTER_SLOTS = threading.BoundedSemaphore(value=8)
 
 DIRECT_TOOL_NAMES = frozenset(
     {
@@ -78,6 +85,14 @@ class IntentRouterProtocol(Protocol):
     ) -> IntentDecision | None: ...
 
 
+class IntentRouterTimeoutError(TimeoutError):
+    """轻量路由调用超过端到端总截止时间。"""
+
+
+class IntentRouterBusyError(RuntimeError):
+    """不可取消的同步路由调用已达到有界并发上限。"""
+
+
 class IntentRouter:
     """调用轻量模型生成路由建议，并对结果做本地白名单校验。"""
 
@@ -119,39 +134,59 @@ class IntentRouter:
                 fallback_reason=guard_reason,
             )
 
-        usage: dict[str, int | str] = {}
-        client = self._llm_client
-        if client is None:
-            context = self.model_gateway.new_call_context(
-                "intent_router",
-                account_id=account_id,
-                candidate_id=candidate_id,
-                session_id=session_id,
-                root_request_id=root_request_id,
-            )
-            client = self.model_gateway.llm_client(
-                context,
-                llm_settings=self.settings.llm,
-                usage_sink=usage.update,
-            )
-
         started_at = time.monotonic()
+        usage: dict[str, int | str] = {}
         try:
-            raw_text = client.complete(
-                build_intent_router_prompt(
-                    message,
-                    history=(
-                        history[-self.settings.history_messages :]
-                        if self.settings.history_messages
-                        else ()
-                    ),
+            client = self._llm_client
+            if client is None:
+                context = self.model_gateway.new_call_context(
+                    "intent_router",
+                    account_id=account_id,
                     candidate_id=candidate_id,
+                    session_id=session_id,
+                    root_request_id=root_request_id,
                 )
+                client = self.model_gateway.llm_client(
+                    context,
+                    llm_settings=self.settings.llm,
+                    usage_sink=usage.update,
+                )
+            remaining_seconds = self.settings.hard_timeout_seconds - (
+                time.monotonic() - started_at
+            )
+            if remaining_seconds <= 0:
+                raise IntentRouterTimeoutError("轻量意图路由初始化超过总截止时间。")
+            prompt = build_intent_router_prompt(
+                message,
+                history=(
+                    history[-self.settings.history_messages :]
+                    if self.settings.history_messages
+                    else ()
+                ),
+                candidate_id=candidate_id,
+            )
+            raw_text = complete_with_hard_timeout(
+                client,
+                prompt,
+                timeout_seconds=remaining_seconds,
             )
             decision = parse_intent_decision(
                 raw_text,
                 confidence_threshold=self.settings.confidence_threshold,
                 candidate_id=candidate_id,
+            )
+            decision.model_attempted = True
+            decision.decision_source = "model"
+        except IntentRouterTimeoutError:
+            decision = IntentDecision(
+                model_attempted=True,
+                decision_source="model",
+                fallback_reason="router_timeout",
+            )
+        except IntentRouterBusyError:
+            decision = IntentDecision(
+                decision_source="capacity_guard",
+                fallback_reason="router_busy",
             )
         except Exception:  # noqa: BLE001 - 路由器失败必须回退主 Agent。
             decision = IntentDecision(
@@ -159,10 +194,10 @@ class IntentRouter:
                 decision_source="model",
                 fallback_reason="router_error",
             )
-        decision.model_attempted = True
-        decision.decision_source = "model"
         decision.latency_ms = max(0, round((time.monotonic() - started_at) * 1000))
-        decision.usage = usage
+        # 同步兼容客户端超时后可能在守护线程中迟到完成；这里只保存截止时刻的快照，
+        # 避免已经返回的 AgentChatResult 被后台线程继续修改。
+        decision.usage = dict(usage)
         return decision
 
 
@@ -339,6 +374,84 @@ def requires_agent_fallback(message: str) -> bool:
     """判断消息是否必须绕过轻量模型进入主 Agent。"""
 
     return agent_fallback_reason(message) is not None
+
+
+def complete_with_hard_timeout(
+    client: LLMClient,
+    prompt: str,
+    *,
+    timeout_seconds: float,
+) -> str:
+    """在总截止时间内完成路由调用，优先使用可取消的异步模型接口。"""
+
+    async_complete = getattr(client, "acomplete", None)
+    if callable(async_complete):
+        return _run_async_completion(
+            lambda: async_complete(prompt),
+            timeout_seconds=timeout_seconds,
+        )
+    return _run_sync_completion(
+        lambda: client.complete(prompt),
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _run_async_completion(
+    completion_factory: Callable[[], Awaitable[str]],
+    *,
+    timeout_seconds: float,
+) -> str:
+    """从同步 Agent 边界运行可取消协程，并转换成稳定的路由超时异常。"""
+
+    async def wait_for_completion() -> str:
+        try:
+            return await asyncio.wait_for(completion_factory(), timeout=timeout_seconds)
+        except TimeoutError as error:
+            raise IntentRouterTimeoutError("轻量意图路由超过总截止时间。") from error
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(wait_for_completion())
+    # 当前路由接口是同步的；若未来从事件循环线程直接调用，则放入有界守护线程，
+    # 避免嵌套 asyncio.run，同时仍按同一总截止时间返回。
+    return _run_sync_completion(
+        lambda: asyncio.run(wait_for_completion()),
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _run_sync_completion(
+    completion: Callable[[], str],
+    *,
+    timeout_seconds: float,
+) -> str:
+    """为没有异步接口的兼容客户端提供有界守护线程截止时间。"""
+
+    if not _SYNC_ROUTER_SLOTS.acquire(blocking=False):
+        raise IntentRouterBusyError("同步路由调用已达到并发上限。")
+    completed = threading.Event()
+    result: dict[str, object] = {}
+
+    def invoke() -> None:
+        try:
+            result["value"] = completion()
+        except Exception as error:  # noqa: BLE001 - 在调用线程恢复原异常。
+            result["error"] = error
+        finally:
+            _SYNC_ROUTER_SLOTS.release()
+            completed.set()
+
+    threading.Thread(target=invoke, name="intent-router-call", daemon=True).start()
+    if not completed.wait(timeout_seconds):
+        raise IntentRouterTimeoutError("轻量意图路由超过总截止时间。")
+    error = result.get("error")
+    if isinstance(error, Exception):
+        raise error
+    value = result.get("value")
+    if not isinstance(value, str):
+        raise TypeError("轻量意图路由没有返回文本。")
+    return value
 
 
 def _requires_candidate(tool_name: object) -> bool:

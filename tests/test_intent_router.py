@@ -1,5 +1,8 @@
 """轻量意图路由的协议、白名单和 Agent 级联行为测试。"""
 
+import asyncio
+import threading
+import time
 from dataclasses import dataclass
 
 import pytest
@@ -27,6 +30,46 @@ class StaticLLMClient:
     def complete(self, prompt: str) -> str:
         self.prompts.append(prompt)
         return self.response
+
+
+class SlowAsyncLLMClient:
+    """模拟可取消的慢供应商请求。"""
+
+    def __init__(self, delay_seconds: float):
+        self.delay_seconds = delay_seconds
+        self.cancelled = False
+
+    def complete(self, prompt: str) -> str:
+        raise AssertionError("有异步接口时不应使用同步调用。")
+
+    async def acomplete(self, prompt: str) -> str:
+        try:
+            await asyncio.sleep(self.delay_seconds)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return (
+            '{"route":"direct_tool","tool_name":"list_imported_jobs",'
+            '"arguments":{},"confidence":1.0}'
+        )
+
+
+class SlowSyncLLMClient:
+    """模拟无法取消但最终会结束的同步兼容客户端。"""
+
+    def __init__(self, delay_seconds: float):
+        self.delay_seconds = delay_seconds
+        self.finished = threading.Event()
+
+    def complete(self, prompt: str) -> str:
+        try:
+            time.sleep(self.delay_seconds)
+            return (
+                '{"route":"direct_tool","tool_name":"list_imported_jobs",'
+                '"arguments":{},"confidence":1.0}'
+            )
+        finally:
+            self.finished.set()
 
 
 class ExplodingChatModel(FakeMessagesListChatModel):
@@ -194,6 +237,70 @@ def test_deterministic_gate_skips_small_model_call():
     assert decision is not None
     assert decision.route == "agent"
     assert client.prompts == []
+
+
+def test_router_hard_timeout_cancels_async_request_and_falls_back():
+    client = SlowAsyncLLMClient(delay_seconds=0.5)
+    settings = IntentRouterSettings(
+        enabled=True,
+        llm=LLMSettings(
+            provider="test",
+            model="small",
+            api_key="test-key",
+            base_url="https://example.test/v1",
+        ),
+        hard_timeout_seconds=0.05,
+    )
+    router = IntentRouter(object(), settings=settings, llm_client=client)  # type: ignore[arg-type]
+
+    started_at = time.monotonic()
+    decision = router.route(
+        "列出我已经导入的职位",
+        candidate_id=1,
+        account_id=2,
+        session_id="session-timeout",
+        root_request_id="request-timeout",
+    )
+    elapsed_seconds = time.monotonic() - started_at
+
+    assert decision is not None
+    assert decision.route == "agent"
+    assert decision.fallback_reason == "router_timeout"
+    assert decision.model_attempted is True
+    assert decision.decision_source == "model"
+    assert decision.latency_ms >= 40
+    assert elapsed_seconds < 0.25
+    assert client.cancelled is True
+
+
+def test_router_hard_timeout_bounds_sync_compatibility_client():
+    client = SlowSyncLLMClient(delay_seconds=0.15)
+    settings = IntentRouterSettings(
+        enabled=True,
+        llm=LLMSettings(
+            provider="test",
+            model="small",
+            api_key="test-key",
+            base_url="https://example.test/v1",
+        ),
+        hard_timeout_seconds=0.03,
+    )
+    router = IntentRouter(object(), settings=settings, llm_client=client)  # type: ignore[arg-type]
+
+    started_at = time.monotonic()
+    decision = router.route(
+        "列出我已经导入的职位",
+        candidate_id=1,
+        account_id=2,
+        session_id="session-sync-timeout",
+        root_request_id="request-sync-timeout",
+    )
+    elapsed_seconds = time.monotonic() - started_at
+
+    assert decision is not None
+    assert decision.fallback_reason == "router_timeout"
+    assert elapsed_seconds < 0.12
+    assert client.finished.wait(timeout=0.5) is True
 
 
 def test_agent_direct_route_bypasses_main_model_for_read_only_query(account_id):

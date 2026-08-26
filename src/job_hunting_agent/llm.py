@@ -38,6 +38,9 @@ class LLMClient(Protocol):
     def complete(self, prompt: str) -> str:
         """根据 prompt 生成文本。"""
 
+    async def acomplete(self, prompt: str) -> str:
+        """异步生成文本，供需要可取消截止时间的调用方使用。"""
+
 
 class StaticLLMClient:
     """测试或演示用的静态 LLM。"""
@@ -49,6 +52,11 @@ class StaticLLMClient:
 
     def complete(self, prompt: str) -> str:
         """忽略 prompt，直接返回固定文本。"""
+
+        return self.response
+
+    async def acomplete(self, prompt: str) -> str:
+        """异步返回固定文本。"""
 
         return self.response
 
@@ -81,15 +89,35 @@ class LangChainLLMClient:
             raise
         except Exception as error:
             raise LLMRequestError(f"LLM 调用失败：{error}") from error
-        if self.usage_callback is not None:
-            # 计量失败不能让已经成功的业务调用失败；回调内部会把缺失 usage
-            # 标记为 missing，并自行处理数据库异常。
-            try:
-                self.usage_callback(response)
-            except Exception as error:  # noqa: BLE001 - 账单旁路失败不影响用户主流程。
-                # 不记录模型响应或 prompt，避免可观测性日志变成新的隐私副本。
-                logger.debug("LLM 用量记录失败：%s", type(error).__name__)
+        self._record_usage(response)
         return extract_message_text(response)
+
+    async def acomplete(self, prompt: str) -> str:
+        """异步调用模型；取消协程时同步取消底层 HTTP 请求。"""
+
+        try:
+            response = await self.model.ainvoke(prompt)
+        except ModelCircuitOpenError:
+            raise
+        except ConcurrencyControlError:
+            raise
+        except Exception as error:
+            raise LLMRequestError(f"LLM 调用失败：{error}") from error
+        self._record_usage(response)
+        return extract_message_text(response)
+
+    def _record_usage(self, response: BaseMessage | object) -> None:
+        """尽力记录模型用量，不让计量旁路影响成功响应。"""
+
+        if self.usage_callback is None:
+            return
+        # 计量失败不能让已经成功的业务调用失败；回调内部会把缺失 usage
+        # 标记为 missing，并自行处理数据库异常。
+        try:
+            self.usage_callback(response)
+        except Exception as error:  # noqa: BLE001 - 账单旁路失败不影响用户主流程。
+            # 不记录模型响应或 prompt，避免可观测性日志变成新的隐私副本。
+            logger.debug("LLM 用量记录失败：%s", type(error).__name__)
 
 
 def build_llm_client(

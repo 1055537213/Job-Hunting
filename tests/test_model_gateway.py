@@ -17,6 +17,39 @@ from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
 from job_hunting_agent.storage import IdempotencyConflictError, InsufficientBalanceError
 
 
+def test_intent_router_disables_gateway_retries(monkeypatch, tmp_path):
+    """路由器由总截止时间控制，不能叠加 SDK 逐次重试。"""
+
+    captured: list[int] = []
+    sentinel = object()
+
+    def fake_build_chat_model(settings, temperature, max_retries, callbacks):
+        captured.append(max_retries)
+        return sentinel
+
+    monkeypatch.setattr(
+        "job_hunting_agent.model_gateway.build_chat_model",
+        fake_build_chat_model,
+    )
+    gateway = ModelGateway(
+        tmp_path / ".env",
+        llm_settings=LLMSettings(
+            provider="test",
+            model="small",
+            api_key="test-key",
+            base_url="https://example.test/v1",
+        ),
+        settings=ModelGatewaySettings(environment="test", chat_max_retries=4),
+    )
+
+    model = gateway.chat_model("intent_router")
+    main_model = gateway.chat_model("agent_chat")
+
+    assert model is sentinel
+    assert main_model is sentinel
+    assert captured == [0, 4]
+
+
 def test_gateway_settings_distinguish_runtime_environment_and_retry_policy(tmp_path):
     """Gateway 配置必须明确标记运行环境，并接受 0 次重试。"""
 

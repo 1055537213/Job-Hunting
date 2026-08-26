@@ -320,6 +320,7 @@ class IntentRouterSettings:
     llm: LLMSettings | None = None
     confidence_threshold: float = 0.9
     history_messages: int = 6
+    hard_timeout_seconds: float = 3.0
 
 
 def load_dotenv_values(env_path: str | Path = DEFAULT_ENV_PATH) -> dict[str, str]:
@@ -456,6 +457,10 @@ def load_intent_router_settings(
     )
     threshold = float(get("JOB_AGENT_INTENT_ROUTER_CONFIDENCE_THRESHOLD", default="0.9") or 0.9)
     history_messages = int(get("JOB_AGENT_INTENT_ROUTER_HISTORY_MESSAGES", default="6") or 6)
+    hard_timeout_seconds = parse_positive_float(
+        get("JOB_AGENT_INTENT_ROUTER_HARD_TIMEOUT_SECONDS", default="3") or "3",
+        "JOB_AGENT_INTENT_ROUTER_HARD_TIMEOUT_SECONDS",
+    )
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("JOB_AGENT_INTENT_ROUTER_CONFIDENCE_THRESHOLD 必须在 0 到 1 之间。")
     if history_messages < 0 or history_messages > 20:
@@ -475,6 +480,7 @@ def load_intent_router_settings(
         ),
         confidence_threshold=threshold,
         history_messages=history_messages,
+        hard_timeout_seconds=hard_timeout_seconds,
     )
 
 

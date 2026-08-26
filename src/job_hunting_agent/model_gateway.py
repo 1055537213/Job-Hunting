@@ -385,7 +385,7 @@ class ModelGateway:
         改这里，不让 Agent、简历改写或 Web 路由直接 import SDK。
         """
 
-        normalize_operation(operation)
+        normalized_operation = normalize_operation(operation)
         if self._chat_circuit_breaker is None:
             gateway_settings = self.settings
             self._chat_circuit_breaker = CircuitBreaker(
@@ -403,7 +403,10 @@ class ModelGateway:
         return build_chat_model(
             llm_settings or self.llm_settings,
             temperature=temperature,
-            max_retries=self.settings.chat_max_retries,
+            # 路由器已有总截止时间，不能让 SDK 的逐次重试把用户等待放大到数倍。
+            max_retries=(
+                0 if normalized_operation == "intent_router" else self.settings.chat_max_retries
+            ),
             callbacks=callbacks,
         )
 

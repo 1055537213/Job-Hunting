@@ -68,6 +68,7 @@ def test_load_intent_router_settings_reads_independent_small_model(tmp_path):
                 "JOB_AGENT_INTENT_ROUTER_ENABLED=true",
                 "JOB_AGENT_INTENT_ROUTER_MODEL=small-router",
                 "JOB_AGENT_INTENT_ROUTER_TIMEOUT_SECONDS=7",
+                "JOB_AGENT_INTENT_ROUTER_HARD_TIMEOUT_SECONDS=2.5",
                 "JOB_AGENT_INTENT_ROUTER_CONFIDENCE_THRESHOLD=0.85",
                 "JOB_AGENT_INTENT_ROUTER_HISTORY_MESSAGES=4",
             ]
@@ -84,6 +85,7 @@ def test_load_intent_router_settings_reads_independent_small_model(tmp_path):
     assert settings.llm.api_key == "sk-main"
     assert settings.llm.base_url == "https://main.example/v1"
     assert settings.llm.timeout_seconds == 7
+    assert settings.hard_timeout_seconds == 2.5
     assert settings.confidence_threshold == 0.85
     assert settings.history_messages == 4
 
@@ -95,6 +97,7 @@ def test_load_intent_router_settings_is_disabled_by_default(tmp_path):
 
     assert settings.enabled is False
     assert settings.llm is None
+    assert settings.hard_timeout_seconds == 3.0
 
 
 def test_build_chat_model_uses_openai_compatible_langchain_model(tmp_path):
