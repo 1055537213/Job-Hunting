@@ -41,11 +41,74 @@ accounts = sa.Table(
     sa.Column("role", sa.String(32), nullable=False, server_default=sa.text("'user'")),
     sa.Column("status", sa.String(32), nullable=False, server_default=sa.text("'active'")),
     sa.Column("must_change_password", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("email_verified_at", timestamp_type),
+    sa.Column("deleted_at", timestamp_type),
     sa.Column("created_at", timestamp_type, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", timestamp_type, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.CheckConstraint("role IN ('user', 'admin')", name="accounts_role"),
     sa.CheckConstraint("status IN ('active', 'disabled')", name="accounts_status"),
 )
+
+
+# 邮箱验证和密码重置共用一次性令牌表；数据库只保存令牌哈希。
+account_action_tokens = sa.Table(
+    "account_action_tokens",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column(
+        "account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("purpose", sa.String(32), nullable=False),
+    sa.Column("token_hash", sa.String(64), nullable=False, unique=True),
+    sa.Column("expires_at", timestamp_type, nullable=False),
+    sa.Column("consumed_at", timestamp_type),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.Column("requested_ip", sa.String(64)),
+    sa.CheckConstraint(
+        "purpose IN ('verify_email', 'reset_password')",
+        name="account_action_tokens_purpose",
+    ),
+)
+sa.Index(
+    "idx_account_action_tokens_account",
+    account_action_tokens.c.account_id,
+    account_action_tokens.c.purpose,
+    account_action_tokens.c.consumed_at,
+)
+sa.Index("idx_account_action_tokens_expiry", account_action_tokens.c.expires_at)
+
+
+# 保存用户同意的协议版本，避免只保留一个随版本更新而失真的布尔值。
+account_consents = sa.Table(
+    "account_consents",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column(
+        "account_id",
+        sa.Integer,
+        sa.ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("document_type", sa.String(32), nullable=False),
+    sa.Column("version", sa.String(64), nullable=False),
+    sa.Column("accepted_at", timestamp_type, nullable=False),
+    sa.Column("ip_address", sa.String(64)),
+    sa.Column("user_agent", sa.String(512)),
+    sa.CheckConstraint(
+        "document_type IN ('terms', 'privacy')",
+        name="account_consents_document_type",
+    ),
+    sa.UniqueConstraint(
+        "account_id",
+        "document_type",
+        "version",
+        name="uq_account_consents_account_document_version",
+    ),
+)
+sa.Index("idx_account_consents_account", account_consents.c.account_id, account_consents.c.accepted_at)
 
 
 candidate_profiles = sa.Table(

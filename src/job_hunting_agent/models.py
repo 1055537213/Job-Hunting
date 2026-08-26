@@ -587,6 +587,8 @@ class AccountRecord:
     created_at: str
     updated_at: str
     must_change_password: bool = False
+    email_verified_at: str | None = None
+    deleted_at: str | None = None
 
 
 @dataclass

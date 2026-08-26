@@ -26,15 +26,16 @@
           <form class="auth-form" @submit.prevent="submitAuth">
             <div class="auth-form-head">
               <div>
-                <p class="eyebrow">{{ authMode === "login" ? "Welcome back" : "Create account" }}</p>
-                <h2>{{ authMode === "login" ? "登录工作区" : "创建账号" }}</h2>
+                <p class="eyebrow">{{ authModeEyebrow }}</p>
+                <h2>{{ authModeTitle }}</h2>
               </div>
-              <button class="text-button" type="button" @click="toggleAuthMode">
+              <button v-if="authMode === 'login' || authMode === 'register'" class="text-button" type="button" @click="toggleAuthMode">
                 {{ authMode === "login" ? "注册" : "返回登录" }}
               </button>
+              <button v-else class="text-button" type="button" @click="returnToLogin">返回登录</button>
             </div>
 
-            <label class="field-group" for="authEmail">
+            <label v-if="authMode !== 'reset'" class="field-group" for="authEmail">
               <span>邮箱</span>
               <input
                 id="authEmail"
@@ -48,7 +49,7 @@
                 aria-describedby="authError"
               />
             </label>
-            <div class="field-group">
+            <div v-if="authMode === 'login' || authMode === 'register'" class="field-group">
               <span><label class="field-label" for="authPassword">密码</label></span>
               <div class="password-field">
                 <input
@@ -85,6 +86,10 @@
                 </button>
               </div>
             </div>
+            <label v-if="authMode === 'reset'" class="field-group" for="authNewPassword">
+              <span>新密码</span>
+              <input id="authNewPassword" v-model="authForm.newPassword" class="field" type="password" autocomplete="new-password" minlength="8" required @input="clearAuthFeedback" />
+            </label>
             <label v-if="authMode === 'register'" class="field-group" for="authDisplayName">
               <span>显示名称（可选）</span>
               <input
@@ -95,6 +100,14 @@
                 autocomplete="name"
               />
             </label>
+            <label v-if="authMode === 'register' && accountLifecycle.consent_required" class="auth-consent">
+              <input v-model="authForm.consentAccepted" type="checkbox" required />
+              <span>我已阅读并同意<a href="/terms" target="_blank" rel="noopener">服务条款</a>（{{ accountLifecycle.terms_version }}）和<a href="/privacy" target="_blank" rel="noopener">隐私政策</a>（{{ accountLifecycle.privacy_version }}）</span>
+            </label>
+            <div v-if="authMode === 'login'" class="auth-secondary-actions">
+              <button class="text-button" type="button" @click="resendLoginVerification">重发验证邮件</button>
+              <button class="text-button" type="button" @click="openForgotPassword">忘记密码</button>
+            </div>
             <div
               v-if="authError"
               id="authError"
@@ -110,7 +123,7 @@
               :disabled="authLoading"
               :data-state="authLoading ? 'loading' : authSuccess ? 'success' : authError ? 'error' : 'idle'"
             >
-              {{ authLoading ? "处理中" : authMode === "login" ? "登录" : "注册并继续" }}
+              {{ authLoading ? "处理中" : authSubmitLabel }}
             </button>
           </form>
         </section>
@@ -1247,6 +1260,41 @@
               </dl>
             </article>
           </section>
+
+          <section class="profile-account-grid" aria-label="账号安全与数据管理">
+            <article class="panel profile-account-panel">
+              <div class="panel-title-row">
+                <div><p class="eyebrow">Account Security</p><h2 class="panel-title">账号安全</h2></div>
+                <span class="profile-simulation-badge">{{ auth.account?.email_verified_at ? "邮箱已验证" : "邮箱未验证" }}</span>
+              </div>
+              <p class="profile-panel-lede">{{ auth.account?.email }}</p>
+              <div class="profile-account-actions">
+                <button v-if="!auth.account?.email_verified_at" class="ghost-button compact" type="button" :disabled="accountActionLoading" @click="resendVerification">重发验证邮件</button>
+                <button class="ghost-button compact" type="button" :disabled="accountActionLoading" @click="downloadAccountExport">导出我的数据</button>
+                <button class="ghost-button compact" type="button" :disabled="accountActionLoading" @click="logoutAll">退出所有设备</button>
+              </div>
+            </article>
+
+            <article class="panel profile-account-panel">
+              <div><p class="eyebrow">Password</p><h2 class="panel-title">修改密码</h2></div>
+              <form class="profile-account-form" @submit.prevent="changeAccountPassword">
+                <label class="field-group" for="currentAccountPassword"><span>当前密码</span><input id="currentAccountPassword" v-model="accountPasswordForm.currentPassword" class="field" type="password" autocomplete="current-password" required /></label>
+                <label class="field-group" for="newAccountPassword"><span>新密码</span><input id="newAccountPassword" v-model="accountPasswordForm.newPassword" class="field" type="password" autocomplete="new-password" minlength="8" required /></label>
+                <button class="primary-button" type="submit" :disabled="accountActionLoading">修改并重新登录</button>
+              </form>
+            </article>
+
+            <article class="panel profile-account-panel profile-danger-panel">
+              <div><p class="eyebrow">Delete Account</p><h2 class="panel-title">注销账号</h2></div>
+              <p class="profile-panel-lede">求职档案、项目、简历和知识库内容将被删除；依法需要保留的财务事实会匿名保存。</p>
+              <form class="profile-account-form" @submit.prevent="deleteMyAccount">
+                <label class="field-group" for="deleteAccountPassword"><span>当前密码</span><input id="deleteAccountPassword" v-model="accountDeleteForm.currentPassword" class="field" type="password" autocomplete="current-password" required /></label>
+                <label class="field-group" for="deleteAccountConfirmation"><span>输入“注销账号”</span><input id="deleteAccountConfirmation" v-model.trim="accountDeleteForm.confirmation" class="field" type="text" autocomplete="off" required /></label>
+                <button class="danger-button" type="submit" :disabled="accountActionLoading || accountDeleteForm.confirmation !== '注销账号'">永久注销</button>
+              </form>
+            </article>
+          </section>
+          <div v-if="accountActionMessage" class="inline-error" :class="{ 'is-success': accountActionSuccess }" role="status">{{ accountActionMessage }}</div>
 
           <section class="panel profile-ledger-panel" aria-labelledby="profileLedgerTitle">
             <div class="panel-title-row">

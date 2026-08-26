@@ -8,6 +8,7 @@
 import json
 import logging
 import re
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -49,6 +50,20 @@ class StreamingFakeChatModel(FakeListChatModel):
         """直接返回自身，让 `create_agent` 保留 fake 模型的 `_stream` 行为。"""
 
         return self
+
+
+class RecordingAccountEmailSender:
+    """记录账号邮件链接，不依赖真实 SMTP。"""
+
+    def __init__(self) -> None:
+        self.verification_messages: list[tuple[str, str]] = []
+        self.password_reset_messages: list[tuple[str, str]] = []
+
+    def send_verification(self, email: str, action_url: str) -> None:
+        self.verification_messages.append((email, action_url))
+
+    def send_password_reset(self, email: str, action_url: str) -> None:
+        self.password_reset_messages.append((email, action_url))
 
 
 def login_test_account(
@@ -105,6 +120,232 @@ def test_web_registration_does_not_persist_password_as_display_name():
     )
     assert logged_in.status_code == 200
     assert logged_in.json()["account"]["email"] == "display-name-web-guard@example.com"
+
+
+def test_email_verification_blocks_login_until_one_time_link_is_consumed(tmp_path) -> None:
+    """需要邮箱验证时，未验证账号不能登录，验证令牌只能使用一次。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            (
+                "JOB_AGENT_EMAIL_VERIFICATION_REQUIRED=true",
+                "JOB_AGENT_ACCOUNT_EMAIL_BACKEND=console",
+                "JOB_AGENT_PUBLIC_BASE_URL=https://agent.example.com",
+                "JOB_AGENT_CONSENT_REQUIRED=true",
+                "JOB_AGENT_TERMS_VERSION=2026-08-26",
+                "JOB_AGENT_PRIVACY_VERSION=2026-08-26",
+            )
+        ),
+        encoding="utf-8",
+    )
+    sender = RecordingAccountEmailSender()
+    client = TestClient(create_web_app(env_file=env_path, account_email_sender=sender))
+
+    registered = client.post(
+        "/api/auth/register",
+        json={
+            "email": "verify-me@example.com",
+            "password": "password-123",
+            "accepted_terms_version": "2026-08-26",
+            "accepted_privacy_version": "2026-08-26",
+        },
+    )
+
+    assert registered.status_code == 200
+    assert registered.json()["verification_required"] is True
+    assert registered.json()["account"]["email_verified_at"] is None
+    assert sender.verification_messages[0][0] == "verify-me@example.com"
+    token = parse_qs(urlsplit(sender.verification_messages[0][1]).query)[
+        "verify_email_token"
+    ][0]
+    assert client.post(
+        "/api/auth/login",
+        json={"email": "verify-me@example.com", "password": "password-123"},
+    ).status_code == 403
+
+    verified = client.post("/api/auth/verify-email", json={"token": token})
+
+    assert verified.status_code == 200
+    assert verified.json()["account"]["email_verified_at"]
+    assert client.post("/api/auth/verify-email", json={"token": token}).status_code == 400
+    assert client.post(
+        "/api/auth/login",
+        json={"email": "verify-me@example.com", "password": "password-123"},
+    ).status_code == 200
+
+
+def test_password_reset_is_one_time_and_revokes_existing_sessions(tmp_path) -> None:
+    """重置密码不泄露账号存在性，并使旧密码、旧 Session 和令牌全部失效。"""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "JOB_AGENT_ACCOUNT_EMAIL_BACKEND=console\n"
+        "JOB_AGENT_PUBLIC_BASE_URL=https://agent.example.com\n",
+        encoding="utf-8",
+    )
+    sender = RecordingAccountEmailSender()
+    client = TestClient(create_web_app(env_file=env_path, account_email_sender=sender))
+    email = "reset-me@example.com"
+    old_password = "password-123"
+    new_password = "changed-password-456"
+    assert client.post(
+        "/api/auth/register",
+        json={"email": email, "password": old_password},
+    ).status_code == 200
+    assert client.post(
+        "/api/auth/login",
+        json={"email": email, "password": old_password},
+    ).status_code == 200
+
+    unknown = client.post(
+        "/api/auth/password-reset/request",
+        json={"email": "unknown@example.com"},
+    )
+    requested = client.post(
+        "/api/auth/password-reset/request",
+        json={"email": email},
+    )
+
+    assert unknown.status_code == requested.status_code == 200
+    assert unknown.json() == requested.json()
+    assert len(sender.password_reset_messages) == 1
+    token = parse_qs(urlsplit(sender.password_reset_messages[0][1]).query)[
+        "reset_password_token"
+    ][0]
+    reset = client.post(
+        "/api/auth/password-reset/confirm",
+        json={"token": token, "new_password": new_password},
+    )
+
+    assert reset.status_code == 200
+    assert client.get("/api/auth/me").json()["authenticated"] is False
+    assert client.post(
+        "/api/auth/login",
+        json={"email": email, "password": old_password},
+    ).status_code == 401
+    assert client.post(
+        "/api/auth/password-reset/confirm",
+        json={"token": token, "new_password": new_password},
+    ).status_code == 400
+    assert client.post(
+        "/api/auth/login",
+        json={"email": email, "password": new_password},
+    ).status_code == 200
+
+
+def test_account_export_change_password_and_anonymized_deletion() -> None:
+    """用户能导出数据；注销清理求职数据，但保留匿名财务事实。"""
+
+    web_app = create_web_app()
+    client = TestClient(web_app)
+    email = "lifecycle-rights@example.com"
+    old_password = "password-123"
+    new_password = "changed-password-456"
+    registered = client.post(
+        "/api/auth/register",
+        json={"email": email, "password": old_password},
+    )
+    account_id = registered.json()["account"]["id"]
+    login = client.post(
+        "/api/auth/login",
+        json={"email": email, "password": old_password},
+    )
+    csrf_headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+    assert client.post(
+        "/api/profiles",
+        headers=csrf_headers,
+        json={"name": "待注销候选人"},
+    ).status_code == 200
+
+    exported = client.get("/api/account/export")
+
+    assert exported.status_code == 200
+    assert "attachment" in exported.headers["content-disposition"]
+    export_text = exported.text.lower()
+    assert email in export_text
+    assert "password_hash" not in export_text
+    assert "token_hash" not in export_text
+
+    changed = client.post(
+        "/api/account/password",
+        headers=csrf_headers,
+        json={"current_password": old_password, "new_password": new_password},
+    )
+    assert changed.status_code == 200
+    assert client.get("/api/auth/me").json()["authenticated"] is False
+    relogin = client.post(
+        "/api/auth/login",
+        json={"email": email, "password": new_password},
+    )
+    delete_headers = {"X-CSRF-Token": relogin.json()["csrf_token"]}
+
+    deleted = client.post(
+        "/api/account/delete",
+        headers=delete_headers,
+        json={"current_password": new_password, "confirmation": "注销账号"},
+    )
+
+    assert deleted.status_code == 200
+    assert client.get("/api/auth/me").json()["authenticated"] is False
+    store = web_app.state.backend.store
+    anonymized = store.get_account(account_id)
+    assert anonymized.deleted_at is not None
+    assert anonymized.status == "disabled"
+    assert anonymized.email != email
+    with store.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) AS count FROM candidate_profiles WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()["count"] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) AS count FROM account_balances WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()["count"] == 1
+
+
+def test_account_deletion_restores_login_when_object_cleanup_fails(monkeypatch) -> None:
+    """对象清理失败时不能把尚未注销的用户永久锁死。"""
+
+    web_app = create_web_app()
+    client = TestClient(web_app)
+    email = "deletion-retry@example.com"
+    password = "password-123"
+    account_id = client.post(
+        "/api/auth/register",
+        json={"email": email, "password": password},
+    ).json()["account"]["id"]
+    login = client.post(
+        "/api/auth/login",
+        json={"email": email, "password": password},
+    )
+    store = web_app.state.backend.store
+    original_prepare = store.prepare_account_deletion
+    monkeypatch.setattr(
+        store,
+        "prepare_account_deletion",
+        lambda target_id: original_prepare(target_id) + ["accounts/test/failing-object"],
+    )
+
+    class FailingObjectStorage:
+        def delete(self, storage_key: str) -> None:
+            raise RuntimeError("simulated object storage outage")
+
+    web_app.state.backend.resume_files = FailingObjectStorage()
+    response = client.post(
+        "/api/account/delete",
+        headers={"X-CSRF-Token": login.json()["csrf_token"]},
+        json={"current_password": password, "confirmation": "注销账号"},
+    )
+
+    assert response.status_code == 503
+    account = store.get_account(account_id)
+    assert account.status == "active"
+    assert account.deleted_at is None
+    assert client.post(
+        "/api/auth/login",
+        json={"email": email, "password": password},
+    ).status_code == 200
 
 
 def test_web_chat_payload_defaults_to_langchain_agent() -> None:
@@ -790,7 +1031,7 @@ def test_web_profile_form_uses_city_picker_and_auth_copy(tmp_path):
     assert 'placeholder="AI Agent 应用开发"' not in home
     assert "Local Boundary" not in home
     assert "运行边界" not in home
-    assert home.count("退出所有设备") == 1
+    assert home.count("退出所有设备") == 2
     assert ':title="auth.account?.email || auth.account?.display_name || \'账号\'"' in home
     assert '{{ auth.account?.email || auth.account?.display_name || "账号" }}' in home
     assert home.count('auth.account?.email || auth.account?.display_name || "账号"') == 3

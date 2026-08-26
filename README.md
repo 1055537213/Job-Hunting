@@ -33,9 +33,9 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 
 | 页面 | 地址 | 用途 |
 | --- | --- | --- |
-| 登录与注册 | `http://127.0.0.1:8000/login` | 注册、登录和认证反馈 |
+| 登录与注册 | `http://127.0.0.1:8000/login` | 注册、邮箱验证、登录和密码找回 |
 | 工作台 | `http://127.0.0.1:8000/workspace` | 档案、Agent 对话、职位、项目和简历 |
-| 个人中心 | `http://127.0.0.1:8000/profile` | 余额、消费流水和开发环境模拟充值入口 |
+| 个人中心 | `http://127.0.0.1:8000/profile` | 余额、消费、改密、数据导出和账号注销 |
 | 管理后台 | `http://127.0.0.1:8000/admin` | 账号用量、人工补款、余额账本、工具轨迹、请求观测和管理员审计 |
 | Swagger | `http://127.0.0.1:8000/docs` | 交互式 API 文档 |
 
@@ -55,7 +55,8 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 
 ### 账号与工作区
 
-- 邮箱注册、Argon2id 密码哈希、服务端 Session、CSRF 和登录限流。
+- 邮箱注册、一次性邮箱验证与密码重置、Argon2id 密码哈希、服务端 Session、CSRF 和登录限流。
+- 注册会记录服务条款与隐私政策版本；用户可导出本人数据、主动改密并撤销全部设备，或删除求职数据并匿名化保留依法需要的财务事实。
 - 登录页、工作台、个人中心和管理后台使用独立路由。
 - 一个账号可创建多个候选人档案，每个档案可维护多个独立对话。
 - 账号、档案、职位、项目、简历、RAG 和用量数据均按归属隔离。
@@ -136,6 +137,7 @@ PostgreSQL 是权威事实源；`rag_chunks` 是可重建的派生索引；Redis
 Job-hunting Agent/
 ├─ src/job_hunting_agent/
 │  ├─ web.py                  # FastAPI 路由、SSE 和页面入口
+│  ├─ account_lifecycle.py    # 一次性令牌、SMTP 邮件和账号找回边界
 │  ├─ web_hardening.py        # CSRF、限流、安全头、请求 ID 与指标
 │  ├─ rate_limiting.py        # 内存/Redis 滑动窗口与后端故障策略
 │  ├─ concurrency_control.py   # 模型/截图全局与账号级共享并发租约
@@ -364,9 +366,13 @@ SHA-256。隔离脚本证明恢复机制可执行，但生产 RPO 仍取决于�
 | 模块 | 方法与路径 | 说明 |
 | --- | --- | --- |
 | 认证 | `POST /api/auth/register` | 注册普通账号 |
+| 认证 | `POST /api/auth/verify-email`、`POST /api/auth/verification/request` | 验证邮箱或重发验证邮件 |
+| 认证 | `POST /api/auth/password-reset/request`、`POST /api/auth/password-reset/confirm` | 请求并完成一次性密码重置 |
 | 认证 | `POST /api/auth/login` | 登录并设置服务端 Session Cookie |
 | 认证 | `GET /api/auth/me` | 获取当前账号、CSRF 和余额摘要 |
 | 认证 | `POST /api/auth/logout`、`POST /api/auth/logout-all` | 退出当前设备或全部设备 |
+| 账号 | `POST /api/account/password` | 校验当前密码后改密并撤销全部 Session |
+| 账号 | `GET /api/account/export`、`POST /api/account/delete` | 导出本人数据或匿名化注销账号 |
 | 档案 | `GET/POST /api/profiles` | 列出或创建候选人档案 |
 | 档案 | `GET/DELETE /api/profiles/{candidate_id}` | 查看或删除档案 |
 | 对话 | `POST /api/chat/stream` | SSE 流式 Agent 对话 |
@@ -438,6 +444,7 @@ SHA-256。隔离脚本证明恢复机制可执行，但生产 RPO 仍取决于�
 
 - [x] 建立充值订单、支付事件、幂等到账和管理员人工补款基础链路。
 - [ ] 接入真实支付渠道、签名 Webhook、退款状态机和渠道对账。
+- [x] 完成邮箱验证、密码找回、协议版本留痕、数据导出和匿名化账号注销。
 - [ ] 在上线前建立足量 RAG 黄金测试集，确定 Recall@K、MRR 和禁止召回阈值。
 - [x] 建立统一知识资产和不可变文件版本底座，并迁移现有原始简历关系。
 - [x] 在现有项目导入面板接入本地目录预扫描、后端采集计划和按需分批传输，不新增独立上传入口。

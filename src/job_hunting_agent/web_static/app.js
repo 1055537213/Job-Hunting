@@ -102,11 +102,21 @@ if (!window.Vue) {
           account: null,
           billing: null,
         },
+        accountLifecycle: {
+          registration_enabled: true,
+          email_verification_required: false,
+          consent_required: false,
+          terms_version: "development",
+          privacy_version: "development",
+        },
         authMode: "login",
         authForm: {
           email: "",
           password: "",
+          newPassword: "",
           displayName: "",
+          consentAccepted: false,
+          actionToken: "",
         },
         authPasswordVisible: false,
         authLoading: false,
@@ -204,6 +214,17 @@ if (!window.Vue) {
           idempotencyKey: "",
         },
         profileRechargeLoading: false,
+        accountActionLoading: false,
+        accountActionMessage: "",
+        accountActionSuccess: false,
+        accountPasswordForm: {
+          currentPassword: "",
+          newPassword: "",
+        },
+        accountDeleteForm: {
+          currentPassword: "",
+          confirmation: "",
+        },
         profiles: [],
         jobs: [],
         matches: [],
@@ -282,6 +303,33 @@ if (!window.Vue) {
     },
 
     computed: {
+      authModeEyebrow() {
+        return {
+          login: "Welcome back",
+          register: "Create account",
+          forgot: "Account recovery",
+          reset: "Set new password",
+        }[this.authMode] || "Account";
+      },
+
+      authModeTitle() {
+        return {
+          login: "登录工作区",
+          register: "创建账号",
+          forgot: "找回密码",
+          reset: "设置新密码",
+        }[this.authMode] || "账号";
+      },
+
+      authSubmitLabel() {
+        return {
+          login: "登录",
+          register: "注册并继续",
+          forgot: "发送重置邮件",
+          reset: "确认重置密码",
+        }[this.authMode] || "提交";
+      },
+
       /** 当前入口是否应该展示登录/注册表单。 */
       showAuthSurface() {
         return this.page === "auth" && !this.auth.authenticated;
@@ -628,7 +676,7 @@ if (!window.Vue) {
 
     mounted() {
       this.syncAuthPageClass(this.auth.authenticated);
-      this.checkAuth();
+      this.initializeAuthSurface();
       document.addEventListener("keydown", this.handleGlobalShortcut);
     },
 
@@ -654,6 +702,39 @@ if (!window.Vue) {
     },
 
     methods: {
+      /** 加载公开认证配置，并处理邮件链接携带的一次性令牌。 */
+      async initializeAuthSurface() {
+        try {
+          this.accountLifecycle = await this.requestJson("/api/auth/config");
+        } catch (error) {
+          // 保留开发默认值；真正提交时仍由后端执行配置校验。
+        }
+        if (this.page === "auth") {
+          const params = new URLSearchParams(window.location.search || "");
+          const verificationToken = params.get("verify_email_token") || "";
+          const resetToken = params.get("reset_password_token") || "";
+          if (verificationToken) {
+            this.authLoading = true;
+            try {
+              await this.requestJson("/api/auth/verify-email", {
+                method: "POST",
+                body: JSON.stringify({ token: verificationToken }),
+              });
+              window.history.replaceState({}, "", FRONTEND_ROUTES.auth);
+              this.showAuthSuccess("邮箱验证完成，请登录。 ");
+            } catch (error) {
+              this.showAuthError(error.message || "邮箱验证失败。");
+            } finally {
+              this.authLoading = false;
+            }
+          } else if (resetToken) {
+            this.authMode = "reset";
+            this.authForm.actionToken = resetToken;
+          }
+        }
+        await this.checkAuth();
+      },
+
       /** 给 Vue 挂载容器切换登录页全宽布局；工作台恢复原有边距和最大宽度。 */
       syncAuthPageClass(authenticated) {
         const app = document.getElementById("app");
@@ -762,6 +843,40 @@ if (!window.Vue) {
         this.authPasswordVisible = false;
       },
 
+      openForgotPassword() {
+        this.authMode = "forgot";
+        this.authForm.password = "";
+        this.clearAuthFeedback();
+      },
+
+      async resendLoginVerification() {
+        if (!this.authForm.email) {
+          this.showAuthError("请先输入注册邮箱。");
+          return;
+        }
+        this.authLoading = true;
+        try {
+          const data = await this.requestJson("/api/auth/verification/request", {
+            method: "POST",
+            body: JSON.stringify({ email: this.authForm.email }),
+          });
+          this.showAuthSuccess(data.message || "如果账号需要验证，验证邮件已发送。");
+        } catch (error) {
+          this.showAuthError(error.message || "验证邮件发送失败。");
+        } finally {
+          this.authLoading = false;
+        }
+      },
+
+      returnToLogin() {
+        this.authMode = "login";
+        this.authForm.password = "";
+        this.authForm.newPassword = "";
+        this.authForm.actionToken = "";
+        window.history.replaceState({}, "", FRONTEND_ROUTES.auth);
+        this.clearAuthFeedback();
+      },
+
       /** 切换登录密码的显示状态；注册模式始终直接显示密码。 */
       toggleAuthPassword() {
         if (this.authMode === "login") {
@@ -852,6 +967,29 @@ if (!window.Vue) {
         this.authLoading = true;
         this.clearAuthFeedback();
         try {
+          if (this.authMode === "forgot") {
+            await this.requestJson("/api/auth/password-reset/request", {
+              method: "POST",
+              body: JSON.stringify({ email: this.authForm.email }),
+            });
+            this.showAuthSuccess("如果该邮箱已注册，密码重置邮件已发送。");
+            return;
+          }
+          if (this.authMode === "reset") {
+            await this.requestJson("/api/auth/password-reset/confirm", {
+              method: "POST",
+              body: JSON.stringify({
+                token: this.authForm.actionToken,
+                new_password: this.authForm.newPassword,
+              }),
+            });
+            this.authMode = "login";
+            this.authForm.newPassword = "";
+            this.authForm.actionToken = "";
+            window.history.replaceState({}, "", FRONTEND_ROUTES.auth);
+            this.showAuthSuccess("密码已重置，请使用新密码登录。");
+            return;
+          }
           const endpoint = this.authMode === "login" ? "/api/auth/login" : "/api/auth/register";
           const data = await this.requestJson(endpoint, {
             method: "POST",
@@ -859,12 +997,23 @@ if (!window.Vue) {
               email: this.authForm.email,
               password: this.authForm.password,
               display_name: this.authForm.displayName || null,
+              accepted_terms_version: this.authForm.consentAccepted
+                ? this.accountLifecycle.terms_version
+                : null,
+              accepted_privacy_version: this.authForm.consentAccepted
+                ? this.accountLifecycle.privacy_version
+                : null,
             }),
           });
           if (this.authMode === "register") {
             this.authMode = "login";
-            this.showAuthSuccess("账号已创建，请登录。");
+            this.showAuthSuccess(
+              data.verification_required
+                ? "账号已创建，请打开验证邮件后登录。"
+                : "账号已创建，请登录。"
+            );
             this.authForm.password = "";
+            this.authForm.consentAccepted = false;
             this.authPasswordVisible = false;
             return;
           }
@@ -933,6 +1082,92 @@ if (!window.Vue) {
         this.sessions = [];
         this.activeSessionId = "";
         this.navigateToAuth(true, false);
+      },
+
+      showAccountAction(message, success = false) {
+        this.accountActionMessage = message || "操作失败，请稍后重试。";
+        this.accountActionSuccess = Boolean(success);
+      },
+
+      async resendVerification() {
+        if (!this.auth.account?.email) return;
+        this.accountActionLoading = true;
+        try {
+          const data = await this.requestJson("/api/auth/verification/request", {
+            method: "POST",
+            body: JSON.stringify({ email: this.auth.account.email }),
+          });
+          this.showAccountAction(data.message || "验证邮件已发送。", true);
+        } catch (error) {
+          this.showAccountAction(error.message || "验证邮件发送失败。");
+        } finally {
+          this.accountActionLoading = false;
+        }
+      },
+
+      async downloadAccountExport() {
+        this.accountActionLoading = true;
+        try {
+          const response = await fetch("/api/account/export", { credentials: "same-origin" });
+          if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.detail || "数据导出失败。");
+          }
+          const blob = await response.blob();
+          const href = URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = href;
+          link.download = `job-agent-account-${this.auth.account?.id || "data"}-export.json`;
+          link.click();
+          URL.revokeObjectURL(href);
+          this.showAccountAction("账号数据已导出。", true);
+        } catch (error) {
+          this.showAccountAction(error.message || "数据导出失败。");
+        } finally {
+          this.accountActionLoading = false;
+        }
+      },
+
+      async changeAccountPassword() {
+        this.accountActionLoading = true;
+        try {
+          await this.requestJson("/api/account/password", {
+            method: "POST",
+            body: JSON.stringify({
+              current_password: this.accountPasswordForm.currentPassword,
+              new_password: this.accountPasswordForm.newPassword,
+            }),
+          });
+          this.auth.authenticated = false;
+          this.auth.account = null;
+          this.navigateToAuth(true, false);
+        } catch (error) {
+          this.showAccountAction(error.message || "密码修改失败。");
+        } finally {
+          this.accountActionLoading = false;
+        }
+      },
+
+      async deleteMyAccount() {
+        if (this.accountDeleteForm.confirmation !== "注销账号") return;
+        if (!window.confirm("账号注销后求职数据无法恢复，确认继续吗？")) return;
+        this.accountActionLoading = true;
+        try {
+          await this.requestJson("/api/account/delete", {
+            method: "POST",
+            body: JSON.stringify({
+              current_password: this.accountDeleteForm.currentPassword,
+              confirmation: this.accountDeleteForm.confirmation,
+            }),
+          });
+          this.auth.authenticated = false;
+          this.auth.account = null;
+          this.navigateToAuth(true, false);
+        } catch (error) {
+          this.showAccountAction(error.message || "账号注销失败。");
+        } finally {
+          this.accountActionLoading = false;
+        }
       },
 
       /** 打开管理员用量页面并刷新脱敏后台数据。 */

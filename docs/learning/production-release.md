@@ -96,6 +96,27 @@
     看到 `project_visual_reinspection`。测试数据完成后按正常项目删除流程清理，以同时验证对象存储、
     数据库和向量生命周期。
 
+12. 配置生产账号邮件和协议版本。生产启动会拒绝 `console` 邮件后端、HTTP 公开地址，
+    或关闭邮箱验证/协议同意的配置：
+
+    ```dotenv
+    JOB_AGENT_EMAIL_VERIFICATION_REQUIRED=true
+    JOB_AGENT_CONSENT_REQUIRED=true
+    JOB_AGENT_PUBLIC_BASE_URL=https://agent.example.com
+    JOB_AGENT_ACCOUNT_EMAIL_BACKEND=smtp
+    JOB_AGENT_SMTP_HOST=smtp.example.com
+    JOB_AGENT_SMTP_PORT=587
+    JOB_AGENT_SMTP_USERNAME=<production-secret>
+    JOB_AGENT_SMTP_PASSWORD=<production-secret>
+    JOB_AGENT_SMTP_FROM_EMAIL=no-reply@example.com
+    JOB_AGENT_TERMS_VERSION=2026-08-26
+    JOB_AGENT_PRIVACY_VERSION=2026-08-26
+    ```
+
+    发布前使用真实收件箱验证注册、重发验证邮件和忘记密码三条链路，并确认一次性链接在
+    使用后或过期后不能再次使用。协议正文和版本号必须由实际运营主体审核，版本更新时只
+    修改版本号不足以替代重新获取用户同意。
+
 生产覆盖不会向宿主机发布 Web 端口，只有 Caddy 和内部采集服务可以访问它，因此
 `FORWARDED_ALLOW_IPS=*` 只在该覆盖配置中启用。不要把这个设置复制到直接暴露 Uvicorn 的开发环境。
 

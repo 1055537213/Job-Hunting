@@ -20,6 +20,7 @@ import re
 import time
 import uuid
 from dataclasses import asdict
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import quote
@@ -41,6 +42,13 @@ from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
 from starlette.concurrency import run_in_threadpool
 
 from .admin_ledger import ADMIN_LEDGER_MAX_PAGES, ADMIN_LEDGER_PAGE_SIZE
+from .account_lifecycle import (
+    AccountEmailSender,
+    account_action_url,
+    action_token_hash,
+    build_account_email_sender,
+    new_action_token,
+)
 from .agent import JobHuntingAgent
 from .app import JobHuntingApp
 from .auth import (
@@ -66,6 +74,7 @@ from .concurrency_control import (
     ConcurrencyLimitExceeded,
 )
 from .config import (
+    load_account_lifecycle_settings,
     load_agent_memory_settings,
     load_billing_settings,
     load_bootstrap_admin_settings,
@@ -82,6 +91,7 @@ from .config import (
     load_task_queue_settings,
     load_web_security_settings,
     masked_agent_memory_settings,
+    masked_account_lifecycle_settings,
     masked_billing_settings,
     masked_concurrency_settings,
     masked_embedding_settings,
@@ -250,6 +260,8 @@ class RegisterPayload(BaseModel):
     email: str
     password: str
     display_name: str | None = None
+    accepted_terms_version: str | None = Field(default=None, max_length=64)
+    accepted_privacy_version: str | None = Field(default=None, max_length=64)
 
 
 class LoginPayload(BaseModel):
@@ -257,6 +269,38 @@ class LoginPayload(BaseModel):
 
     email: str
     password: str
+
+
+class AccountActionTokenPayload(BaseModel):
+    """一次性邮箱操作令牌。"""
+
+    token: str = Field(min_length=32, max_length=256)
+
+
+class AccountEmailPayload(BaseModel):
+    """账号邮件请求；响应不得泄露邮箱是否存在。"""
+
+    email: str = Field(min_length=3, max_length=254)
+
+
+class PasswordResetConfirmPayload(AccountActionTokenPayload):
+    """密码重置确认。"""
+
+    new_password: str = Field(min_length=8, max_length=1024)
+
+
+class PasswordChangePayload(BaseModel):
+    """登录用户主动修改密码。"""
+
+    current_password: str = Field(min_length=1, max_length=1024)
+    new_password: str = Field(min_length=8, max_length=1024)
+
+
+class AccountDeletePayload(BaseModel):
+    """账号注销的二次确认。"""
+
+    current_password: str = Field(min_length=1, max_length=1024)
+    confirmation: str = Field(min_length=1, max_length=32)
 
 
 class AccountStatusPayload(BaseModel):
@@ -348,6 +392,7 @@ def create_web_app(
     rate_limiter: RateLimiter | None = None,
     concurrency_controller: ConcurrencyController | None = None,
     file_scanner: object | None = None,
+    account_email_sender: AccountEmailSender | None = None,
 ) -> FastAPI:
     """创建本地 FastAPI 应用。
 
@@ -372,6 +417,10 @@ def create_web_app(
     bootstrap_initial_admin(backend, env_path)
     cookie_secure = load_cookie_secure(env_path)
     web_security_settings = load_web_security_settings(env_path)
+    account_lifecycle_settings = load_account_lifecycle_settings(env_path)
+    lifecycle_email_sender = account_email_sender or build_account_email_sender(
+        account_lifecycle_settings
+    )
 
     agent_error: str | None = None
     if chat_agent is None:
@@ -505,13 +554,38 @@ def create_web_app(
         backend.store.prune_usage_events_to_limit()
         backend.store.prune_tool_call_traces_to_limit()
 
+    @web_app.get("/api/auth/config")
+    def auth_config() -> dict[str, object]:
+        """Expose only public registration requirements to the login page."""
+
+        return {
+            "registration_enabled": account_lifecycle_settings.registration_enabled,
+            "email_verification_required": account_lifecycle_settings.email_verification_required,
+            "consent_required": account_lifecycle_settings.consent_required,
+            "terms_version": account_lifecycle_settings.terms_version,
+            "privacy_version": account_lifecycle_settings.privacy_version,
+        }
+
     @web_app.post("/api/auth/register")
-    def register(payload: RegisterPayload) -> dict[str, object]:
+    def register(payload: RegisterPayload, request: Request) -> dict[str, object]:
         """开放普通用户注册；管理员账号不通过此接口创建。"""
 
-        email = payload.email.strip().lower()
-        if "@" not in email or len(email) > 254:
-            raise HTTPException(status_code=400, detail="请输入有效邮箱。")
+        if not account_lifecycle_settings.registration_enabled:
+            raise HTTPException(status_code=403, detail="当前未开放新账号注册。")
+        try:
+            email = backend.auth.normalize_email(payload.email)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        consent_rows: list[tuple[str, str]] = []
+        if account_lifecycle_settings.consent_required:
+            if payload.accepted_terms_version != account_lifecycle_settings.terms_version:
+                raise HTTPException(status_code=400, detail="请阅读并同意当前版本的服务条款。")
+            if payload.accepted_privacy_version != account_lifecycle_settings.privacy_version:
+                raise HTTPException(status_code=400, detail="请阅读并同意当前版本的隐私政策。")
+            consent_rows = [
+                ("terms", account_lifecycle_settings.terms_version),
+                ("privacy", account_lifecycle_settings.privacy_version),
+            ]
         try:
             password_hash = hash_password(payload.password)
             account = backend.store.create_account(
@@ -519,13 +593,125 @@ def create_web_app(
                 password_hash=password_hash,
                 display_name=normalize_display_name(payload.display_name, payload.password),
                 role="user",
+                email_verified=not account_lifecycle_settings.email_verification_required,
+                consents=consent_rows,
+                consent_ip_address=request.client.host if request.client else None,
+                consent_user_agent=request.headers.get("user-agent"),
             )
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         # PostgreSQL 唯一约束异常统一映射为同一 409 响应。
         except SQLAlchemyIntegrityError as error:
             raise HTTPException(status_code=409, detail="该邮箱已经注册。") from error
+        if account_lifecycle_settings.email_verification_required:
+            raw_token = new_action_token()
+            expires_at = iso_utc(
+                utc_now()
+                + timedelta(minutes=account_lifecycle_settings.verification_token_ttl_minutes)
+            )
+            backend.store.save_account_action_token(
+                account.id,
+                "verify_email",
+                action_token_hash(raw_token),
+                expires_at,
+                request.client.host if request.client else None,
+            )
+            lifecycle_email_sender.send_verification(
+                account.email,
+                account_action_url(
+                    account_lifecycle_settings.public_base_url,
+                    "verify_email_token",
+                    raw_token,
+                ),
+            )
+        return {
+            "account": asdict(account),
+            "verification_required": account_lifecycle_settings.email_verification_required,
+        }
+
+    @web_app.post("/api/auth/verify-email")
+    def verify_email(payload: AccountActionTokenPayload) -> dict[str, object]:
+        """Consume a one-time verification token."""
+
+        account = backend.store.consume_email_verification_token(
+            action_token_hash(payload.token)
+        )
+        if account is None:
+            raise HTTPException(status_code=400, detail="验证链接无效或已过期。")
         return {"account": asdict(account)}
+
+    def send_account_action_email(
+        account: AccountRecord,
+        purpose: str,
+        request: Request,
+    ) -> None:
+        """Create a replacement token and send the corresponding account email."""
+
+        raw_token = new_action_token()
+        ttl_minutes = (
+            account_lifecycle_settings.verification_token_ttl_minutes
+            if purpose == "verify_email"
+            else account_lifecycle_settings.password_reset_token_ttl_minutes
+        )
+        backend.store.save_account_action_token(
+            account.id,
+            purpose,
+            action_token_hash(raw_token),
+            iso_utc(utc_now() + timedelta(minutes=ttl_minutes)),
+            request.client.host if request.client else None,
+        )
+        if purpose == "verify_email":
+            lifecycle_email_sender.send_verification(
+                account.email,
+                account_action_url(
+                    account_lifecycle_settings.public_base_url,
+                    "verify_email_token",
+                    raw_token,
+                ),
+            )
+        else:
+            lifecycle_email_sender.send_password_reset(
+                account.email,
+                account_action_url(
+                    account_lifecycle_settings.public_base_url,
+                    "reset_password_token",
+                    raw_token,
+                ),
+            )
+
+    @web_app.post("/api/auth/verification/request")
+    def request_verification(payload: AccountEmailPayload, request: Request) -> dict[str, str]:
+        """Resend verification without revealing whether the email is registered."""
+
+        record = backend.store.get_account_by_email(payload.email.strip().lower())
+        if record is not None and record[0].status == "active" and record[0].email_verified_at is None:
+            send_account_action_email(record[0], "verify_email", request)
+        return {"message": "如果账号需要验证，验证邮件已发送。"}
+
+    @web_app.post("/api/auth/password-reset/request")
+    def request_password_reset(payload: AccountEmailPayload, request: Request) -> dict[str, str]:
+        """Issue a reset token while keeping account existence private."""
+
+        record = backend.store.get_account_by_email(payload.email.strip().lower())
+        if record is not None and record[0].status == "active":
+            send_account_action_email(record[0], "reset_password", request)
+        return {"message": "如果该邮箱已注册，密码重置邮件已发送。"}
+
+    @web_app.post("/api/auth/password-reset/confirm")
+    def confirm_password_reset(payload: PasswordResetConfirmPayload) -> dict[str, bool]:
+        """Consume a reset token and revoke every existing device session."""
+
+        try:
+            password_hash = hash_password(payload.new_password)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        account = backend.store.consume_password_reset_token(
+            action_token_hash(payload.token),
+            password_hash,
+        )
+        if account is None:
+            raise HTTPException(status_code=400, detail="重置链接无效或已过期。")
+        return {"ok": True}
 
     @web_app.post("/api/auth/login")
     def login(payload: LoginPayload, response: Response, request: Request) -> dict[str, object]:
@@ -537,6 +723,11 @@ def create_web_app(
         account, _ = record
         if account.status != "active":
             raise HTTPException(status_code=403, detail="账号已被禁用。")
+        if (
+            account_lifecycle_settings.email_verification_required
+            and account.email_verified_at is None
+        ):
+            raise HTTPException(status_code=403, detail="请先完成邮箱验证。")
         raw_token = new_session_token()
         now = utc_now().isoformat(timespec="seconds")
         expires_at, absolute_expires_at = session_expiry()
@@ -621,6 +812,83 @@ def create_web_app(
         delete_csrf_cookie(response)
         return {"ok": True, "revoked_sessions": count}
 
+    @web_app.post("/api/account/password")
+    def change_password(
+        payload: PasswordChangePayload,
+        request: Request,
+        response: Response,
+    ) -> dict[str, bool]:
+        """Change the current password and revoke all browser sessions."""
+
+        account = current_account(request)
+        assert account is not None
+        _, current_hash = backend.store.get_account_with_password(account.id)
+        if not verify_password(current_hash, payload.current_password):
+            raise HTTPException(status_code=400, detail="当前密码错误。")
+        try:
+            new_hash = hash_password(payload.new_password)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        if verify_password(current_hash, payload.new_password):
+            raise HTTPException(status_code=400, detail="新密码不能与当前密码相同。")
+        backend.store.update_account_password_and_revoke_sessions(account.id, new_hash)
+        response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+        delete_csrf_cookie(response)
+        return {"ok": True}
+
+    @web_app.get("/api/account/export")
+    def export_account_data(request: Request, response: Response) -> dict[str, object]:
+        """Download the current account's structured portable data export."""
+
+        account = current_account(request)
+        assert account is not None
+        response.headers["Content-Disposition"] = (
+            f'attachment; filename="job-agent-account-{account.id}-export.json"'
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return backend.store.export_account_data(account.id)
+
+    @web_app.post("/api/account/delete")
+    def delete_account(
+        payload: AccountDeletePayload,
+        request: Request,
+        response: Response,
+    ) -> dict[str, bool]:
+        """Delete job-search data and anonymize the retained financial account."""
+
+        account = current_account(request)
+        assert account is not None
+        if payload.confirmation != "注销账号":
+            raise HTTPException(status_code=400, detail="请输入“注销账号”完成确认。")
+        _, current_hash = backend.store.get_account_with_password(account.id)
+        if not verify_password(current_hash, payload.current_password):
+            raise HTTPException(status_code=400, detail="当前密码错误。")
+        try:
+            storage_keys = backend.store.prepare_account_deletion(account.id)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        try:
+            for storage_key in storage_keys:
+                backend.resume_files.delete(storage_key)
+        except Exception as error:  # noqa: BLE001 - keep database data until object cleanup succeeds.
+            web_logger.exception("account object cleanup failed", extra={"account_id": account.id})
+            try:
+                backend.store.restore_account_after_failed_deletion(account.id)
+            except Exception:  # noqa: BLE001 - preserve the original cleanup failure response.
+                web_logger.exception(
+                    "account status restore failed after object cleanup error",
+                    extra={"account_id": account.id},
+                )
+            raise HTTPException(status_code=503, detail="账号文件清理失败，请稍后重试。") from error
+        backend.store.finalize_account_deletion(
+            account.id,
+            f"deleted-{account.id}-{uuid.uuid4().hex}@invalid.local",
+            hash_password(new_action_token()),
+        )
+        response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+        delete_csrf_cookie(response)
+        return {"ok": True}
+
     def frontend_shell() -> FileResponse:
         response = FileResponse(STATIC_DIR / "index.html")
         response.headers["Cache-Control"] = "no-store, max-age=0"
@@ -649,6 +917,18 @@ def create_web_app(
         """个人中心页面。"""
 
         return frontend_shell()
+
+    @web_app.get("/terms")
+    def terms_page() -> FileResponse:
+        """服务条款基线页面；正式版本仍需运营主体审核。"""
+
+        return FileResponse(STATIC_DIR / "terms.html", headers={"Cache-Control": "no-store"})
+
+    @web_app.get("/privacy")
+    def privacy_page() -> FileResponse:
+        """隐私政策基线页面；正式版本仍需运营主体审核。"""
+
+        return FileResponse(STATIC_DIR / "privacy.html", headers={"Cache-Control": "no-store"})
 
     @web_app.get("/admin")
     def admin_page() -> FileResponse:
@@ -699,6 +979,12 @@ def create_web_app(
         except ValueError as error:
             web_security_config = {"configured": False, "error": str(error)}
         try:
+            account_lifecycle_config = masked_account_lifecycle_settings(
+                load_account_lifecycle_settings(env_path)
+            )
+        except ValueError as error:
+            account_lifecycle_config = {"configured": False, "error": str(error)}
+        try:
             billing_config = masked_billing_settings(load_billing_settings(env_path))
         except ValueError as error:
             billing_config = {"configured": False, "error": str(error)}
@@ -743,6 +1029,12 @@ def create_web_app(
                     ),
                     "rate_limit_enabled": bool(web_security_config.get("rate_limit_enabled")),
                 },
+                "account_lifecycle": {
+                    "configured": not bool(account_lifecycle_config.get("error")),
+                    "email_verification_required": bool(
+                        account_lifecycle_config.get("email_verification_required")
+                    ),
+                },
                 "billing": {"configured": bool(billing_config.get("configured"))},
                 "concurrency": {
                     "configured": not bool(concurrency_config.get("error")),
@@ -767,6 +1059,7 @@ def create_web_app(
             "memory": memory_config,
             "task_queue": task_queue_config,
             "web_security": web_security_config,
+            "account_lifecycle": account_lifecycle_config,
             "billing": billing_config,
             "concurrency": concurrency_config,
             "file_scanning": file_scanning_config,

@@ -194,6 +194,28 @@ class WebSecuritySettings:
 
 
 @dataclass(frozen=True)
+class AccountLifecycleSettings:
+    """注册验证、协议留痕和账号找回配置。"""
+
+    environment: str = "development"
+    registration_enabled: bool = True
+    email_verification_required: bool = False
+    consent_required: bool = False
+    public_base_url: str = "http://127.0.0.1:8000"
+    email_backend: str = "console"
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_from_email: str | None = None
+    smtp_use_starttls: bool = True
+    verification_token_ttl_minutes: int = 1440
+    password_reset_token_ttl_minutes: int = 30
+    terms_version: str = "development"
+    privacy_version: str = "development"
+
+
+@dataclass(frozen=True)
 class BillingSettings:
     """实时扣费与余额展示配置。
 
@@ -1039,6 +1061,89 @@ def masked_web_security_settings(settings: WebSecuritySettings) -> dict[str, obj
         "rate_limit_write_requests": settings.rate_limit_write_requests,
         "rate_limit_backend": settings.rate_limit_backend,
         "rate_limit_redis_configured": bool(settings.rate_limit_redis_url),
+    }
+
+
+def load_account_lifecycle_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> AccountLifecycleSettings:
+    """读取账号注册、邮件和协议版本配置。"""
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(key: str, default: str | None = None) -> str | None:
+        return environment.get(key) or file_values.get(key) or default
+
+    runtime_environment = (get("JOB_AGENT_ENVIRONMENT", "development") or "development").lower()
+    if runtime_environment not in {"development", "test", "production"}:
+        raise ValueError("JOB_AGENT_ENVIRONMENT 只能是 development、test 或 production")
+    default_required = "true" if runtime_environment == "production" else "false"
+    email_backend = (
+        get(
+            "JOB_AGENT_ACCOUNT_EMAIL_BACKEND",
+            "smtp" if runtime_environment == "production" else "console",
+        )
+        or "console"
+    ).strip().lower()
+    if email_backend not in {"console", "smtp"}:
+        raise ValueError("JOB_AGENT_ACCOUNT_EMAIL_BACKEND 只能是 console 或 smtp")
+    settings = AccountLifecycleSettings(
+        environment=runtime_environment,
+        registration_enabled=parse_bool(get("JOB_AGENT_REGISTRATION_ENABLED", "true")),
+        email_verification_required=parse_bool(
+            get("JOB_AGENT_EMAIL_VERIFICATION_REQUIRED", default_required)
+        ),
+        consent_required=parse_bool(get("JOB_AGENT_CONSENT_REQUIRED", default_required)),
+        public_base_url=(
+            get("JOB_AGENT_PUBLIC_BASE_URL", "http://127.0.0.1:8000")
+            or "http://127.0.0.1:8000"
+        ).rstrip("/"),
+        email_backend=email_backend,
+        smtp_host=get("JOB_AGENT_SMTP_HOST"),
+        smtp_port=parse_positive_int(get("JOB_AGENT_SMTP_PORT", "587"), "JOB_AGENT_SMTP_PORT"),
+        smtp_username=get("JOB_AGENT_SMTP_USERNAME"),
+        smtp_password=get("JOB_AGENT_SMTP_PASSWORD"),
+        smtp_from_email=get("JOB_AGENT_SMTP_FROM_EMAIL"),
+        smtp_use_starttls=parse_bool(get("JOB_AGENT_SMTP_USE_STARTTLS", "true")),
+        verification_token_ttl_minutes=parse_positive_int(
+            get("JOB_AGENT_VERIFICATION_TOKEN_TTL_MINUTES", "1440"),
+            "JOB_AGENT_VERIFICATION_TOKEN_TTL_MINUTES",
+        ),
+        password_reset_token_ttl_minutes=parse_positive_int(
+            get("JOB_AGENT_PASSWORD_RESET_TOKEN_TTL_MINUTES", "30"),
+            "JOB_AGENT_PASSWORD_RESET_TOKEN_TTL_MINUTES",
+        ),
+        terms_version=(get("JOB_AGENT_TERMS_VERSION", "development") or "development").strip(),
+        privacy_version=(get("JOB_AGENT_PRIVACY_VERSION", "development") or "development").strip(),
+    )
+    parsed_public_url = urlsplit(settings.public_base_url)
+    if parsed_public_url.scheme not in {"http", "https"} or not parsed_public_url.netloc:
+        raise ValueError("JOB_AGENT_PUBLIC_BASE_URL 必须是完整的 http:// 或 https:// 地址。")
+    if settings.environment == "production":
+        if not settings.email_verification_required or not settings.consent_required:
+            raise ValueError("生产环境必须启用邮箱验证和协议同意。")
+        if parsed_public_url.scheme != "https":
+            raise ValueError("生产环境的 JOB_AGENT_PUBLIC_BASE_URL 必须使用 HTTPS。")
+        if settings.email_backend != "smtp":
+            raise ValueError("生产环境必须使用 SMTP 发送账号邮件。")
+        if not settings.smtp_host or not settings.smtp_from_email:
+            raise ValueError("生产环境必须配置 JOB_AGENT_SMTP_HOST 和 JOB_AGENT_SMTP_FROM_EMAIL。")
+    return settings
+
+
+def masked_account_lifecycle_settings(settings: AccountLifecycleSettings) -> dict[str, object]:
+    """返回不含 SMTP 凭据的账号生命周期配置摘要。"""
+
+    return {
+        "registration_enabled": settings.registration_enabled,
+        "email_verification_required": settings.email_verification_required,
+        "consent_required": settings.consent_required,
+        "email_backend": settings.email_backend,
+        "smtp_configured": bool(settings.smtp_host and settings.smtp_from_email),
+        "terms_version": settings.terms_version,
+        "privacy_version": settings.privacy_version,
     }
 
 

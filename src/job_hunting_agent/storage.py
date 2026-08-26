@@ -160,6 +160,10 @@ class RepositoryStore:
         role: str = "user",
         status: str = "active",
         must_change_password: bool = False,
+        email_verified: bool = True,
+        consents: list[tuple[str, str]] | None = None,
+        consent_ip_address: str | None = None,
+        consent_user_agent: str | None = None,
     ) -> AccountRecord:
         """写入一个账号并返回不含密码的账号记录。"""
 
@@ -168,13 +172,18 @@ class RepositoryStore:
         if status not in {"active", "disabled"}:
             raise ValueError("账号状态只能是 active 或 disabled。")
         now = now_iso()
+        consent_rows = consents or []
+        for document_type, version in consent_rows:
+            if document_type not in {"terms", "privacy"} or not version.strip():
+                raise ValueError("协议同意记录无效。")
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO accounts (
                     email, password_hash, display_name, role, status,
-                    must_change_password, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    must_change_password, email_verified_at, deleted_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
                 """,
                 (
                     email,
@@ -183,12 +192,30 @@ class RepositoryStore:
                     role,
                     status,
                     bool(must_change_password),
+                    now if email_verified else None,
                     now,
                     now,
                 ),
             )
             account_id = int(cursor.lastrowid)
             self._ensure_account_billing_row(conn, account_id)
+            for document_type, version in consent_rows:
+                conn.execute(
+                    """
+                    INSERT INTO account_consents (
+                        account_id, document_type, version, accepted_at,
+                        ip_address, user_agent
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        account_id,
+                        document_type,
+                        version.strip(),
+                        now,
+                        consent_ip_address,
+                        consent_user_agent,
+                    ),
+                )
         return self.get_account(account_id)
 
     def get_account(self, account_id: int) -> AccountRecord:
@@ -214,7 +241,10 @@ class RepositoryStore:
 
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT * FROM accounts WHERE LOWER(email) = LOWER(?)",
+                """
+                SELECT * FROM accounts
+                WHERE LOWER(email) = LOWER(?) AND deleted_at IS NULL
+                """,
                 (email,),
             ).fetchone()
         if row is None:
@@ -226,10 +256,16 @@ class RepositoryStore:
 
         with self.connect() as conn:
             if include_disabled:
-                rows = conn.execute("SELECT * FROM accounts ORDER BY id").fetchall()
+                rows = conn.execute(
+                    "SELECT * FROM accounts WHERE deleted_at IS NULL ORDER BY id"
+                ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM accounts WHERE status = 'active' ORDER BY id"
+                    """
+                    SELECT * FROM accounts
+                    WHERE status = 'active' AND deleted_at IS NULL
+                    ORDER BY id
+                    """
                 ).fetchall()
         return [account_from_row(row) for row in rows]
 
@@ -238,9 +274,157 @@ class RepositoryStore:
 
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS count FROM accounts WHERE role = 'admin' AND status = 'active'"
+                """
+                SELECT COUNT(*) AS count FROM accounts
+                WHERE role = 'admin' AND status = 'active' AND deleted_at IS NULL
+                """
             ).fetchone()
         return int(row["count"])
+
+    def save_account_action_token(
+        self,
+        account_id: int,
+        purpose: str,
+        token_hash: str,
+        expires_at: str,
+        requested_ip: str | None = None,
+    ) -> None:
+        """Replace outstanding tokens for one purpose and persist only the digest."""
+
+        if purpose not in {"verify_email", "reset_password"}:
+            raise ValueError("账号操作令牌类型无效。")
+        created_at = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE account_action_tokens SET consumed_at = ?
+                WHERE account_id = ? AND purpose = ? AND consumed_at IS NULL
+                """,
+                (created_at, account_id, purpose),
+            )
+            conn.execute(
+                """
+                INSERT INTO account_action_tokens (
+                    account_id, purpose, token_hash, expires_at,
+                    consumed_at, created_at, requested_ip
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (account_id, purpose, token_hash, expires_at, created_at, requested_ip),
+            )
+
+    def consume_email_verification_token(self, token_hash: str) -> AccountRecord | None:
+        """Consume one live verification token and mark its account verified atomically."""
+
+        consumed_at = now_iso()
+        account_id: int | None = None
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, account_id FROM account_action_tokens
+                WHERE token_hash = ? AND purpose = 'verify_email'
+                  AND consumed_at IS NULL AND expires_at > ?
+                """,
+                (token_hash, consumed_at),
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = conn.execute(
+                """
+                UPDATE account_action_tokens SET consumed_at = ?
+                WHERE id = ? AND consumed_at IS NULL AND expires_at > ?
+                """,
+                (consumed_at, int(row["id"]), consumed_at),
+            )
+            if cursor.rowcount != 1:
+                return None
+            account_id = int(row["account_id"])
+            conn.execute(
+                """
+                UPDATE accounts
+                SET email_verified_at = COALESCE(email_verified_at, ?), updated_at = ?
+                WHERE id = ? AND deleted_at IS NULL
+                """,
+                (consumed_at, consumed_at, account_id),
+            )
+        return self.get_account(account_id)
+
+    def consume_password_reset_token(
+        self,
+        token_hash: str,
+        password_hash: str,
+    ) -> AccountRecord | None:
+        """Atomically consume a reset token, change the password, and revoke sessions."""
+
+        consumed_at = now_iso()
+        account_id: int | None = None
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, account_id FROM account_action_tokens
+                WHERE token_hash = ? AND purpose = 'reset_password'
+                  AND consumed_at IS NULL AND expires_at > ?
+                """,
+                (token_hash, consumed_at),
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = conn.execute(
+                """
+                UPDATE account_action_tokens SET consumed_at = ?
+                WHERE id = ? AND consumed_at IS NULL AND expires_at > ?
+                """,
+                (consumed_at, int(row["id"]), consumed_at),
+            )
+            if cursor.rowcount != 1:
+                return None
+            account_id = int(row["account_id"])
+            account_cursor = conn.execute(
+                """
+                UPDATE accounts
+                SET password_hash = ?, must_change_password = FALSE,
+                    email_verified_at = COALESCE(email_verified_at, ?), updated_at = ?
+                WHERE id = ? AND deleted_at IS NULL
+                """,
+                (password_hash, consumed_at, consumed_at, account_id),
+            )
+            if account_cursor.rowcount != 1:
+                return None
+            conn.execute(
+                """
+                UPDATE auth_sessions SET revoked_at = ?
+                WHERE account_id = ? AND revoked_at IS NULL
+                """,
+                (consumed_at, account_id),
+            )
+            conn.execute(
+                """
+                UPDATE account_action_tokens SET consumed_at = ?
+                WHERE account_id = ? AND consumed_at IS NULL
+                """,
+                (consumed_at, account_id),
+            )
+        return self.get_account(account_id)
+
+    def list_account_consents(self, account_id: int) -> list[dict[str, object]]:
+        """List immutable agreement acceptances for account export and support."""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT document_type, version, accepted_at
+                FROM account_consents WHERE account_id = ?
+                ORDER BY accepted_at, id
+                """,
+                (account_id,),
+            ).fetchall()
+        return [
+            {
+                "document_type": str(row["document_type"]),
+                "version": str(row["version"]),
+                "accepted_at": str(row["accepted_at"]),
+            }
+            for row in rows
+        ]
 
     def touch_account_login(self, account_id: int) -> None:
         """记录最近一次成功登录时间，兼容 Web 认证门面。"""
@@ -320,6 +504,266 @@ class RepositoryStore:
             )
             if cursor.rowcount == 0:
                 raise KeyError(f"Account not found: {account_id}")
+        return self.get_account(account_id)
+
+    def update_account_password_and_revoke_sessions(
+        self,
+        account_id: int,
+        password_hash: str,
+    ) -> AccountRecord:
+        """Change a password and invalidate every existing browser session atomically."""
+
+        changed_at = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE accounts
+                SET password_hash = ?, must_change_password = FALSE, updated_at = ?
+                WHERE id = ? AND deleted_at IS NULL
+                """,
+                (password_hash, changed_at, account_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Account not found: {account_id}")
+            conn.execute(
+                """
+                UPDATE auth_sessions SET revoked_at = ?
+                WHERE account_id = ? AND revoked_at IS NULL
+                """,
+                (changed_at, account_id),
+            )
+            conn.execute(
+                """
+                UPDATE account_action_tokens SET consumed_at = ?
+                WHERE account_id = ? AND consumed_at IS NULL
+                """,
+                (changed_at, account_id),
+            )
+        return self.get_account(account_id)
+
+    def export_account_data(self, account_id: int) -> dict[str, object]:
+        """Return a structured account export without password, session, or token secrets."""
+
+        account = self.get_account(account_id)
+        if account.deleted_at is not None:
+            raise ValueError("已注销账号不能再次导出数据。")
+        direct_tables = (
+            "candidate_profiles",
+            "jobs",
+            "long_texts",
+            "chat_sessions",
+            "chat_messages",
+            "project_experience_cards",
+            "resume_drafts",
+            "knowledge_assets",
+            "project_archive_imports",
+            "project_collection_sessions",
+            "visual_knowledge_items",
+            "resume_artifacts",
+            "usage_events",
+            "tool_call_traces",
+            "background_tasks",
+            "account_balance_ledger",
+            "recharge_orders",
+        )
+
+        def row_dict(row: RepositoryRow) -> dict[str, object]:
+            excluded = {"password_hash", "token_hash", "embedding"}
+            return {
+                key: row[key]
+                for key in row.keys()
+                if key not in excluded
+            }
+
+        exported: dict[str, object] = {
+            "exported_at": now_iso(),
+            "account": asdict(account),
+            "consents": self.list_account_consents(account_id),
+        }
+        with self.connect() as conn:
+            for table_name in direct_tables:
+                rows = conn.execute(
+                    f"SELECT * FROM {table_name} WHERE account_id = ? ORDER BY id",  # noqa: S608 - fixed allowlist
+                    (account_id,),
+                ).fetchall()
+                exported[table_name] = [row_dict(row) for row in rows]
+            exported["account_balance"] = row_dict(
+                conn.execute(
+                    "SELECT * FROM account_balances WHERE account_id = ?",
+                    (account_id,),
+                ).fetchone()
+            )
+            version_rows = conn.execute(
+                """
+                SELECT versions.* FROM knowledge_asset_versions AS versions
+                JOIN knowledge_assets AS assets ON assets.id = versions.asset_id
+                WHERE assets.account_id = ? ORDER BY versions.id
+                """,
+                (account_id,),
+            ).fetchall()
+            exported["knowledge_asset_versions"] = [row_dict(row) for row in version_rows]
+            archive_file_rows = conn.execute(
+                """
+                SELECT files.* FROM project_archive_files AS files
+                JOIN project_archive_imports AS imports
+                  ON imports.id = files.project_archive_id
+                WHERE imports.account_id = ? ORDER BY files.id
+                """,
+                (account_id,),
+            ).fetchall()
+            exported["project_archive_files"] = [row_dict(row) for row in archive_file_rows]
+            collection_file_rows = conn.execute(
+                """
+                SELECT files.* FROM project_collection_files AS files
+                JOIN project_collection_sessions AS sessions
+                  ON sessions.id = files.collection_id
+                WHERE sessions.account_id = ? ORDER BY files.id
+                """,
+                (account_id,),
+            ).fetchall()
+            exported["project_collection_files"] = [
+                row_dict(row) for row in collection_file_rows
+            ]
+        return exported
+
+    def prepare_account_deletion(self, account_id: int) -> list[str]:
+        """Disable an account, reject active work, and return owned object keys."""
+
+        account = self.get_account(account_id)
+        if account.role == "admin":
+            raise ValueError("管理员账号不能通过个人中心自助注销。")
+        if account.deleted_at is not None:
+            raise ValueError("账号已经注销。")
+        changed_at = now_iso()
+        with self.connect() as conn:
+            running = conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM background_tasks
+                WHERE account_id = ? AND status = 'running'
+                """,
+                (account_id,),
+            ).fetchone()
+            if running is not None and int(running["count"]) > 0:
+                raise ValueError("仍有后台任务正在执行，请等待任务结束后再注销。")
+            key_rows = conn.execute(
+                """
+                SELECT versions.storage_key FROM knowledge_asset_versions AS versions
+                JOIN knowledge_assets AS assets ON assets.id = versions.asset_id
+                WHERE assets.account_id = ?
+                UNION
+                SELECT files.storage_key FROM project_collection_files AS files
+                JOIN project_collection_sessions AS sessions ON sessions.id = files.collection_id
+                WHERE sessions.account_id = ? AND files.storage_key IS NOT NULL
+                UNION
+                SELECT storage_key FROM visual_knowledge_items WHERE account_id = ?
+                UNION
+                SELECT storage_key FROM resume_artifacts WHERE account_id = ?
+                """,
+                (account_id, account_id, account_id, account_id),
+            ).fetchall()
+            conn.execute(
+                "UPDATE accounts SET status = 'disabled', updated_at = ? WHERE id = ?",
+                (changed_at, account_id),
+            )
+            conn.execute(
+                """
+                UPDATE auth_sessions SET revoked_at = ?
+                WHERE account_id = ? AND revoked_at IS NULL
+                """,
+                (changed_at, account_id),
+            )
+            conn.execute(
+                """
+                UPDATE background_tasks
+                SET status = 'cancelled', finished_at = ?, updated_at = ?
+                WHERE account_id = ? AND status = 'queued'
+                """,
+                (changed_at, changed_at, account_id),
+            )
+        return sorted({str(row["storage_key"]) for row in key_rows if row["storage_key"]})
+
+    def restore_account_after_failed_deletion(self, account_id: int) -> None:
+        """Re-enable an account when object cleanup fails before database deletion."""
+
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE accounts SET status = 'active', updated_at = ?
+                WHERE id = ? AND deleted_at IS NULL AND status = 'disabled'
+                """,
+                (now_iso(), account_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Account not found or already deleted: {account_id}")
+
+    def finalize_account_deletion(
+        self,
+        account_id: int,
+        anonymized_email: str,
+        unusable_password_hash: str,
+    ) -> AccountRecord:
+        """Delete personal workload data and retain anonymized financial facts."""
+
+        deleted_at = now_iso()
+        with self.connect() as conn:
+            running = conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM background_tasks
+                WHERE account_id = ? AND status = 'running'
+                """,
+                (account_id,),
+            ).fetchone()
+            if running is not None and int(running["count"]) > 0:
+                raise ValueError("注销过程中出现新的后台任务，请稍后重试。")
+            # Child tables not directly removed by the candidate/profile cascades.
+            for table_name in (
+                "rag_chunks",
+                "visual_knowledge_items",
+                "resume_artifacts",
+                "background_tasks",
+                "tool_call_traces",
+                "usage_events",
+                "chat_messages",
+                "chat_sessions",
+                "resume_drafts",
+                "project_archive_imports",
+                "project_collection_sessions",
+                "project_experience_cards",
+                "knowledge_assets",
+                "long_texts",
+                "jobs",
+                "candidate_profiles",
+                "auth_sessions",
+                "account_action_tokens",
+            ):
+                conn.execute(
+                    f"DELETE FROM {table_name} WHERE account_id = ?",  # noqa: S608 - fixed allowlist
+                    (account_id,),
+                )
+            conn.execute(
+                """
+                UPDATE account_consents
+                SET ip_address = NULL, user_agent = NULL
+                WHERE account_id = ?
+                """,
+                (account_id,),
+            )
+            conn.execute(
+                """
+                UPDATE accounts
+                SET email = ?, password_hash = ?, display_name = NULL,
+                    status = 'disabled', must_change_password = FALSE,
+                    email_verified_at = NULL, deleted_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    anonymized_email,
+                    unusable_password_hash,
+                    deleted_at,
+                    deleted_at,
+                    account_id,
+                ),
+            )
         return self.get_account(account_id)
 
     def assert_account_can_spend(self, account_id: int) -> None:
@@ -6200,6 +6644,16 @@ def account_from_row(row: RepositoryRow) -> AccountRecord:
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
         must_change_password=bool(row["must_change_password"]),
+        email_verified_at=(
+            str(row["email_verified_at"])
+            if "email_verified_at" in row and row["email_verified_at"] is not None
+            else None
+        ),
+        deleted_at=(
+            str(row["deleted_at"])
+            if "deleted_at" in row and row["deleted_at"] is not None
+            else None
+        ),
     )
 
 

@@ -56,7 +56,8 @@ assert.match(
   source,
   /navigateToAuth\(replace = false, preserveCurrentRoute = true\)/,
 );
-assert.equal((source.match(/this\.navigateToAuth\(true, false\);/g) || []).length, 2);
+// 退出、退出全部设备、改密和注销都会失去当前 Session，必须回登录页且不能带 next。
+assert.equal((source.match(/this\.navigateToAuth\(true, false\);/g) || []).length, 4);
 assert.match(template, /app\.js\?v=20260825-project-collection-v3/);
 
 const navigateToAuth = extractMethod(

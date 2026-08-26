@@ -3013,6 +3013,87 @@ textarea:focus-visible,
 .text-button:hover { color: var(--auth-ink); }
 .text-button:focus-visible { outline: 2px solid var(--auth-focus); outline-offset: 2px; }
 
+.auth-secondary-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  margin-block-start: calc(var(--space-2xs) * -1);
+}
+
+.auth-consent {
+  display: grid;
+  grid-template-columns: 1rem minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-xs);
+  color: var(--auth-muted);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.auth-consent input {
+  width: 1rem;
+  height: 1rem;
+  margin-block-start: 0.2rem;
+  accent-color: var(--auth-accent);
+}
+
+.auth-consent a {
+  color: var(--auth-accent);
+  text-underline-offset: 0.16em;
+}
+
+.legal-page {
+  min-height: 100svh;
+  margin: 0;
+  padding: clamp(1rem, 4vw, 3rem);
+  color: var(--color-ink);
+  background: var(--color-canvas);
+}
+
+.legal-document {
+  width: min(100%, 52rem);
+  margin-inline: auto;
+  padding: clamp(1.25rem, 4vw, 3rem);
+  background: var(--color-paper-raised);
+  border: var(--rule-thin) solid var(--color-rule);
+  border-radius: var(--radius-md);
+}
+
+.legal-document h1 { margin-block-start: 0; font-family: var(--font-display); }
+.legal-document h2 { margin-block-start: var(--space-xl); font-size: var(--text-lg); }
+.legal-document p,
+.legal-document li { color: var(--color-ink-2); line-height: 1.75; }
+.legal-document a { color: var(--color-accent-strong); }
+
+.profile-account-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-md);
+}
+
+.profile-account-panel {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: var(--space-md);
+}
+
+.profile-account-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+}
+
+.profile-account-form {
+  display: grid;
+  gap: var(--space-sm);
+}
+
+.profile-danger-panel {
+  border-color: color-mix(in oklch, var(--color-error) 35%, var(--color-rule));
+}
+
 .chat-head { padding: var(--space-lg) var(--space-lg) var(--space-md); }
 .chat-title { font-size: var(--text-lg); }
 .chat-session-actions { display: flex; align-items: center; gap: var(--space-xs); min-width: 0; }
@@ -3896,6 +3977,7 @@ textarea:focus-visible,
   .admin-table-wrap { max-block-size: min(28rem, 48svh); }
   .admin-tool-workspace { grid-template-columns: 1fr; }
   .admin-tool-list { max-block-size: min(18rem, 36svh); }
+  .profile-account-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 40rem) {

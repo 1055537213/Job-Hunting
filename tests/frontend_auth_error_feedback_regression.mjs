@@ -28,7 +28,7 @@ function extractMethod(signature, functionSignature) {
 }
 
 assert.match(source, /const AUTH_ERROR_DISMISS_MS = 6000;/);
-assert.equal((page.match(/@input="clearAuthFeedback"/g) || []).length, 2);
+assert.equal((page.match(/@input="clearAuthFeedback"/g) || []).length, 3);
 assert.match(page, /class="inline-error"\s+:class="\{ 'is-success': authSuccess \}"/);
 
 const clearAuthFeedback = extractMethod(
@@ -73,7 +73,13 @@ const context = {
   authForm: {
     email: "candidate@example.com",
     password: "wrong-password",
+    newPassword: "",
     displayName: "",
+    consentAccepted: false,
+  },
+  accountLifecycle: {
+    terms_version: "development",
+    privacy_version: "development",
   },
   authLoading: false,
   authMode: "login",
@@ -123,7 +129,9 @@ const registerContext = {
   authForm: {
     email: "new-candidate@example.com",
     password: "strong-password-123",
+    newPassword: "",
     displayName: "新候选人",
+    consentAccepted: false,
   },
   async requestJson() {
     return { account: null };
