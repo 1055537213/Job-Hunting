@@ -456,7 +456,7 @@ class ChatMessageRecord:
 class RAGIndexStats:
     """一次 RAG 索引写入的统计结果。
 
-    `mode` 用来区分全量重建和增量追加；两种模式都只描述向量索引动作，
+    `mode` 用来区分全量重建和增量替换；两种模式都只描述向量索引动作，
     不改变结构化事实源。
     """
 

@@ -986,7 +986,7 @@ class RepositoryStore:
             excluded = {"password_hash", "token_hash", "embedding"}
             return {
                 key: row[key]
-                for key in row.keys()
+                for key in row
                 if key not in excluded
             }
 
@@ -998,7 +998,7 @@ class RepositoryStore:
         with self.connect() as conn:
             for table_name in direct_tables:
                 rows = conn.execute(
-                    f"SELECT * FROM {table_name} WHERE account_id = ? ORDER BY id",  # noqa: S608 - fixed allowlist
+                    f"SELECT * FROM {table_name} WHERE account_id = ? ORDER BY id",
                     (account_id,),
                 ).fetchall()
                 exported[table_name] = [row_dict(row) for row in rows]
@@ -1168,7 +1168,7 @@ class RepositoryStore:
                 "account_action_tokens",
             ):
                 conn.execute(
-                    f"DELETE FROM {table_name} WHERE account_id = ?",  # noqa: S608 - fixed allowlist
+                    f"DELETE FROM {table_name} WHERE account_id = ?",
                     (account_id,),
                 )
             conn.execute(

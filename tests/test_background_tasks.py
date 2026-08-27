@@ -20,13 +20,13 @@ from job_hunting_agent.background_tasks import (
 )
 from job_hunting_agent.config import TaskQueueSettings, load_task_queue_settings
 from job_hunting_agent.llm import StaticLLMClient
+from job_hunting_agent.model_resilience import ModelCircuitOpenError
 from job_hunting_agent.models import (
     CandidateProfileInput,
     RAGIndexStats,
     ToolCallTraceRecord,
     UsageEventRecord,
 )
-from job_hunting_agent.model_resilience import ModelCircuitOpenError
 from job_hunting_agent.rag import RAGProviderRequestError
 from job_hunting_agent.resume_document import ResumeFileStore
 from job_hunting_agent.storage import InsufficientBalanceError
@@ -38,7 +38,11 @@ from job_hunting_agent.task_queue import (
     build_celery_app,
     maintenance_queue_name,
 )
-from job_hunting_agent.web import load_or_new_tool_trace, new_task_trace, owned_or_new_root_request_id
+from job_hunting_agent.web import (
+    load_or_new_tool_trace,
+    new_task_trace,
+    owned_or_new_root_request_id,
+)
 
 
 class FakeCeleryProducer:

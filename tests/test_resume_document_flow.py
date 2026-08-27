@@ -46,12 +46,15 @@ def build_docx_bytes(*paragraphs: str) -> bytes:
     return output.getvalue()
 
 
-def build_text_pdf_bytes(text: str) -> bytes:
-    """创建一个包含可直接提取 ASCII 文本的单页 PDF。"""
+def build_text_pdf_bytes(*pages: str) -> bytes:
+    """创建一个包含可直接提取 ASCII 文本层的 PDF。"""
 
     output = BytesIO()
     pdf = canvas.Canvas(output)
-    pdf.drawString(72, 760, text)
+    for index, text in enumerate(pages):
+        if index:
+            pdf.showPage()
+        pdf.drawString(72, 760, text)
     pdf.save()
     return output.getvalue()
 
@@ -141,6 +144,22 @@ def test_resume_parser_handles_docx_text_pdf_and_scanned_pdf() -> None:
     assert scanned_pdf_result.method == "pdf_ocr"
     assert "扫描简历" in scanned_pdf_result.text
     assert scanned_pdf_result.page_count == 1
+
+
+def test_pdf_parser_preserves_page_boundaries_for_rag() -> None:
+    """真实多页 PDF 应在校验正文后写入页标记，供语义切分和引用页码使用。"""
+
+    first_page = "First page Python FastAPI project experience details"
+    second_page = "Second page PostgreSQL pgvector retrieval details"
+
+    result = extract_resume_document(
+        "two-pages.pdf",
+        build_text_pdf_bytes(first_page, second_page),
+    )
+
+    assert result.method == "pdf_text"
+    assert result.page_count == 2
+    assert result.text == f"[第 1 页]\n{first_page}\n\n[第 2 页]\n{second_page}"
 
 
 def test_pdf_text_layer_inspection_does_not_start_ocr(monkeypatch) -> None:

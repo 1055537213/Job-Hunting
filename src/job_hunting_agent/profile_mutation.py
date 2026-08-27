@@ -10,7 +10,11 @@
 from __future__ import annotations
 
 from .city_catalog import normalize_city_list
-from .models import CandidateProfileInput, CandidateProfilePatch, sanitize_preference_weights
+from .models import (
+    CandidateProfileInput,
+    CandidateProfilePatch,
+    sanitize_preference_weights,
+)
 from .skill_normalization import merge_skill_mappings, normalize_skill_mapping
 
 

@@ -21,7 +21,6 @@ from typing import Any, Protocol
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from .config import (
     DEFAULT_ENV_PATH,
@@ -209,7 +208,7 @@ class OpenAICompatibleEmbeddings(Embeddings):
                     payload,
                     self.timeout_seconds,
                 )
-            except Exception as error:  # noqa: BLE001 - 统一转换并分类供应商错误。
+            except Exception as error:
                 retryable = is_transient_model_error(error)
                 if self.circuit_breaker is not None:
                     retryable = record_model_call_failure(self.circuit_breaker, error)
@@ -364,7 +363,7 @@ class NativeMultimodalEmbeddings(Embeddings):
                     payload,
                     self.timeout_seconds,
                 )
-            except Exception as error:  # noqa: BLE001 - 统一转换并分类供应商错误。
+            except Exception as error:
                 retryable = is_transient_model_error(error)
                 if self.circuit_breaker is not None:
                     retryable = record_model_call_failure(self.circuit_breaker, error)
@@ -621,7 +620,7 @@ class HttpReranker:
                     payload,
                     self.timeout_seconds,
                 )
-            except Exception as error:  # noqa: BLE001 - 统一转换并分类供应商错误。
+            except Exception as error:
                 retryable = is_transient_model_error(error)
                 if self.circuit_breaker is not None:
                     retryable = record_model_call_failure(self.circuit_breaker, error)
@@ -822,23 +821,472 @@ def build_rag_documents(
     return documents
 
 
-def split_rag_documents(documents: list[Document]) -> list[Document]:
-    """按统一规则切分文档，并为每一块生成跨后端稳定的 chunk ID。"""
+RAG_CHUNKING_VERSION = "semantic-v1"
+# 这是软目标，不是切分边界；只有结构化块或句子超过硬上限时才会继续拆分。
+RAG_CHUNK_TARGET_CHARACTERS = 900
+RAG_CHUNK_MAX_CHARACTERS = 1_400
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=80,
-        separators=["\n\n", "\n", "。", "；", "，", " ", ""],
-    )
-    chunks = splitter.split_documents(documents)
+_MARKDOWN_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+|[一二三四五六七八九十]+[、.)]\s*)")
+_FENCE_RE = re.compile(r"^\s*(```+|~~~+)")
+_PAGE_MARKER_RE = re.compile(
+    r"^\s*(?:\[page\s*=\s*(\d+)\]|\[第\s*(\d+)\s*页\])\s*$",
+    re.IGNORECASE,
+)
+_SECTION_MARKER_RE = re.compile(r"^\s*\[([^\[\]\n]{1,80})\]\s*$")
+_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
+_PLAIN_SECTION_LABELS = frozenset(
+    {
+        "个人信息",
+        "求职意向",
+        "自我介绍",
+        "自我评价",
+        "教育背景",
+        "教育经历",
+        "工作经历",
+        "实习经历",
+        "职业经历",
+        "项目经历",
+        "项目背景",
+        "项目描述",
+        "项目职责",
+        "个人职责",
+        "主要职责",
+        "工作内容",
+        "技术栈",
+        "专业技能",
+        "技能清单",
+        "核心功能",
+        "实现方案",
+        "项目亮点",
+        "项目成果",
+        "证书",
+        "奖项",
+        "职位描述",
+        "岗位职责",
+        "任职要求",
+        "任职资格",
+        "福利待遇",
+        "公司介绍",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _SemanticBlock:
+    """切分器内部的结构化语义块；不暴露给 RAG 调用方。"""
+
+    content: str
+    semantic_type: str
+    section_title: str | None
+    heading: str | None
+    source_page: int | None
+
+
+def split_rag_documents(documents: list[Document]) -> list[Document]:
+    """按语义边界优先、长度兜底的规则切分文档。
+
+    外部接口保持为一个纯函数：调用方不需要知道 Markdown、OCR、项目材料和
+    对话文本分别如何处理。实现先识别结构化语义块，再合并相邻短块，最后只对
+    仍然超长的块按句子/行/字符递归拆分。
+    """
+
+    chunks: list[Document] = []
     chunk_indexes_by_long_text: dict[int, int] = {}
-    for chunk in chunks:
-        long_text_id = int(chunk.metadata["long_text_id"])
-        chunk_index = chunk_indexes_by_long_text.get(long_text_id, 0)
-        chunk_indexes_by_long_text[long_text_id] = chunk_index + 1
-        chunk.metadata["chunk_index"] = chunk_index
-        chunk.metadata["chunk_id"] = f"long-text-{long_text_id}-chunk-{chunk_index}"
+    for document in documents:
+        blocks = _merge_semantic_blocks(_extract_semantic_blocks(document))
+        for block_index, block in enumerate(blocks):
+            fragments = _split_semantic_block(block)
+            for fragment_index, content in enumerate(fragments):
+                metadata = dict(document.metadata)
+                long_text_id = int(metadata["long_text_id"])
+                chunk_index = chunk_indexes_by_long_text.get(long_text_id, 0)
+                chunk_indexes_by_long_text[long_text_id] = chunk_index + 1
+                metadata.update(
+                    {
+                        "chunk_index": chunk_index,
+                        "chunk_id": f"long-text-{long_text_id}-chunk-{chunk_index}",
+                        "chunking_version": RAG_CHUNKING_VERSION,
+                        "block_index": block_index,
+                        "semantic_type": block.semantic_type,
+                    }
+                )
+                if block.section_title is not None:
+                    metadata["section_title"] = block.section_title
+                if block.source_page is not None:
+                    metadata["source_page"] = block.source_page
+                if len(fragments) > 1:
+                    metadata["fragment_index"] = fragment_index
+                    metadata["fragment_count"] = len(fragments)
+                chunks.append(Document(page_content=content, metadata=metadata))
     return chunks
+
+
+def _extract_semantic_blocks(document: Document) -> list[_SemanticBlock]:
+    """识别标题、段落、列表、代码、表格和页面边界。"""
+
+    text = document.page_content.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+    lines = text.split("\n")
+    metadata = document.metadata
+    source_page = _source_page_from_metadata(metadata)
+    section_title: str | None = None
+    heading: str | None = None
+    blocks: list[_SemanticBlock] = []
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip():
+            index += 1
+            continue
+        page_match = _PAGE_MARKER_RE.match(line)
+        if page_match:
+            source_page = int(page_match.group(1) or page_match.group(2))
+            index += 1
+            continue
+
+        section_match = _SECTION_MARKER_RE.match(line)
+        if section_match:
+            section_title = section_match.group(1).strip()
+            heading = line.strip()
+            index += 1
+            if index >= len(lines) or not any(item.strip() for item in lines[index:]):
+                blocks.append(_SemanticBlock(heading, "heading", section_title, heading, source_page))
+            continue
+
+        heading_match = _MARKDOWN_HEADING_RE.match(line)
+        if heading_match:
+            section_title = heading_match.group(1).strip()
+            heading = line.strip()
+            index += 1
+            # 标题只作为下一个语义块的上下文；没有正文时仍保留标题本身。
+            if index >= len(lines) or not any(item.strip() for item in lines[index:]):
+                blocks.append(_SemanticBlock(heading, "heading", section_title, heading, source_page))
+            continue
+
+        plain_section_title = _plain_section_title(line)
+        if plain_section_title is not None:
+            section_title = plain_section_title
+            heading = line.strip()
+            index += 1
+            if index >= len(lines) or not any(item.strip() for item in lines[index:]):
+                blocks.append(_SemanticBlock(heading, "heading", section_title, heading, source_page))
+            continue
+
+        fence_match = _FENCE_RE.match(line)
+        if fence_match:
+            fence = fence_match.group(1)[0]
+            end = index + 1
+            while end < len(lines) and not re.match(rf"^\s*{re.escape(fence)}{{3,}}\s*$", lines[end]):
+                end += 1
+            if end < len(lines):
+                end += 1
+            blocks.append(
+                _make_semantic_block(
+                    lines[index:end],
+                    "code_block",
+                    section_title,
+                    heading,
+                    source_page,
+                )
+            )
+            index = end
+            continue
+
+        if _looks_like_table(lines, index):
+            end = index + 1
+            while end < len(lines) and lines[end].strip() and _is_table_row(lines[end]):
+                end += 1
+            blocks.append(
+                _make_semantic_block(
+                    lines[index:end],
+                    "table",
+                    section_title,
+                    heading,
+                    source_page,
+                )
+            )
+            index = end
+            continue
+
+        if _LIST_ITEM_RE.match(line):
+            end = index + 1
+            while end < len(lines):
+                candidate = lines[end]
+                if not candidate.strip():
+                    break
+                if _LIST_ITEM_RE.match(candidate) or candidate.startswith((" ", "\t")):
+                    end += 1
+                    continue
+                break
+            blocks.append(
+                _make_semantic_block(
+                    lines[index:end],
+                    "bullet_list",
+                    section_title,
+                    heading,
+                    source_page,
+                )
+            )
+            index = end
+            continue
+
+        end = index + 1
+        while end < len(lines):
+            candidate = lines[end]
+            if (
+                not candidate.strip()
+                or _PAGE_MARKER_RE.match(candidate)
+                or _SECTION_MARKER_RE.match(candidate)
+                or _MARKDOWN_HEADING_RE.match(candidate)
+                or _plain_section_title(candidate) is not None
+                or _FENCE_RE.match(candidate)
+                or _LIST_ITEM_RE.match(candidate)
+                or _looks_like_table(lines, end)
+            ):
+                break
+            end += 1
+        blocks.append(
+            _make_semantic_block(
+                lines[index:end],
+                "paragraph",
+                section_title,
+                heading,
+                source_page,
+            )
+        )
+        index = end
+
+    return blocks
+
+
+def _make_semantic_block(
+    lines: list[str],
+    semantic_type: str,
+    section_title: str | None,
+    heading: str | None,
+    source_page: int | None,
+) -> _SemanticBlock:
+    """生成带章节上下文的语义块，并去掉 OCR 常见的行尾空白。"""
+
+    body = "\n".join(line.rstrip() for line in lines).strip()
+    if heading and body != heading:
+        content = f"{heading}\n{body}"
+    else:
+        content = body
+    return _SemanticBlock(content, semantic_type, section_title, heading, source_page)
+
+
+def _source_page_from_metadata(metadata: dict[str, object]) -> int | None:
+    """从来源元数据或 ``#page=N`` 标签中恢复页码。"""
+
+    for key in ("source_page", "page_number"):
+        value = metadata.get(key)
+        if value is not None and str(value).isdigit():
+            return int(str(value))
+    source_label = str(metadata.get("source_label") or "")
+    match = re.search(r"#page\s*=\s*(\d+)", source_label, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _plain_section_title(line: str) -> str | None:
+    """识别简历、职位和项目材料中的常见无 Markdown 章节标题。"""
+
+    candidate = line.strip().rstrip("：:").strip()
+    candidate = re.sub(r"^(?:\d+[.)、]|[一二三四五六七八九十]+[、.)])\s*", "", candidate)
+    return candidate if candidate in _PLAIN_SECTION_LABELS else None
+
+
+def _looks_like_table(lines: list[str], index: int) -> bool:
+    """识别 Markdown 或项目提取器产生的制表符表格。"""
+
+    if index + 1 >= len(lines):
+        return False
+    if "|" in lines[index] and _TABLE_SEPARATOR_RE.match(lines[index + 1]):
+        return True
+    return "\t" in lines[index] and "\t" in lines[index + 1]
+
+
+def _is_table_row(line: str) -> bool:
+    return "|" in line or "\t" in line
+
+
+def _merge_semantic_blocks(blocks: list[_SemanticBlock]) -> list[_SemanticBlock]:
+    """合并同一章节内的相邻短段落，避免一个事实被过度碎片化。"""
+
+    merged: list[_SemanticBlock] = []
+    for block in blocks:
+        if not merged:
+            merged.append(block)
+            continue
+        previous = merged[-1]
+        compatible_type = previous.semantic_type == block.semantic_type == "paragraph"
+        compatible_heading = previous.heading == block.heading
+        compatible_section = previous.section_title == block.section_title
+        compatible_page = previous.source_page == block.source_page
+        combined_length = len(previous.content) + len(block.content) + 2
+        if compatible_type and compatible_heading and compatible_section and compatible_page and combined_length <= RAG_CHUNK_TARGET_CHARACTERS:
+            body = _block_body(previous) + "\n\n" + _block_body(block)
+            merged[-1] = _SemanticBlock(
+                _with_heading(body, previous.heading),
+                "paragraph",
+                previous.section_title,
+                previous.heading,
+                previous.source_page,
+            )
+        elif previous.semantic_type == "heading" and compatible_section:
+            merged[-1] = _SemanticBlock(
+                block.content,
+                block.semantic_type,
+                block.section_title,
+                block.heading,
+                block.source_page,
+            )
+        else:
+            merged.append(block)
+    return merged
+
+
+def _block_body(block: _SemanticBlock) -> str:
+    """移除重复的章节标题，供相邻段落合并使用。"""
+
+    if block.heading and block.content.startswith(f"{block.heading}\n"):
+        return block.content[len(block.heading) + 1 :]
+    return block.content
+
+
+def _with_heading(body: str, heading: str | None) -> str:
+    return f"{heading}\n{body}" if heading else body
+
+
+def _split_semantic_block(block: _SemanticBlock) -> list[str]:
+    """只在结构化块过长时拆分，并尽量保留标题、表头和代码围栏。"""
+
+    if len(block.content) <= RAG_CHUNK_MAX_CHARACTERS:
+        return [block.content]
+    heading = block.heading
+    body = _block_body(block)
+    prefix_length = len(heading) + 1 if heading else 0
+    budget = RAG_CHUNK_MAX_CHARACTERS - prefix_length
+    # 极端长标题若继续复制到每个分片，会挤占全部正文预算并突破硬上限。
+    # 此时退化为对完整块做一次硬切，保留全部内容但不重复病态前缀。
+    if budget < 80:
+        return _hard_split(block.content, RAG_CHUNK_MAX_CHARACTERS)
+    if block.semantic_type == "table":
+        fragments = _split_table_body(body, budget)
+    elif block.semantic_type == "code_block":
+        fragments = _split_code_body(body, budget)
+    elif block.semantic_type == "bullet_list":
+        fragments = _pack_units(body.splitlines(), budget, joiner="\n")
+    else:
+        fragments = _pack_units(_sentence_units(body), budget, joiner=" ")
+    contents = [_with_heading(fragment, heading) for fragment in fragments if fragment.strip()]
+    # 表头、代码围栏等结构前缀也可能异常超长；最终出口再次执行硬上限兜底。
+    return [
+        part
+        for content in contents
+        for part in _hard_split(content, RAG_CHUNK_MAX_CHARACTERS)
+        if part.strip()
+    ]
+
+
+def _sentence_units(text: str) -> list[str]:
+    """按中英文句末标点切分，不把句子中间的逗号当成首选边界。"""
+
+    units: list[str] = []
+    start = 0
+    index = 0
+    while index < len(text):
+        character = text[index]
+        is_english_period = character == "." and (index + 1 == len(text) or text[index + 1].isspace())
+        if character in "。！？!?；;" or is_english_period:
+            end = index + 1
+            while end < len(text) and text[end] in "\"'”’」』】）》)":
+                end += 1
+            unit = text[start:end].strip()
+            if unit:
+                units.append(unit)
+            start = end
+            index = end
+            continue
+        index += 1
+    tail = text[start:].strip()
+    if tail:
+        units.append(tail)
+    return units or [text.strip()]
+
+
+def _pack_units(units: list[str], budget: int, *, joiner: str) -> list[str]:
+    """在自然单元之间打包，单元本身过长时才递归硬切。"""
+
+    packed: list[str] = []
+    current = ""
+    for unit in units:
+        for part in _hard_split(unit, budget):
+            candidate = f"{current}{joiner if current else ''}{part}"
+            if current and len(candidate) > min(RAG_CHUNK_TARGET_CHARACTERS, budget):
+                packed.append(current.strip())
+                current = part
+            else:
+                current = candidate
+    if current.strip():
+        packed.append(current.strip())
+    return packed
+
+
+def _hard_split(text: str, budget: int) -> list[str]:
+    """对单个异常超长句子使用标点、空白和最终字符边界兜底。"""
+
+    remaining = text.strip()
+    parts: list[str] = []
+    while len(remaining) > budget:
+        window = remaining[: budget + 1]
+        cut = max((window.rfind(marker) for marker in ("，", ",", "、", "：", ":", " ", "\n")), default=-1)
+        if cut < max(1, budget // 2):
+            cut = budget
+        else:
+            cut = min(cut + 1, budget)
+        parts.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        parts.append(remaining)
+    return parts or [text.strip()]
+
+
+def _split_table_body(body: str, budget: int) -> list[str]:
+    """按完整数据行拆表，并在每个片段重复表头。"""
+
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return _pack_units(lines, budget, joiner="\n")
+    header_end = 2 if _TABLE_SEPARATOR_RE.match(lines[1]) else 1
+    header = "\n".join(lines[:header_end])
+    row_budget = budget - len(header) - 1
+    if row_budget < 80:
+        return _hard_split(body, budget)
+    groups = _pack_units(lines[header_end:], row_budget, joiner="\n")
+    return [f"{header}\n{group}" for group in groups] or [header]
+
+
+def _split_code_body(body: str, budget: int) -> list[str]:
+    """超长代码按完整行拆分，并为每段补齐代码围栏。"""
+
+    lines = body.splitlines()
+    if len(lines) < 2:
+        return _pack_units([body], budget, joiner="\n")
+    opening = lines[0] if lines[0].lstrip().startswith(("```", "~~~")) else ""
+    closing = lines[-1] if opening and lines[-1].lstrip().startswith(opening.lstrip()[0] * 3) else ""
+    code_lines = lines[1:-1] if opening and closing else lines
+    overhead = len(opening) + len(closing) + 2 if opening else 0
+    content_budget = budget - overhead
+    if content_budget < 80:
+        return _hard_split(body, budget)
+    groups = _pack_units(code_lines, content_budget, joiner="\n")
+    if not opening:
+        return groups
+    return [f"{opening}\n{group}\n{closing}" for group in groups]
 
 
 def rerank_rag_results(

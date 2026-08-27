@@ -26,8 +26,8 @@ TIMESTAMP_TYPE = sa.DateTime(timezone=True)
 INITIAL_BALANCE_YUAN = 100.0
 LOW_BALANCE_THRESHOLD_YUAN = 10.0
 PRICE_PER_MILLION_TOKENS_YUAN = 25.0
-INITIAL_BALANCE_MICRO_YUAN = int(round(INITIAL_BALANCE_YUAN * 1_000_000))
-LOW_BALANCE_THRESHOLD_MICRO_YUAN = int(round(LOW_BALANCE_THRESHOLD_YUAN * 1_000_000))
+INITIAL_BALANCE_MICRO_YUAN = round(INITIAL_BALANCE_YUAN * 1_000_000)
+LOW_BALANCE_THRESHOLD_MICRO_YUAN = round(LOW_BALANCE_THRESHOLD_YUAN * 1_000_000)
 
 
 def upgrade() -> None:
@@ -165,7 +165,7 @@ def upgrade() -> None:
             if total_tokens <= 0:
                 continue
             call_id = str(usage["call_id"])
-            cost_micro_yuan = int(round(total_tokens * PRICE_PER_MILLION_TOKENS_YUAN))
+            cost_micro_yuan = round(total_tokens * PRICE_PER_MILLION_TOKENS_YUAN)
             balance_before = balance
             balance_after = balance_before - cost_micro_yuan
             balance = balance_after

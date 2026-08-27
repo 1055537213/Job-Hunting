@@ -85,7 +85,7 @@ def action_token_hash(token: str) -> str:
 def derive_action_token(secret: str, delivery_key: str, purpose: str, account_id: int) -> str:
     """从服务端密钥和持久派生键重建一次性令牌。"""
 
-    message = f"v1:{purpose}:{account_id}:{delivery_key}".encode("utf-8")
+    message = f"v1:{purpose}:{account_id}:{delivery_key}".encode()
     digest = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
@@ -97,7 +97,7 @@ def request_source_hash(secret: str, source: str | None) -> str | None:
         return None
     return hmac.new(
         secret.encode("utf-8"),
-        f"request-source:{source}".encode("utf-8"),
+        f"request-source:{source}".encode(),
         hashlib.sha256,
     ).hexdigest()
 

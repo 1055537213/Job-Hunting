@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Protocol
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.embeddings import Embeddings
@@ -45,8 +46,8 @@ from .config import (
     load_rerank_settings,
 )
 from .llm import LangChainLLMClient, LLMClient, build_chat_model
-from .models import UsageEventRecord
 from .model_resilience import CircuitBreaker, ModelCircuitCallbackHandler
+from .models import UsageEventRecord
 from .rag import (
     Reranker,
     RerankResult,
@@ -228,7 +229,8 @@ class ConcurrencyLimitedEmbeddings(Embeddings):
 
         embed_images = getattr(self.delegate, "embed_images", None)
         if not callable(embed_images):
-            raise ValueError("当前 Embedding 配置不支持图片向量。")
+            # 对外保持配置校验异常契约；调用方会把它转换成可读配置错误。
+            raise ValueError("当前 Embedding 配置不支持图片向量。")  # noqa: TRY004
         lease = self.controller.acquire("model", account_id=self.account_id)
         try:
             return embed_images(images)

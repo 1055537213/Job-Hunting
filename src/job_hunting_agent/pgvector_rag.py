@@ -22,6 +22,7 @@ from sqlalchemy.engine import Engine
 from .database_schema import long_texts, rag_chunks, visual_knowledge_items
 from .models import LongTextRecord, RAGIndexStats, RAGSearchResult
 from .rag import (
+    RAG_CHUNKING_VERSION,
     Reranker,
     build_rag_documents,
     rag_embedding_model_name,
@@ -73,6 +74,18 @@ def _visual_evidence_text(row: Any) -> str:
     return "\n".join(lines)
 
 
+def _text_evidence_page_number(row: Any) -> int | None:
+    """从文字 Chunk 元数据恢复页码，供引用和前端定位原文。"""
+
+    metadata = row.get("metadata_json")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    source_page = metadata.get("source_page")
+    if source_page is None or not str(source_page).isdigit():
+        return None
+    page_number = int(str(source_page))
+    return page_number if page_number > 0 else None
+
+
 class PgVectorKnowledgeBase:
     """在 PostgreSQL 内维护账号隔离的 pgvector RAG 索引。
 
@@ -119,12 +132,23 @@ class PgVectorKnowledgeBase:
         long_texts: list[LongTextRecord],
         account_id: int | None = None,
     ) -> RAGIndexStats:
-        """增量 upsert 指定长文本；稳定 chunk ID 防止重复索引产生重复证据。"""
+        """事务性替换指定长文本的全部 Chunk，避免旧尾块残留。"""
 
         documents = split_rag_documents(build_rag_documents(long_texts, account_id=account_id))
         rows = self._rows_for_documents(documents)
-        if rows:
+        # Chunk 数量可能因正文修改或切分版本升级而减少；仅 upsert 会遗留旧尾块，
+        # 因此删除与本批来源对应的旧派生索引后，再在同一事务中写入新行。
+        long_text_ids = sorted(
+            {int(document.metadata["long_text_id"]) for document in documents}
+            | {int(record.id) for record in long_texts}
+        )
+        if long_text_ids:
             with self.engine.begin() as connection:
+                self._lock_long_text_ids(connection, long_text_ids)
+                delete_statement = sa.delete(rag_chunks).where(rag_chunks.c.long_text_id.in_(long_text_ids))
+                if account_id is not None:
+                    delete_statement = delete_statement.where(rag_chunks.c.account_id == account_id)
+                connection.execute(delete_statement)
                 self._upsert_rows(connection, rows)
         return self._stats(len(long_texts), len(documents), mode="incremental")
 
@@ -142,6 +166,7 @@ class PgVectorKnowledgeBase:
         if account_id is not None:
             statement = statement.where(rag_chunks.c.account_id == account_id)
         with self.engine.begin() as connection:
+            self._lock_long_text_ids(connection, normalized_ids)
             result = connection.execute(statement)
         return max(0, result.rowcount or 0)
 
@@ -178,6 +203,7 @@ class PgVectorKnowledgeBase:
                 rag_chunks.c.source_label,
                 rag_chunks.c.long_text_id,
                 rag_chunks.c.chunk_index,
+                rag_chunks.c.metadata_json,
                 distance.label("distance"),
             )
             .where(
@@ -217,6 +243,7 @@ class PgVectorKnowledgeBase:
                 long_text_id=int(row["long_text_id"]),
                 chunk_index=int(row["chunk_index"]),
                 distance=float(row["distance"]),
+                page_number=_text_evidence_page_number(row),
             )
             for row in rows
         ]
@@ -241,6 +268,19 @@ class PgVectorKnowledgeBase:
         )
         candidates.sort(key=lambda item: item.distance)
         return rerank_rag_results(query, candidates, top_k, self.reranker)
+
+    @staticmethod
+    def _lock_long_text_ids(connection: sa.Connection, long_text_ids: list[int]) -> None:
+        """按稳定顺序锁定来源，防止并发替换产生跨版本混合 Chunk。"""
+
+        lock_statement = sa.text(
+            "SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"
+        )
+        for long_text_id in sorted(set(long_text_ids)):
+            connection.execute(
+                lock_statement,
+                {"lock_key": f"rag-long-text:{long_text_id}"},
+            )
 
     @staticmethod
     def _visual_search_statement(
@@ -337,6 +377,13 @@ class PgVectorKnowledgeBase:
                         "account_id": account_id,
                         "candidate_id": candidate_id,
                         "chunk_id": str(metadata["chunk_id"]),
+                        "chunking_version": str(metadata.get("chunking_version") or RAG_CHUNKING_VERSION),
+                        "block_index": int(metadata["block_index"]),
+                        "semantic_type": str(metadata["semantic_type"]),
+                        "section_title": metadata.get("section_title"),
+                        "source_page": metadata.get("source_page"),
+                        "fragment_index": metadata.get("fragment_index"),
+                        "fragment_count": metadata.get("fragment_count"),
                     },
                     "embedding": normalized_vector,
                     "embedding_model": model_name,

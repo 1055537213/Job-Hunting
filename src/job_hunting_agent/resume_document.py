@@ -291,8 +291,14 @@ def extract_pdf(content: bytes, *, ocr_runner: OCRRunner | None = None) -> Resum
         for index, text in ocr_texts.items():
             page_texts[index] = normalize_extracted_text(text)
 
-    text = normalize_extracted_text("\n\n".join(page_texts))
-    ensure_meaningful_resume_text(text)
+    extracted_text = normalize_extracted_text("\n\n".join(page_texts))
+    # 先只校验真实提取正文，避免空 PDF 依靠后续添加的页标记绕过有效文本检查。
+    ensure_meaningful_resume_text(extracted_text)
+    page_sections = [
+        f"[第 {index} 页]\n{page_text}".rstrip()
+        for index, page_text in enumerate(page_texts, start=1)
+    ]
+    text = normalize_extracted_text("\n\n".join(page_sections))
     if not pages_needing_ocr:
         method = "pdf_text"
     elif len(pages_needing_ocr) == page_count:

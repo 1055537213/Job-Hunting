@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from io import BytesIO
 import hashlib
+from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
 

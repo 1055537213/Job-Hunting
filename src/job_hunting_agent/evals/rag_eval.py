@@ -32,7 +32,7 @@ class EvidenceRef:
     entity_id: int | None = None
 
     @classmethod
-    def from_mapping(cls, payload: Mapping[str, object]) -> "EvidenceRef":
+    def from_mapping(cls, payload: Mapping[str, object]) -> EvidenceRef:
         ref = cls(
             long_text_id=_optional_int(payload.get("long_text_id")),
             source_label=_optional_str(payload.get("source_label")),
@@ -55,16 +55,14 @@ class EvidenceRef:
             )
         )
 
-    def matches(self, hit: "RetrievedEvidence") -> bool:
+    def matches(self, hit: RetrievedEvidence) -> bool:
         if self.long_text_id is not None and hit.long_text_id != self.long_text_id:
             return False
         if self.source_label is not None and hit.source_label != self.source_label:
             return False
         if self.entity_type is not None and hit.entity_type != self.entity_type:
             return False
-        if self.entity_id is not None and hit.entity_id != self.entity_id:
-            return False
-        return True
+        return self.entity_id is None or hit.entity_id == self.entity_id
 
 
 @dataclass(frozen=True)
@@ -80,7 +78,7 @@ class RetrievedEvidence:
     content: str = ""
 
     @classmethod
-    def from_object(cls, value: object) -> "RetrievedEvidence":
+    def from_object(cls, value: object) -> RetrievedEvidence:
         if isinstance(value, RAGSearchResult):
             return cls(
                 long_text_id=value.long_text_id,
@@ -102,10 +100,10 @@ class RetrievedEvidence:
                 content=str(value.get("content") or ""),
             )
         return cls(
-            long_text_id=int(getattr(value, "long_text_id")),
-            source_label=str(getattr(value, "source_label")),
-            entity_type=str(getattr(value, "entity_type")),
-            entity_id=int(getattr(value, "entity_id")),
+            long_text_id=int(value.long_text_id),
+            source_label=str(value.source_label),
+            entity_type=str(value.entity_type),
+            entity_id=int(value.entity_id),
             chunk_index=int(getattr(value, "chunk_index", 0)),
             distance=_optional_float(getattr(value, "distance", None)),
             content=str(getattr(value, "content", "")),
@@ -125,7 +123,7 @@ class RAGEvalCase:
     min_recall: float = 1.0
 
     @classmethod
-    def from_mapping(cls, payload: Mapping[str, object]) -> "RAGEvalCase":
+    def from_mapping(cls, payload: Mapping[str, object]) -> RAGEvalCase:
         case_id = _required_str(payload, "id")
         query = _required_str(payload, "query")
         expected = _load_refs(
@@ -264,7 +262,9 @@ def load_rag_eval_cases(path: str | Path) -> list[RAGEvalCase]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     raw_cases = payload.get("cases") if isinstance(payload, Mapping) else payload
     if not isinstance(raw_cases, list):
-        raise ValueError("RAG eval JSON must be a list or an object with a cases list.")
+        raise ValueError(  # noqa: TRY004 - preserve the eval payload contract
+            "RAG eval JSON must be a list or an object with a cases list."
+        )
     return [RAGEvalCase.from_mapping(item) for item in raw_cases]
 
 
@@ -377,10 +377,12 @@ def _load_refs(
     refs: list[EvidenceRef] = []
     raw_refs = payload.get(refs_key) or []
     if not isinstance(raw_refs, list):
-        raise ValueError(f"{refs_key} must be a list.")
+        raise ValueError(f"{refs_key} must be a list.")  # noqa: TRY004 - eval payload contract
     for item in raw_refs:
         if not isinstance(item, Mapping):
-            raise ValueError(f"{refs_key} entries must be objects.")
+            raise ValueError(  # noqa: TRY004 - preserve the eval payload contract
+                f"{refs_key} entries must be objects."
+            )
         refs.append(EvidenceRef.from_mapping(item))
     for long_text_id in payload.get(id_key, []) or []:
         refs.append(EvidenceRef(long_text_id=int(long_text_id)))

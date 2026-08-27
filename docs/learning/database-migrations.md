@@ -79,10 +79,15 @@ Embedding、模型身份和维度。
 
 当前实现已具备以下保护：
 
-1. 全量重建按账号原子替换，增量写入按稳定 chunk ID upsert，不会重复产生证据。
+1. 全量重建按账号原子替换；增量索引按 `long_text_id` 事务性替换整组 chunk，避免正文缩短或切分版本变化后残留旧尾块。
 2. 查询先按账号、Embedding 模型身份和向量维度过滤，再使用 pgvector 余弦距离召回。
 3. 删除长文本或候选人时，外键级联会删除对应派生 chunk。
 4. 自动化测试与 Web 使用同一 PostgreSQL + pgvector 后端，避免隐藏的回退实现。
+
+切分策略升级后，已有 `rag_chunks` 不会在应用启动时自动调用外部 Embedding 重建，
+避免发布过程产生不可控费用。应在维护窗口暂停该账号的新材料写入，排空其 RAG 索引任务后，
+再调用 `JobHuntingApp.rebuild_rag_index(account_id=...)`；重建结束后才能恢复写入。新写入或
+重新索引的长文本会直接使用当前 `chunking_version`。
 
 因为项目暂时允许更换 Embedding 模型和维度，当前没有建立 HNSW 或 IVFFlat 索引。数据量增长后，
 应先固定生产 Embedding 模型与维度，再通过新的 Alembic revision 为对应向量空间建立合适索引。

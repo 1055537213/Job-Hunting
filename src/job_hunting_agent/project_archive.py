@@ -24,20 +24,20 @@ from .github_project import (
     safe_archive_path,
 )
 from .models import ProjectExperienceCard
-from .project_evidence import (
-    MAX_FILE_BYTES_BY_KIND,
-    MAX_SELECTED_PROJECT_BYTES,
-    MAX_SELECTED_PROJECT_FILES,
-    MAX_SELECTED_FILES_BY_KIND,
-    ProjectEvidenceError,
-    ProjectVisualArtifact,
-    extract_project_evidence,
-    project_file_kind,
-)
 from .project_analyzer import (
     SKIP_DIRS,
     build_project_experience_card,
     is_sensitive,
+)
+from .project_evidence import (
+    MAX_FILE_BYTES_BY_KIND,
+    MAX_SELECTED_FILES_BY_KIND,
+    MAX_SELECTED_PROJECT_BYTES,
+    MAX_SELECTED_PROJECT_FILES,
+    ProjectEvidenceError,
+    ProjectVisualArtifact,
+    extract_project_evidence,
+    project_file_kind,
 )
 from .project_visual import ProjectVisualAnalyzerProtocol
 
@@ -69,8 +69,8 @@ class ProjectArchiveAnalysis:
 
     card: ProjectExperienceCard
     files: list[ProjectArchiveFile]
-    evidence: list["ProjectArchiveEvidence"] = field(default_factory=list)
-    visual_artifacts: list["ProjectArchiveVisualArtifact"] = field(default_factory=list)
+    evidence: list[ProjectArchiveEvidence] = field(default_factory=list)
+    visual_artifacts: list[ProjectArchiveVisualArtifact] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

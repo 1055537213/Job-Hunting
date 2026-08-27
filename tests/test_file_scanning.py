@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+from typing import Self
 
 import pytest
 
@@ -21,7 +22,7 @@ class FakeClamAVConnection:
         self.sent = bytearray()
         self.timeout: float | None = None
 
-    def __enter__(self) -> FakeClamAVConnection:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args: object) -> None:

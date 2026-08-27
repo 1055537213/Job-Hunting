@@ -13,7 +13,6 @@ dependencies = [
     "langchain>=1.2.12",
     "langchain-core>=1.2.18",
     "langchain-openai>=1.1.11",
-    "langchain-text-splitters>=1.1.1",
     "argon2-cffi>=23.1.0",
     "onnxruntime>=1.18.0",
     "pdfplumber>=0.11.0",

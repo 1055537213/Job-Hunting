@@ -15,10 +15,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage  # noqa: E402
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
-from job_hunting_agent.intent_router import IntentRouter  # noqa: E402
-from job_hunting_agent.model_gateway import ModelGateway  # noqa: E402
+from job_hunting_agent.intent_router import IntentRouter
+from job_hunting_agent.model_gateway import ModelGateway
 
 
 @dataclass(frozen=True)

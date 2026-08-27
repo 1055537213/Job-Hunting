@@ -21,7 +21,12 @@ from xml.etree import ElementTree
 import pdfplumber
 from PIL import Image, UnidentifiedImageError
 
-from .project_analyzer import IMPORTANT_NAMES, SKIP_DIRS, SOURCE_SUFFIXES, decode_text_bytes
+from .project_analyzer import (
+    IMPORTANT_NAMES,
+    SKIP_DIRS,
+    SOURCE_SUFFIXES,
+    decode_text_bytes,
+)
 from .project_visual import (
     ProjectVisualAnalysisResult,
     ProjectVisualAnalyzerProtocol,
@@ -110,7 +115,7 @@ class ExtractedProjectEvidence:
     text: str
     method: str
     metadata: dict[str, object] = field(default_factory=dict)
-    visual_artifacts: tuple["ProjectVisualArtifact", ...] = ()
+    visual_artifacts: tuple[ProjectVisualArtifact, ...] = ()
 
 
 @dataclass(frozen=True)

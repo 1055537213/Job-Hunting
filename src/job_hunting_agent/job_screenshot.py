@@ -19,8 +19,8 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage
 from PIL import Image, UnidentifiedImageError
 
-from .job_parser import validate_job_text
 from .concurrency_control import ConcurrencyControlError
+from .job_parser import validate_job_text
 from .llm import LLMRequestError, extract_message_text
 from .model_resilience import ModelCircuitOpenError
 

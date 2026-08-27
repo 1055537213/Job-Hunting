@@ -14,8 +14,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from job_hunting_agent.conversation_ingestion import decide_conversation_ingestion
 from job_hunting_agent.city_catalog import normalize_city_list
+from job_hunting_agent.conversation_ingestion import decide_conversation_ingestion
 from job_hunting_agent.models import (
     CandidateProfile,
     CandidateProfileInput,
@@ -37,15 +37,21 @@ class ConversationEvalCase:
     expected_reply_contains: tuple[str, ...] = ()
 
     @classmethod
-    def from_mapping(cls, payload: Mapping[str, object]) -> "ConversationEvalCase":
+    def from_mapping(cls, payload: Mapping[str, object]) -> ConversationEvalCase:
         case_id = _required_str(payload, "id")
         message = _required_str(payload, "message")
         initial_profile_payload = payload.get("initial_profile")
         if not isinstance(initial_profile_payload, Mapping):
-            raise ValueError(f"Conversation eval case {case_id!r} must include initial_profile.")
+            raise ValueError(  # noqa: TRY004 - preserve the eval payload contract
+                f"Conversation eval case {case_id!r} must include initial_profile."
+            )
         initial_profile = _candidate_profile_input_from_mapping(initial_profile_payload)
         expected_profile = payload.get("expected_profile")
-        if not isinstance(expected_profile, Mapping) or not expected_profile:
+        if not isinstance(expected_profile, Mapping):
+            raise ValueError(  # noqa: TRY004 - preserve the eval payload contract
+                f"Conversation eval case {case_id!r} must include expected_profile."
+            )
+        if not expected_profile:
             raise ValueError(f"Conversation eval case {case_id!r} must include expected_profile.")
         expected_saved_structured_fields = tuple(
             str(item)
@@ -180,7 +186,9 @@ def load_conversation_eval_cases(path: str | Path) -> list[ConversationEvalCase]
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     raw_cases = payload.get("cases") if isinstance(payload, Mapping) else payload
     if not isinstance(raw_cases, list):
-        raise ValueError("Conversation eval JSON must be a list or an object with a cases list.")
+        raise ValueError(  # noqa: TRY004 - preserve the eval payload contract
+            "Conversation eval JSON must be a list or an object with a cases list."
+        )
     return [ConversationEvalCase.from_mapping(item) for item in raw_cases]
 
 
@@ -336,7 +344,7 @@ def _string_list(value: object) -> list[str]:
     if value is None:
         return []
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        raise ValueError("Expected a list of strings.")
+        raise ValueError("Expected a list of strings.")  # noqa: TRY004 - eval payload contract
     return [str(item).strip() for item in value if str(item).strip()]
 
 
@@ -344,7 +352,7 @@ def _string_mapping(value: object) -> dict[str, str]:
     if value is None:
         return {}
     if not isinstance(value, Mapping):
-        raise ValueError("Expected a mapping of strings.")
+        raise ValueError("Expected a mapping of strings.")  # noqa: TRY004 - eval payload contract
     return {str(key): str(item) for key, item in value.items() if str(key).strip()}
 
 
@@ -352,7 +360,7 @@ def _float_mapping(value: object) -> dict[str, float]:
     if value is None:
         return {}
     if not isinstance(value, Mapping):
-        raise ValueError("Expected a mapping of numbers.")
+        raise ValueError("Expected a mapping of numbers.")  # noqa: TRY004 - eval payload contract
     return {str(key): float(item) for key, item in value.items() if str(key).strip()}
 
 

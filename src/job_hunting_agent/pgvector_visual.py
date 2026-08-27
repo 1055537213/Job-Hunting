@@ -50,7 +50,8 @@ class PgVectorVisualKnowledgeBase:
         try:
             embed_images = getattr(self.embeddings, "embed_images", None)
             if not callable(embed_images):
-                raise ValueError("当前 Embedding 配置不支持图片向量。")
+                # 视觉索引失败记录和上层错误处理约定使用 ValueError 表示配置不兼容。
+                raise ValueError("当前 Embedding 配置不支持图片向量。")  # noqa: TRY004
             payloads: list[tuple[bytes, str]] = []
             for item in items:
                 content = self.object_storage.read(item.storage_key)

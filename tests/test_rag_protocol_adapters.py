@@ -12,6 +12,7 @@ from job_hunting_agent.config import (
     load_rerank_settings,
     masked_rerank_settings,
 )
+from job_hunting_agent.model_resilience import CircuitBreaker, ModelCircuitOpenError
 from job_hunting_agent.rag import (
     EmbeddingRequestError,
     HttpReranker,
@@ -23,7 +24,6 @@ from job_hunting_agent.rag import (
     build_reranker,
     rag_embedding_model_name,
 )
-from job_hunting_agent.model_resilience import CircuitBreaker, ModelCircuitOpenError
 
 
 def write_native_env(path) -> None:

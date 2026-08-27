@@ -42,9 +42,9 @@ from .file_scanning import (
     ClamAVScanner,
     FileInfectedError,
     FileScanError,
-    FileScanResult,
     FileScanner,
     FileScannerUnavailableError,
+    FileScanResult,
     LocalSafetyScanner,
 )
 from .github_project import (
@@ -80,6 +80,7 @@ from .models import (
 from .object_storage import ObjectNotFoundError, ObjectStorage, S3ObjectStorage
 from .pgvector_rag import PgVectorKnowledgeBase
 from .pgvector_visual import PgVectorVisualKnowledgeBase
+from .project_analyzer import analyze_project, build_project_experience_card
 from .project_archive import (
     PROJECT_ARCHIVE_MEDIA_TYPE,
     analyze_project_archive,
@@ -92,7 +93,6 @@ from .project_evidence import (
     manifest_fingerprint,
     plan_project_manifest,
 )
-from .project_analyzer import analyze_project, build_project_experience_card
 from .project_visual import ProjectVisualAnalyzer, ProjectVisualInput
 from .rag import Reranker
 from .resume_document import (
@@ -670,7 +670,7 @@ class JobHuntingApp:
         rag_index_stats = None
         rag_update_mode = "none"
         if auto_rebuild_rag:
-            # 参数名沿用早期版本；现在对话入库的自动 RAG 刷新采用增量追加，不做全量重建。
+            # 参数名沿用早期版本；现在只同步本次新增来源，不做账号级全量重建。
             rag_index_stats = self.index_rag_long_texts(
                 saved_long_text_ids,
                 account_id=account_id,
@@ -1928,7 +1928,7 @@ class JobHuntingApp:
         session_id: str | None = None,
         root_request_id: str | None = None,
     ) -> RAGIndexStats:
-        """把指定长文本增量追加到当前 RAG 派生索引。
+        """按来源事务性替换指定长文本的 RAG 派生索引。
 
         PostgreSQL 是长文本材料登记处；这个方法只同步指定 ID，适合对话式自动
         入库后的即时检索，直接写入 PostgreSQL 的 pgvector 派生索引。

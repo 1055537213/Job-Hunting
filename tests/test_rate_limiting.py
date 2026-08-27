@@ -21,12 +21,12 @@ from job_hunting_agent.rate_limiting import (
     RateLimitBackendUnavailable,
     RedisRateLimiter,
 )
+from job_hunting_agent.web import create_web_app
 from job_hunting_agent.web_hardening import (
     format_prometheus_request_metrics,
     install_web_hardening,
     rate_limit_group,
 )
-from job_hunting_agent.web import create_web_app
 
 
 @dataclass

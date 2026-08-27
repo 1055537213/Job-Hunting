@@ -122,8 +122,8 @@ ModelGateway.embed(operation, texts, context)
 - 若存在真实旧数据，编写一次性旧版本数据到当前 PostgreSQL schema 的导入和校验脚本。
 
 当前状态：已完成 SQLAlchemy Engine/事务边界、冻结初始 Alembic revision、PostgreSQL +
-pgvector Compose 启动链、Web 对 PostgreSQL 的结构化读写，以及 pgvector 的全量重建、增量
-upsert、账号隔离检索、删除级联和真实 PostgreSQL 回归。当前测试数据允许丢弃，因此不实施
+pgvector Compose 启动链、Web 对 PostgreSQL 的结构化读写，以及 pgvector 的全量重建、按来源
+事务性替换、账号隔离检索、删除级联和真实 PostgreSQL 回归。当前测试数据允许丢弃，因此不实施
 旧数据库或独立向量目录的数据导入。
 
 完成门槛：空库可由 Alembic 升级到最新；生产启动不执行 `CREATE TABLE IF NOT EXISTS`；

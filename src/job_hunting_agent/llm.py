@@ -21,8 +21,8 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_openai import ChatOpenAI
 
-from .config import LLMSettings
 from .concurrency_control import ConcurrencyControlError
+from .config import LLMSettings
 from .model_resilience import ModelCircuitOpenError
 
 logger = logging.getLogger(__name__)
