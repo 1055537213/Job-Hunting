@@ -55,6 +55,7 @@
 - 对话上下文恢复、历史压缩和 SSE 流式回复。
 - 可选轻量意图路由器：仅对高置信度只读请求直达，歧义指代、多步骤、修改/确认表达、低置信度、超时和异常全部回退主 Agent。
 - 路由直达次数、超时次数、固定回退原因和模型延迟直方图接入 Prometheus。
+- 13 个 Agent 工具统一注册在 ToolRegistry；LangChain、直达路由、审计和可选 MCP adapter 共享名称、Schema、风险和执行元数据。
 
 ### 职位与匹配
 
@@ -120,7 +121,7 @@
 ## 5. 项目亮点（体现你做了什么，有何价值）
 
 1. **事实与推断分离**：模型推断的项目职责、技能和成果不会自动变成候选人事实，降低简历夸大和事实污染风险。
-2. **Agent 工具边界清晰**：Agent 只调用 JobHuntingApp 工具，不直接操作数据库和对象存储，业务规则集中在应用门面和领域模块。
+2. **Agent 工具接口统一**：ToolRegistry 统一参数校验、执行、错误码和结果 envelope；LangChain 与轻量直达路由调用同一个 handler，避免双实现漂移。
 3. **多租户隔离贯穿全链路**：数据库查询、对象键、RAG 检索、后台任务、工具轨迹、余额和审计事件都携带账号归属。
 4. **后台任务可恢复**：任务状态以 PostgreSQL 为准，Redis 只传递任务键；幂等键和原子认领避免重复执行、重复扣费和重复导出。
 5. **多模态证据链**：职位截图、项目图片和有限复杂 PDF 页面能够进入 OCR、视觉分析和视觉向量检索，同时保留来源定位。
@@ -134,8 +135,12 @@
 .
 ├─ src/job_hunting_agent/
 │  ├─ web.py                  # FastAPI API、页面入口、SSE 和鉴权
-│  ├─ agent.py                # LangChain Agent、提示词、工具和意图路由
+│  ├─ agent.py                # LangChain Agent、提示词、对话记忆和路由编排
 │  ├─ app.py                  # 业务门面与模块编排
+│  ├─ tool_registry.py        # 工具定义、上下文、统一结果和执行接口
+│  ├─ job_hunting_tools.py    # 13 个求职工具的唯一注册位置
+│  ├─ langchain_tool_adapter.py # ToolRegistry 到 LangChain 的 adapter
+│  ├─ mcp_tool_adapter.py     # 可选 MCP 定义/结果 adapter，不启动 Server
 │  ├─ models.py               # 领域记录、输入模型和结果模型
 │  ├─ storage.py              # 领域仓储与事务逻辑
 │  ├─ sqlalchemy_store.py     # PostgreSQL Store 实现与迁移版本检查
@@ -148,7 +153,8 @@
 │  ├─ pgvector_visual.py      # 视觉向量写入与校验
 │  ├─ project_*.py             # GitHub、本地目录和项目证据处理
 │  ├─ resume_*.py              # 简历解析、写作和 DOCX/PDF 导出
-│  ├─ background_tasks.py      # Celery 任务注册、执行、重试和回收
+│  ├─ task_registry.py         # 独立后台任务目录和 Worker 分发接口
+│  ├─ background_tasks.py      # 后台任务 handler、Celery 注册、重试和回收
 │  ├─ worker.py / beat.py      # Worker 和 Beat 入口
 │  ├─ account_*.py / auth.py   # 账号生命周期、邮件 Outbox 和认证
 │  ├─ rate_limiting.py         # 内存/Redis 滑动窗口限流
@@ -338,6 +344,10 @@ job_agent_intent_router_timeouts_total
 job_agent_intent_router_model_duration_seconds_bucket
 ~~~
 
+### 项目现在是否已经运行 MCP Server？
+
+没有。内部 ToolRegistry 是唯一工具实现，当前 LangChain Agent 和轻量路由都在进程内调用它。mcp_tool_adapter.py 只负责生成 MCP 兼容的 inputSchema、outputSchema、annotations 和 CallToolResult，默认仅导出只读工具；只有出现外部 Agent、独立进程或跨语言调用需求时，才需要在它之上启动 MCP Server。
+
 ### 系统会自动帮我投递或联系 HR 吗？
 
 不会。系统只处理候选人主动带回的内容、分析和草稿生成；投递、发送消息和承诺类信息必须由候选人自行确认和执行。
@@ -347,6 +357,7 @@ job_agent_intent_router_model_duration_seconds_bucket
 - [ ] 接入真实支付渠道、签名 Webhook、退款状态机和渠道对账。
 - [ ] 建立足量 RAG 黄金测试集，持续评估 Recall@K、MRR 和禁止召回阈值。
 - [ ] 接入 Alertmanager 通知、OpenTelemetry Trace 和集中日志平台。
+- [ ] 出现明确外部调用方后，在现有 MCP adapter 上增加鉴权、授权和 Server 生命周期。
 - [ ] 建立严格类型检查基线，逐步消化第三方 stub 和内部 Protocol 类型债务。
 - [ ] 完成目标生产服务器的 ClamAV 验收、渗透测试、灾难恢复演练和密钥轮换流程。
 - [ ] 根据正式 Embedding 模型评估 pgvector HNSW/IVFFlat 索引参数。

@@ -12,15 +12,17 @@ import json
 import re
 import threading
 import time
-from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass, field
-from typing import Any, Literal, Protocol, Sequence
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
+from typing import Literal, Protocol
 
 from langchain_core.messages import BaseMessage
 
 from .config import IntentRouterSettings
+from .job_hunting_tools import job_hunting_tool_catalog
 from .llm import LLMClient
 from .model_gateway import ModelGateway
+from .tool_registry import ToolContext, ToolRegistry
 
 RouteKind = Literal["direct_tool", "agent"]
 
@@ -28,16 +30,11 @@ RouteKind = Literal["direct_tool", "agent"]
 # 客户端，避免超时后仍在运行的不可取消线程无限堆积。
 _SYNC_ROUTER_SLOTS = threading.BoundedSemaphore(value=8)
 
-DIRECT_TOOL_NAMES = frozenset(
-    {
-        "get_current_candidate_profile",
-        "list_candidate_profiles",
-        "list_imported_jobs",
-        "match_all_jobs_for_candidate",
-        "list_project_cards_for_candidate",
-        "search_candidate_evidence",
-    }
+_DIRECT_TOOL_CATALOG = tuple(
+    metadata for metadata in job_hunting_tool_catalog() if metadata.direct_route
 )
+_DIRECT_TOOL_METADATA = {metadata.name: metadata for metadata in _DIRECT_TOOL_CATALOG}
+DIRECT_TOOL_NAMES = frozenset(_DIRECT_TOOL_METADATA)
 
 ROUTER_LATENCY_BUCKETS_MS = (50, 100, 250, 500, 1000, 2000, 3000)
 ROUTER_FALLBACK_REASONS = frozenset(
@@ -285,8 +282,8 @@ class IntentRouter:
 class DirectIntentExecutor:
     """执行路由器允许的只读工具，并返回 Agent 兼容的摘要。"""
 
-    def __init__(self, app: Any) -> None:
-        self.app = app
+    def __init__(self, registry: ToolRegistry) -> None:
+        self.registry = registry
 
     def execute(
         self,
@@ -300,52 +297,26 @@ class DirectIntentExecutor:
         """执行一个已通过白名单校验的只读路由。"""
 
         tool_name = decision.tool_name
-        if decision.route != "direct_tool" or tool_name not in DIRECT_TOOL_NAMES:
+        if decision.route != "direct_tool" or not isinstance(tool_name, str):
             raise ValueError("当前路由不是可直接执行的只读工具。")
-
-        if tool_name == "get_current_candidate_profile":
-            if candidate_id is None:
-                raise ValueError("读取当前候选人档案需要候选人 ID。")
-            data = asdict(self.app.get_candidate_profile(candidate_id, account_id=account_id))
-            reply = f"当前候选人档案是“{data.get('name') or '未命名候选人'}”，已读取完成。"
-        elif tool_name == "list_candidate_profiles":
-            profiles = self.app.list_candidate_profiles(account_id=account_id)
-            data = {"profiles": [asdict(profile) for profile in profiles]}
-            reply = f"当前账号共有 {len(profiles)} 个候选人档案。"
-        elif tool_name == "list_imported_jobs":
-            jobs = self.app.list_jobs(account_id=account_id)
-            data = {"jobs": [asdict(job) for job in jobs]}
-            reply = f"当前职位池共有 {len(jobs)} 个已导入职位。"
-        elif tool_name == "match_all_jobs_for_candidate":
-            if candidate_id is None:
-                raise ValueError("匹配职位需要候选人 ID。")
-            matches = self.app.match_all_jobs(candidate_id, account_id=account_id)
-            data = {"candidate_id": candidate_id, "matches": [asdict(match) for match in matches]}
-            reply = f"已完成职位匹配，共分析 {len(matches)} 个职位。"
-        elif tool_name == "list_project_cards_for_candidate":
-            if candidate_id is None:
-                raise ValueError("读取项目经历卡片需要候选人 ID。")
-            cards = self.app.list_project_cards(candidate_id, account_id=account_id)
-            data = {"project_cards": [asdict(card) for card in cards]}
-            reply = f"当前共有 {len(cards)} 张项目经历卡片。"
-        else:
-            query = str(decision.arguments.get("query") or "").strip()
-            top_k = _bounded_int(decision.arguments.get("top_k"), default=5, minimum=1, maximum=10)
-            if candidate_id is None or not query:
-                raise ValueError("检索候选人证据需要候选人 ID 和查询内容。")
-            results = self.app.search_rag(
-                query,
-                top_k=top_k,
-                entity_types=_string_list_or_none(decision.arguments.get("entity_types")),
-                account_id=account_id,
+        spec = self.registry.get(tool_name)
+        if not spec.direct_route or spec.direct_reply is None:
+            raise ValueError("当前工具不允许绕过主 Agent 直接执行。")
+        result = self.registry.execute(
+            tool_name,
+            decision.arguments,
+            ToolContext(
                 candidate_id=candidate_id,
+                account_id=account_id,
                 session_id=session_id,
                 root_request_id=root_request_id,
-            )
-            data = {"query": query, "results": [asdict(result) for result in results]}
-            reply = f"已检索候选人证据，找到 {len(results)} 条相关材料。"
-
-        return reply, [{"tool_name": tool_name, "status": "success", "data": data}]
+                use_tool_llm=False,
+            ),
+        )
+        if result.status != "success" or result.data is None:
+            message = result.error.message if result.error is not None else "工具执行失败。"
+            raise ValueError(message)
+        return spec.direct_reply(result.data), [result.to_trace_output(tool_name)]
 
 
 def build_intent_router_prompt(
@@ -361,17 +332,21 @@ def build_intent_router_prompt(
         for item in history
         if _message_text(item).strip()
     )
+    direct_tool_text = "\n".join(
+        f"- {metadata.name}：{metadata.audit_label}"
+        + (
+            f"，arguments 必须包含 {', '.join(metadata.input_schema().get('required', []))}"
+            if metadata.input_schema().get("required")
+            else ""
+        )
+        for metadata in _DIRECT_TOOL_CATALOG
+    )
     return f"""
 你是求职助手的轻量意图路由器。你不能回答用户问题，也不能执行工具。
 你的任务只有一个：判断当前消息是否可以直接交给一个只读工具；无法确定时必须返回 agent。
 
 允许 direct_tool 的工具：
-- get_current_candidate_profile：读取当前候选人档案
-- list_candidate_profiles：列出候选人档案
-- list_imported_jobs：列出已导入职位
-- match_all_jobs_for_candidate：匹配当前候选人与职位池
-- list_project_cards_for_candidate：列出项目经历卡片
-- search_candidate_evidence：检索候选人证据，arguments 必须包含 query
+{direct_tool_text}
 
 以下情况必须返回 agent：保存或修改资料、导入职位、生成或改写简历、HR 回复、GitHub 分析、
 涉及确认/真实性边界的请求、多步骤请求、无法从当前消息和历史确定参数的请求。
@@ -554,27 +529,8 @@ def _run_sync_completion(
 
 
 def _requires_candidate(tool_name: object) -> bool:
-    return tool_name in {
-        "get_current_candidate_profile",
-        "match_all_jobs_for_candidate",
-        "list_project_cards_for_candidate",
-        "search_candidate_evidence",
-    }
-
-
-def _bounded_int(value: object, *, default: int, minimum: int, maximum: int) -> int:
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        number = default
-    return max(minimum, min(maximum, number))
-
-
-def _string_list_or_none(value: object) -> list[str] | None:
-    if not isinstance(value, list):
-        return None
-    result = [str(item).strip() for item in value if str(item).strip()]
-    return result or None
+    metadata = _DIRECT_TOOL_METADATA.get(str(tool_name))
+    return metadata.requires_candidate if metadata is not None else False
 
 
 def _extract_json_object(text: str) -> str:

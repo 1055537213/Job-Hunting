@@ -40,7 +40,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
 from starlette.concurrency import run_in_threadpool
 
-from .admin_ledger import ADMIN_LEDGER_MAX_PAGES, ADMIN_LEDGER_PAGE_SIZE
 from .account_email_outbox import AccountEmailOutboxService, redact_email
 from .account_lifecycle import (
     AccountEmailSender,
@@ -48,6 +47,7 @@ from .account_lifecycle import (
     build_account_email_sender,
     new_action_token,
 )
+from .admin_ledger import ADMIN_LEDGER_MAX_PAGES, ADMIN_LEDGER_PAGE_SIZE
 from .agent import JobHuntingAgent
 from .app import JobHuntingApp
 from .auth import (
@@ -80,20 +80,20 @@ from .config import (
     load_concurrency_settings,
     load_cookie_secure,
     load_database_settings,
-    masked_file_scanning_settings,
-    load_file_scanning_settings,
     load_embedding_settings,
+    load_file_scanning_settings,
     load_llm_settings,
     load_object_storage_settings,
     load_project_visual_analysis_settings,
     load_rerank_settings,
     load_task_queue_settings,
     load_web_security_settings,
-    masked_agent_memory_settings,
     masked_account_lifecycle_settings,
+    masked_agent_memory_settings,
     masked_billing_settings,
     masked_concurrency_settings,
     masked_embedding_settings,
+    masked_file_scanning_settings,
     masked_llm_settings,
     masked_object_storage_settings,
     masked_project_visual_analysis_settings,
@@ -865,11 +865,11 @@ def create_web_app(
         try:
             for storage_key in storage_keys:
                 backend.resume_files.delete(storage_key)
-        except Exception as error:  # noqa: BLE001 - keep database data until object cleanup succeeds.
+        except Exception as error:
             web_logger.exception("account object cleanup failed", extra={"account_id": account.id})
             try:
                 backend.store.restore_account_after_failed_deletion(account.id)
-            except Exception:  # noqa: BLE001 - preserve the original cleanup failure response.
+            except Exception:
                 web_logger.exception(
                     "account status restore failed after object cleanup error",
                     extra={"account_id": account.id},
@@ -3216,6 +3216,7 @@ def reconcile_task_trace(trace: dict[str, object], tool_outputs: list[dict[str, 
         if not isinstance(item, dict):
             continue
         tool_name = str(item.get("tool_name") or "unknown_tool")
+        trace_data = tool_output_trace_data(item)
         tool_names.append(tool_name)
         existing = next(
             (
@@ -3228,16 +3229,16 @@ def reconcile_task_trace(trace: dict[str, object], tool_outputs: list[dict[str, 
             None,
         )
         if existing is None:
-            existing = complete_task_step(trace, tool_name, item.get("data"))
+            existing = complete_task_step(trace, tool_name, trace_data)
         else:
             now = iso_utc()
             status = (
                 "failed"
-                if isinstance(item.get("data"), dict) and item["data"].get("error")
+                if isinstance(trace_data, dict) and trace_data.get("error")
                 else "completed"
             )
-            summary = summarize_task_step(tool_name, item.get("data"))
-            result = summarize_tool_result(tool_name, item.get("data"))
+            summary = summarize_task_step(tool_name, trace_data)
+            result = summarize_tool_result(tool_name, trace_data)
             existing["status"] = status
             existing["summary"] = summary
             existing["result"] = result
@@ -3257,6 +3258,22 @@ def reconcile_task_trace(trace: dict[str, object], tool_outputs: list[dict[str, 
         matched_step_ids.add(str(existing.get("id")))
     trace["title"] = tool_trace_title(tool_names)
     trace["updated_at"] = iso_utc()
+
+
+def tool_output_trace_data(item: dict[str, object]) -> object:
+    """把新旧工具错误格式统一成轨迹层已有的低敏 ``data.error`` 结构。"""
+
+    data = item.get("data")
+    if str(item.get("status") or "success") not in {"error", "rejected", "failed"}:
+        return data
+    if isinstance(data, dict) and data.get("error"):
+        return data
+    error = item.get("error")
+    if isinstance(error, dict):
+        message = str(error.get("message") or error.get("code") or "工具调用失败。")
+    else:
+        message = str(error or "工具调用失败。")
+    return {"error": message}
 
 
 def task_trace_completion_status(

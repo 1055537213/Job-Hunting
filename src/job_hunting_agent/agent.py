@@ -23,13 +23,11 @@ import json
 import time
 import uuid
 from collections.abc import Iterator
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, TypedDict
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
-from langchain.tools import ToolRuntime, tool
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
@@ -43,7 +41,6 @@ from langgraph.checkpoint.memory import MemorySaver
 from .app import JobHuntingApp
 from .config import DEFAULT_ENV_PATH, AgentMemorySettings, load_agent_memory_settings
 from .conversation_memory import build_restored_context_messages
-from .deduplication import DuplicateResourceError
 from .intent_router import (
     DirectIntentExecutor,
     IntentDecision,
@@ -51,9 +48,10 @@ from .intent_router import (
     IntentRouterProtocol,
     IntentRoutingMetrics,
 )
-from .job_parser import InvalidJobTextError
+from .job_hunting_tools import build_job_hunting_tool_registry
+from .langchain_tool_adapter import build_langchain_tools
 from .llm import extract_message_text
-from .models import AgentChatResult, BackgroundTaskRecord
+from .models import AgentChatResult
 
 
 class JobHuntingAgentContext(TypedDict):
@@ -156,7 +154,8 @@ class JobHuntingAgent:
                 self.tool_llm_available = True
         self.memory_settings = memory_settings or load_agent_memory_settings(self.env_path)
         self.intent_router = intent_router or IntentRouter(self.model_gateway)
-        self.direct_intent_executor = DirectIntentExecutor(app)
+        self.tool_registry = build_job_hunting_tool_registry(app)
+        self.direct_intent_executor = DirectIntentExecutor(self.tool_registry)
         self.routing_metrics = IntentRoutingMetrics()
         self._restored_sessions: set[tuple[int | None, int | None, str]] = set()
         checkpointer = (
@@ -166,7 +165,7 @@ class JobHuntingAgent:
         )
         self.graph = create_agent(
             model=self.model,
-            tools=build_job_hunting_tools(app),
+            tools=build_langchain_tools(self.tool_registry),
             system_prompt=AGENT_SYSTEM_PROMPT,
             middleware=build_memory_middleware(self.model, self.memory_settings),
             context_schema=JobHuntingAgentContext,
@@ -564,398 +563,9 @@ def build_memory_middleware(
 
 
 def build_job_hunting_tools(app: JobHuntingApp) -> list[object]:
-    """构建标准 LangChain Agent 工具列表。"""
+    """兼容旧调用方：从统一注册表生成 LangChain 工具。"""
 
-    @tool
-    def ingest_candidate_message(
-        message: str,
-        runtime: ToolRuntime[JobHuntingAgentContext, Any],
-        auto_rag: bool | None = None,
-    ) -> str:
-        """当用户补充候选人资料、技能、项目经历或 HR 对话时，自动保存到 PostgreSQL 和 RAG。"""
-
-        context = require_runtime_context(runtime)
-        candidate_id = require_candidate_id(context)
-        account_id = context.get("account_id")
-        llm_client = (
-            app.model_gateway.llm_client(
-                app.model_gateway.new_call_context(
-                    "tool_llm_ingestion",
-                    account_id=account_id,
-                    candidate_id=candidate_id,
-                    session_id=context.get("session_id"),
-                    root_request_id=context.get("root_request_id"),
-                )
-            )
-            if context["use_tool_llm"]
-            else None
-        )
-        result = app.ingest_conversation_message(
-            candidate_id,
-            message,
-            llm_client=llm_client,
-            auto_rebuild_rag=context["default_auto_rag"] if auto_rag is None else auto_rag,
-            account_id=account_id,
-        )
-        return dumps_tool_output(
-            {
-                "candidate_id": candidate_id,
-                "reply": result.reply,
-                "saved_structured_fields": result.saved_structured_fields,
-                "saved_long_text_ids": result.saved_long_text_ids,
-                "rag_update_mode": result.rag_update_mode,
-            }
-        )
-
-    @tool
-    def get_current_candidate_profile(runtime: ToolRuntime[JobHuntingAgentContext, Any]) -> str:
-        """读取当前候选人的结构化档案，用于回答“我现在的档案里有什么”。"""
-
-        context = require_runtime_context(runtime)
-        candidate_id = require_candidate_id(context)
-        return dumps_tool_output(asdict(app.get_candidate_profile(candidate_id, account_id=context.get("account_id"))))
-
-    @tool
-    def list_candidate_profiles(runtime: ToolRuntime[JobHuntingAgentContext, Any]) -> str:
-        """列出本地所有候选人档案，适合在用户不确定当前档案时使用。"""
-
-        # 同账号内可以共享所有档案，但不能看到其它账号的档案。
-        context = require_runtime_context(runtime)
-        return dumps_tool_output(
-            {"profiles": [asdict(profile) for profile in app.list_candidate_profiles(account_id=context.get("account_id"))]}
-        )
-
-    @tool
-    def search_candidate_evidence(
-        query: str,
-        runtime: ToolRuntime[JobHuntingAgentContext, Any],
-        top_k: int = 5,
-        entity_types: list[str] | None = None,
-    ) -> str:
-        """从本地 RAG 索引检索候选人证据片段，但不要把结果直接当成新的事实。"""
-
-        context = require_runtime_context(runtime)
-        results = app.search_rag(
-            query,
-            top_k,
-            entity_types,
-            account_id=context.get("account_id"),
-            candidate_id=require_candidate_id(context),
-        )
-        return dumps_tool_output({"query": query, "results": [asdict(item) for item in results]})
-
-    @tool
-    def import_job_from_text(
-        raw_text: str,
-        runtime: ToolRuntime[JobHuntingAgentContext, Any],
-        source_url: str | None = None,
-    ) -> str:
-        """导入用户主动复制回来的职位文本，并解析成标准化职位记录。"""
-
-        try:
-            # Agent 的 `use_tool_llm=False` 不仅用于资料入库和简历工具，也必须传给
-            # 职位技能分类。否则测试或离线规则模式仍可能意外发起真实模型请求。
-            job = app.import_job_text(
-                raw_text,
-                source_url,
-                account_id=runtime.context.get("account_id"),
-                classify_with_llm=runtime.context["use_tool_llm"],
-            )
-        except (InvalidJobTextError, DuplicateResourceError) as error:
-            # 工具返回可读失败结果，避免 Agent 把非职位文本误认为已经成功入库。
-            return dumps_tool_output({"saved": False, "error": str(error)})
-        return dumps_tool_output({"job": asdict(job)})
-
-    @tool
-    def list_imported_jobs(runtime: ToolRuntime[JobHuntingAgentContext, Any]) -> str:
-        """列出本地已经导入的职位池，供后续匹配或简历改写选择。"""
-
-        context = require_runtime_context(runtime)
-        return dumps_tool_output({"jobs": [asdict(job) for job in app.list_jobs(account_id=context.get("account_id"))]})
-
-    @tool
-    def match_all_jobs_for_candidate(runtime: ToolRuntime[JobHuntingAgentContext, Any]) -> str:
-        """匹配当前候选人与本地全部职位，并返回按推荐顺序排序的结果。"""
-
-        context = require_runtime_context(runtime)
-        candidate_id = require_candidate_id(context)
-        account_id = context.get("account_id")
-        jobs_by_id = {job.id: job for job in app.list_jobs(account_id=account_id)}
-        matches = app.match_all_jobs(candidate_id, account_id=account_id)
-        return dumps_tool_output(
-            {
-                "candidate_id": candidate_id,
-                "matches": [
-                    {
-                        "job": asdict(jobs_by_id[match.job_id]),
-                        "match": asdict(match),
-                    }
-                    for match in matches
-                ],
-            }
-        )
-
-    @tool
-    def list_project_cards_for_candidate(runtime: ToolRuntime[JobHuntingAgentContext, Any]) -> str:
-        """列出当前候选人的项目经历卡片，查看哪些还待确认。"""
-
-        context = require_runtime_context(runtime)
-        candidate_id = require_candidate_id(context)
-        cards = app.list_project_cards(candidate_id, account_id=context.get("account_id"))
-        return dumps_tool_output({"project_cards": [asdict(card) for card in cards]})
-
-    @tool
-    def analyze_github_project_for_candidate(
-        repository_url: str,
-        runtime: ToolRuntime[JobHuntingAgentContext, Any],
-    ) -> str:
-        """分析公开 GitHub 仓库并保存成待确认项目经历卡片。
-
-        只接受 ``https://github.com/owner/repository`` 形式的公开仓库首页链接。
-        网页运行环境会把任务交给 Worker；工具返回排队状态，不会假装已经完成分析。
-        """
-
-        context = require_runtime_context(runtime)
-        candidate_id = require_candidate_id(context)
-        account_id = context.get("account_id")
-        try:
-            if app.task_queue_enabled:
-                if account_id is None:
-                    raise ValueError("GitHub 项目分析任务缺少账号归属。")
-                task = app.enqueue_github_project_analysis_task(
-                    repository_url=repository_url,
-                    account_id=account_id,
-                    candidate_id=candidate_id,
-                    session_id=context.get("session_id"),
-                    root_request_id=context.get("root_request_id"),
-                )
-                return dumps_tool_output(
-                    {
-                        "task": background_task_tool_payload(task),
-                        "message": "GitHub 项目分析任务已排队，完成后会生成待确认项目经历卡片。",
-                    }
-                )
-            record = app.analyze_github_project_for_candidate(
-                candidate_id,
-                repository_url,
-                account_id=account_id,
-            )
-        except DuplicateResourceError as error:
-            return dumps_tool_output({"saved": False, "error": str(error)})
-        return dumps_tool_output(asdict(record))
-
-    @tool
-    def confirm_project_card(
-        record_id: int,
-        runtime: ToolRuntime[JobHuntingAgentContext, Any],
-        confirmed_summary: str | None = None,
-    ) -> str:
-        """确认一张项目卡片，并把候选人确认摘要保存为后续可检索证据。
-
-        真实性边界：只有在候选人已经明确确认内容时，才应该调用这个工具。
-        它会把“待确认卡片”提升为后续可引用的项目证据，但不会反向覆盖候选人档案。
-        """
-
-        context = require_runtime_context(runtime)
-        candidate_id = require_candidate_id(context)
-        allowed_record_ids = {
-            record.id
-            for record in app.list_project_cards(candidate_id, account_id=context.get("account_id"))
-        }
-        if record_id not in allowed_record_ids:
-            raise ValueError(f"项目卡片 {record_id} 不属于当前候选人 {candidate_id}。")
-        account_id = context.get("account_id")
-        if account_id is None:
-            raise ValueError("确认项目经历缺少账号归属。")
-        record, rag_task = app.confirm_project_card_and_enqueue_rag(
-            record_id,
-            confirmed_summary,
-            account_id=account_id,
-            session_id=context.get("session_id"),
-            root_request_id=context.get("root_request_id"),
-        )
-        return dumps_tool_output(
-            {
-                "project_card": asdict(record),
-                "task": background_task_tool_payload(rag_task) if rag_task is not None else None,
-            }
-        )
-
-    @tool
-    def create_resume_draft_for_job(
-        job_id: int,
-        runtime: ToolRuntime[JobHuntingAgentContext, Any],
-        use_rag: bool = True,
-        rag_query: str | None = None,
-    ) -> str:
-        """为当前候选人生成职位定制简历草稿，并保存成单独版本，不覆盖原档案。"""
-
-        context = require_runtime_context(runtime)
-        candidate_id = require_candidate_id(context)
-        account_id = context.get("account_id")
-        llm_client = (
-            app.model_gateway.llm_client(
-                app.model_gateway.new_call_context(
-                    "resume_rewrite",
-                    account_id=account_id,
-                    candidate_id=candidate_id,
-                    session_id=context.get("session_id"),
-                    root_request_id=context.get("root_request_id"),
-                )
-            )
-            if context["use_tool_llm"]
-            else None
-        )
-        draft = app.create_resume_draft(
-            candidate_id,
-            job_id,
-            llm_client=llm_client,
-            rag_query=rag_query,
-            use_rag=use_rag,
-            account_id=account_id,
-        )
-        return dumps_tool_output(asdict(draft))
-
-    @tool
-    def list_resume_artifacts_for_candidate(runtime: ToolRuntime[JobHuntingAgentContext, Any]) -> str:
-        """列出当前候选人已上传和已生成的简历文件，供改写前选择源文件。"""
-
-        context = require_runtime_context(runtime)
-        candidate_id = require_candidate_id(context)
-        artifacts = app.list_resume_artifacts(
-            candidate_id,
-            account_id=context.get("account_id"),
-        )
-        return dumps_tool_output(
-            {
-                "artifacts": [
-                    resume_artifact_tool_payload(artifact)
-                    for artifact in artifacts
-                ]
-            }
-        )
-
-    @tool
-    def create_tailored_resume_from_upload(
-        source_artifact_id: int,
-        job_id: int,
-        runtime: ToolRuntime[JobHuntingAgentContext, Any],
-        use_rag: bool = True,
-        rag_query: str | None = None,
-        allow_proficiency_upgrade: bool = False,
-    ) -> str:
-        """基于当前候选人的原始上传简历生成职位定制 DOCX/PDF 和独立草稿版本。
-
-        默认不得拔高技能熟练度。只有已提示风险且用户再次确认提高措辞时，才能把
-        `allow_proficiency_upgrade` 设为 true；生成结果始终不会覆盖原文件或档案。
-        """
-
-        context = require_runtime_context(runtime)
-        candidate_id = require_candidate_id(context)
-        account_id = context.get("account_id")
-        llm_client = (
-            app.model_gateway.llm_client(
-                app.model_gateway.new_call_context(
-                    "resume_document_rewrite",
-                    account_id=account_id,
-                    candidate_id=candidate_id,
-                    session_id=context.get("session_id"),
-                    root_request_id=context.get("root_request_id"),
-                )
-            )
-            if context["use_tool_llm"]
-            else None
-        )
-        result = app.create_tailored_resume_from_artifact(
-            candidate_id=candidate_id,
-            source_artifact_id=source_artifact_id,
-            job_id=job_id,
-            llm_client=llm_client,
-            rag_query=rag_query,
-            use_rag=use_rag,
-            allow_proficiency_upgrade=allow_proficiency_upgrade,
-            account_id=account_id,
-        )
-        return dumps_tool_output(
-            {
-                "draft": asdict(result.draft),
-                "artifacts": [
-                    resume_artifact_tool_payload(artifact)
-                    for artifact in result.artifacts
-                ],
-            }
-        )
-
-    return [
-        ingest_candidate_message,
-        get_current_candidate_profile,
-        list_candidate_profiles,
-        search_candidate_evidence,
-        import_job_from_text,
-        list_imported_jobs,
-        match_all_jobs_for_candidate,
-        list_project_cards_for_candidate,
-        analyze_github_project_for_candidate,
-        confirm_project_card,
-        create_resume_draft_for_job,
-        list_resume_artifacts_for_candidate,
-        create_tailored_resume_from_upload,
-    ]
-
-
-def require_runtime_context(
-    runtime: ToolRuntime[JobHuntingAgentContext, Any],
-) -> JobHuntingAgentContext:
-    """读取工具运行时上下文。"""
-
-    if runtime is None:
-        raise ValueError("当前工具缺少 Agent 运行时上下文。")
-    return runtime.context
-
-
-def require_candidate_id(context: JobHuntingAgentContext) -> int:
-    """确保当前会话已经绑定候选人。"""
-
-    candidate_id = context.get("candidate_id")
-    if candidate_id is None:
-        raise ValueError("当前会话还没有绑定候选人档案，请先创建或选择候选人。")
-    return candidate_id
-
-
-def dumps_tool_output(value: dict[str, Any]) -> str:
-    """统一序列化工具输出，方便 Agent 阅读，也方便 Web API 再解析。
-
-    数据库驱动在读取 ``jobs.captured_at`` 等时间列时可能返回 ``datetime``，
-    而 dataclass 转字典不会自动把它变成 JSON 标量。工具输出不应因某个可展示的
-    数据库标量而中断 Agent 循环，因此把这类未知标量降级为其字符串表示。
-    """
-
-    return json.dumps(value, ensure_ascii=False, indent=2, default=str)
-
-
-def resume_artifact_tool_payload(artifact) -> dict[str, Any]:
-    """把简历文件记录转换为 Agent 可读且不泄露服务器路径的工具结果。"""
-
-    payload = asdict(artifact)
-    payload.pop("storage_key", None)
-    payload.pop("account_id", None)
-    payload["download_url"] = f"/api/resumes/{artifact.id}/download"
-    return payload
-
-
-def background_task_tool_payload(task: BackgroundTaskRecord) -> dict[str, Any]:
-    """把后台任务压缩成 Agent 可读摘要，不暴露账号和任务 payload。"""
-
-    return {
-        "task_key": task.task_key,
-        "task_type": task.task_type,
-        "status": task.status,
-        "progress": task.progress,
-        "attempt": task.attempt,
-        "max_attempts": task.max_attempts,
-        "result": task.result,
-        "error_summary": task.error_summary,
-    }
+    return list(build_langchain_tools(build_job_hunting_tool_registry(app)))
 
 
 def extract_usage_metadata(message: object) -> dict[str, int]:
@@ -1142,12 +752,29 @@ def tool_message_to_output(message: ToolMessage) -> dict[str, object]:
 
     raw_content = stringify_tool_message_content(message.content)
     status = str(getattr(message, "status", "success") or "success")
+    parsed = try_parse_json(raw_content)
+    if isinstance(parsed, dict) and parsed.get("status") in {
+        "success",
+        "queued",
+        "rejected",
+        "failed",
+    }:
+        item: dict[str, object] = {
+            "tool_name": message.name or "unknown_tool",
+            "raw_content": raw_content,
+            "status": str(parsed["status"]),
+            "data": parsed.get("data"),
+        }
+        if isinstance(parsed.get("error"), dict):
+            item["error"] = parsed["error"]
+        if isinstance(parsed.get("meta"), dict):
+            item["meta"] = parsed["meta"]
+        return item
     item: dict[str, object] = {
         "tool_name": message.name or "unknown_tool",
         "raw_content": raw_content,
         "status": status,
     }
-    parsed = try_parse_json(raw_content)
     if status == "error":
         if isinstance(parsed, dict) and parsed.get("error"):
             item["data"] = parsed

@@ -45,6 +45,8 @@ GITHUB_PROJECT_ANALYSIS_TASK_TYPE = "github_project_analysis"
 PROJECT_ARCHIVE_ANALYSIS_TASK_TYPE = "project_archive_analysis"
 # 定制简历的模型改写和 DOCX/PDF 导出在 Worker 中执行。
 RESUME_EXPORT_TASK_TYPE = "resume_export"
+# Worker 探针只验证任务消费和数据库状态更新，不读取候选人材料。
+SYSTEM_PROBE_TASK_TYPE = "system_probe"
 
 
 class TaskQueueError(RuntimeError):

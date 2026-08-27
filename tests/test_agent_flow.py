@@ -193,9 +193,13 @@ def test_agent_rag_tool_always_scopes_search_to_current_candidate(account_id, mo
         account_id=account_id,
     )
 
-    assert calls == [
-        ("项目证据", 3, None, {"account_id": account_id, "candidate_id": candidate_id})
-    ]
+    assert len(calls) == 1
+    query, top_k, entity_types, scope = calls[0]
+    assert (query, top_k, entity_types) == ("项目证据", 3, None)
+    assert scope["account_id"] == account_id
+    assert scope["candidate_id"] == candidate_id
+    assert scope["session_id"] == "candidate-rag-scope"
+    assert isinstance(scope["root_request_id"], str) and scope["root_request_id"]
 
 
 def test_langchain_agent_context_schema_does_not_emit_serializer_warning(tmp_path, account_id):
@@ -568,8 +572,10 @@ def test_langchain_agent_rejects_non_job_text_import(tmp_path, account_id):
     )
 
     assert app.list_jobs(account_id=account_id) == []
-    assert result.tool_outputs[0]["data"]["saved"] is False
-    assert "不像一段完整的招聘职位信息" in result.tool_outputs[0]["data"]["error"]
+    assert result.tool_outputs[0]["status"] == "rejected"
+    assert result.tool_outputs[0]["data"] is None
+    assert result.tool_outputs[0]["error"]["code"] == "invalid_job_text"
+    assert "不像一段完整的招聘职位信息" in result.tool_outputs[0]["error"]["message"]
 
 
 def test_langchain_agent_restores_persisted_chat_history_on_startup(tmp_path, account_id):

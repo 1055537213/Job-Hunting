@@ -4,31 +4,23 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from .job_hunting_tools import job_hunting_tool_catalog
 from .models import ToolCallTraceRecord
+from .task_registry import background_task_catalog
 
 AUDIT_SKIP_STEP_NAMES = {"compose_reply"}
 
+_AGENT_TOOL_METADATA = {item.name: item for item in job_hunting_tool_catalog()}
+_BACKGROUND_TASK_METADATA = {
+    item.task_type: item for item in background_task_catalog()
+}
+
 TOOL_STEP_LABELS = {
-    "ingest_candidate_message": "整理并保存候选人资料",
-    "get_current_candidate_profile": "读取当前候选人档案",
-    "list_candidate_profiles": "读取候选人档案列表",
-    "search_candidate_evidence": "检索相关项目经历",
-    "import_job_from_text": "解析职位信息",
-    "list_imported_jobs": "读取已导入职位",
-    "match_all_jobs_for_candidate": "计算职位匹配结果",
-    "list_project_cards_for_candidate": "读取项目经历卡片",
-    "analyze_github_project_for_candidate": "分析项目经历",
-    "confirm_project_card": "确认项目经历",
-    "create_resume_draft_for_job": "生成职位定制简历草稿",
-    "list_resume_artifacts_for_candidate": "读取已上传简历",
-    "create_tailored_resume_from_upload": "生成职位定制简历",
-    "resume_ocr": "识别扫描版简历",
-    "rag_index": "更新 RAG 检索索引",
-    "visual_index": "更新视觉知识索引",
-    "resume_export": "生成职位定制简历文件",
-    "github_project_analysis": "分析 GitHub 项目",
-    "project_archive_analysis": "扫描项目整包",
-    "system_probe": "检查 Worker 连通性",
+    **{name: item.audit_label for name, item in _AGENT_TOOL_METADATA.items()},
+    **{
+        task_type: item.audit_label
+        for task_type, item in _BACKGROUND_TASK_METADATA.items()
+    },
     "compose_reply": "整理回复",
 }
 
@@ -42,16 +34,7 @@ def tool_step_label(tool_name: str) -> str:
 def background_task_tool_name(task_type: str) -> str:
     """把后台任务类型映射为审计里的工具步骤名。"""
 
-    aliases = {
-        "github_project_analysis": "github_project_analysis",
-        "project_archive_analysis": "project_archive_analysis",
-        "resume_ocr": "resume_ocr",
-        "rag_index": "rag_index",
-        "visual_index": "visual_index",
-        "resume_export": "resume_export",
-        "system_probe": "system_probe",
-    }
-    return aliases.get(task_type, task_type or "background_task")
+    return task_type if task_type in _BACKGROUND_TASK_METADATA else task_type or "background_task"
 
 
 def audited_steps(trace: Mapping[str, object] | None) -> list[dict[str, object]]:
@@ -82,25 +65,17 @@ def has_audited_steps(trace: Mapping[str, object] | None) -> bool:
 def tool_trace_title(tool_names: list[str]) -> str:
     """根据真实工具名称生成可读标题。"""
 
-    priorities = [
-        ("create_tailored_resume_from_upload", "生成职位定制简历"),
-        ("create_resume_draft_for_job", "生成职位定制简历草稿"),
-        ("analyze_github_project_for_candidate", "分析项目经历"),
-        ("github_project_analysis", "分析 GitHub 项目"),
-        ("project_archive_analysis", "扫描项目整包"),
-        ("resume_ocr", "识别扫描版简历"),
-        ("resume_export", "生成职位定制简历文件"),
-        ("rag_index", "更新 RAG 检索索引"),
-        ("visual_index", "更新视觉知识索引"),
-        ("confirm_project_card", "确认项目经历"),
-        ("match_all_jobs_for_candidate", "职位匹配分析"),
-        ("import_job_from_text", "导入职位信息"),
-        ("ingest_candidate_message", "整理候选人资料"),
-        ("system_probe", "检查 Worker 连通性"),
-    ]
-    for tool_name, title in priorities:
-        if tool_name in tool_names:
-            return title
+    candidates: list[tuple[int, str]] = []
+    for tool_name in tool_names:
+        metadata = _AGENT_TOOL_METADATA.get(tool_name)
+        if metadata is not None and metadata.trace_priority > 0:
+            candidates.append((metadata.trace_priority, metadata.audit_label))
+            continue
+        task_metadata = _BACKGROUND_TASK_METADATA.get(tool_name)
+        if task_metadata is not None:
+            candidates.append((task_metadata.trace_priority, task_metadata.audit_label))
+    if candidates:
+        return max(candidates, key=lambda item: item[0])[1]
     return "本次任务"
 
 
