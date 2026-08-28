@@ -5,6 +5,7 @@ import json
 from job_hunting_agent.evals.rag_eval import (
     EvidenceRef,
     RAGEvalCase,
+    RAGEvalThresholds,
     evaluate_rag_cases,
     format_rag_eval_report,
     load_rag_eval_cases,
@@ -80,6 +81,52 @@ def test_rag_eval_fails_when_forbidden_evidence_is_retrieved() -> None:
     assert not report.all_passed
     assert report.forbidden_case_rate == 1.0
     assert report.case_results[0].forbidden_hit_count == 1
+
+
+def test_rag_eval_applies_suite_thresholds_and_reports_tag_metrics() -> None:
+    cases = [
+        RAGEvalCase(
+            id="industrial-parameter",
+            query="泵轴公差是多少",
+            expected=(EvidenceRef(source_label="drawing:shaft"),),
+            tags=("industrial", "numeric"),
+        ),
+        RAGEvalCase(
+            id="design-visual",
+            query="海报的视觉层级",
+            expected=(EvidenceRef(source_label="design:poster"),),
+            tags=("design", "visual"),
+            min_recall=0.0,
+        ),
+    ]
+
+    report = evaluate_rag_cases(
+        cases,
+        lambda case, _top_k: (
+            [rag_hit(1, "drawing:shaft", "project_archive_file", 1)]
+            if case.id == "industrial-parameter"
+            else [rag_hit(2, "design:noise", "project_archive_file", 1)]
+        ),
+        thresholds=RAGEvalThresholds(
+            min_case_pass_rate=1.0,
+            min_mean_recall_at_k=0.75,
+            min_mean_reciprocal_rank=0.75,
+            max_forbidden_case_rate=0.0,
+        ),
+    )
+
+    assert not report.all_passed
+    assert report.case_pass_rate == 1.0
+    assert report.mean_recall_at_k == 0.5
+    assert report.quality_gate_failures == (
+        "mean_recall_at_k 0.500 < 0.750",
+        "mean_reciprocal_rank 0.500 < 0.750",
+    )
+    assert report.metrics_by_tag["industrial"]["mean_recall_at_k"] == 1.0
+    assert report.metrics_by_tag["visual"]["mean_recall_at_k"] == 0.0
+    payload = report.to_dict()
+    assert payload["thresholds"]["min_mean_recall_at_k"] == 0.75
+    assert payload["quality_gate_passed"] is False
 
 
 def test_rag_eval_loads_case_json_with_compact_reference_fields(tmp_path) -> None:

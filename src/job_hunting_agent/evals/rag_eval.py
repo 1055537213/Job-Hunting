@@ -23,6 +23,35 @@ SearchBackend = Callable[["RAGEvalCase", int], Sequence[object]]
 
 
 @dataclass(frozen=True)
+class RAGEvalThresholds:
+    """套件级质量门槛，防止单条宽松阈值掩盖整体召回退化。"""
+
+    min_case_pass_rate: float = 1.0
+    min_mean_recall_at_k: float = 0.0
+    min_mean_reciprocal_rank: float = 0.0
+    max_forbidden_case_rate: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name, value in asdict(self).items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"RAG eval threshold {name} must be between 0 and 1.")
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, object] | None) -> RAGEvalThresholds:
+        values = payload or {}
+        return cls(
+            min_case_pass_rate=float(values.get("min_case_pass_rate", 1.0)),
+            min_mean_recall_at_k=float(values.get("min_mean_recall_at_k", 0.0)),
+            min_mean_reciprocal_rank=float(
+                values.get("min_mean_reciprocal_rank", 0.0)
+            ),
+            max_forbidden_case_rate=float(
+                values.get("max_forbidden_case_rate", 0.0)
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class EvidenceRef:
     """A stable reference to a long-text source expected in RAG results."""
 
@@ -121,6 +150,7 @@ class RAGEvalCase:
     entity_types: tuple[str, ...] = ()
     top_k: int | None = None
     min_recall: float = 1.0
+    tags: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> RAGEvalCase:
@@ -151,6 +181,13 @@ class RAGEvalCase:
             entity_types=tuple(str(item) for item in payload.get("entity_types", []) or []),
             top_k=_optional_int(payload.get("top_k")),
             min_recall=min_recall,
+            tags=tuple(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in payload.get("tags", []) or []
+                    if str(item).strip()
+                )
+            ),
         )
 
 
@@ -167,6 +204,7 @@ class RAGEvalCaseResult:
     reciprocal_rank: float
     forbidden_hit_count: int
     passed: bool
+    tags: tuple[str, ...] = ()
     hits: list[RetrievedEvidence] = field(default_factory=list)
 
 
@@ -175,6 +213,7 @@ class RAGEvalReport:
     """Aggregated RAG evaluation metrics."""
 
     case_results: list[RAGEvalCaseResult]
+    thresholds: RAGEvalThresholds = field(default_factory=RAGEvalThresholds)
 
     @property
     def case_count(self) -> int:
@@ -186,7 +225,13 @@ class RAGEvalReport:
 
     @property
     def all_passed(self) -> bool:
-        return bool(self.case_results) and self.passed_count == self.case_count
+        return bool(self.case_results) and not self.quality_gate_failures
+
+    @property
+    def case_pass_rate(self) -> float:
+        if not self.case_count:
+            return 0.0
+        return self.passed_count / self.case_count
 
     @property
     def mean_recall_at_k(self) -> float:
@@ -203,14 +248,68 @@ class RAGEvalReport:
             for result in self.case_results
         )
 
+    @property
+    def quality_gate_failures(self) -> tuple[str, ...]:
+        failures: list[str] = []
+        checks = (
+            ("case_pass_rate", self.case_pass_rate, self.thresholds.min_case_pass_rate),
+            (
+                "mean_recall_at_k",
+                self.mean_recall_at_k,
+                self.thresholds.min_mean_recall_at_k,
+            ),
+            (
+                "mean_reciprocal_rank",
+                self.mean_reciprocal_rank,
+                self.thresholds.min_mean_reciprocal_rank,
+            ),
+        )
+        for label, actual, minimum in checks:
+            if actual < minimum:
+                failures.append(f"{label} {actual:.3f} < {minimum:.3f}")
+        if self.forbidden_case_rate > self.thresholds.max_forbidden_case_rate:
+            failures.append(
+                "forbidden_case_rate "
+                f"{self.forbidden_case_rate:.3f} > "
+                f"{self.thresholds.max_forbidden_case_rate:.3f}"
+            )
+        return tuple(failures)
+
+    @property
+    def metrics_by_tag(self) -> dict[str, dict[str, float | int]]:
+        tags = sorted({tag for result in self.case_results for tag in result.tags})
+        metrics: dict[str, dict[str, float | int]] = {}
+        for tag in tags:
+            results = [result for result in self.case_results if tag in result.tags]
+            metrics[tag] = {
+                "case_count": len(results),
+                "passed_count": sum(1 for result in results if result.passed),
+                "mean_recall_at_k": _mean(
+                    result.recall_at_k for result in results
+                ),
+                "mean_reciprocal_rank": _mean(
+                    result.reciprocal_rank for result in results
+                ),
+                "forbidden_case_rate": _mean(
+                    1.0 if result.forbidden_hit_count else 0.0
+                    for result in results
+                ),
+            }
+        return metrics
+
     def to_dict(self) -> dict[str, object]:
         return {
             "case_count": self.case_count,
             "passed_count": self.passed_count,
             "all_passed": self.all_passed,
+            "case_pass_rate": self.case_pass_rate,
             "mean_recall_at_k": self.mean_recall_at_k,
             "mean_reciprocal_rank": self.mean_reciprocal_rank,
             "forbidden_case_rate": self.forbidden_case_rate,
+            "thresholds": asdict(self.thresholds),
+            "quality_gate_passed": not self.quality_gate_failures,
+            "quality_gate_failures": list(self.quality_gate_failures),
+            "metrics_by_tag": self.metrics_by_tag,
             "cases": [asdict(result) for result in self.case_results],
         }
 
@@ -220,6 +319,7 @@ def evaluate_rag_cases(
     search_backend: SearchBackend,
     *,
     top_k: int = DEFAULT_TOP_K,
+    thresholds: RAGEvalThresholds | None = None,
 ) -> RAGEvalReport:
     """Run golden retrieval cases against a RAG search backend."""
 
@@ -250,10 +350,11 @@ def evaluate_rag_cases(
                 reciprocal_rank=reciprocal_rank,
                 forbidden_hit_count=len(forbidden_hits),
                 passed=recall >= case.min_recall and not forbidden_hits,
+                tags=case.tags,
                 hits=hits,
             )
         )
-    return RAGEvalReport(results)
+    return RAGEvalReport(results, thresholds or RAGEvalThresholds())
 
 
 def load_rag_eval_cases(path: str | Path) -> list[RAGEvalCase]:
@@ -276,7 +377,9 @@ def format_rag_eval_report(report: RAGEvalReport) -> str:
         f"mean_recall_at_k={report.mean_recall_at_k:.3f}",
         f"mrr={report.mean_reciprocal_rank:.3f}",
         f"forbidden_case_rate={report.forbidden_case_rate:.3f}",
+        f"quality_gate={'PASS' if report.all_passed else 'FAIL'}",
     ]
+    lines.extend(f"gate_failure={failure}" for failure in report.quality_gate_failures)
     for result in report.case_results:
         status = "PASS" if result.passed else "FAIL"
         lines.append(

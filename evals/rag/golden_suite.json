@@ -1,0 +1,214 @@
+{
+  "name": "cross-industry-rag-golden-suite",
+  "version": "1.0.0",
+  "description": "隔离的跨行业 RAG 黄金集，覆盖语义改写、精确数值、表格关系、视觉摘要、版本冲突和账号隔离。",
+  "thresholds": {
+    "min_case_pass_rate": 0.9,
+    "min_mean_recall_at_k": 0.8,
+    "min_mean_reciprocal_rank": 0.75,
+    "max_forbidden_case_rate": 0.0
+  },
+  "documents": [
+    {
+      "id": "software-backend",
+      "source_label": "eval:software:backend-order-service",
+      "entity_type": "project_archive_file",
+      "text": "项目：电商订单服务。候选人使用 Python、FastAPI 和 PostgreSQL 实现异步订单接口，引入 Redis 缓存与 Celery 后台任务。通过幂等键防止重复创建订单，接口 P95 响应时间从 420 ms 降至 180 ms，并为支付回调补充重试和审计日志。"
+    },
+    {
+      "id": "software-frontend-negative",
+      "source_label": "eval:software:frontend-dashboard",
+      "entity_type": "project_archive_file",
+      "text": "项目：营销数据看板。候选人主要使用 Vue 3、TypeScript 和 ECharts 开发浏览器端交互，负责组件样式、响应式布局和前端埋点，不承担 Python 后端接口开发。"
+    },
+    {
+      "id": "industrial-shaft-current",
+      "source_label": "eval:industrial:shaft-revision-b-current",
+      "entity_type": "industrial_drawing_summary",
+      "text": "传动轴零件图，图号 ZX-2048，版本 B，状态：当前生效。材料为 40Cr，热处理硬度 HRC 28-32。关键配合轴颈直径为 18.00 mm，上偏差 +0.02 mm，下偏差 -0.01 mm；表面粗糙度 Ra 1.6。版本 B 已于 2026-06-12 替代版本 A。"
+    },
+    {
+      "id": "industrial-shaft-obsolete",
+      "source_label": "eval:industrial:shaft-revision-a-obsolete",
+      "entity_type": "industrial_drawing_summary",
+      "text": "传动轴零件图，图号 ZX-2048，版本 A，状态：已作废，仅供历史追溯。旧版轴颈直径为 17.80 mm，尺寸公差为正负 0.05 mm，材料为 45 钢。不得把本页参数用于当前生产或求职成果描述。"
+    },
+    {
+      "id": "industrial-pump-table",
+      "source_label": "eval:industrial:pump-maintenance-table",
+      "entity_type": "industrial_pdf_table",
+      "text": "设备点检表：P-203 循环泵振动预警值 3.8 mm/s，停机值 6.0 mm/s；P-204 冷却泵振动预警值 4.5 mm/s，停机值 7.1 mm/s；P-205 备用泵振动预警值 4.0 mm/s，停机值 6.5 mm/s。测点均位于驱动端轴承座，检测周期为每 8 小时一次。"
+    },
+    {
+      "id": "construction-spec",
+      "source_label": "eval:construction:slab-spec-page-17",
+      "entity_type": "construction_pdf_page",
+      "text": "结构施工图第 17 页，地下车库顶板说明。混凝土强度等级 C35，受力钢筋采用 HRB400，板厚 120 mm，保护层厚度 20 mm。正文中的材料说明与本页右下角配筋表共同适用于 B2 区，不得拆开解释。"
+    },
+    {
+      "id": "visual-poster-summary",
+      "source_label": "eval:design:poster-visual-summary",
+      "entity_type": "project_visual_summary",
+      "text": "视觉文件 poster-final.png 的多模态摘要：竖版公益海报，主标题“让旧衣重新出发”位于上方中央，主体是蓝色回收箱与三件彩色衣物，右下角有红色圆角行动按钮“预约回收”。画面采用蓝、白、红对比配色，信息层级依次为标题、主体插画、三步说明和行动按钮；OCR 同时识别出日期 6 月 18 日。"
+    },
+    {
+      "id": "healthcare-scheduling",
+      "source_label": "eval:healthcare:outpatient-scheduling",
+      "entity_type": "project_archive_file",
+      "text": "门诊排班优化项目：基于历史到诊量重新划分医生班次与预约时段，试点科室患者平均等待时间由 47 分钟降至 38.5 分钟，下降约 18%；同时将高峰期窗口利用率从 71% 提升至 84%。数据已做匿名化处理。"
+    },
+    {
+      "id": "education-course",
+      "source_label": "eval:education:adaptive-course",
+      "entity_type": "project_archive_file",
+      "text": "职业教育课程改造：为数控加工课程建立诊断测验和分层练习，依据错题类型向学生分配不同难度任务。一个学期后，实训任务按时完成率从 76% 提升到 91%，教师每周人工批改时间减少 6 小时。"
+    },
+    {
+      "id": "finance-risk",
+      "source_label": "eval:finance:invoice-risk-review",
+      "entity_type": "project_archive_file",
+      "text": "供应链发票风险复核项目：将合同、入库单和发票三单匹配，配置金额偏差、重复票号和异常开票时间规则。试运行期间识别 23 笔待复核交易，误报率经二次调参由 14% 降到 6%，最终决定仍由财务人员确认。"
+    },
+    {
+      "id": "logistics-cold-chain",
+      "source_label": "eval:logistics:cold-chain-route",
+      "entity_type": "project_archive_file",
+      "text": "冷链配送线路优化：综合车辆容积、门店时间窗和温控要求调整路线，覆盖 42 家门店。平均单车里程减少 11.6%，准时送达率从 92.1% 提升到 97.4%，超过 8 摄氏度的温度异常批次由每月 9 次降到 2 次。"
+    },
+    {
+      "id": "manufacturing-quality",
+      "source_label": "eval:manufacturing:welding-quality",
+      "entity_type": "project_archive_file",
+      "text": "焊接质量改进项目：针对气孔缺陷执行鱼骨图分析，调整保护气体流量与工件清洁步骤。连续四周抽检 320 件，首次合格率从 93.2% 提升至 98.1%，返修工时每周减少 14 小时。"
+    },
+    {
+      "id": "legal-contract",
+      "source_label": "eval:legal:contract-review-workflow",
+      "entity_type": "project_archive_file",
+      "text": "合同审查流程优化：统一采购合同的付款、交付、保密和违约条款清单，设置高风险条款升级复核。试点后平均初审周期由 2.4 天缩短到 1.3 天，但最终法律意见仍由执业人员签发。"
+    },
+    {
+      "id": "account-primary-note",
+      "source_label": "eval:isolation:primary-calibration",
+      "entity_type": "private_project_note",
+      "text": "当前评测账号的专属校准记录：设备代号 ORBIT-731，扭矩设定值为 36 N·m，校准日期为 2026-08-01。该记录只允许在所属账号内检索。"
+    },
+    {
+      "id": "account-foreign-note",
+      "source_label": "eval:isolation:foreign-calibration",
+      "entity_type": "private_project_note",
+      "account_scope": "foreign",
+      "text": "另一个账号的机密校准记录：设备代号 ORBIT-731，扭矩设定值为 92 N·m。即使查询词完全相同，也不得被当前评测账号召回。"
+    }
+  ],
+  "cases": [
+    {
+      "id": "software-semantic-backend",
+      "query": "找出做过接口幂等、异步任务和数据库优化的服务端项目",
+      "expected_source_labels": ["eval:software:backend-order-service"],
+      "forbidden_source_labels": ["eval:software:frontend-dashboard"],
+      "entity_types": ["project_archive_file"],
+      "top_k": 3,
+      "tags": ["software", "semantic"]
+    },
+    {
+      "id": "industrial-current-tolerance",
+      "query": "ZX-2048 当前生效版本的 18 毫米轴颈上下偏差分别是多少",
+      "expected_source_labels": ["eval:industrial:shaft-revision-b-current"],
+      "forbidden_source_labels": ["eval:industrial:shaft-revision-a-obsolete"],
+      "entity_types": ["industrial_drawing_summary"],
+      "top_k": 1,
+      "tags": ["industrial", "numeric", "conflict"]
+    },
+    {
+      "id": "industrial-current-material",
+      "query": "正在用于生产的 ZX-2048 传动轴材料和热处理硬度是什么",
+      "expected_source_labels": ["eval:industrial:shaft-revision-b-current"],
+      "forbidden_source_labels": ["eval:industrial:shaft-revision-a-obsolete"],
+      "entity_types": ["industrial_drawing_summary"],
+      "top_k": 1,
+      "tags": ["industrial", "conflict"]
+    },
+    {
+      "id": "industrial-table-relation",
+      "query": "冷却泵 P-204 的振动预警值和必须停机的阈值",
+      "expected_source_labels": ["eval:industrial:pump-maintenance-table"],
+      "entity_types": ["industrial_pdf_table"],
+      "top_k": 2,
+      "tags": ["industrial", "numeric", "table"]
+    },
+    {
+      "id": "construction-cross-element",
+      "query": "B2 区地下车库顶板使用什么混凝土和钢筋，板厚及保护层是多少",
+      "expected_source_labels": ["eval:construction:slab-spec-page-17"],
+      "entity_types": ["construction_pdf_page"],
+      "top_k": 2,
+      "tags": ["construction", "numeric", "table"]
+    },
+    {
+      "id": "design-visual-layout",
+      "query": "哪份设计稿把红色预约回收按钮放在画面右下角，主标题又是什么",
+      "expected_source_labels": ["eval:design:poster-visual-summary"],
+      "entity_types": ["project_visual_summary"],
+      "top_k": 2,
+      "tags": ["design", "visual-summary"]
+    },
+    {
+      "id": "healthcare-waiting-time",
+      "query": "哪个医疗项目通过重新安排预约时段把患者等候时间降低约百分之十八",
+      "expected_source_labels": ["eval:healthcare:outpatient-scheduling"],
+      "entity_types": ["project_archive_file"],
+      "top_k": 3,
+      "tags": ["healthcare", "numeric", "semantic"]
+    },
+    {
+      "id": "education-completion-rate",
+      "query": "数控课程分层练习带来了什么学习完成率改进",
+      "expected_source_labels": ["eval:education:adaptive-course"],
+      "entity_types": ["project_archive_file"],
+      "top_k": 3,
+      "tags": ["education", "numeric", "semantic"]
+    },
+    {
+      "id": "finance-human-review",
+      "query": "三单匹配项目怎样发现异常发票，最终是谁决定风险结论",
+      "expected_source_labels": ["eval:finance:invoice-risk-review"],
+      "entity_types": ["project_archive_file"],
+      "top_k": 3,
+      "tags": ["finance", "semantic"]
+    },
+    {
+      "id": "logistics-temperature",
+      "query": "覆盖四十多家门店的配送优化如何改善准时率和温度异常",
+      "expected_source_labels": ["eval:logistics:cold-chain-route"],
+      "entity_types": ["project_archive_file"],
+      "top_k": 3,
+      "tags": ["logistics", "numeric", "semantic"]
+    },
+    {
+      "id": "manufacturing-welding",
+      "query": "气孔缺陷改善后首次合格率和返修工时发生了什么变化",
+      "expected_source_labels": ["eval:manufacturing:welding-quality"],
+      "entity_types": ["project_archive_file"],
+      "top_k": 3,
+      "tags": ["manufacturing", "numeric", "semantic"]
+    },
+    {
+      "id": "legal-review-cycle",
+      "query": "采购合同审查清单把初审周期缩短到多少天，谁负责最终意见",
+      "expected_source_labels": ["eval:legal:contract-review-workflow"],
+      "entity_types": ["project_archive_file"],
+      "top_k": 3,
+      "tags": ["legal", "numeric", "semantic"]
+    },
+    {
+      "id": "account-isolation-exact-key",
+      "query": "ORBIT-731 的扭矩设定值和校准日期",
+      "expected_source_labels": ["eval:isolation:primary-calibration"],
+      "forbidden_source_labels": ["eval:isolation:foreign-calibration"],
+      "entity_types": ["private_project_note"],
+      "top_k": 3,
+      "tags": ["account-isolation", "numeric", "security"]
+    }
+  ]
+}

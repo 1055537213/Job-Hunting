@@ -263,8 +263,14 @@ docker run --rm --entrypoint /bin/promtool -v "$((Get-Location).Path)/deploy/pro
 .\scripts\validate_worker_recovery.ps1
 .\scripts\validate_backup_restore.ps1
 .\scripts\validate_file_scanning.ps1
+.\scripts\validate_rag_retrieval.ps1 -Python E:\Anaconda\python.exe
 .\scripts\security_scan.ps1
 ~~~
+
+RAG 评测使用 `evals/rag/golden_suite.json` 中的固定跨行业语料。脚本会创建两个临时账号，
+在真实 PostgreSQL/pgvector 中索引后统计 Recall@K、MRR、禁止召回率和标签分组指标，再自动
+删除临时数据。默认使用 `.env` 中配置的正式 Embedding 与可选 Rerank，报告写入已忽略的
+`data/eval-reports/`；`-EmbeddingMode local_hash` 只用于验证评测管线，不能代表语义召回质量。
 
 ### 7.5 单机生产基线
 
@@ -356,7 +362,8 @@ job_agent_intent_router_model_duration_seconds_bucket
 ## 10. TODO / 未来计划（体现成长）
 
 - [ ] 接入真实支付渠道、签名 Webhook、退款状态机和渠道对账。
-- [ ] 建立足量 RAG 黄金测试集，持续评估 Recall@K、MRR 和禁止召回阈值。
+- [x] 建立首版隔离跨行业 RAG 黄金测试集，评估 Recall@K、MRR、禁止召回和账号隔离。
+- [ ] 持续扩充脱敏真实行业语料、原始视觉文件和难负样本，并按正式 Embedding 模型校准阈值。
 - [ ] 接入 Alertmanager 通知、OpenTelemetry Trace 和集中日志平台。
 - [ ] 出现明确外部调用方后，在现有 MCP adapter 上增加鉴权、授权和 Server 生命周期。
 - [ ] 建立严格类型检查基线，逐步消化第三方 stub 和内部 Protocol 类型债务。

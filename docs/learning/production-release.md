@@ -228,6 +228,30 @@ Worker，等待 Beat 把任务从 `running` 原子回收为 `queued`，再启动
 这项演练验证的是恢复链路，不等同于真实简历导出压力测试。上线前仍应使用接近生产大小的
 文件和并发量，另外测量大文件、模型超时、Redis 重启以及多个 Worker 同时消费时的 RTO/RPO。
 
+## RAG 召回质量门禁
+
+固定黄金集位于 `evals/rag/golden_suite.json`，覆盖软件、工业图纸、公差数值、PDF 表格、
+视觉摘要、医疗、教育、财务、物流、制造、法律、版本冲突和账号隔离。执行：
+
+```powershell
+.\scripts\validate_rag_retrieval.ps1 -Python E:\Anaconda\python.exe
+```
+
+脚本不读取现有用户知识库来凑测试数据。每次运行会在同一 PostgreSQL 中建立一个主评测账号
+和一个隔离账号，写入固定语料、执行真实 pgvector 检索，然后在 `finally` 中按账号级联删除
+长文本与向量。质量门禁同时检查用例通过率、平均 Recall@K、MRR 和禁止材料命中率，JSON
+报告保存在 `data/eval-reports/`，其中不保存连接串、API Key 或临时账号 ID。
+
+默认 `configured` 模式读取 `.env` 中的 Embedding 和 Rerank 配置，适合形成上线结论；
+`-EmbeddingMode local_hash` 是完全本地、确定性的管线冒烟测试，只能证明建库、检索、指标和
+清理链路可运行，不能用于判断中文语义召回准确率。更换 Embedding 模型、Rerank 模型、切片
+规则或检索参数后必须重新执行并保存报告。门禁失败时应查看失败用例和标签分组，不得通过
+降低阈值掩盖具体行业、数值或冲突材料的退化。
+
+首版 `visual-summary` 用例验证的是项目扫描阶段由多模态模型生成的视觉文字摘要能否被文字
+RAG 召回，不等于直接检索原始图片像素。上线前仍要逐步加入经过授权和脱敏的真实 PDF、
+表格、设计图与难负样本，并单独评估图像向量或 CAD 解析能力。
+
 ## 备份
 
 备份脚本会在线导出 PostgreSQL，并在短暂维护窗口中归档 MinIO 数据卷：
