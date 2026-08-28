@@ -308,7 +308,10 @@ class RecordingEmbeddings:
 
 
 class FailingReranker:
-    candidate_multiplier = 4
+    retrieval_top_k = 20
+    model = "rerank-model"
+    min_relevance_score = 0.65
+    relative_score_threshold = 0.86
 
     def rerank(
         self,
@@ -334,6 +337,9 @@ def test_embedding_and_rerank_wrappers_release_model_slots_on_all_paths() -> Non
         controller,
         account_id=12,
     )
+    assert reranker.model == "rerank-model"
+    assert reranker.min_relevance_score == 0.65
+    assert reranker.relative_score_threshold == 0.86
     with pytest.raises(RuntimeError, match="provider failed"):
         reranker.rerank("query", ["document"], 1)
 

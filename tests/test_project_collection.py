@@ -235,6 +235,27 @@ def test_pdf_and_xlsx_keep_page_and_sheet_boundaries() -> None:
     assert workbook.metadata["sheet_count"] == 1
 
 
+def test_ifc_is_collected_as_engineering_text() -> None:
+    content = b"\n".join(
+        [
+            b"ISO-10303-21;",
+            b"FILE_SCHEMA(('IFC4'));",
+            b"#100=IFCWALL('wall-guid',$,'Ground Floor East Shear Wall',$);",
+            b"END-ISO-10303-21;",
+        ]
+    )
+
+    evidence = extract_project_evidence(
+        "models/northstar.ifc",
+        content,
+        "engineering_drawing",
+    )
+
+    assert evidence.method == "engineering_text"
+    assert evidence.metadata["format"] == "ifc"
+    assert "Ground Floor East Shear Wall" in evidence.text
+
+
 def test_image_visual_analysis_preserves_relationships_and_exact_parameters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

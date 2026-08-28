@@ -94,7 +94,9 @@
     `indexed`，并用只描述视觉内容的文字问题验证能够命中对应图片或 PDF 页。检索会限量重开
     前两项命中原图进行查询相关复核，因此测试账号还必须有可用余额，并应在 Token/消费流水中
     看到 `project_visual_reinspection`。测试数据完成后按正常项目删除流程清理，以同时验证对象存储、
-    数据库和向量生命周期。
+    数据库和向量生命周期。生产环境还应按实际供应商响应时间设置
+    `JOB_AGENT_PROJECT_VISUAL_BATCH_TIMEOUT_SECONDS` 与
+    `JOB_AGENT_PROJECT_VISUAL_TOTAL_TIMEOUT_SECONDS`；超时必须能回退到 OCR/文字证据并完成任务收尾。
 
 12. 配置生产账号邮件和协议版本。生产启动会拒绝 `console` 邮件后端、HTTP 公开地址，
     或关闭邮箱验证/协议同意的配置：
@@ -239,7 +241,7 @@ Worker，等待 Beat 把任务从 `running` 原子回收为 `queued`，再启动
 
 脚本不读取现有用户知识库来凑测试数据。每次运行会在同一 PostgreSQL 中建立一个主评测账号
 和一个隔离账号，写入固定语料、执行真实 pgvector 检索，然后在 `finally` 中按账号级联删除
-长文本与向量。质量门禁同时检查用例通过率、平均 Recall@K、MRR 和禁止材料命中率，JSON
+长文本与向量。质量门禁同时检查用例通过率、最终 Top-N 的平均 Recall、Precision、nDCG、MRR 和禁止材料命中率，JSON
 报告保存在 `data/eval-reports/`，其中不保存连接串、API Key 或临时账号 ID。
 
 默认 `configured` 模式读取 `.env` 中的 Embedding 和 Rerank 配置，适合形成上线结论；
@@ -251,6 +253,58 @@ Worker，等待 Beat 把任务从 `running` 原子回收为 `queued`，再启动
 首版 `visual-summary` 用例验证的是项目扫描阶段由多模态模型生成的视觉文字摘要能否被文字
 RAG 召回，不等于直接检索原始图片像素。上线前仍要逐步加入经过授权和脱敏的真实 PDF、
 表格、设计图与难负样本，并单独评估图像向量或 CAD 解析能力。
+
+### GitHub 真实文件端到端门禁
+
+版本化真实文件评测分成两个用途不同的套件：
+
+- `evals/rag/github_artifact_suite.json`：12 份材料的冒烟集，只验证端到端链路。
+- `evals/rag/github_hard_negative_suite.json`：33 份材料、33 条问题的正式发布集，包含 31 条困难
+  负样本约束和 12 条保留问题，`Top 5` 只占语料 15.2%。
+
+材料覆盖工业图纸、IFC BIM、施工进度、医疗、财务、视觉设计和物流。来源仓库分别采用 MIT、
+Apache-2.0 或 CC-BY-4.0 许可证；清单必须同时记录固定提交、文件大小和 SHA-256，禁止使用
+`main`、`master` 或任意外部下载地址。冒烟集执行：
+
+```powershell
+.\scripts\validate_rag_artifacts.ps1 `
+  -Python E:\Anaconda\python.exe `
+  -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent"
+```
+
+正式发布集执行：
+
+```powershell
+.\scripts\validate_rag_artifacts.ps1 `
+  -BenchmarkRole release `
+  -Python E:\Anaconda\python.exe `
+  -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent"
+```
+
+下载器只根据清单生成 `raw.githubusercontent.com` 地址，并限制重定向主机、单文件大小和总
+下载量。全部下载内容在内存中复核大小与 SHA-256，通过后才进入现有项目采集入口；该入口再
+执行清单规划、敏感路径拒绝、本地 EICAR 检查、格式解析、OCR/多模态提取和视觉副本保存。
+ClamAV 自身由 `validate_file_scanning.ps1` 单独验收，避免 RAG 质量测试因病毒库服务状态产生
+无关波动。
+
+脚本使用临时账号和本地临时对象目录。视觉模型调用通过临时模拟余额完成，调用仍会产生模型
+供应商费用；完成或异常时均按账号级联删除余额流水、长文本和向量，并删除临时视觉副本。报告
+只包含来源 ID、行业、提取方法、字符数、视觉状态和检索指标，不包含原始文件、连接串、密钥或
+临时账号 ID。第三方原文件不得提交到仓库。
+
+`-EmbeddingMode local_hash -VisualMode disabled` 只用于离线检查清单、提取、建库、检索和清理
+程序。发布结论必须使用默认 `configured` 模式，并在更换视觉模型、Embedding、Rerank、OCR、
+切片规则或项目解析器后重新运行。若上游固定文件不可用或摘要变化，应先人工核对许可证与内容，
+再显式更新提交、大小和 SHA-256，不能跳过完整性校验。
+
+正式报告不能只看 `Recall@5`。必须同时审查 `Recall@1/3/5`、Precision@K、nDCG@K、MRR、
+困难负样本命中率和行业分组。`development` 可用于日常调参；`holdout` 只在阶段验收时运行和
+查看，不能针对其中某条问题反复改查询措辞或预期来源。正式门禁的阈值是首版工程基线，不是
+行业通用标准；积累真实用户材料后应重新校准，但不得为了通过一次失败而直接降低阈值。
+
+宿主机脚本不能使用 Compose 网络内的 `postgres` 主机名。若 `.env` 没有宿主机
+`JOB_AGENT_DATABASE_URL`，必须通过 `-DatabaseUrl` 传入 `127.0.0.1` 地址；启用数据库密码后，
+应从当前终端环境或受控密钥文件传入，不要把密码写入 README、脚本或 Git。
 
 ## 备份
 

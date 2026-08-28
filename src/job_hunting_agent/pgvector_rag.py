@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -19,12 +21,20 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.engine import Engine
 
+from .config import (
+    DEFAULT_RAG_RETRIEVAL_TOP_K,
+    DEFAULT_RAG_RERANK_TOP_N,
+    MAX_RAG_RETRIEVAL_TOP_K,
+    MAX_RAG_RERANK_TOP_N,
+)
 from .database_schema import long_texts, rag_chunks, visual_knowledge_items
 from .models import LongTextRecord, RAGIndexStats, RAGSearchResult
 from .rag import (
     RAG_CHUNKING_VERSION,
     Reranker,
+    build_rag_retrieval_query,
     build_rag_documents,
+    decompose_rag_query,
     rag_embedding_model_name,
     rerank_rag_results,
     split_rag_documents,
@@ -32,6 +42,78 @@ from .rag import (
 
 PGVECTOR_COLLECTION_NAME = "rag_chunks"
 PGVECTOR_PERSISTENCE_LABEL = "postgresql+pgvector"
+
+# 含数字的编号、尺寸、公差、版本号和全大写业务标签是向量模型容易忽略的
+# 高价值信号。只对这类 token 做精确补召回，避免把普通词变成低效模糊检索。
+_EXACT_RETRIEVAL_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"[A-Za-z][A-Za-z0-9_./+\-]*\d[A-Za-z0-9_./+\-]*|"
+    r"\d+(?:\.\d+)?|"
+    r"[A-Z][A-Z_./+\-]{2,}"
+    r")(?![A-Za-z0-9])"
+)
+
+
+def _extract_exact_retrieval_tokens(query: str) -> tuple[str, ...]:
+    """提取适合精确补召回的数字、编号或全大写业务标签。"""
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for match in _EXACT_RETRIEVAL_TOKEN_PATTERN.finditer(query):
+        token = match.group(0).strip()
+        normalized = token.casefold()
+        if len(token) < 2 or normalized in seen:
+            continue
+        seen.add(normalized)
+        tokens.append(token)
+    return tuple(tokens)
+
+
+def _text_row_key(row: Any) -> tuple[int, int, str]:
+    """返回同一文字 chunk 在向量和精确通道中的稳定身份。"""
+
+    return (int(row["long_text_id"]), int(row["chunk_index"]), str(row["content"]))
+
+
+def _merge_text_retrieval_rows(
+    vector_rows: Sequence[Any],
+    exact_rows: Sequence[Any],
+    limit: int,
+) -> list[Any]:
+    """在同一个文字 Top-K 预算内优先保留精确命中的行。"""
+
+    merged: list[Any] = []
+    seen: set[tuple[int, int, str]] = set()
+    for row in (*exact_rows, *vector_rows):
+        key = _text_row_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def _deduplicate_rag_results(
+    candidates: Sequence[RAGSearchResult],
+) -> list[RAGSearchResult]:
+    """合并子查询候选时按来源片段去重，保留第一次出现的结果。"""
+
+    deduplicated: list[RAGSearchResult] = []
+    seen: set[tuple[int, int, int | None, str]] = set()
+    for candidate in candidates:
+        key = (
+            candidate.long_text_id,
+            candidate.chunk_index,
+            candidate.visual_item_id,
+            candidate.content,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(candidate)
+    return deduplicated
 
 
 def _visual_evidence_text(row: Any) -> str:
@@ -173,17 +255,71 @@ class PgVectorKnowledgeBase:
     def search(
         self,
         query: str,
-        top_k: int = 5,
+        top_n: int = DEFAULT_RAG_RERANK_TOP_N,
         entity_types: list[str] | None = None,
         account_id: int | None = None,
         candidate_id: int | None = None,
+        retrieval_top_k: int | None = None,
     ) -> list[RAGSearchResult]:
-        """执行文字与视觉双路召回，再把可读证据统一交给可选 Rerank。"""
+        """按需拆解多步骤查询，再合并候选并统一重排。"""
 
-        if not query.strip() or top_k <= 0:
+        if not query.strip() or top_n <= 0:
+            return []
+        resolved_top_n = min(int(top_n), MAX_RAG_RERANK_TOP_N)
+        positive_query = build_rag_retrieval_query(query)
+        subqueries = decompose_rag_query(positive_query)
+        if len(subqueries) > 1:
+            candidates: list[RAGSearchResult] = []
+            for subquery in subqueries:
+                candidates.extend(
+                    self._search_single(
+                        subquery,
+                        # 每个阶段保留两个候选，给相邻表/报告一个纠错机会，避免
+                        # 阶段 Top-1 偶发偏移后导致整个流程缺少一个来源。
+                        top_n=2,
+                        entity_types=entity_types,
+                        account_id=account_id,
+                        candidate_id=candidate_id,
+                        retrieval_top_k=retrieval_top_k,
+                    )
+                )
+            candidates = _deduplicate_rag_results(candidates)
+            return rerank_rag_results(
+                query,
+                candidates,
+                resolved_top_n,
+                self.reranker,
+            )
+        return self._search_single(
+            query,
+            top_n=resolved_top_n,
+            entity_types=entity_types,
+            account_id=account_id,
+            candidate_id=candidate_id,
+            retrieval_top_k=retrieval_top_k,
+        )
+
+    def _search_single(
+        self,
+        query: str,
+        top_n: int,
+        entity_types: list[str] | None = None,
+        account_id: int | None = None,
+        candidate_id: int | None = None,
+        retrieval_top_k: int | None = None,
+        *,
+        _rerank: bool = True,
+    ) -> list[RAGSearchResult]:
+        """先按 Retriever Top-K 粗排，再由 Reranker 输出最终 Top-N。"""
+
+        if not query.strip() or top_n <= 0:
             return []
         embeddings = self._require_embeddings()
-        query_vector = self._validate_vector(embeddings.embed_query(query), "查询")
+        retrieval_query = build_rag_retrieval_query(query)
+        query_vector = self._validate_vector(
+            embeddings.embed_query(retrieval_query),
+            "查询",
+        )
         vector_dimension = len(query_vector)
         # ``<=>`` 的左操作数是 vector，因此 SQLAlchemy 默认会沿用 Vector 结果处理器；
         # 但 pgvector 实际返回的是余弦距离浮点数，必须在 Python 侧显式标记结果类型。
@@ -193,8 +329,23 @@ class PgVectorKnowledgeBase:
             ),
             sa.Float(),
         )
-        candidate_multiplier = getattr(self.reranker, "candidate_multiplier", 1) if self.reranker else 1
-        candidate_limit = max(top_k * max(1, int(candidate_multiplier)), top_k)
+        resolved_top_n = min(int(top_n), MAX_RAG_RERANK_TOP_N)
+        configured_top_k = getattr(self.reranker, "retrieval_top_k", DEFAULT_RAG_RETRIEVAL_TOP_K)
+        requested_top_k = configured_top_k if retrieval_top_k is None else retrieval_top_k
+        resolved_top_k = min(MAX_RAG_RETRIEVAL_TOP_K, max(1, int(requested_top_k)))
+        candidate_limit = max(resolved_top_k, resolved_top_n)
+        normalized_entity_types = [item for item in (entity_types or []) if item]
+        scope_conditions = [
+            rag_chunks.c.embedding.is_not(None),
+            rag_chunks.c.embedding_dimensions == vector_dimension,
+            rag_chunks.c.embedding_model == rag_embedding_model_name(embeddings),
+        ]
+        if account_id is not None:
+            scope_conditions.append(rag_chunks.c.account_id == account_id)
+        if candidate_id is not None:
+            scope_conditions.append(rag_chunks.c.candidate_id == candidate_id)
+        if normalized_entity_types:
+            scope_conditions.append(rag_chunks.c.entity_type.in_(normalized_entity_types))
         statement = (
             sa.select(
                 rag_chunks.c.content,
@@ -206,23 +357,39 @@ class PgVectorKnowledgeBase:
                 rag_chunks.c.metadata_json,
                 distance.label("distance"),
             )
-            .where(
-                rag_chunks.c.embedding.is_not(None),
-                rag_chunks.c.embedding_dimensions == vector_dimension,
-                rag_chunks.c.embedding_model == rag_embedding_model_name(embeddings),
-            )
+            .where(*scope_conditions)
             .order_by(distance.asc())
             .limit(candidate_limit)
         )
-        if account_id is not None:
-            statement = statement.where(rag_chunks.c.account_id == account_id)
-        if candidate_id is not None:
-            statement = statement.where(rag_chunks.c.candidate_id == candidate_id)
-        normalized_entity_types = [item for item in (entity_types or []) if item]
-        if normalized_entity_types:
-            statement = statement.where(rag_chunks.c.entity_type.in_(normalized_entity_types))
+        exact_tokens = _extract_exact_retrieval_tokens(retrieval_query)
+        lexical_rows: list[Any] = []
+        if exact_tokens:
+            lexical_conditions = [
+                rag_chunks.c.content.ilike(f"%{token}%") for token in exact_tokens
+            ]
+            lexical_score: Any = sa.literal(0)
+            for condition in lexical_conditions:
+                lexical_score = lexical_score + sa.case((condition, 1), else_=0)
+            lexical_statement = (
+                sa.select(
+                    rag_chunks.c.content,
+                    rag_chunks.c.entity_type,
+                    rag_chunks.c.entity_id,
+                    rag_chunks.c.source_label,
+                    rag_chunks.c.long_text_id,
+                    rag_chunks.c.chunk_index,
+                    rag_chunks.c.metadata_json,
+                    distance.label("distance"),
+                    lexical_score.label("lexical_score"),
+                )
+                .where(*scope_conditions, sa.or_(*lexical_conditions))
+                .order_by(lexical_score.desc(), distance.asc())
+                .limit(candidate_limit)
+            )
         with self.engine.connect() as connection:
             rows = connection.execute(statement).mappings().all()
+            if exact_tokens:
+                lexical_rows = connection.execute(lexical_statement).mappings().all()
             visual_rows = connection.execute(
                 self._visual_search_statement(
                     query_vector,
@@ -234,6 +401,7 @@ class PgVectorKnowledgeBase:
                     entity_types=normalized_entity_types,
                 )
             ).mappings().all()
+        text_rows = _merge_text_retrieval_rows(rows, lexical_rows, candidate_limit)
         candidates = [
             RAGSearchResult(
                 content=str(row["content"]),
@@ -245,7 +413,7 @@ class PgVectorKnowledgeBase:
                 distance=float(row["distance"]),
                 page_number=_text_evidence_page_number(row),
             )
-            for row in rows
+            for row in text_rows
         ]
         candidates.extend(
             RAGSearchResult(
@@ -266,8 +434,11 @@ class PgVectorKnowledgeBase:
             )
             for row in visual_rows
         )
-        candidates.sort(key=lambda item: item.distance)
-        return rerank_rag_results(query, candidates, top_k, self.reranker)
+        if not lexical_rows:
+            candidates.sort(key=lambda item: item.distance)
+        if not _rerank:
+            return candidates
+        return rerank_rag_results(query, candidates, resolved_top_n, self.reranker)
 
     @staticmethod
     def _lock_long_text_ids(connection: sa.Connection, long_text_ids: list[int]) -> None:

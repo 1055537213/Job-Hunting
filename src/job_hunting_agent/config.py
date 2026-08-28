@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -14,6 +15,14 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 DEFAULT_ENV_PATH = Path(".env")
+
+# RAG 采用标准两阶段漏斗：Retriever 先召回候选 Top-K，Reranker 再输出最终 Top-N。
+DEFAULT_RAG_RETRIEVAL_TOP_K = 20
+DEFAULT_RAG_RERANK_TOP_N = 5
+DEFAULT_RAG_RERANK_MIN_RELEVANCE_SCORE = 0.65
+DEFAULT_RAG_RERANK_RELATIVE_SCORE_THRESHOLD = 0.86
+MAX_RAG_RETRIEVAL_TOP_K = 500
+MAX_RAG_RERANK_TOP_N = 50
 
 # 向量和重排接口的请求结构通过 `.env` 中的 API_STYLE 显式选择，地址由用户配置。
 
@@ -153,6 +162,8 @@ class ProjectVisualAnalysisSettings:
     enabled: bool = True
     max_pdf_pages: int = 8
     max_images_per_call: int = 4
+    batch_timeout_seconds: float = 90.0
+    total_timeout_seconds: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -284,7 +295,18 @@ class RerankSettings:
     # Rerank 没有跨供应商统一标准，必须声明端点采用的协议样式。
     api_style: str = "standard"
     timeout_seconds: int = 60
-    candidate_multiplier: int = 4
+    retrieval_top_k: int = DEFAULT_RAG_RETRIEVAL_TOP_K
+    min_relevance_score: float = DEFAULT_RAG_RERANK_MIN_RELEVANCE_SCORE
+    relative_score_threshold: float = DEFAULT_RAG_RERANK_RELATIVE_SCORE_THRESHOLD
+
+    @property
+    def candidate_multiplier(self) -> int:
+        """兼容旧调用方的只读别名；新代码应直接使用 retrieval_top_k。"""
+
+        return max(
+            1,
+            math.ceil(self.retrieval_top_k / DEFAULT_RAG_RERANK_TOP_N),
+        )
 
 
 @dataclass(frozen=True)
@@ -898,14 +920,32 @@ def load_project_visual_analysis_settings(
         get("JOB_AGENT_PROJECT_VISUAL_MAX_IMAGES_PER_CALL", "4"),
         "JOB_AGENT_PROJECT_VISUAL_MAX_IMAGES_PER_CALL",
     )
+    batch_timeout_seconds = parse_positive_float(
+        get("JOB_AGENT_PROJECT_VISUAL_BATCH_TIMEOUT_SECONDS", "120"),
+        "JOB_AGENT_PROJECT_VISUAL_BATCH_TIMEOUT_SECONDS",
+    )
+    total_timeout_seconds = parse_positive_float(
+        get("JOB_AGENT_PROJECT_VISUAL_TOTAL_TIMEOUT_SECONDS", "300"),
+        "JOB_AGENT_PROJECT_VISUAL_TOTAL_TIMEOUT_SECONDS",
+    )
     if max_pdf_pages > 20:
         raise ValueError("JOB_AGENT_PROJECT_VISUAL_MAX_PDF_PAGES 不能超过 20")
     if max_images_per_call > 8:
         raise ValueError("JOB_AGENT_PROJECT_VISUAL_MAX_IMAGES_PER_CALL 不能超过 8")
+    if batch_timeout_seconds > 600:
+        raise ValueError("JOB_AGENT_PROJECT_VISUAL_BATCH_TIMEOUT_SECONDS 不能超过 600")
+    if total_timeout_seconds > 1_800:
+        raise ValueError("JOB_AGENT_PROJECT_VISUAL_TOTAL_TIMEOUT_SECONDS 不能超过 1800")
+    if total_timeout_seconds < batch_timeout_seconds:
+        raise ValueError(
+            "JOB_AGENT_PROJECT_VISUAL_TOTAL_TIMEOUT_SECONDS 不能小于单批次超时时间"
+        )
     return ProjectVisualAnalysisSettings(
         enabled=parse_bool(get("JOB_AGENT_PROJECT_VISUAL_ANALYSIS_ENABLED", "true")),
         max_pdf_pages=max_pdf_pages,
         max_images_per_call=max_images_per_call,
+        batch_timeout_seconds=batch_timeout_seconds,
+        total_timeout_seconds=total_timeout_seconds,
     )
 
 
@@ -918,6 +958,8 @@ def masked_project_visual_analysis_settings(
         "enabled": settings.enabled,
         "max_pdf_pages": settings.max_pdf_pages,
         "max_images_per_call": settings.max_images_per_call,
+        "batch_timeout_seconds": settings.batch_timeout_seconds,
+        "total_timeout_seconds": settings.total_timeout_seconds,
     }
 
 
@@ -1521,10 +1563,40 @@ def load_rerank_settings(
         get("JOB_AGENT_RERANK_TIMEOUT_SECONDS", default="60"),
         "JOB_AGENT_RERANK_TIMEOUT_SECONDS",
     )
-    candidate_multiplier = parse_positive_int(
-        get("JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER", default="4"),
-        "JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER",
+    min_relevance_score = parse_non_negative_float(
+        get(
+            "JOB_AGENT_RERANK_MIN_RELEVANCE_SCORE",
+            default=str(DEFAULT_RAG_RERANK_MIN_RELEVANCE_SCORE),
+        ),
+        "JOB_AGENT_RERANK_MIN_RELEVANCE_SCORE",
     )
+    relative_score_threshold = parse_positive_float(
+        get(
+            "JOB_AGENT_RERANK_RELATIVE_SCORE_THRESHOLD",
+            default=str(DEFAULT_RAG_RERANK_RELATIVE_SCORE_THRESHOLD),
+        ),
+        "JOB_AGENT_RERANK_RELATIVE_SCORE_THRESHOLD",
+    )
+    if min_relevance_score > 1:
+        raise ValueError("JOB_AGENT_RERANK_MIN_RELEVANCE_SCORE 不能超过 1")
+    if relative_score_threshold > 1:
+        raise ValueError("JOB_AGENT_RERANK_RELATIVE_SCORE_THRESHOLD 不能超过 1")
+    raw_retrieval_top_k = get("JOB_AGENT_RAG_RETRIEVAL_TOP_K")
+    if raw_retrieval_top_k:
+        retrieval_top_k = parse_positive_int(
+            raw_retrieval_top_k,
+            "JOB_AGENT_RAG_RETRIEVAL_TOP_K",
+        )
+    else:
+        legacy_candidate_multiplier = parse_positive_int(
+            get("JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER", default="4"),
+            "JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER",
+        )
+        retrieval_top_k = DEFAULT_RAG_RERANK_TOP_N * legacy_candidate_multiplier
+    if retrieval_top_k > MAX_RAG_RETRIEVAL_TOP_K:
+        raise ValueError(
+            f"JOB_AGENT_RAG_RETRIEVAL_TOP_K 不能超过 {MAX_RAG_RETRIEVAL_TOP_K}"
+        )
 
     if not any(
         [
@@ -1559,7 +1631,9 @@ def load_rerank_settings(
         base_url=base_url,
         api_style=api_style,
         timeout_seconds=timeout,
-        candidate_multiplier=candidate_multiplier,
+        retrieval_top_k=retrieval_top_k,
+        min_relevance_score=min_relevance_score,
+        relative_score_threshold=relative_score_threshold,
     )
 
 
@@ -1575,7 +1649,10 @@ def masked_rerank_settings(settings: RerankSettings | None) -> dict[str, object]
         "base_url": settings.base_url,
         "api_key_set": bool(settings.api_key),
         "timeout_seconds": settings.timeout_seconds,
-        "candidate_multiplier": settings.candidate_multiplier,
+        "retrieval_top_k": settings.retrieval_top_k,
+        "rerank_top_n_default": DEFAULT_RAG_RERANK_TOP_N,
+        "min_relevance_score": settings.min_relevance_score,
+        "relative_score_threshold": settings.relative_score_threshold,
         "configured": True,
     }
 

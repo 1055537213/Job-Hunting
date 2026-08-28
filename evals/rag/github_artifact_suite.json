@@ -1,0 +1,261 @@
+{
+  "name": "github-cross-industry-artifact-suite",
+  "version": "1.0.0",
+  "benchmark_role": "smoke",
+  "description": "固定到 GitHub 具体提交的跨行业公开样本，经项目采集、文件扫描、OCR/VLM、长文本和 pgvector 全链路评测。",
+  "thresholds": {
+    "min_case_pass_rate": 0.8,
+    "min_mean_recall_at_n": 0.8,
+    "min_mean_reciprocal_rank": 0.5,
+    "max_forbidden_case_rate": 0.0
+  },
+  "artifacts": [
+    {
+      "id": "industrial-core-sleeve-drawing",
+      "industry": "industrial-engineering",
+      "repository_url": "https://github.com/ThanosDrossos/drawing-intelligence",
+      "commit_sha": "ef48b2f8cdbbfae7414d5cf733eda17ab579ba72",
+      "source_path": "sample_data/ASM270897.pdf",
+      "relative_path": "industrial/drawings/ASM270897.pdf",
+      "license_spdx": "MIT",
+      "size_bytes": 10865,
+      "sha256": "4f0a20fb97d335b48b26beb67bd36f4409e3828106b701f51907e0d398d0a4bb",
+      "media_type": "application/pdf",
+      "expected_terms": ["ASM270897", "65.53", "prosthetic knee joint"],
+      "require_visual_analysis": true
+    },
+    {
+      "id": "industrial-wind-turbine-drawing",
+      "industry": "industrial-engineering",
+      "repository_url": "https://github.com/ThanosDrossos/drawing-intelligence",
+      "commit_sha": "ef48b2f8cdbbfae7414d5cf733eda17ab579ba72",
+      "source_path": "sample_data/ASM479942.pdf",
+      "relative_path": "industrial/drawings/ASM479942.pdf",
+      "license_spdx": "MIT",
+      "size_bytes": 11161,
+      "sha256": "71acf6844f231b2daccd1cf671d365325fec09c73c218a21c0c0a6b38bb89aa4",
+      "media_type": "application/pdf",
+      "expected_terms": ["ASM479942", "53.69", "wind turbine pitch drive"],
+      "require_visual_analysis": true
+    },
+    {
+      "id": "industrial-drawing-ground-truth",
+      "industry": "industrial-engineering",
+      "repository_url": "https://github.com/ThanosDrossos/drawing-intelligence",
+      "commit_sha": "ef48b2f8cdbbfae7414d5cf733eda17ab579ba72",
+      "source_path": "sample_data/ground_truth.json",
+      "relative_path": "industrial/metadata/ground_truth.json",
+      "license_spdx": "MIT",
+      "size_bytes": 3887,
+      "sha256": "8b514575f678ef52dc034f2858bf4685d8165b754120279bb977588c4478e87a",
+      "media_type": "application/json",
+      "expected_terms": ["ASM479942", "key_dimensions", "53.69"]
+    },
+    {
+      "id": "construction-bim-ifc",
+      "industry": "construction-bim",
+      "repository_url": "https://github.com/HUSNAIN-MUNAWAR/buildtwin-vision",
+      "commit_sha": "8d9119636cf5077d1b09cdb9bb7daa283bd8957b",
+      "source_path": "sample_data/ifc/northstar_minimal.ifc",
+      "relative_path": "construction/bim/northstar_minimal.ifc",
+      "license_spdx": "MIT",
+      "size_bytes": 1329,
+      "sha256": "6b25c96692182f5e042e2646c550307a8c84b1a162983189129cb80ca8af8a76",
+      "media_type": "application/x-step",
+      "expected_terms": ["Northstar Medical Center Expansion", "GF East Shear Wall", "Level 1 Patient Rooms"]
+    },
+    {
+      "id": "construction-schedule",
+      "industry": "construction-bim",
+      "repository_url": "https://github.com/HUSNAIN-MUNAWAR/buildtwin-vision",
+      "commit_sha": "8d9119636cf5077d1b09cdb9bb7daa283bd8957b",
+      "source_path": "sample_data/schedules/northstar_schedule.csv",
+      "relative_path": "construction/schedules/northstar_schedule.csv",
+      "license_spdx": "MIT",
+      "size_bytes": 1023,
+      "sha256": "71e87b6f2a9da9d16e2da177e4f2ceb2535b30925625566492ffbb3832c0ae2e",
+      "media_type": "text/csv",
+      "expected_terms": ["A120", "Level 1 Core Columns", "Prime Concrete"]
+    },
+    {
+      "id": "construction-progress-report",
+      "industry": "construction-bim",
+      "repository_url": "https://github.com/HUSNAIN-MUNAWAR/buildtwin-vision",
+      "commit_sha": "8d9119636cf5077d1b09cdb9bb7daa283bd8957b",
+      "source_path": "sample_data/reports/northstar_weekly_progress.pdf",
+      "relative_path": "construction/reports/northstar_weekly_progress.pdf",
+      "license_spdx": "MIT",
+      "size_bytes": 3193,
+      "sha256": "5518a44c605a957e84d17d45c7ffb9afc196cdffd27126413fc6bca1a0235130",
+      "media_type": "application/pdf",
+      "expected_terms": ["Schedule Variance", "-5.3", "Critical Safety Events"],
+      "require_visual_analysis": true
+    },
+    {
+      "id": "construction-current-capture",
+      "industry": "construction-bim",
+      "repository_url": "https://github.com/HUSNAIN-MUNAWAR/buildtwin-vision",
+      "commit_sha": "8d9119636cf5077d1b09cdb9bb7daa283bd8957b",
+      "source_path": "sample_data/images/ground_east_current.jpg",
+      "relative_path": "construction/images/ground_east_current.jpg",
+      "license_spdx": "MIT",
+      "size_bytes": 40165,
+      "sha256": "8e14874cf20c598ad5b27d3352bb9b37ff0321bf2fc2095fa04f916f72079aa0",
+      "media_type": "image/jpeg",
+      "expected_terms": ["NORTHSTAR", "CURRENT CAPTURE"],
+      "require_visual_analysis": true
+    },
+    {
+      "id": "healthcare-cabg-cases",
+      "industry": "healthcare",
+      "repository_url": "https://github.com/synthetichealth/synthea",
+      "commit_sha": "d9d07a6eef91ee5144293b42ab64224d84d124f8",
+      "source_path": "src/test/resources/cabg_test_cases.csv",
+      "relative_path": "healthcare/cabg/cabg_test_cases.csv",
+      "license_spdx": "Apache-2.0",
+      "size_bytes": 1375,
+      "sha256": "e2a3313c910ce9979cf3eb402d947faf9a4dfbdcac778f6c5272574ef90c75c7",
+      "media_type": "text/csv",
+      "expected_terms": ["calculatedBMI", "hasDialysis", "meanSurgeonTime"]
+    },
+    {
+      "id": "accounting-invoices",
+      "industry": "accounting",
+      "repository_url": "https://github.com/R3n0va/synthetic-accounting-data-generator",
+      "commit_sha": "b0f0e34ade2b18995252837e3011f3a89eb1ca52",
+      "source_path": "data/samples/business_invoice.csv",
+      "relative_path": "accounting/invoices/business_invoice.csv",
+      "license_spdx": "MIT",
+      "size_bytes": 9100,
+      "sha256": "d1ec023b38c721df554fb958246a993198e5342fde75426e02fe24bfc6df67d4",
+      "media_type": "text/csv",
+      "expected_terms": ["AR-00001-202301-000001", "5749.26", "OPEN"]
+    },
+    {
+      "id": "accounting-bank-transactions",
+      "industry": "accounting",
+      "repository_url": "https://github.com/R3n0va/synthetic-accounting-data-generator",
+      "commit_sha": "b0f0e34ade2b18995252837e3011f3a89eb1ca52",
+      "source_path": "data/samples/bank_transaction.csv",
+      "relative_path": "accounting/transactions/bank_transaction.csv",
+      "license_spdx": "MIT",
+      "size_bytes": 6882,
+      "sha256": "b174ddd1cf1a38e1c050e359b11f7f33aca985f9f3accda1c3f46a09f069c514",
+      "media_type": "text/csv",
+      "expected_terms": ["BTX000000001", "CUSTOMER_PAYMENT", "MATCHED"]
+    },
+    {
+      "id": "design-neural-poster",
+      "industry": "visual-design",
+      "repository_url": "https://github.com/Y-Research-SBU/PosterGen",
+      "commit_sha": "8a54325f871ee10fa6545de3b3a9b771aa12620c",
+      "source_path": "resource/neural-encoding.png",
+      "relative_path": "design/posters/neural-encoding.png",
+      "license_spdx": "MIT",
+      "size_bytes": 1147625,
+      "sha256": "dcc92c0a76888a010db0ba1e292882f1e25aefb7f8c2602e72394ed765f33874",
+      "media_type": "image/png",
+      "expected_terms": ["Neural Encoding and Decoding at Scale", "multimodal transformer", "83% accuracy"],
+      "require_visual_analysis": true
+    },
+    {
+      "id": "logistics-warehouse-routing",
+      "industry": "logistics",
+      "repository_url": "https://github.com/fnuni/2026rico",
+      "commit_sha": "e799e7f366ee103b85a4e96eb7606215412bde23",
+      "source_path": "data/warehouse_dataset_synthetic.csv",
+      "relative_path": "logistics/warehouse/warehouse_dataset_synthetic.csv",
+      "license_spdx": "CC-BY-4.0",
+      "size_bytes": 98309,
+      "sha256": "7d0698c5cf9bf5678fc52f825635c8a43315c265286f26bb74c18a960bb066d3",
+      "media_type": "text/csv",
+      "expected_terms": ["WH_0000", "optimal_tour_length", "hybrid_gap_percent"]
+    }
+  ],
+  "cases": [
+    {
+      "id": "industrial-core-sleeve-diameter",
+      "query": "用于假肢膝关节的 CoreSleeve 工程图中，H10 外径标注是多少？",
+      "expected_source_labels": ["industrial/drawings/ASM270897.pdf"],
+      "top_n": 5,
+      "tags": ["industrial", "pdf", "numeric"]
+    },
+    {
+      "id": "industrial-wind-turbine-rotahub",
+      "query": "风力发电机变桨驱动使用的 RotaHub 图纸关键 H10 直径是多少？",
+      "expected_source_labels": ["industrial/drawings/ASM479942.pdf"],
+      "top_n": 5,
+      "tags": ["industrial", "pdf", "numeric"]
+    },
+    {
+      "id": "industrial-structured-dimensions",
+      "query": "ASM479942 的结构化 key_dimensions 数组记录在哪份文件？",
+      "expected_source_labels": ["industrial/metadata/ground_truth.json"],
+      "top_n": 5,
+      "tags": ["industrial", "json", "structured-data"]
+    },
+    {
+      "id": "construction-ifc-shear-wall",
+      "query": "Northstar Medical Center Expansion 的 Ground Floor East 剪力墙在 BIM 模型中叫什么？",
+      "expected_source_labels": ["construction/bim/northstar_minimal.ifc"],
+      "top_n": 5,
+      "tags": ["construction", "bim", "ifc"]
+    },
+    {
+      "id": "construction-core-columns-progress",
+      "query": "Level 1 Core Columns 的计划进度和实际进度分别是多少，由哪家承包商负责？",
+      "expected_source_labels": ["construction/schedules/northstar_schedule.csv"],
+      "top_n": 5,
+      "tags": ["construction", "table", "numeric"]
+    },
+    {
+      "id": "construction-weekly-variance",
+      "query": "BuildTwin 周报中的进度偏差和关键安全事件数量是多少？",
+      "expected_source_labels": ["construction/reports/northstar_weekly_progress.pdf"],
+      "top_n": 5,
+      "tags": ["construction", "pdf", "numeric"]
+    },
+    {
+      "id": "construction-current-image",
+      "query": "Northstar Ground East 当前施工现场捕获图像是哪份文件？",
+      "expected_source_labels": ["construction/images/ground_east_current.jpg"],
+      "top_n": 5,
+      "tags": ["construction", "image", "visual"]
+    },
+    {
+      "id": "healthcare-cabg-features",
+      "query": "CABG 测试病例中哪些字段描述 BMI、透析状态和外科医生平均手术时间？",
+      "expected_source_labels": ["healthcare/cabg/cabg_test_cases.csv"],
+      "top_n": 5,
+      "tags": ["healthcare", "table"]
+    },
+    {
+      "id": "accounting-invoice-gross-amount",
+      "query": "发票 AR-00001-202301-000001 的含税总额和付款状态是什么？",
+      "expected_source_labels": ["accounting/invoices/business_invoice.csv"],
+      "top_n": 5,
+      "tags": ["accounting", "table", "numeric"]
+    },
+    {
+      "id": "accounting-bank-reconciliation",
+      "query": "银行流水 BTX000000001 的交易类型和对账状态是什么？",
+      "expected_source_labels": ["accounting/transactions/bank_transaction.csv"],
+      "top_n": 5,
+      "tags": ["accounting", "table"]
+    },
+    {
+      "id": "design-poster-result",
+      "query": "Neural Encoding and Decoding at Scale 海报中，NEDS 对脑区分类达到的准确率是多少？",
+      "expected_source_labels": ["design/posters/neural-encoding.png"],
+      "top_n": 5,
+      "tags": ["design", "image", "visual", "numeric"]
+    },
+    {
+      "id": "logistics-hybrid-gap",
+      "query": "仓库实例 WH_0000 的节点数、最优路径长度和 hybrid gap 分别是多少？",
+      "expected_source_labels": ["logistics/warehouse/warehouse_dataset_synthetic.csv"],
+      "top_n": 5,
+      "tags": ["logistics", "table", "numeric"]
+    }
+  ]
+}

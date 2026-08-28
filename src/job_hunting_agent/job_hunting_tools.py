@@ -39,7 +39,7 @@ class IngestCandidateMessageArgs(ToolArgs):
 
 class SearchCandidateEvidenceArgs(ToolArgs):
     query: str = Field(min_length=1, description="要检索的候选人证据")
-    top_k: int = Field(default=5, ge=1, le=10, description="最多返回的证据数量")
+    top_n: int = Field(default=5, ge=1, le=10, description="重排后最多返回的证据数量")
     entity_types: list[str] | None = Field(default=None, description="可选的材料类型过滤")
 
 
@@ -129,8 +129,8 @@ def build_job_hunting_tool_registry(app: JobHuntingApp) -> ToolRegistry:
         args = cast(SearchCandidateEvidenceArgs, arguments)
         results = app.search_rag(
             args.query,
-            args.top_k,
-            args.entity_types,
+            top_n=args.top_n,
+            entity_types=args.entity_types,
             account_id=context.account_id,
             candidate_id=context.require_candidate_id(),
             session_id=context.session_id,

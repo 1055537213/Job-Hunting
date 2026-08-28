@@ -34,6 +34,7 @@ from .auth import utc_now
 from .concurrency_control import ConcurrencyController, ConcurrencyLease
 from .config import (
     DEFAULT_ENV_PATH,
+    DEFAULT_RAG_RERANK_TOP_N,
     EmbeddingSettings,
     IntentRouterSettings,
     LLMSettings,
@@ -250,7 +251,24 @@ class ConcurrencyLimitedReranker:
         self.delegate = delegate
         self.controller = controller
         self.account_id = account_id
-        self.candidate_multiplier = delegate.candidate_multiplier
+        self.retrieval_top_k = delegate.retrieval_top_k
+        self.model = getattr(delegate, "model", None)
+        self.min_relevance_score = getattr(delegate, "min_relevance_score", None)
+        self.relative_score_threshold = getattr(
+            delegate,
+            "relative_score_threshold",
+            None,
+        )
+
+    @property
+    def candidate_multiplier(self) -> int:
+        """兼容旧调用方的只读别名。"""
+
+        return max(
+            1,
+            (self.retrieval_top_k + DEFAULT_RAG_RERANK_TOP_N - 1)
+            // DEFAULT_RAG_RERANK_TOP_N,
+        )
 
     def rerank(
         self,

@@ -73,6 +73,8 @@ from .concurrency_control import (
     ConcurrencyLimitExceeded,
 )
 from .config import (
+    DEFAULT_RAG_RERANK_TOP_N,
+    MAX_RAG_RERANK_TOP_N,
     load_account_lifecycle_settings,
     load_agent_memory_settings,
     load_billing_settings,
@@ -2306,12 +2308,16 @@ def create_web_app(
         }
 
     @web_app.get("/api/rag/search")
-    def search_rag(request: Request, query: str = Query(...), top_k: int = 5) -> dict[str, object]:
-        """检索本地 RAG 证据片段。"""
+    def search_rag(
+        request: Request,
+        query: str = Query(...),
+        top_n: int = Query(DEFAULT_RAG_RERANK_TOP_N, ge=1, le=MAX_RAG_RERANK_TOP_N),
+    ) -> dict[str, object]:
+        """检索本地 RAG 最终 Top-N 证据片段。"""
 
         account = current_account(request)
         try:
-            results = backend.search_rag(query, top_k, account_id=account.id if account else None)
+            results = backend.search_rag(query, top_n=top_n, account_id=account.id if account else None)
         except RAGProviderRequestError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         return {"query": query, "results": [asdict(result) for result in results]}

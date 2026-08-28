@@ -125,7 +125,7 @@
 2. **Agent 工具接口统一**：ToolRegistry 统一参数校验、执行、错误码和结果 envelope；LangChain 与轻量直达路由调用同一个 handler，避免双实现漂移。
 3. **多租户隔离贯穿全链路**：数据库查询、对象键、RAG 检索、后台任务、工具轨迹、余额和审计事件都携带账号归属。
 4. **后台任务可恢复**：任务状态以 PostgreSQL 为准，Redis 只传递任务键；幂等键和原子认领避免重复执行、重复扣费和重复导出。
-5. **多模态证据链**：职位截图、项目图片和有限复杂 PDF 页面能够进入 OCR、视觉分析和视觉向量检索，同时保留来源定位。
+5. **多模态证据链**：职位截图、项目图片和有限复杂 PDF 页面能够进入 OCR、视觉分析和视觉向量检索，同时保留来源定位；对图号、尺寸、公差等含数字术语提供精确补召回，避免只依赖向量相似度。
 6. **轻量意图路由可控降级**：小模型只负责低风险、高置信度直达；对历史指代、多个意图、修改确认和身份缺失等风险场景保留主 Agent。
 7. **生产基线可验收**：提供迁移门禁、备份恢复、Worker 崩溃恢复、多副本、文件扫描、Prometheus 和容器漏洞验收入口。
 8. **计费事实可追溯**：供应商 usage、调用 ID、充值幂等键、管理员原因和余额流水能够关联排查。
@@ -256,6 +256,18 @@ docker compose --env-file .env.example -f compose.yaml config --quiet
 docker run --rm --entrypoint /bin/promtool -v "$((Get-Location).Path)/deploy/prometheus:/etc/prometheus:ro" prom/prometheus:v3.13.1 check config /etc/prometheus/prometheus.yml
 ~~~
 
+生产 Compose 配置检查还需要显式提供镜像、数据库密码和域名变量。CI 会执行同样的配置解析，
+但不会启动生产服务或申请证书：
+
+~~~powershell
+$env:JOB_AGENT_REDIS_PASSWORD='replace-with-a-long-redis-password'
+$env:JOB_AGENT_POSTGRES_PASSWORD='replace-with-a-long-url-safe-password'
+$env:JOB_AGENT_IMAGE='ghcr.io/your-org/job-hunting-agent:release-tag'
+$env:JOB_AGENT_DOMAIN='agent.example.com'
+$env:JOB_AGENT_TLS_EMAIL='ops@example.com'
+docker compose --env-file .env -f compose.yaml -f compose.prod.yaml config --quiet
+~~~
+
 专项验收脚本：
 
 ~~~powershell
@@ -264,23 +276,82 @@ docker run --rm --entrypoint /bin/promtool -v "$((Get-Location).Path)/deploy/pro
 .\scripts\validate_backup_restore.ps1
 .\scripts\validate_file_scanning.ps1
 .\scripts\validate_rag_retrieval.ps1 -Python E:\Anaconda\python.exe
+.\scripts\validate_rag_artifacts.ps1 `
+  -Python E:\Anaconda\python.exe `
+  -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent"
 .\scripts\security_scan.ps1
 ~~~
 
 RAG 评测使用 `evals/rag/golden_suite.json` 中的固定跨行业语料。脚本会创建两个临时账号，
-在真实 PostgreSQL/pgvector 中索引后统计 Recall@K、MRR、禁止召回率和标签分组指标，再自动
+在真实 PostgreSQL/pgvector 中索引后统计最终 Top-N 的 Recall、Precision、nDCG、MRR、禁止召回率和标签分组指标，再自动
 删除临时数据。默认使用 `.env` 中配置的正式 Embedding 与可选 Rerank，报告写入已忽略的
 `data/eval-reports/`；`-EmbeddingMode local_hash` 只用于验证评测管线，不能代表语义召回质量。
+
+真实文件评测分为两层。默认 `evals/rag/github_artifact_suite.json` 只有 12 份材料，定位是检查
+下载、扫描、OCR/多模态、入库、检索和清理是否连通的冒烟集，不能作为上线准确率结论。正式
+门禁使用 `evals/rag/github_hard_negative_suite.json`，扩充到 33 份材料和 33 条问题，加入同系列
+工业图纸、施工基线/当前/变化图、关联财务表、相近医疗模块、相似设计海报和物流输入输出。
+正式集的 `Top 5` 仅占语料 15.2%，31 条问题声明困难负样本，12 条属于保留验收集。
+
+两套清单都固定 GitHub 仓库、40 位提交、文件大小、SHA-256 和许可证。运行时才从
+`raw.githubusercontent.com` 下载，下载结果先校验，再经过项目清单规划、本地恶意内容检查、
+OCR/多模态提取、长文本、pgvector 和检索指标链路。第三方原文件不会写入仓库；评测结束会
+删除临时账号、余额流水、提取文字、向量和视觉副本，只在 `data/eval-reports/` 保留低敏报告。
+
+默认同时使用当前 `.env` 的视觉模型、Embedding 和 Rerank，会产生真实模型费用。只有检查
+评测程序本身时才使用 `-EmbeddingMode local_hash -VisualMode disabled`；该模式不能形成上线
+质量结论。宿主机 `.env` 没有 `JOB_AGENT_DATABASE_URL` 时必须显式传 `-DatabaseUrl`；容器内的
+`postgres` 主机名不能直接用于宿主机脚本。上游仓库文件即使在相同路径被替换，也会因提交或
+内容摘要不匹配而在模型调用前失败。
+
+正式发布前执行困难集：
+
+~~~powershell
+.\scripts\validate_rag_artifacts.ps1 `
+  -BenchmarkRole release `
+  -Python E:\Anaconda\python.exe `
+  -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent"
+~~~
+
+报告同时给出 `Recall@1/3/5`、最终 Top-N 的 Recall/Precision/nDCG、MRR、困难负样本命中率、行业
+分组和 `development/holdout` 分层。默认线上检索漏斗为 Retriever Top-K=20、Reranker 最终 Top-N=5；开发集可用于切片、Embedding、Rerank 和检索参数调优；
+保留集只用于阶段性验收，不能根据其中的失败问题逐条改查询或答案，否则会再次产生虚高结果。
+`VisualMode configured` 会额外校验视觉分析产物数量，建立图片向量索引，并通过线上 `app.search_rag`
+执行文字/图片混合召回和原图复核；报告中的 `visual_indexed` 必须与视觉项总数一致。`disabled` 只评估
+文本层和 OCR 文字，不能用于声明图片结构或空间关系的召回能力。
+
+RAG 在重排前会对查询中明确写出的排除条件进行规则过滤，例如“不要返回基线图”；过滤范围包含
+来源路径和已提取证据正文。向量召回和重排使用移除否定从句后的正向查询，原始查询只用于结果过滤，
+避免“不要返回的对象”反而污染语义相似度。明确包含“从……到……”“比较……并找到……”或“联合查询”
+的多步骤问题会最多拆成 4 条阶段查询，每个阶段先取最佳证据，再合并去重，普通问题不会增加检索次数。
+重排输入还会附带低敏的来源文件名、证据类型和页码，帮助模型区分同领域的表格、报告、图片和模块文件，
+但最终返回给业务层的正文保持不变。Reranker 原始相关性分数会随证据写入评测报告，仅用于同一次重排
+内的相对置信度校准，不作为跨模型通用的事实可信度。默认最高分低于 `0.65` 时返回空结果，其余候选
+需达到本次最高分的 `86%`；Top-N 因此是最大返回数而不是必须凑满的数量，多步骤查询则按拆解阶段数
+保留必要证据。两个阈值可通过 `JOB_AGENT_RERANK_MIN_RELEVANCE_SCORE` 和
+`JOB_AGENT_RERANK_RELATIVE_SCORE_THRESHOLD` 调整，并且只能使用 development 集校准。对于包含尺寸、金额、编号等数值的查询，重排后还会优先保留与查询
+数值一致且具有相同语义锚点的候选，并将同对象但数值不一致的候选后置。上述规则只修正排序和过滤，
+不替代 Reranker，也不把评测集中的相似硬负样本误认为明确否定条件。
 
 ### 7.5 单机生产基线
 
 生产部署必须使用正式 .env、独立数据卷、预创建对象存储 bucket、不可变镜像标签和 HTTPS 域名：
 
 ~~~powershell
-docker build --tag $env:JOB_AGENT_IMAGE .
+Copy-Item .env.example .env
+# 将 deploy/env.production.example 中的生产项合并到 .env，并填写模型、SMTP、数据库、Redis、对象存储和域名密钥。
+# JOB_AGENT_IMAGE 必须指向已经通过 CI 构建和扫描的不可变镜像标签。
+$env:JOB_AGENT_IMAGE='ghcr.io/your-org/job-hunting-agent:release-tag'
 docker compose -f compose.yaml -f compose.prod.yaml config --quiet
 docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 ~~~
+
+生产模板位于 `deploy/env.production.example`。它不会覆盖模型供应商配置，部署时应先从
+`.env.example` 复制模型和业务配置，再用生产模板中的值替换开发项；`JOB_AGENT_DOMAIN`、
+`JOB_AGENT_TLS_EMAIL`、`JOB_AGENT_PUBLIC_BASE_URL` 和 SMTP 配置必须使用真实生产值。
+生产 Compose 会使用带密码的 PostgreSQL、Redis、ClamAV、MinIO、Caddy 和 Prometheus，
+第一次启动前还要创建对象存储 bucket，并先执行 `docker compose ... run --rm migrate` 或让
+Compose 的 `migrate` 服务完成迁移。生产环境的模拟充值接口会关闭，真实支付仍待后续接入。
 
 生产上线前至少完成数据库迁移、健康检查、备份恢复演练、文件扫描验收和安全扫描。详细规则见 docs/learning/production-release.md。
 
@@ -362,8 +433,9 @@ job_agent_intent_router_model_duration_seconds_bucket
 ## 10. TODO / 未来计划（体现成长）
 
 - [ ] 接入真实支付渠道、签名 Webhook、退款状态机和渠道对账。
-- [x] 建立首版隔离跨行业 RAG 黄金测试集，评估 Recall@K、MRR、禁止召回和账号隔离。
-- [ ] 持续扩充脱敏真实行业语料、原始视觉文件和难负样本，并按正式 Embedding 模型校准阈值。
+- [x] 建立首版隔离跨行业 RAG 黄金测试集，评估 Retriever Top-K、最终 Top-N、MRR、禁止召回和账号隔离。
+- [x] 建立固定 GitHub 提交和哈希的跨行业真实文件端到端 RAG 评测。
+- [ ] 持续扩充已授权的真实行业语料和难负样本，并按正式 Embedding 模型校准阈值。
 - [ ] 接入 Alertmanager 通知、OpenTelemetry Trace 和集中日志平台。
 - [ ] 出现明确外部调用方后，在现有 MCP adapter 上增加鉴权、授权和 Server 生命周期。
 - [ ] 建立严格类型检查基线，逐步消化第三方 stub 和内部 Protocol 类型债务。

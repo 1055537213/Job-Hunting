@@ -15,15 +15,19 @@ import re
 import urllib.error
 import urllib.request
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol
+import unicodedata
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
 from .config import (
     DEFAULT_ENV_PATH,
+    DEFAULT_RAG_RETRIEVAL_TOP_K,
+    DEFAULT_RAG_RERANK_TOP_N,
     EmbeddingSettings,
     RerankSettings,
     load_embedding_settings,
@@ -66,10 +70,374 @@ class RerankResult:
 class Reranker(Protocol):
     """RAG 重排器的最小接口，避免业务层依赖具体供应商 SDK。"""
 
-    candidate_multiplier: int
+    retrieval_top_k: int
 
     def rerank(self, query: str, documents: list[str], top_n: int) -> list[RerankResult]:
         """按照查询相关性返回候选文本的排序结果。"""
+
+
+_NEGATIVE_CLAUSE_PATTERNS = (
+    re.compile(
+        r"(?:不要|不需要|不返回|不显示|不展示|不使用|不包含|排除|避开|忽略)\s*"
+        r"(?:返回|显示|展示|使用|包含|选择|召回)?\s*"
+        r"([^,，。；;、\n]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:do not|don't|exclude|excluding|without)\s*"
+        r"(?:return|show|display|use|include)?\s*"
+        r"([^,.;\n]+)",
+        re.IGNORECASE,
+    ),
+)
+_NEGATIVE_CLAUSE_FULL_PATTERNS = (
+    re.compile(
+        r"(?:不要|不需要|不返回|不显示|不展示|不使用|不包含|排除|避开|忽略)\s*"
+        r"(?:返回|显示|展示|使用|包含|选择|召回)?\s*"
+        r"[^,，。；;、\n]+",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:do not|don't|exclude|excluding|without)\s*"
+        r"(?:return|show|display|use|include)?\s*"
+        r"[^,.;\n]+",
+        re.IGNORECASE,
+    ),
+)
+_NEGATIVE_STOPWORDS = {
+    "图",
+    "图片",
+    "文件",
+    "材料",
+    "项目",
+    "image",
+    "images",
+    "file",
+    "files",
+    "document",
+    "documents",
+}
+_NEGATIVE_TERM_ALIASES = {
+    "基线": ("baseline",),
+    "当前图": ("current", "current capture"),
+    "旧版本": ("legacy", "old version"),
+}
+_QUERY_IDENTITY_ANCHOR_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")
+_QUERY_LABEL_PATTERN = re.compile(
+    r"\b(?:[A-Z][A-Z0-9_-]{2,})(?:\s+[A-Z][A-Z0-9_-]{2,})*\b"
+)
+_MULTI_SOURCE_QUERY_MARKERS = ("联合查询", "分别", "两份", "多份", "各自")
+_NUMERIC_VALUE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?P<value>[+-]?\d+(?:\.\d+)?)(?!\d|\.)"
+)
+
+
+def _normalize_rag_match_text(value: object) -> str:
+    """归一化检索后规则匹配文本，不改变原始证据正文。"""
+
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"\s+", "", normalized)
+
+
+def _extract_negative_term_groups(query: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """分别返回原始否定词和由中文语义生成的来源名别名。"""
+
+    literal_terms: list[str] = []
+    alias_terms: list[str] = []
+    seen_literals: set[str] = set()
+    seen_aliases: set[str] = set()
+    for pattern in _NEGATIVE_CLAUSE_PATTERNS:
+        for match in pattern.finditer(query):
+            raw_term = re.split(r"\s*(?:只|仅|但是|但|同时|并且|and|but|only)\s*", match.group(1), maxsplit=1, flags=re.IGNORECASE)[0]
+            term = raw_term.strip(" \t:：()[]{}\"")
+            if not term:
+                continue
+            variants = [term]
+            variants.extend(re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", term))
+            for variant in variants:
+                normalized = _normalize_rag_match_text(variant)
+                if (
+                    len(normalized) < 2
+                    or normalized in _NEGATIVE_STOPWORDS
+                    or normalized in seen_literals
+                ):
+                    continue
+                seen_literals.add(normalized)
+                literal_terms.append(normalized)
+            for keyword, aliases in _NEGATIVE_TERM_ALIASES.items():
+                if keyword not in term:
+                    continue
+                for alias in aliases:
+                    normalized = _normalize_rag_match_text(alias)
+                    if normalized in seen_literals or normalized in seen_aliases:
+                        continue
+                    seen_aliases.add(normalized)
+                    alias_terms.append(normalized)
+    return tuple(literal_terms), tuple(alias_terms)
+
+
+def _extract_negative_terms(query: str) -> tuple[str, ...]:
+    """从查询中提取明确的排除对象，避免把普通语义词当成过滤条件。"""
+
+    literal_terms, alias_terms = _extract_negative_term_groups(query)
+    return (*literal_terms, *alias_terms)
+
+
+def build_rag_retrieval_query(query: str) -> str:
+    """移除明确的否定从句，生成用于召回和重排的正向查询。
+
+    原始查询不能直接用于向量召回：否定对象可能反而成为向量的强语义信号。
+    这里只改写检索副本；原始查询仍由 ``filter_rag_candidates`` 用于排除结果。
+    如果查询只有否定条件，则保留原查询，避免把召回范围扩大成无条件搜索。
+    """
+
+    normalized_query = str(query or "").strip()
+    if not normalized_query:
+        return ""
+    rewritten = normalized_query
+    for pattern in _NEGATIVE_CLAUSE_FULL_PATTERNS:
+        rewritten = pattern.sub(" ", rewritten)
+    rewritten = re.sub(r"[\s,，;；]+", " ", rewritten).strip(" ,，;；。.")
+    return rewritten or normalized_query
+
+
+def decompose_rag_query(query: str) -> tuple[str, ...]:
+    """只对明确的多步骤或多来源查询做受控拆解。
+
+    这里不把普通的“并且”当成拆解信号，避免增加检索次数和噪声。每次最多返回
+    4 条子查询，调用方负责分别召回、合并去重，再用原始查询统一排序和过滤。
+    """
+
+    normalized_query = re.sub(r"\s+", " ", str(query or "").strip())
+    if not normalized_query:
+        return ()
+
+    workflow_match = re.search(
+        r"(?P<context>[^。！？?]{1,80}?)从(?P<steps>[^。！？?]{1,80}?)到(?P<last>[^。！？?]{1,40})",
+        normalized_query,
+    )
+    if workflow_match:
+        context = workflow_match.group("context").strip(" ，,：:的")
+        raw_steps = workflow_match.group("steps").strip(" ，,：:")
+        raw_last = re.split(
+            r"的(?:[一二三四五六七八九十百千万\d]+)?份(?:相关)?证据",
+            workflow_match.group("last"),
+            maxsplit=1,
+        )[0]
+        raw_steps = f"{raw_steps}、{raw_last}".strip(" 、，,")
+        steps = [
+            item.strip(" ，,、")
+            for item in re.split(r"[、，,]|\s*(?:和|与|及)\s*", raw_steps)
+            if item.strip(" ，,、")
+        ]
+        if 2 <= len(steps) <= 4 and context:
+            return tuple(f"{context} {step}" for step in steps)
+
+    comparison_match = re.search(
+        r"(?:比较|对比)\s*(?P<items>[^，,。！？?]{2,100})[，,]\s*"
+        r"(?:并)?(?:找到|查找|获取)\s*(?P<output>[^。！？?]{2,80})",
+        normalized_query,
+    )
+    if comparison_match:
+        items = [
+            item.strip(" ，,、")
+            for item in re.split(r"\s*(?:和|与|及)\s*", comparison_match.group("items"))
+            if item.strip(" ，,、")
+        ]
+        output = comparison_match.group("output").strip(" ，,、")
+        if 2 <= len(items) <= 3 and output:
+            return tuple((*items, output))
+
+    if "联合查询" in normalized_query:
+        joined = normalized_query.split("联合查询", 1)[1].strip(" ：:，,")
+        parts = [
+            item.strip(" ，,、")
+            for item in re.split(r"\s*(?:和|与|及)\s*", joined.rstrip("。！？?"))
+            if item.strip(" ，,、")
+        ]
+        if 2 <= len(parts) <= 4:
+            return tuple(parts)
+
+    return (normalized_query,)
+
+
+def filter_rag_candidates(
+    query: str,
+    candidates: list[RAGSearchResult],
+) -> list[RAGSearchResult]:
+    """在重排前过滤查询明确排除的来源或证据内容。"""
+
+    literal_terms, source_alias_terms = _extract_negative_term_groups(query)
+    if not literal_terms and not source_alias_terms:
+        return candidates
+    filtered: list[RAGSearchResult] = []
+    for candidate in candidates:
+        source_searchable = _normalize_rag_match_text(candidate.source_label)
+        full_searchable = _normalize_rag_match_text(
+            f"{candidate.source_label}\n{candidate.content}"
+        )
+        if any(term in full_searchable for term in literal_terms):
+            continue
+        # 中文否定短语派生出的英文别名只约束来源名。视觉正例自身可能同时
+        # 展示 baseline 与 current 标签，不能因正文出现 baseline 就误删。
+        if any(term in source_searchable for term in source_alias_terms):
+            continue
+        filtered.append(candidate)
+    return filtered
+
+
+def _query_identity_anchors(query: str) -> tuple[str, ...]:
+    """提取查询中可逐字核验的英文名称或标识符。"""
+
+    anchors: list[str] = []
+    seen: set[str] = set()
+    for match in _QUERY_IDENTITY_ANCHOR_PATTERN.finditer(
+        build_rag_retrieval_query(query)
+    ):
+        anchor = match.group(0).casefold()
+        if anchor in seen:
+            continue
+        seen.add(anchor)
+        anchors.append(anchor)
+    return tuple(anchors)
+
+
+def _apply_positive_query_label_order(
+    query: str,
+    candidates: list[RAGSearchResult],
+) -> list[RAGSearchResult]:
+    """优先保留候选正文中明确出现的查询大写标签。"""
+
+    labels = tuple(
+        dict.fromkeys(
+            _normalize_rag_match_text(match.group(0))
+            for match in _QUERY_LABEL_PATTERN.finditer(build_rag_retrieval_query(query))
+        )
+    )
+    if not labels:
+        return candidates
+    match_counts = [
+        sum(
+            label in _normalize_rag_match_text(
+                f"{candidate.source_label}\n{candidate.content}"
+            )
+            for label in labels
+        )
+        for candidate in candidates
+    ]
+    if not any(match_counts):
+        return candidates
+    return [
+        candidate
+        for _, candidate in sorted(
+            enumerate(candidates),
+            key=lambda item: (-match_counts[item[0]], item[0]),
+        )
+    ]
+
+
+def _filter_identity_anchor_outliers(
+    query: str,
+    candidates: list[RAGSearchResult],
+) -> list[RAGSearchResult]:
+    """剔除明显缺少单一目标身份锚点的相似硬负样本。"""
+
+    if len(decompose_rag_query(build_rag_retrieval_query(query))) > 1:
+        return candidates
+    if any(marker in query for marker in _MULTI_SOURCE_QUERY_MARKERS):
+        return candidates
+    anchors = _query_identity_anchors(query)
+    if len(anchors) < 4:
+        return candidates
+    coverage = [
+        sum(
+            anchor in _normalize_rag_match_text(
+                f"{candidate.source_label}\n{candidate.content}"
+            )
+            for anchor in anchors
+        )
+        for candidate in candidates
+    ]
+    best_coverage = max(coverage, default=0)
+    if best_coverage != len(anchors):
+        return candidates
+    return [
+        candidate
+        for candidate, matched_count in zip(candidates, coverage, strict=True)
+        if matched_count == best_coverage
+    ]
+
+
+def _extract_numeric_values(text: str) -> frozenset[str]:
+    """提取可比较的数值，避免把带数字的文件编号拆成普通数字。"""
+
+    values: set[str] = set()
+    for match in _NUMERIC_VALUE_PATTERN.finditer(text):
+        try:
+            value = Decimal(match.group("value"))
+        except InvalidOperation:
+            continue
+        values.add(format(value.normalize(), "f"))
+    return frozenset(values)
+
+
+def _semantic_anchor_tokens(text: str) -> frozenset[str]:
+    """提取轻量语义锚点，用于判断数值是否和同一对象绑定。"""
+
+    return frozenset(
+        token
+        for token in tokenize(text)
+        if len(token) >= 2 and token not in _extract_numeric_values(token)
+    )
+
+
+def _numeric_consistency_bucket(query: str, candidate: RAGSearchResult) -> int:
+    """返回数值一致性等级；只用于重排，不直接删除候选。"""
+
+    query_values = _extract_numeric_values(query)
+    if not query_values:
+        return 0
+    candidate_text = f"{candidate.source_label}\n{candidate.content}"
+    candidate_values = _extract_numeric_values(candidate_text)
+    if not candidate_values:
+        return 0
+    matched_values = query_values & candidate_values
+    anchors_overlap = bool(
+        _semantic_anchor_tokens(query) & _semantic_anchor_tokens(candidate_text)
+    )
+    if matched_values == query_values:
+        return 3 if anchors_overlap else 2
+    if matched_values:
+        return 1
+    return -1 if anchors_overlap else -2
+
+
+def _apply_numeric_consistency_order(
+    query: str,
+    candidates: list[RAGSearchResult],
+) -> list[RAGSearchResult]:
+    """在保留重排顺序的前提下，把数值错配候选稳定地后置。"""
+
+    if not _extract_numeric_values(query):
+        return candidates
+    return [
+        candidate
+        for _, candidate in sorted(
+            enumerate(candidates),
+            key=lambda item: (-_numeric_consistency_bucket(query, item[1]), item[0]),
+        )
+    ]
+
+
+def _build_rerank_document(candidate: RAGSearchResult) -> str:
+    """把来源类型提供给重排器，但不改变最终返回的证据正文。"""
+
+    source_lines = [f"Source: {candidate.source_label}"]
+    if candidate.evidence_kind:
+        source_lines.append(f"Evidence kind: {candidate.evidence_kind}")
+    if candidate.page_number is not None:
+        source_lines.append(f"Page: {candidate.page_number}")
+    return "\n".join((*source_lines, candidate.content))
 
 
 class LocalHashEmbeddings(Embeddings):
@@ -539,25 +907,46 @@ class HttpReranker:
         base_url: str,
         model: str,
         timeout_seconds: int = 60,
-        candidate_multiplier: int = 4,
+        candidate_multiplier: int | None = None,
         api_style: str = "standard",
         transport: Callable[[str, dict[str, str], dict[str, object], int], dict[str, object]] | None = None,
         usage_callback: Callable[[dict[str, object]], None] | None = None,
         max_retries: int = 2,
         circuit_breaker: CircuitBreaker | None = None,
+        retrieval_top_k: int | None = None,
+        min_relevance_score: float = 0.65,
+        relative_score_threshold: float = 0.86,
     ):
-        """保存 Rerank 调用配置；候选倍数控制向量召回后送入模型的数量。"""
+        """保存 Rerank 配置；retrieval_top_k 控制送入重排器的粗排候选数量。
+
+        ``candidate_multiplier`` 只为旧版调用方保留。新配置直接声明绝对的
+        Retriever Top-K，避免随着最终 Top-N 改变而产生隐含的候选数量。
+        """
 
         self.api_key = api_key
         self.api_style = api_style
         self.endpoint = normalize_rerank_endpoint(base_url, api_style)
         self.model = model
         self.timeout_seconds = timeout_seconds
-        self.candidate_multiplier = max(1, candidate_multiplier)
+        if retrieval_top_k is None:
+            retrieval_top_k = (
+                DEFAULT_RAG_RERANK_TOP_N * max(1, candidate_multiplier)
+                if candidate_multiplier is not None
+                else DEFAULT_RAG_RETRIEVAL_TOP_K
+            )
+        self.retrieval_top_k = max(1, retrieval_top_k)
+        self.min_relevance_score = min_relevance_score
+        self.relative_score_threshold = relative_score_threshold
         self.transport = transport or post_rerank_json
         self.usage_callback = usage_callback
         self.max_retries = max(0, max_retries)
         self.circuit_breaker = circuit_breaker
+
+    @property
+    def candidate_multiplier(self) -> int:
+        """兼容旧测试和旧包装器的只读别名。"""
+
+        return max(1, (self.retrieval_top_k + DEFAULT_RAG_RERANK_TOP_N - 1) // DEFAULT_RAG_RERANK_TOP_N)
 
     @classmethod
     def from_settings(
@@ -574,7 +963,9 @@ class HttpReranker:
             base_url=settings.base_url,
             model=settings.model,
             timeout_seconds=settings.timeout_seconds,
-            candidate_multiplier=settings.candidate_multiplier,
+            retrieval_top_k=settings.retrieval_top_k,
+            min_relevance_score=settings.min_relevance_score,
+            relative_score_threshold=settings.relative_score_threshold,
             api_style=settings.api_style,
             usage_callback=usage_callback,
             max_retries=max_retries,
@@ -1289,35 +1680,132 @@ def _split_code_body(body: str, budget: int) -> list[str]:
     return [f"{opening}\n{group}\n{closing}" for group in groups]
 
 
+def _normalized_rerank_score(score: float | None) -> float | None:
+    """把常见的 0-1 或 0-100 相关性分数归一化到 0-1。"""
+
+    if score is None or not math.isfinite(score) or score < 0:
+        return None
+    if score <= 1:
+        return score
+    if score <= 100:
+        return score / 100
+    return None
+
+
+def _filter_low_confidence_rag_results(
+    query: str,
+    candidates: list[RAGSearchResult],
+    top_n: int,
+    reranker: Reranker,
+) -> list[RAGSearchResult]:
+    """按本次重排的绝对分数和相对分数裁剪低可信候选。
+
+    只有显式配置了阈值且每条候选都有可归一化分数时才启用。多步骤查询至少
+    保留与拆解阶段数一致的候选；如果最高分仍低于可信线，则返回空结果，让
+    上层明确表示没有可靠证据，而不是把最像的错误材料交给 LLM。
+    """
+
+    min_score = getattr(reranker, "min_relevance_score", None)
+    relative_threshold = getattr(reranker, "relative_score_threshold", None)
+    if not isinstance(min_score, (int, float)) or not isinstance(
+        relative_threshold,
+        (int, float),
+    ):
+        return candidates
+    scores = [_normalized_rerank_score(item.relevance_score) for item in candidates]
+    if not scores or any(score is None for score in scores):
+        return candidates
+    normalized_scores = [float(score) for score in scores if score is not None]
+    best_score = max(normalized_scores)
+    if best_score < float(min_score):
+        return []
+
+    cutoff = best_score * float(relative_threshold)
+    kept_indices = {
+        index
+        for index, score in enumerate(normalized_scores)
+        if score >= cutoff
+    }
+    stage_count = len(decompose_rag_query(build_rag_retrieval_query(query)))
+    minimum_results = min(len(candidates), top_n, max(1, stage_count))
+    if len(kept_indices) < minimum_results:
+        for index in range(len(candidates)):
+            kept_indices.add(index)
+            if len(kept_indices) >= minimum_results:
+                break
+    return [
+        candidate
+        for index, candidate in enumerate(candidates)
+        if index in kept_indices
+    ]
+
+
 def rerank_rag_results(
     query: str,
     candidates: list[RAGSearchResult],
-    top_k: int,
+    top_n: int,
     reranker: Reranker | None,
 ) -> list[RAGSearchResult]:
-    """把可选 Rerank 输出映射回向量召回结果，并保留来源与距离。"""
+    """重排候选并返回来源多样化的最终 Top-N 证据。
 
-    if not candidates or top_k <= 0 or reranker is None:
-        return candidates[:top_k]
+    同一 ``long_text_id`` 代表同一份来源材料。最终上下文默认每份材料只占一个
+    位置，避免一个 PDF 的多个 Chunk 挤掉其他相关材料。
+    """
+
+    if not candidates or top_n <= 0:
+        return []
+    candidates = filter_rag_candidates(query, candidates)
+    if not candidates:
+        return []
+    if reranker is None:
+        return _select_diverse_rag_results(
+            _apply_numeric_consistency_order(query, candidates),
+            top_n,
+        )
     rankings = reranker.rerank(
-        query,
-        [candidate.content for candidate in candidates],
-        top_n=min(top_k, len(candidates)),
+        build_rag_retrieval_query(query),
+        [_build_rerank_document(candidate) for candidate in candidates],
+        top_n=len(candidates),
     )
     selected_indices: set[int] = set()
-    reranked: list[RAGSearchResult] = []
+    ordered: list[RAGSearchResult] = []
     for ranking in rankings:
         if ranking.index in selected_indices or not 0 <= ranking.index < len(candidates):
             continue
         selected_indices.add(ranking.index)
-        reranked.append(candidates[ranking.index])
-        if len(reranked) >= top_k:
-            return reranked
+        ordered.append(
+            replace(
+                candidates[ranking.index],
+                relevance_score=ranking.relevance_score,
+            )
+        )
 
     # 上游偶发缺项时仍返回已经可靠召回的证据，避免无故丢失上下文。
     for index, candidate in enumerate(candidates):
         if index not in selected_indices:
-            reranked.append(candidate)
-        if len(reranked) >= top_k:
+            ordered.append(candidate)
+    ordered = _apply_positive_query_label_order(query, ordered)
+    ordered = _filter_identity_anchor_outliers(query, ordered)
+    selected = _select_diverse_rag_results(
+        _apply_numeric_consistency_order(query, ordered),
+        top_n,
+    )
+    return _filter_low_confidence_rag_results(query, selected, top_n, reranker)
+
+
+def _select_diverse_rag_results(
+    candidates: list[RAGSearchResult],
+    top_n: int,
+) -> list[RAGSearchResult]:
+    """按来源材料去重后截取最终 Top-N。"""
+
+    selected: list[RAGSearchResult] = []
+    seen_sources: set[int] = set()
+    for candidate in candidates:
+        if candidate.long_text_id in seen_sources:
+            continue
+        seen_sources.add(candidate.long_text_id)
+        selected.append(candidate)
+        if len(selected) >= top_n:
             break
-    return reranked
+    return selected

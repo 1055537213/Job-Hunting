@@ -4,7 +4,7 @@
   "description": "隔离的跨行业 RAG 黄金集，覆盖语义改写、精确数值、表格关系、视觉摘要、版本冲突和账号隔离。",
   "thresholds": {
     "min_case_pass_rate": 0.9,
-    "min_mean_recall_at_k": 0.8,
+    "min_mean_recall_at_n": 0.8,
     "min_mean_reciprocal_rank": 0.75,
     "max_forbidden_case_rate": 0.0
   },
@@ -108,7 +108,7 @@
       "expected_source_labels": ["eval:software:backend-order-service"],
       "forbidden_source_labels": ["eval:software:frontend-dashboard"],
       "entity_types": ["project_archive_file"],
-      "top_k": 3,
+      "top_n": 3,
       "tags": ["software", "semantic"]
     },
     {
@@ -117,7 +117,7 @@
       "expected_source_labels": ["eval:industrial:shaft-revision-b-current"],
       "forbidden_source_labels": ["eval:industrial:shaft-revision-a-obsolete"],
       "entity_types": ["industrial_drawing_summary"],
-      "top_k": 1,
+      "top_n": 1,
       "tags": ["industrial", "numeric", "conflict"]
     },
     {
@@ -126,7 +126,7 @@
       "expected_source_labels": ["eval:industrial:shaft-revision-b-current"],
       "forbidden_source_labels": ["eval:industrial:shaft-revision-a-obsolete"],
       "entity_types": ["industrial_drawing_summary"],
-      "top_k": 1,
+      "top_n": 1,
       "tags": ["industrial", "conflict"]
     },
     {
@@ -134,7 +134,7 @@
       "query": "冷却泵 P-204 的振动预警值和必须停机的阈值",
       "expected_source_labels": ["eval:industrial:pump-maintenance-table"],
       "entity_types": ["industrial_pdf_table"],
-      "top_k": 2,
+      "top_n": 2,
       "tags": ["industrial", "numeric", "table"]
     },
     {
@@ -142,7 +142,7 @@
       "query": "B2 区地下车库顶板使用什么混凝土和钢筋，板厚及保护层是多少",
       "expected_source_labels": ["eval:construction:slab-spec-page-17"],
       "entity_types": ["construction_pdf_page"],
-      "top_k": 2,
+      "top_n": 2,
       "tags": ["construction", "numeric", "table"]
     },
     {
@@ -150,7 +150,7 @@
       "query": "哪份设计稿把红色预约回收按钮放在画面右下角，主标题又是什么",
       "expected_source_labels": ["eval:design:poster-visual-summary"],
       "entity_types": ["project_visual_summary"],
-      "top_k": 2,
+      "top_n": 2,
       "tags": ["design", "visual-summary"]
     },
     {
@@ -158,7 +158,7 @@
       "query": "哪个医疗项目通过重新安排预约时段把患者等候时间降低约百分之十八",
       "expected_source_labels": ["eval:healthcare:outpatient-scheduling"],
       "entity_types": ["project_archive_file"],
-      "top_k": 3,
+      "top_n": 3,
       "tags": ["healthcare", "numeric", "semantic"]
     },
     {
@@ -166,7 +166,7 @@
       "query": "数控课程分层练习带来了什么学习完成率改进",
       "expected_source_labels": ["eval:education:adaptive-course"],
       "entity_types": ["project_archive_file"],
-      "top_k": 3,
+      "top_n": 3,
       "tags": ["education", "numeric", "semantic"]
     },
     {
@@ -174,7 +174,7 @@
       "query": "三单匹配项目怎样发现异常发票，最终是谁决定风险结论",
       "expected_source_labels": ["eval:finance:invoice-risk-review"],
       "entity_types": ["project_archive_file"],
-      "top_k": 3,
+      "top_n": 3,
       "tags": ["finance", "semantic"]
     },
     {
@@ -182,7 +182,7 @@
       "query": "覆盖四十多家门店的配送优化如何改善准时率和温度异常",
       "expected_source_labels": ["eval:logistics:cold-chain-route"],
       "entity_types": ["project_archive_file"],
-      "top_k": 3,
+      "top_n": 3,
       "tags": ["logistics", "numeric", "semantic"]
     },
     {
@@ -190,7 +190,7 @@
       "query": "气孔缺陷改善后首次合格率和返修工时发生了什么变化",
       "expected_source_labels": ["eval:manufacturing:welding-quality"],
       "entity_types": ["project_archive_file"],
-      "top_k": 3,
+      "top_n": 3,
       "tags": ["manufacturing", "numeric", "semantic"]
     },
     {
@@ -198,7 +198,7 @@
       "query": "采购合同审查清单把初审周期缩短到多少天，谁负责最终意见",
       "expected_source_labels": ["eval:legal:contract-review-workflow"],
       "entity_types": ["project_archive_file"],
-      "top_k": 3,
+      "top_n": 3,
       "tags": ["legal", "numeric", "semantic"]
     },
     {
@@ -207,7 +207,7 @@
       "expected_source_labels": ["eval:isolation:primary-calibration"],
       "forbidden_source_labels": ["eval:isolation:foreign-calibration"],
       "entity_types": ["private_project_note"],
-      "top_k": 3,
+      "top_n": 3,
       "tags": ["account-isolation", "numeric", "security"]
     }
   ]

@@ -46,7 +46,7 @@ PDF_SUFFIXES = {".pdf"}
 IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 SPREADSHEET_SUFFIXES = {".csv", ".xlsx"}
 DOCUMENT_SUFFIXES = {".docx", ".pptx"}
-DRAWING_SUFFIXES = {".dxf", ".iges", ".igs", ".step", ".stp", ".svg"}
+DRAWING_SUFFIXES = {".dxf", ".ifc", ".iges", ".igs", ".step", ".stp", ".svg"}
 
 MAX_MANIFEST_FILES = 20_000
 MAX_MANIFEST_PATH_LENGTH = 2_048

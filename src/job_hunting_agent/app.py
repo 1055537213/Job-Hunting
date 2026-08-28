@@ -22,6 +22,7 @@ from .concurrency_control import (
 )
 from .config import (
     DEFAULT_ENV_PATH,
+    DEFAULT_RAG_RERANK_TOP_N,
     load_billing_settings,
     load_concurrency_settings,
     load_database_settings,
@@ -197,6 +198,12 @@ class JobHuntingApp:
                 max_pdf_pages=self.project_visual_analysis_settings.max_pdf_pages,
                 max_images_per_call=(
                     self.project_visual_analysis_settings.max_images_per_call
+                ),
+                batch_timeout_seconds=(
+                    self.project_visual_analysis_settings.batch_timeout_seconds
+                ),
+                total_timeout_seconds=(
+                    self.project_visual_analysis_settings.total_timeout_seconds
                 ),
             )
             if self.project_visual_analysis_settings.enabled
@@ -1427,7 +1434,7 @@ class JobHuntingApp:
                 format_rag_evidence(result)
                 for result in self.search_rag(
                     query,
-                    top_k=5,
+                    top_n=DEFAULT_RAG_RERANK_TOP_N,
                     entity_types=["candidate_profile", "job", "project_experience_card"],
                     account_id=account_id,
                     candidate_id=candidate_id,
@@ -1791,7 +1798,7 @@ class JobHuntingApp:
                 format_rag_evidence(result)
                 for result in self.search_rag(
                     query,
-                    top_k=6,
+                    top_n=DEFAULT_RAG_RERANK_TOP_N,
                     entity_types=[
                         "candidate_profile",
                         "job",
@@ -1985,14 +1992,15 @@ class JobHuntingApp:
     def search_rag(
         self,
         query: str,
-        top_k: int = 5,
+        top_n: int = DEFAULT_RAG_RERANK_TOP_N,
         entity_types: list[str] | None = None,
         account_id: int | None = None,
         candidate_id: int | None = None,
         session_id: str | None = None,
         root_request_id: str | None = None,
+        retrieval_top_k: int | None = None,
     ) -> list[RAGSearchResult]:
-        """从当前 RAG 后端检索带来源、账号隔离的证据片段。"""
+        """先召回 Retriever Top-K，再返回 Reranker 选出的最终 Top-N。"""
 
         call_context = self.model_gateway.new_call_context(
             "embedding_query",
@@ -2014,10 +2022,11 @@ class JobHuntingApp:
         )
         results = knowledge_base.search(
             query,
-            top_k,
-            entity_types,
+            top_n=top_n,
+            entity_types=entity_types,
             account_id=account_id,
             candidate_id=candidate_id,
+            retrieval_top_k=retrieval_top_k,
         )
         return self._reinspect_visual_search_results(
             query,

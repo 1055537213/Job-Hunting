@@ -11,6 +11,9 @@ import base64
 import json
 import logging
 import math
+import re
+import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -33,10 +36,22 @@ MAX_VISUAL_OUTPUT_ITEMS = 8
 MAX_VISUAL_LIST_ITEMS = 40
 MAX_VISUAL_FIELD_CHARS = 2_000
 MIN_VISUAL_CONFIDENCE = 0.55
+PROJECT_VISUAL_JSON_RETRY_SUFFIX = """
+
+上一次响应无法通过 JSON 协议校验。请重新检查同一批图片，并且只返回符合上述
+schema 的单个 JSON 对象；不要输出思考标签、Markdown 代码围栏或任何解释文字。
+summary 必须是字符串，element_relationships、tables、warnings 必须是字符串数组，
+parameters 必须是对象数组。每个数组最多保留 8 项，只保留最重要的可见事实，避免
+重复 OCR 全文。
+""".strip()
 
 
 class ProjectVisualAnalysisError(ValueError):
     """视觉输入或模型结构化响应不符合受控协议。"""
+
+
+class ProjectVisualAnalysisTimeout(ProjectVisualAnalysisError):
+    """视觉模型调用超过项目级硬截止时间。"""
 
 
 @dataclass(frozen=True)
@@ -181,14 +196,22 @@ class ProjectVisualAnalyzer:
         *,
         max_pdf_pages: int = 8,
         max_images_per_call: int = 4,
+        batch_timeout_seconds: float = 90.0,
+        total_timeout_seconds: float = 300.0,
     ) -> None:
         if not 1 <= max_pdf_pages <= 20:
             raise ValueError("项目视觉分析 PDF 页数上限必须在 1 到 20 之间。")
         if not 1 <= max_images_per_call <= 8:
             raise ValueError("项目视觉分析单次图片数必须在 1 到 8 之间。")
+        if batch_timeout_seconds <= 0:
+            raise ValueError("项目视觉分析单批次超时时间必须大于 0。")
+        if total_timeout_seconds < batch_timeout_seconds:
+            raise ValueError("项目视觉分析总超时时间不能小于单批次超时时间。")
         self.model_gateway = model_gateway
         self.max_pdf_pages = max_pdf_pages
         self.max_images_per_call = max_images_per_call
+        self.batch_timeout_seconds = float(batch_timeout_seconds)
+        self.total_timeout_seconds = float(total_timeout_seconds)
 
     def analyze(
         self,
@@ -254,38 +277,80 @@ class ProjectVisualAnalyzer:
         findings: dict[str, ProjectVisualFinding] = {}
         failed: list[str] = []
         error_type: str | None = None
+        completed_batches = 0
+        deadline = time.monotonic() + self.total_timeout_seconds
         for start in range(0, len(normalized), self.max_images_per_call):
             batch = normalized[start : start + self.max_images_per_call]
-            try:
-                context = self.model_gateway.new_call_context(
-                    operation,
-                    account_id=account_id,
-                    candidate_id=candidate_id,
-                )
-                response = self.model_gateway.chat_model(
-                    operation,
-                    temperature=0,
-                    account_id=context.account_id,
-                ).invoke([build_project_visual_message(batch, prompt=prompt)])
-            except Exception as error:  # noqa: BLE001 - 上层必须能够回退到本地 OCR。
-                error_type = type(error).__name__
-                failed.extend(item.source_id for item in normalized[start:])
-                logger.info("项目视觉分析降级为本地解析：%s", error_type)
+            batch_findings: dict[str, ProjectVisualFinding] | None = None
+            abort_remaining_batches = False
+            for attempt in range(2):
+                try:
+                    remaining_seconds = deadline - time.monotonic()
+                    if remaining_seconds <= 0:
+                        raise ProjectVisualAnalysisTimeout(
+                            "项目视觉分析达到总超时时间，已回退到本地解析。"
+                        )
+                    context = self.model_gateway.new_call_context(
+                        operation,
+                        account_id=account_id,
+                        candidate_id=candidate_id,
+                    )
+                    response_model = self.model_gateway.chat_model(
+                        operation,
+                        temperature=0,
+                        account_id=context.account_id,
+                    )
+                    request_prompt = prompt
+                    if attempt:
+                        request_prompt = f"{prompt}\n\n{PROJECT_VISUAL_JSON_RETRY_SUFFIX}"
+                    response = _invoke_with_timeout(
+                        response_model,
+                        [build_project_visual_message(batch, prompt=request_prompt)],
+                        timeout_seconds=min(
+                            self.batch_timeout_seconds,
+                            remaining_seconds,
+                        ),
+                    )
+                except Exception as error:  # noqa: BLE001 - 上层必须能够回退到本地 OCR。
+                    error_type = type(error).__name__
+                    failed.extend(item.source_id for item in normalized[start:])
+                    logger.info("项目视觉分析降级为本地解析：%s", error_type)
+                    abort_remaining_batches = True
+                    break
+
+                try:
+                    self.model_gateway.record_chat_response(context, response)
+                except Exception as error:  # noqa: BLE001 - 计量旁路不能丢弃已成功的证据。
+                    logger.debug("项目视觉模型用量记录失败：%s", type(error).__name__)
+                try:
+                    batch_findings = parse_project_visual_response(
+                        extract_message_text(response),
+                        expected_source_ids={item.source_id for item in batch},
+                    )
+                except ProjectVisualAnalysisError as error:
+                    if attempt == 0:
+                        logger.info("项目视觉响应协议校验失败，执行一次格式修复重试。")
+                        continue
+                    error_type = type(error).__name__
+                    failed.extend(item.source_id for item in normalized[start:])
+                    logger.info("项目视觉响应无法入库，降级为本地解析：%s", error_type)
+                    abort_remaining_batches = True
+                    break
+                except Exception as error:  # noqa: BLE001 - 未知解析异常必须安全降级。
+                    error_type = type(error).__name__
+                    failed.extend(item.source_id for item in normalized[start:])
+                    logger.info("项目视觉响应无法入库，降级为本地解析：%s", error_type)
+                    abort_remaining_batches = True
+                    break
+                completed_batches += 1
                 break
 
-            try:
-                self.model_gateway.record_chat_response(context, response)
-            except Exception as error:  # noqa: BLE001 - 计量旁路不能丢弃已成功的证据。
-                logger.debug("项目视觉模型用量记录失败：%s", type(error).__name__)
-            try:
-                batch_findings = parse_project_visual_response(
-                    extract_message_text(response),
-                    expected_source_ids={item.source_id for item in batch},
-                )
-            except Exception as error:  # noqa: BLE001 - 已计量，证据仍安全降级。
-                error_type = type(error).__name__
+            if abort_remaining_batches:
+                break
+            if batch_findings is None:
+                error_type = "ProjectVisualAnalysisError"
                 failed.extend(item.source_id for item in normalized[start:])
-                logger.info("项目视觉响应无法入库，降级为本地解析：%s", error_type)
+                logger.info("项目视觉响应缺少可入库结果，降级为本地解析。")
                 break
             findings.update(batch_findings)
             failed.extend(
@@ -296,6 +361,8 @@ class ProjectVisualAnalyzer:
             status = "partial"
         elif findings:
             status = "succeeded"
+        elif completed_batches and error_type is None:
+            status = "no_evidence"
         else:
             status = "failed"
         return ProjectVisualAnalysisResult(
@@ -304,6 +371,46 @@ class ProjectVisualAnalyzer:
             status=status,
             error_type=error_type,
         )
+
+
+def _invoke_with_timeout(
+    model: BaseChatModel | object,
+    messages: object,
+    *,
+    timeout_seconds: float,
+) -> object:
+    """为同步模型调用增加进程级硬截止，避免供应商流式连接无限等待。
+
+    LangChain 的同步 ``invoke`` 无法被调用方可靠取消，因此这里使用 daemon
+    线程隔离等待。底层 HTTP 客户端仍会按自身 timeout 结束请求；本层保证导入
+    主流程在项目级截止时间到达后立即回退，不把用户请求一直挂住。
+    """
+
+    response: list[object] = []
+    error: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            response.append(model.invoke(messages))  # type: ignore[attr-defined]
+        except BaseException as exc:  # noqa: BLE001 - 交给调用方统一降级。
+            error.append(exc)
+
+    worker = threading.Thread(
+        target=run,
+        name="project-visual-model-call",
+        daemon=True,
+    )
+    worker.start()
+    worker.join(max(0.0, timeout_seconds))
+    if worker.is_alive():
+        raise ProjectVisualAnalysisTimeout(
+            "项目视觉分析单批次超时，已回退到本地解析。"
+        )
+    if error:
+        raise error[0]
+    if not response:
+        raise ProjectVisualAnalysisError("项目视觉模型没有返回响应。")
+    return response[0]
 
 
 def _normalize_visual_input(item: ProjectVisualInput) -> ProjectVisualInput:
@@ -441,13 +548,9 @@ def parse_project_visual_response(
 ) -> dict[str, ProjectVisualFinding]:
     """校验模型 JSON，并拒绝未知来源、低置信度和无限长度字段。"""
 
-    stripped = _strip_json_fence(text)
-    try:
-        payload = json.loads(stripped)
-    except json.JSONDecodeError as error:
-        raise ProjectVisualAnalysisError("项目视觉模型返回格式无效。") from error
-    items = payload.get("items") if isinstance(payload, dict) else None
-    if not isinstance(items, list) or len(items) > MAX_VISUAL_OUTPUT_ITEMS:
+    payload = _load_visual_json_payload(text)
+    items = _normalize_visual_response_items(payload)
+    if items is None or len(items) > MAX_VISUAL_OUTPUT_ITEMS:
         raise ProjectVisualAnalysisError("项目视觉模型返回的 items 无效。")
 
     findings: dict[str, ProjectVisualFinding] = {}
@@ -478,6 +581,8 @@ def parse_project_visual_response(
             parameters=parameters,
             warnings=warnings,
         )
+    if items and not findings:
+        raise ProjectVisualAnalysisError("项目视觉模型没有返回可入库的视觉证据。")
     return findings
 
 
@@ -491,7 +596,67 @@ def _strip_json_fence(text: str) -> str:
     return stripped
 
 
+def _load_visual_json_payload(text: str) -> dict[str, object] | list[object]:
+    """从思考标签、代码围栏或少量说明文字中提取 JSON 容器。"""
+
+    stripped = re.sub(
+        r"<think\b[^>]*>.*?</think>",
+        "",
+        str(text or ""),
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+    stripped = _strip_json_fence(stripped)
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        payload = None
+        for index, character in enumerate(stripped):
+            if character not in "[{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(stripped[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, (dict, list)):
+                payload = candidate
+                break
+    if not isinstance(payload, (dict, list)):
+        raise ProjectVisualAnalysisError("项目视觉模型返回格式无效。")
+    return payload
+
+
+def _normalize_visual_response_items(
+    payload: dict[str, object] | list[object],
+) -> list[object] | None:
+    """兼容模型常见 JSON 外壳，字段内容仍由严格协议逐项校验。"""
+
+    if isinstance(payload, list):
+        return payload
+    raw_items = payload.get("items")
+    if isinstance(raw_items, list):
+        return raw_items
+    if isinstance(raw_items, dict):
+        normalized: list[object] = []
+        for source_id, raw in raw_items.items():
+            if not isinstance(raw, dict):
+                normalized.append(raw)
+                continue
+            item = dict(raw)
+            item.setdefault("source_id", str(source_id))
+            normalized.append(item)
+        return normalized
+    if "source_id" in payload:
+        return [payload]
+    return None
+
+
 def _bounded_string(value: object) -> str:
+    if isinstance(value, (dict, list)):
+        try:
+            value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            value = str(value)
     return str(value or "").strip()[:MAX_VISUAL_FIELD_CHARS]
 
 

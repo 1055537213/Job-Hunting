@@ -256,9 +256,9 @@ def run_rag_benchmark(
         )
         report = evaluate_rag_cases(
             suite.cases,
-            lambda case, limit: knowledge_base.search(
+            lambda case, top_n: knowledge_base.search(
                 case.query,
-                top_k=limit,
+                top_n=top_n,
                 entity_types=list(case.entity_types) or None,
                 account_id=primary_account.id,
             ),

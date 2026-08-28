@@ -39,7 +39,7 @@ def test_repository_golden_suite_covers_cross_industry_risks() -> None:
         "conflict",
         "account-isolation",
     } <= tags
-    assert suite.thresholds.min_mean_recall_at_k >= 0.8
+    assert suite.thresholds.min_mean_recall_at_n >= 0.8
     assert suite.thresholds.max_forbidden_case_rate == 0.0
 
 
@@ -124,20 +124,20 @@ def test_rag_benchmark_runs_in_isolated_accounts_and_cleans_up(database_url) -> 
                 query="isolationgoldenalpha",
                 expected=(EvidenceRef(source_label="eval:primary-alpha"),),
                 forbidden=(EvidenceRef(source_label="eval:foreign-alpha"),),
-                top_k=1,
+                top_n=1,
                 tags=("account-isolation",),
             ),
             RAGEvalCase(
                 id="primary-beta",
                 query="isolationgoldenbeta",
                 expected=(EvidenceRef(source_label="eval:primary-beta"),),
-                top_k=1,
+                top_n=1,
                 tags=("software",),
             ),
         ),
         thresholds=RAGEvalThresholds(
             min_case_pass_rate=1.0,
-            min_mean_recall_at_k=1.0,
+            min_mean_recall_at_n=1.0,
             min_mean_reciprocal_rank=1.0,
             max_forbidden_case_rate=0.0,
         ),

@@ -6,8 +6,11 @@
 
 from __future__ import annotations
 
+import sys
 import zipfile
 from io import BytesIO
+from threading import local
+from types import SimpleNamespace
 
 import pytest
 from docx import Document
@@ -176,6 +179,37 @@ def test_pdf_text_layer_inspection_does_not_start_ocr(monkeypatch) -> None:
 
     assert inspection.page_count == 1
     assert inspection.pages_needing_ocr == [0]
+
+
+def test_rapidocr_reuses_one_engine_per_thread(monkeypatch) -> None:
+    """连续处理图片时只初始化一次 OCR 模型，避免评测和导入反复加载权重。"""
+
+    initializations: list[bool] = []
+    calls: list[Image.Image] = []
+
+    class FakeRapidOCR:
+        def __init__(self) -> None:
+            initializations.append(True)
+
+        def __call__(self, image: Image.Image) -> SimpleNamespace:
+            calls.append(image)
+            return SimpleNamespace(txts=("CURRENT", "CAPTURE"))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "rapidocr",
+        SimpleNamespace(RapidOCR=FakeRapidOCR),
+    )
+    monkeypatch.setattr(resume_document, "_RAPIDOCR_THREAD_STATE", local())
+    image = Image.new("RGB", (32, 32), "white")
+    try:
+        assert resume_document.run_rapidocr(image) == "CURRENT\nCAPTURE"
+        assert resume_document.run_rapidocr(image) == "CURRENT\nCAPTURE"
+    finally:
+        image.close()
+
+    assert len(initializations) == 1
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize(

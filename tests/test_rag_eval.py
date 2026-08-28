@@ -24,17 +24,22 @@ def test_rag_eval_reports_recall_mrr_and_pass_status() -> None:
         )
     ]
 
-    def search(_case: RAGEvalCase, _top_k: int) -> list[RAGSearchResult]:
+    def search(_case: RAGEvalCase, _top_n: int) -> list[RAGSearchResult]:
         return [
             rag_hit(21, "resume-source", "resume", 1),
             rag_hit(22, "project-card:backend", "project_experience", 2),
         ]
 
-    report = evaluate_rag_cases(cases, search, top_k=5)
+    report = evaluate_rag_cases(cases, search, top_n=5)
 
     assert report.all_passed
     assert report.passed_count == 1
-    assert report.mean_recall_at_k == 1.0
+    assert report.mean_recall_at_n == 1.0
+    assert report.mean_recall_at_1 == 0.0
+    assert report.mean_recall_at_3 == 1.0
+    assert report.mean_recall_at_5 == 1.0
+    assert report.mean_precision_at_n == 0.2
+    assert round(report.mean_ndcg_at_n, 3) == 0.631
     assert report.mean_reciprocal_rank == 0.5
     assert report.forbidden_case_rate == 0.0
     assert "RAG eval: 1/1 cases passed" in format_rag_eval_report(report)
@@ -51,12 +56,12 @@ def test_rag_eval_fails_when_expected_evidence_is_missing() -> None:
 
     report = evaluate_rag_cases(
         cases,
-        lambda _case, _top_k: [rag_hit(10, "unrelated", "conversation_message", 1)],
+        lambda _case, _top_n: [rag_hit(10, "unrelated", "conversation_message", 1)],
     )
 
     assert not report.all_passed
     assert report.case_results[0].expected_found == 0
-    assert report.case_results[0].recall_at_k == 0.0
+    assert report.case_results[0].recall_at_n == 0.0
     assert report.case_results[0].reciprocal_rank == 0.0
 
 
@@ -72,7 +77,7 @@ def test_rag_eval_fails_when_forbidden_evidence_is_retrieved() -> None:
 
     report = evaluate_rag_cases(
         cases,
-        lambda _case, _top_k: [
+        lambda _case, _top_n: [
             rag_hit(30, "profile-skill:python", "conversation_message", 1),
             rag_hit(31, "profile-negative:python", "conversation_message", 1),
         ],
@@ -102,14 +107,14 @@ def test_rag_eval_applies_suite_thresholds_and_reports_tag_metrics() -> None:
 
     report = evaluate_rag_cases(
         cases,
-        lambda case, _top_k: (
+        lambda case, _top_n: (
             [rag_hit(1, "drawing:shaft", "project_archive_file", 1)]
             if case.id == "industrial-parameter"
             else [rag_hit(2, "design:noise", "project_archive_file", 1)]
         ),
         thresholds=RAGEvalThresholds(
             min_case_pass_rate=1.0,
-            min_mean_recall_at_k=0.75,
+            min_mean_recall_at_n=0.75,
             min_mean_reciprocal_rank=0.75,
             max_forbidden_case_rate=0.0,
         ),
@@ -117,15 +122,15 @@ def test_rag_eval_applies_suite_thresholds_and_reports_tag_metrics() -> None:
 
     assert not report.all_passed
     assert report.case_pass_rate == 1.0
-    assert report.mean_recall_at_k == 0.5
+    assert report.mean_recall_at_n == 0.5
     assert report.quality_gate_failures == (
-        "mean_recall_at_k 0.500 < 0.750",
+        "mean_recall_at_n 0.500 < 0.750",
         "mean_reciprocal_rank 0.500 < 0.750",
     )
-    assert report.metrics_by_tag["industrial"]["mean_recall_at_k"] == 1.0
-    assert report.metrics_by_tag["visual"]["mean_recall_at_k"] == 0.0
+    assert report.metrics_by_tag["industrial"]["mean_recall_at_n"] == 1.0
+    assert report.metrics_by_tag["visual"]["mean_recall_at_n"] == 0.0
     payload = report.to_dict()
-    assert payload["thresholds"]["min_mean_recall_at_k"] == 0.75
+    assert payload["thresholds"]["min_mean_recall_at_n"] == 0.75
     assert payload["quality_gate_passed"] is False
 
 
@@ -142,7 +147,8 @@ def test_rag_eval_loads_case_json_with_compact_reference_fields(tmp_path) -> Non
                         "expected_source_labels": ["project-card:rag"],
                         "forbidden_source_labels": ["chat:noise"],
                         "entity_types": ["project_experience"],
-                        "top_k": 3,
+                        "top_n": 3,
+                        "split": "holdout",
                     }
                 ]
             }
@@ -153,13 +159,68 @@ def test_rag_eval_loads_case_json_with_compact_reference_fields(tmp_path) -> Non
     cases = load_rag_eval_cases(path)
 
     assert cases[0].id == "resume-project"
-    assert cases[0].top_k == 3
+    assert cases[0].top_n == 3
     assert cases[0].entity_types == ("project_experience",)
+    assert cases[0].split == "holdout"
     assert cases[0].expected == (
         EvidenceRef(long_text_id=1),
         EvidenceRef(source_label="project-card:rag"),
     )
     assert cases[0].forbidden == (EvidenceRef(source_label="chat:noise"),)
+
+
+def test_rag_eval_applies_ranking_thresholds_and_split_metrics() -> None:
+    cases = [
+        RAGEvalCase(
+            id="development-first",
+            query="first",
+            expected=(EvidenceRef(source_label="target:first"),),
+            top_n=5,
+            split="development",
+        ),
+        RAGEvalCase(
+            id="holdout-fourth",
+            query="fourth",
+            expected=(EvidenceRef(source_label="target:fourth"),),
+            top_n=5,
+            split="holdout",
+        ),
+    ]
+
+    report = evaluate_rag_cases(
+        cases,
+        lambda case, _top_n: (
+            [rag_hit(1, "target:first", "project_archive_file", 1)]
+            if case.id == "development-first"
+            else [
+                rag_hit(2, "noise:one", "project_archive_file", 2),
+                rag_hit(3, "noise:two", "project_archive_file", 3),
+                rag_hit(4, "noise:three", "project_archive_file", 4),
+                rag_hit(5, "target:fourth", "project_archive_file", 5),
+            ]
+        ),
+        thresholds=RAGEvalThresholds(
+            min_case_pass_rate=1.0,
+            min_mean_recall_at_1=0.75,
+            min_mean_recall_at_3=0.5,
+            min_mean_recall_at_5=1.0,
+            min_mean_precision_at_n=0.2,
+            min_mean_ndcg_at_n=0.75,
+        ),
+    )
+
+    assert not report.all_passed
+    assert report.mean_recall_at_1 == 0.5
+    assert report.mean_recall_at_3 == 0.5
+    assert report.mean_recall_at_5 == 1.0
+    assert report.mean_precision_at_n == 0.2
+    assert report.metrics_by_split["development"]["mean_recall_at_1"] == 1.0
+    assert report.metrics_by_split["holdout"]["mean_recall_at_1"] == 0.0
+    assert any("mean_recall_at_1" in item for item in report.quality_gate_failures)
+    assert any("mean_ndcg_at_n" in item for item in report.quality_gate_failures)
+    formatted = format_rag_eval_report(report)
+    assert "split_summary=development passed=1/1" in formatted
+    assert "split_summary=holdout passed=1/1" in formatted
 
 
 def test_rag_eval_writes_example_case_file(tmp_path) -> None:

@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from threading import local
 from uuid import uuid4
 from xml.etree import ElementTree
 
@@ -41,6 +42,7 @@ MAX_DOCX_XML_PART_BYTES = 10 * 1024 * 1024
 MIN_DOCUMENT_TEXT_CHARS = 20
 MIN_PDF_TEXT_CHARS_PER_PAGE = 20
 WORD_NAMESPACE = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_RAPIDOCR_THREAD_STATE = local()
 
 
 class ResumeDocumentError(ValueError):
@@ -372,12 +374,16 @@ def render_and_ocr_pdf_pages(
 
 
 def run_rapidocr(image: Image.Image) -> str:
-    """惰性加载本地 RapidOCR，避免文字版 PDF 也承担模型初始化开销。"""
+    """惰性加载并按线程复用 RapidOCR，避免每张图片重复初始化模型。"""
 
     try:
-        from rapidocr import RapidOCR
+        engine = getattr(_RAPIDOCR_THREAD_STATE, "engine", None)
+        if engine is None:
+            from rapidocr import RapidOCR
 
-        result = RapidOCR()(image)
+            engine = RapidOCR()
+            _RAPIDOCR_THREAD_STATE.engine = engine
+        result = engine(image)
     except Exception as error:
         raise ResumeDocumentError(f"本地 OCR 不可用：{error}") from error
     texts = getattr(result, "txts", None) or ()

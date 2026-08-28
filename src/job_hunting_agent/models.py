@@ -485,6 +485,9 @@ class RAGSearchResult:
     evidence_kind: str = "text"
     visual_item_id: int | None = None
     page_number: int | None = None
+    # Reranker 返回的原始相关性分数。不同供应商量纲可能不同，只能在同一次
+    # 重排请求内做相对比较，不能把它当作跨模型通用的事实可信度。
+    relevance_score: float | None = None
 
 
 @dataclass

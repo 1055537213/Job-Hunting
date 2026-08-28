@@ -163,8 +163,8 @@ def test_agent_rag_tool_always_scopes_search_to_current_candidate(account_id, mo
     )
     calls = []
 
-    def record_search(query, top_k=5, entity_types=None, **kwargs):
-        calls.append((query, top_k, entity_types, kwargs))
+    def record_search(query, top_n=5, entity_types=None, **kwargs):
+        calls.append((query, top_n, entity_types, kwargs))
         return []
 
     monkeypatch.setattr(app, "search_rag", record_search)
@@ -176,7 +176,7 @@ def test_agent_rag_tool_always_scopes_search_to_current_candidate(account_id, mo
                     {
                         "id": "call_candidate_rag",
                         "name": "search_candidate_evidence",
-                        "args": {"query": "项目证据", "top_k": 3},
+                        "args": {"query": "项目证据", "top_n": 3},
                         "type": "tool_call",
                     }
                 ],
@@ -194,8 +194,8 @@ def test_agent_rag_tool_always_scopes_search_to_current_candidate(account_id, mo
     )
 
     assert len(calls) == 1
-    query, top_k, entity_types, scope = calls[0]
-    assert (query, top_k, entity_types) == ("项目证据", 3, None)
+    query, top_n, entity_types, scope = calls[0]
+    assert (query, top_n, entity_types) == ("项目证据", 3, None)
     assert scope["account_id"] == account_id
     assert scope["candidate_id"] == candidate_id
     assert scope["session_id"] == "candidate-rag-scope"

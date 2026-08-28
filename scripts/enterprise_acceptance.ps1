@@ -3,7 +3,7 @@ param(
     [string]$RagCases = "",
     [string]$ConversationCases = "",
     [int]$AccountId = 0,
-    [int]$TopK = 5
+    [int]$TopN = 5
 )
 
 $ErrorActionPreference = "Stop"
@@ -54,8 +54,8 @@ if ($RagCases) {
             "job_hunting_agent.evals.rag_eval",
             "--cases",
             $RagCases,
-            "--top-k",
-            [string]$TopK
+            "--top-n",
+            [string]$TopN
         )
         if ($AccountId -gt 0) {
             $args += @("--account-id", [string]$AccountId)

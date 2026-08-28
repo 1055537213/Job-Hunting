@@ -200,8 +200,8 @@ def test_resume_draft_rag_is_scoped_to_current_candidate(account_id, monkeypatch
     )
     calls = []
 
-    def record_search(query, top_k=5, entity_types=None, **kwargs):
-        calls.append((query, top_k, entity_types, kwargs))
+    def record_search(query, top_n=5, entity_types=None, **kwargs):
+        calls.append((query, top_n, entity_types, kwargs))
         return []
 
     monkeypatch.setattr(app, "search_rag", record_search)

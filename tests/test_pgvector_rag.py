@@ -22,8 +22,38 @@ from job_hunting_agent.evals.rag_eval import (
     evaluate_rag_cases,
 )
 from job_hunting_agent.models import CandidateProfileInput
-from job_hunting_agent.pgvector_rag import PgVectorKnowledgeBase
+from job_hunting_agent.pgvector_rag import (
+    PgVectorKnowledgeBase,
+    _extract_exact_retrieval_tokens,
+    _merge_text_retrieval_rows,
+)
 from job_hunting_agent.rag import LocalHashEmbeddings
+
+
+def test_exact_retrieval_tokens_keep_numeric_and_identifier_signals() -> None:
+    """数字、公差、编号和全大写标签进入精确补召回，普通词不会进入。"""
+
+    assert _extract_exact_retrieval_tokens(
+        "ZX-2048 直径 18.00 mm，上偏差 +0.02，下偏差 -0.01，CURRENT CAPTURE"
+    ) == ("ZX-2048", "18.00", "0.02", "0.01", "CURRENT", "CAPTURE")
+
+
+def test_exact_rows_share_the_text_top_k_budget_with_vector_rows() -> None:
+    """精确通道补入向量候选时，文字候选总数仍不超过 Top-K。"""
+
+    def row(long_text_id: int, chunk_index: int, content: str) -> dict[str, object]:
+        return {
+            "long_text_id": long_text_id,
+            "chunk_index": chunk_index,
+            "content": content,
+        }
+
+    vector_rows = [row(index, 0, f"vector-{index}") for index in range(1, 5)]
+    exact_rows = [row(99, 0, "exact 18.00 mm"), vector_rows[0]]
+
+    merged = _merge_text_retrieval_rows(vector_rows, exact_rows, limit=4)
+
+    assert [item["long_text_id"] for item in merged] == [99, 1, 2, 3]
 
 
 def test_pgvector_rebuilds_and_searches_only_the_requested_account(database_url):
@@ -213,14 +243,14 @@ def test_pgvector_incremental_indexing_is_idempotent_and_supports_deletion(datab
         second_stats = knowledge_base.index_long_texts(source, account_id=account.id)
         before_delete = knowledge_base.search(
             "唯一 pgvector 增量索引验证笔记",
-            top_k=10,
+            top_n=10,
             entity_types=["conversation_message"],
             account_id=account.id,
         )
         deleted_count = knowledge_base.delete_long_texts([long_text_id], account_id=account.id)
         after_delete = knowledge_base.search(
             "唯一 pgvector 增量索引验证笔记",
-            top_k=10,
+            top_n=10,
             entity_types=["conversation_message"],
             account_id=account.id,
         )
@@ -269,14 +299,14 @@ def test_pgvector_incremental_reindex_removes_stale_tail_chunks(database_url):
         first_stats = knowledge_base.index_long_texts([source], account_id=account.id)
         old_tail_results = knowledge_base.search(
             "stale-tail-unique-90210",
-            top_k=10,
+            top_n=10,
             account_id=account.id,
         )
         shortened = replace(source, text="保留的项目事实。")
         second_stats = knowledge_base.index_long_texts([shortened], account_id=account.id)
         after_reindex = knowledge_base.search(
             "stale-tail-unique-90210",
-            top_k=10,
+            top_n=10,
             account_id=account.id,
         )
 
@@ -457,38 +487,38 @@ def test_semantic_chunking_passes_fixed_pgvector_retrieval_cases(database_url):
                 id="resume-project",
                 query="semanticgoldenfastapi",
                 expected=(EvidenceRef(source_label="golden:resume-project"),),
-                top_k=1,
+                top_n=1,
             ),
             RAGEvalCase(
                 id="spreadsheet-parameter",
                 query="semanticgoldentolerance",
                 expected=(EvidenceRef(source_label="golden:spreadsheet-parameter"),),
-                top_k=1,
+                top_n=1,
             ),
             RAGEvalCase(
                 id="ocr-drawing",
                 query="semanticgoldenpumpaxis",
                 expected=(EvidenceRef(source_label="golden:ocr-drawing"),),
-                top_k=1,
+                top_n=1,
             ),
         ]
 
         report = evaluate_rag_cases(
             cases,
-            lambda case, limit: knowledge_base.search(
+            lambda case, top_n: knowledge_base.search(
                 case.query,
-                top_k=limit,
+                top_n=top_n,
                 entity_types=list(case.entity_types) or None,
                 account_id=account.id,
             ),
         )
 
         assert report.all_passed
-        assert report.mean_recall_at_k == 1.0
+        assert report.mean_recall_at_n == 1.0
         assert report.mean_reciprocal_rank == 1.0
         ocr_results = knowledge_base.search(
             "semanticgoldenpumpaxis",
-            top_k=1,
+            top_n=1,
             account_id=account.id,
         )
         assert ocr_results[0].page_number == 2

@@ -13,6 +13,8 @@ from job_hunting_agent.config import (
     masked_rerank_settings,
 )
 from job_hunting_agent.model_resilience import CircuitBreaker, ModelCircuitOpenError
+from job_hunting_agent.models import RAGSearchResult
+from job_hunting_agent.pgvector_rag import PgVectorKnowledgeBase
 from job_hunting_agent.rag import (
     EmbeddingRequestError,
     HttpReranker,
@@ -21,8 +23,12 @@ from job_hunting_agent.rag import (
     RerankRequestError,
     RerankResult,
     build_rag_embeddings,
+    build_rag_retrieval_query,
     build_reranker,
+    decompose_rag_query,
+    filter_rag_candidates,
     rag_embedding_model_name,
+    rerank_rag_results,
 )
 
 
@@ -42,7 +48,9 @@ def write_native_env(path) -> None:
                 "JOB_AGENT_RERANK_MODEL=rerank-model",
                 "JOB_AGENT_RERANK_API_KEY=test-rag-key",
                 "JOB_AGENT_RERANK_BASE_URL=https://rerank.example/v1/score",
-                "JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER=4",
+                "JOB_AGENT_RAG_RETRIEVAL_TOP_K=20",
+                "JOB_AGENT_RERANK_MIN_RELEVANCE_SCORE=0.65",
+                "JOB_AGENT_RERANK_RELATIVE_SCORE_THRESHOLD=0.86",
             ]
         ),
         encoding="utf-8",
@@ -70,6 +78,9 @@ def test_native_settings_load_explicit_protocols_and_mask_key(tmp_path):
     assert rerank.model == "rerank-model"
     assert rerank.api_key == "test-rag-key"
     assert rerank.base_url == "https://rerank.example/v1/score"
+    assert rerank.retrieval_top_k == 20
+    assert rerank.min_relevance_score == 0.65
+    assert rerank.relative_score_threshold == 0.86
     assert rerank.candidate_multiplier == 4
     assert "test-rag-key" not in str(masked_rerank_settings(rerank))
     assert isinstance(build_rag_embeddings(env_file), NativeMultimodalEmbeddings)
@@ -217,6 +228,473 @@ def test_native_reranker_uses_query_documents_payload_and_preserves_indexes():
         "input": {"query": "FastAPI 岗位要求", "documents": ["Python 项目", "FastAPI 服务"]},
         "parameters": {"return_documents": False, "top_n": 2},
     }
+
+
+def test_rag_final_top_n_deduplicates_same_source_after_rerank():
+    """最终 Top-N 不应被同一份材料的多个 Chunk 占满。"""
+
+    candidates = [
+        RAGSearchResult("a1", "text", 1, "source-a", 101, 0, 0.10),
+        RAGSearchResult("a2", "text", 1, "source-a", 101, 1, 0.11),
+        RAGSearchResult("b1", "text", 2, "source-b", 102, 0, 0.12),
+        RAGSearchResult("c1", "text", 3, "source-c", 103, 0, 0.13),
+    ]
+
+    class FakeReranker:
+        retrieval_top_k = 20
+
+        def rerank(self, query, documents, top_n):
+            assert query == "target"
+            assert len(documents) == 4
+            assert top_n == 4
+            return [
+                RerankResult(index=1, relevance_score=0.99),
+                RerankResult(index=0, relevance_score=0.98),
+                RerankResult(index=2, relevance_score=0.90),
+                RerankResult(index=3, relevance_score=0.80),
+            ]
+
+    results = rerank_rag_results("target", candidates, top_n=3, reranker=FakeReranker())
+
+    assert [result.source_label for result in results] == [
+        "source-a",
+        "source-b",
+        "source-c",
+    ]
+    assert results[0].chunk_index == 1
+    assert [result.relevance_score for result in results] == [0.99, 0.90, 0.80]
+
+
+def test_rag_filters_explicitly_forbidden_terms_before_reranking():
+    """明确的否定条件应在重排前排除来源和证据正文中的禁用对象。"""
+
+    candidates = [
+        RAGSearchResult(
+            "CURRENT CAPTURE: columns and people",
+            "visual",
+            1,
+            "construction/images/current_capture.jpg",
+            101,
+            -1,
+            0.1,
+            evidence_kind="visual",
+        ),
+        RAGSearchResult(
+            "BASELINE: blank reference image",
+            "visual",
+            2,
+            "construction/images/ground_east_baseline.jpg",
+            102,
+            -1,
+            0.2,
+            evidence_kind="visual",
+        ),
+    ]
+
+    filtered = filter_rag_candidates(
+        "只查找 CURRENT CAPTURE，不要返回空白基线图。",
+        candidates,
+    )
+
+    assert [item.entity_id for item in filtered] == [1]
+
+
+def test_rag_negative_alias_does_not_remove_current_image_that_mentions_baseline():
+    """中文派生的 baseline 别名只匹配来源名，不能误删同时展示对照标签的正例。"""
+
+    candidates = [
+        RAGSearchResult(
+            "Labels: NORTHSTAR - BASELINE and CURRENT CAPTURE; columns and diagonal beam",
+            "visual",
+            1,
+            "construction/images/ground_east_current.jpg",
+            101,
+            -1,
+            0.1,
+            evidence_kind="visual",
+        ),
+        RAGSearchResult(
+            "BASELINE: blank reference image",
+            "visual",
+            2,
+            "construction/images/ground_east_baseline.jpg",
+            102,
+            -1,
+            0.2,
+            evidence_kind="visual",
+        ),
+    ]
+
+    filtered = filter_rag_candidates(
+        "只查找 CURRENT CAPTURE，不要返回空白基线图。",
+        candidates,
+    )
+
+    assert [item.entity_id for item in filtered] == [1]
+
+
+def test_rag_positive_label_is_prioritized_before_top_n_cutoff():
+    """正向大写标签命中的视觉证据应在最终截断前优先保留。"""
+
+    candidates = [
+        RAGSearchResult(
+            "A generic construction frame with columns",
+            "visual",
+            1,
+            "construction/images/frame_00060.jpg",
+            101,
+            -1,
+            0.1,
+            evidence_kind="visual",
+        ),
+        RAGSearchResult(
+            "CURRENT CAPTURE with columns, diagonal beam, and a person marker",
+            "visual",
+            2,
+            "construction/images/ground_east_current.jpg",
+            102,
+            -1,
+            0.2,
+            evidence_kind="visual",
+        ),
+    ]
+
+    class FakeReranker:
+        retrieval_top_k = 20
+
+        def rerank(self, query, documents, top_n):
+            return [
+                RerankResult(index=0, relevance_score=0.90),
+                RerankResult(index=1, relevance_score=0.80),
+            ]
+
+    results = rerank_rag_results(
+        "只查找 CURRENT CAPTURE 中的柱体和现场人员标记。",
+        candidates,
+        top_n=1,
+        reranker=FakeReranker(),
+    )
+
+    assert [item.source_label for item in results] == [
+        "construction/images/ground_east_current.jpg"
+    ]
+
+
+def test_rag_negative_clause_uses_positive_query_for_reranking_after_filtering():
+    """否定对象既不会送进重排候选，也不会污染重排查询。"""
+
+    query = "只查找 CURRENT CAPTURE，不要返回空白基线图。"
+    assert build_rag_retrieval_query(query) == "只查找 CURRENT CAPTURE"
+    candidates = [
+        RAGSearchResult(
+            "CURRENT CAPTURE: columns and people",
+            "visual",
+            1,
+            "construction/images/current_capture.jpg",
+            101,
+            -1,
+            0.1,
+            evidence_kind="visual",
+        ),
+        RAGSearchResult(
+            "BASELINE: blank reference image",
+            "visual",
+            2,
+            "construction/images/ground_east_baseline.jpg",
+            102,
+            -1,
+            0.2,
+            evidence_kind="visual",
+        ),
+    ]
+    captured: dict[str, object] = {}
+
+    class FakeReranker:
+        retrieval_top_k = 20
+
+        def rerank(self, query, documents, top_n):
+            captured.update(query=query, documents=documents, top_n=top_n)
+            return [RerankResult(index=0, relevance_score=1.0)]
+
+    results = rerank_rag_results(query, candidates, top_n=1, reranker=FakeReranker())
+
+    assert captured == {
+        "query": "只查找 CURRENT CAPTURE",
+        "documents": [
+            "Source: construction/images/current_capture.jpg\n"
+            "Evidence kind: visual\n"
+            "CURRENT CAPTURE: columns and people"
+        ],
+        "top_n": 1,
+    }
+    assert [item.entity_id for item in results] == [1]
+
+
+def test_rag_query_decomposition_only_splits_explicit_workflows():
+    """只拆解明确的流程、多来源查询，普通问题保持单查询。"""
+
+    assert decompose_rag_query(
+        "完整追踪第一张销售发票从开票、付款、银行入账到对账匹配的四份证据。"
+    ) == (
+        "完整追踪第一张销售发票 开票",
+        "完整追踪第一张销售发票 付款",
+        "完整追踪第一张销售发票 银行入账",
+        "完整追踪第一张销售发票 对账匹配",
+    )
+    assert decompose_rag_query(
+        "普通查询需要 Python FastAPI 项目经历。"
+    ) == ("普通查询需要 Python FastAPI 项目经历。",)
+
+
+def test_pgvector_search_merges_decomposed_candidates_before_one_final_rerank(monkeypatch):
+    """多步骤查询应分别召回，再把合并结果统一交给一次最终重排。"""
+
+    knowledge_base = object.__new__(PgVectorKnowledgeBase)
+    captured: dict[str, object] = {}
+    calls: list[tuple[str, int, bool]] = []
+
+    class FakeReranker:
+        retrieval_top_k = 20
+
+        def rerank(self, query, documents, top_n):
+            captured.update(query=query, documents=documents, top_n=top_n)
+            return [
+                RerankResult(index=index, relevance_score=1.0 - index / 10)
+                for index in range(len(documents))
+            ]
+
+    knowledge_base.reranker = FakeReranker()
+
+    def fake_search_single(self, query, top_n, entity_types=None, account_id=None,
+                           candidate_id=None, retrieval_top_k=None, *, _rerank=True):
+        calls.append((query, top_n, _rerank))
+        stage = len(calls)
+        return [
+            RAGSearchResult(
+                f"evidence-{stage}",
+                "text",
+                stage,
+                f"stage-{stage}",
+                100 + stage,
+                0,
+                0.1,
+            )
+        ]
+
+    monkeypatch.setattr(PgVectorKnowledgeBase, "_search_single", fake_search_single)
+
+    results = knowledge_base.search(
+        "完整追踪第一张销售发票从开票、付款、银行入账到对账匹配的四份证据。",
+        top_n=4,
+    )
+
+    assert calls == [
+            ("完整追踪第一张销售发票 开票", 2, True),
+            ("完整追踪第一张销售发票 付款", 2, True),
+            ("完整追踪第一张销售发票 银行入账", 2, True),
+            ("完整追踪第一张销售发票 对账匹配", 2, True),
+    ]
+    assert captured["query"] == "完整追踪第一张销售发票从开票、付款、银行入账到对账匹配的四份证据"
+    assert captured["top_n"] == 4
+    assert captured["documents"] == [
+        "Source: stage-1\nEvidence kind: text\nevidence-1",
+        "Source: stage-2\nEvidence kind: text\nevidence-2",
+        "Source: stage-3\nEvidence kind: text\nevidence-3",
+        "Source: stage-4\nEvidence kind: text\nevidence-4",
+    ]
+    assert [item.source_label for item in results] == [
+        "stage-1",
+        "stage-2",
+        "stage-3",
+        "stage-4",
+    ]
+
+
+def test_rag_numeric_consistency_moves_wrong_measurement_after_matching_one():
+    """同一对象的错误数值不能排在匹配查询数值之前。"""
+
+    candidates = [
+        RAGSearchResult(
+            "泵轴直径 53.69 mm",
+            "text",
+            1,
+            "drawing-wrong",
+            101,
+            0,
+            0.1,
+        ),
+        RAGSearchResult(
+            "泵轴直径 65.53 mm",
+            "text",
+            2,
+            "drawing-correct",
+            102,
+            0,
+            0.2,
+        ),
+    ]
+
+    class FakeReranker:
+        retrieval_top_k = 20
+
+        def rerank(self, query, documents, top_n):
+            return [
+                RerankResult(index=0, relevance_score=0.99),
+                RerankResult(index=1, relevance_score=0.98),
+            ]
+
+    results = rerank_rag_results(
+        "泵轴直径 65.53 mm",
+        candidates,
+        top_n=2,
+        reranker=FakeReranker(),
+    )
+
+    assert [item.source_label for item in results] == [
+        "drawing-correct",
+        "drawing-wrong",
+    ]
+
+
+def test_rag_confidence_filter_removes_relative_hard_negatives():
+    """最终 Top-N 是上限；明显低于首条证据的硬负样本不应继续进入上下文。"""
+
+    candidates = [
+        RAGSearchResult("目标证据", "text", 1, "expected", 101, 0, 0.1),
+        RAGSearchResult("相似但错误", "text", 2, "hard-negative", 102, 0, 0.2),
+        RAGSearchResult("无关内容", "text", 3, "unrelated", 103, 0, 0.3),
+    ]
+
+    class FakeReranker:
+        retrieval_top_k = 20
+        min_relevance_score = 0.65
+        relative_score_threshold = 0.85
+
+        def rerank(self, query, documents, top_n):
+            return [
+                RerankResult(index=0, relevance_score=0.90),
+                RerankResult(index=1, relevance_score=0.70),
+                RerankResult(index=2, relevance_score=0.40),
+            ]
+
+    results = rerank_rag_results(
+        "目标查询",
+        candidates,
+        top_n=3,
+        reranker=FakeReranker(),
+    )
+
+    assert [item.source_label for item in results] == ["expected"]
+
+
+def test_rag_identity_anchors_remove_partial_match_hard_negative():
+    """单一目标已有完整英文锚点命中时，不保留只覆盖一半名称的相似图纸。"""
+
+    candidates = [
+        RAGSearchResult(
+            "Wind turbine pitch drive RotaHub with Support Ring and EndCap",
+            "text",
+            1,
+            "industrial/drawings/ASM479942.pdf",
+            101,
+            0,
+            0.1,
+        ),
+        RAGSearchResult(
+            "Spindle assembly RotaHub with Ring and EndCap",
+            "text",
+            2,
+            "industrial/drawings/SP-MT33969129T05.pdf",
+            102,
+            0,
+            0.2,
+        ),
+    ]
+
+    class FakeReranker:
+        retrieval_top_k = 20
+        min_relevance_score = 0.65
+        relative_score_threshold = 0.85
+
+        def rerank(self, query, documents, top_n):
+            return [
+                RerankResult(index=0, relevance_score=0.90),
+                RerankResult(index=1, relevance_score=0.78),
+            ]
+
+    results = rerank_rag_results(
+        "风力变桨 RotaHub 的 Support Ring 和 EndCap 属于哪份图？",
+        candidates,
+        top_n=2,
+        reranker=FakeReranker(),
+    )
+
+    assert [item.source_label for item in results] == [
+        "industrial/drawings/ASM479942.pdf"
+    ]
+
+
+def test_rag_confidence_filter_abstains_when_every_candidate_is_weak():
+    """没有候选达到最低可信线时应返回空结果，不把最相似项伪装成答案。"""
+
+    candidates = [
+        RAGSearchResult("弱候选 A", "text", 1, "weak-a", 101, 0, 0.1),
+        RAGSearchResult("弱候选 B", "text", 2, "weak-b", 102, 0, 0.2),
+    ]
+
+    class FakeReranker:
+        retrieval_top_k = 20
+        min_relevance_score = 0.65
+        relative_score_threshold = 0.85
+
+        def rerank(self, query, documents, top_n):
+            return [
+                RerankResult(index=0, relevance_score=0.56),
+                RerankResult(index=1, relevance_score=0.52),
+            ]
+
+    assert rerank_rag_results(
+        "没有可靠证据的问题",
+        candidates,
+        top_n=2,
+        reranker=FakeReranker(),
+    ) == []
+
+
+def test_rag_confidence_filter_preserves_decomposed_stage_count():
+    """流程查询即使阶段分数有差异，也应保留每个阶段需要的结果数量。"""
+
+    candidates = [
+        RAGSearchResult(f"阶段 {index}", "text", index, f"stage-{index}", 100 + index, 0, 0.1)
+        for index in range(1, 5)
+    ]
+
+    class FakeReranker:
+        retrieval_top_k = 20
+        min_relevance_score = 0.65
+        relative_score_threshold = 0.85
+
+        def rerank(self, query, documents, top_n):
+            return [
+                RerankResult(index=0, relevance_score=0.90),
+                RerankResult(index=1, relevance_score=0.80),
+                RerankResult(index=2, relevance_score=0.70),
+                RerankResult(index=3, relevance_score=0.66),
+            ]
+
+    results = rerank_rag_results(
+        "完整追踪发票从开票、付款、银行入账到对账匹配的四份证据。",
+        candidates,
+        top_n=4,
+        reranker=FakeReranker(),
+    )
+
+    assert [item.source_label for item in results] == [
+        "stage-1",
+        "stage-2",
+        "stage-3",
+        "stage-4",
+    ]
 
 
 def test_standard_reranker_uses_common_rerank_payload():
