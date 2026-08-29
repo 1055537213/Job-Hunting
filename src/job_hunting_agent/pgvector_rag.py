@@ -17,7 +17,7 @@ from typing import Any
 import sqlalchemy as sa
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from pgvector.sqlalchemy import Vector
+from pgvector.sqlalchemy import HALFVEC, Vector
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.engine import Engine
 
@@ -42,6 +42,11 @@ from .rag import (
 
 PGVECTOR_COLLECTION_NAME = "rag_chunks"
 PGVECTOR_PERSISTENCE_LABEL = "postgresql+pgvector"
+PGVECTOR_HNSW_EF_SEARCH = 400
+PGVECTOR_HNSW_OVERSAMPLING = 20
+PGVECTOR_HNSW_MAX_CANDIDATES = 2_000
+PGVECTOR_MAX_VECTOR_HNSW_DIMENSIONS = 2_000
+PGVECTOR_MAX_HALFVEC_HNSW_DIMENSIONS = 4_000
 
 # 含数字的编号、尺寸、公差、版本号和全大写业务标签是向量模型容易忽略的
 # 高价值信号。只对这类 token 做精确补召回，避免把普通词变成低效模糊检索。
@@ -166,6 +171,79 @@ def _text_evidence_page_number(row: Any) -> int | None:
         return None
     page_number = int(str(source_page))
     return page_number if page_number > 0 else None
+
+
+def _indexed_vector_type(vector_dimension: int) -> Vector | HALFVEC:
+    """返回与 pgvector HNSW 维度上限兼容的查询类型。
+
+    pgvector 的 ``vector`` HNSW 最多支持 2000 维，``halfvec`` 最多支持
+    4000 维。正式 2560 维模型因此只在距离计算和 ANN 索引中转成 halfvec；
+    原始向量仍以完整精度保存在 ``vector`` 列中。
+    """
+
+    if PGVECTOR_MAX_VECTOR_HNSW_DIMENSIONS < vector_dimension <= (
+        PGVECTOR_MAX_HALFVEC_HNSW_DIMENSIONS
+    ):
+        return HALFVEC(vector_dimension)
+    return Vector(vector_dimension)
+
+
+def _cosine_distance_expression(
+    column: Any,
+    *,
+    parameter_name: str,
+    vector: list[float],
+    vector_dimension: int,
+) -> Any:
+    indexed_type = _indexed_vector_type(vector_dimension)
+    return sa.type_coerce(
+        sa.cast(column, indexed_type).op("<=>")(
+            sa.bindparam(
+                parameter_name,
+                value=vector,
+                type_=indexed_type,
+            )
+        ),
+        sa.Float(),
+    )
+
+
+def _full_precision_cosine_distance_expression(
+    column: Any,
+    *,
+    parameter_name: str,
+    vector: list[float],
+    vector_dimension: int,
+) -> Any:
+    vector_type = Vector(vector_dimension)
+    return sa.type_coerce(
+        sa.cast(column, vector_type).op("<=>")(
+            sa.bindparam(
+                parameter_name,
+                value=vector,
+                type_=vector_type,
+            )
+        ),
+        sa.Float(),
+    )
+
+
+def _ann_candidate_limit(result_limit: int) -> int:
+    """扩大 ANN 候选池，同时限制异常 Top-K 配置的数据库开销。"""
+
+    return min(
+        result_limit * PGVECTOR_HNSW_OVERSAMPLING,
+        max(result_limit, PGVECTOR_HNSW_MAX_CANDIDATES),
+    )
+
+
+def _configure_hnsw_search(connection: sa.Connection) -> None:
+    """启用带租户过滤时的迭代 HNSW 扫描，并提高候选探索预算。"""
+
+    connection.exec_driver_sql(f"SET LOCAL hnsw.ef_search = {PGVECTOR_HNSW_EF_SEARCH}")
+    connection.exec_driver_sql("SET LOCAL hnsw.iterative_scan = 'strict_order'")
+    connection.exec_driver_sql("SET LOCAL hnsw.max_scan_tuples = 100000")
+    connection.exec_driver_sql("SET LOCAL hnsw.scan_mem_multiplier = 4")
 
 
 class PgVectorKnowledgeBase:
@@ -321,13 +399,11 @@ class PgVectorKnowledgeBase:
             "查询",
         )
         vector_dimension = len(query_vector)
-        # ``<=>`` 的左操作数是 vector，因此 SQLAlchemy 默认会沿用 Vector 结果处理器；
-        # 但 pgvector 实际返回的是余弦距离浮点数，必须在 Python 侧显式标记结果类型。
-        distance = sa.type_coerce(
-            rag_chunks.c.embedding.op("<=>")(
-                sa.bindparam("query_embedding", value=query_vector, type_=Vector(vector_dimension))
-            ),
-            sa.Float(),
+        ann_distance = _cosine_distance_expression(
+            rag_chunks.c.embedding,
+            parameter_name="ann_query_embedding",
+            vector=query_vector,
+            vector_dimension=vector_dimension,
         )
         resolved_top_n = min(int(top_n), MAX_RAG_RERANK_TOP_N)
         configured_top_k = getattr(self.reranker, "retrieval_top_k", DEFAULT_RAG_RETRIEVAL_TOP_K)
@@ -346,7 +422,7 @@ class PgVectorKnowledgeBase:
             scope_conditions.append(rag_chunks.c.candidate_id == candidate_id)
         if normalized_entity_types:
             scope_conditions.append(rag_chunks.c.entity_type.in_(normalized_entity_types))
-        statement = (
+        ann_candidates = (
             sa.select(
                 rag_chunks.c.content,
                 rag_chunks.c.entity_type,
@@ -355,15 +431,43 @@ class PgVectorKnowledgeBase:
                 rag_chunks.c.long_text_id,
                 rag_chunks.c.chunk_index,
                 rag_chunks.c.metadata_json,
-                distance.label("distance"),
+                rag_chunks.c.embedding,
             )
             .where(*scope_conditions)
-            .order_by(distance.asc())
+            .order_by(ann_distance.asc())
+            .limit(_ann_candidate_limit(candidate_limit))
+            .cte("rag_ann_candidates")
+            .prefix_with("MATERIALIZED", dialect="postgresql")
+        )
+        exact_distance = _full_precision_cosine_distance_expression(
+            ann_candidates.c.embedding,
+            parameter_name="exact_query_embedding",
+            vector=query_vector,
+            vector_dimension=vector_dimension,
+        )
+        statement = (
+            sa.select(
+                ann_candidates.c.content,
+                ann_candidates.c.entity_type,
+                ann_candidates.c.entity_id,
+                ann_candidates.c.source_label,
+                ann_candidates.c.long_text_id,
+                ann_candidates.c.chunk_index,
+                ann_candidates.c.metadata_json,
+                exact_distance.label("distance"),
+            )
+            .order_by(exact_distance.asc())
             .limit(candidate_limit)
         )
         exact_tokens = _extract_exact_retrieval_tokens(retrieval_query)
         lexical_rows: list[Any] = []
         if exact_tokens:
+            lexical_distance = _full_precision_cosine_distance_expression(
+                rag_chunks.c.embedding,
+                parameter_name="lexical_query_embedding",
+                vector=query_vector,
+                vector_dimension=vector_dimension,
+            )
             lexical_conditions = [
                 rag_chunks.c.content.ilike(f"%{token}%") for token in exact_tokens
             ]
@@ -379,14 +483,15 @@ class PgVectorKnowledgeBase:
                     rag_chunks.c.long_text_id,
                     rag_chunks.c.chunk_index,
                     rag_chunks.c.metadata_json,
-                    distance.label("distance"),
+                    lexical_distance.label("distance"),
                     lexical_score.label("lexical_score"),
                 )
                 .where(*scope_conditions, sa.or_(*lexical_conditions))
-                .order_by(lexical_score.desc(), distance.asc())
+                .order_by(lexical_score.desc(), lexical_distance.asc())
                 .limit(candidate_limit)
             )
         with self.engine.connect() as connection:
+            _configure_hnsw_search(connection)
             rows = connection.execute(statement).mappings().all()
             if exact_tokens:
                 lexical_rows = connection.execute(lexical_statement).mappings().all()
@@ -466,17 +571,25 @@ class PgVectorKnowledgeBase:
     ) -> sa.Select:
         """构建与文字查询向量同空间的视觉召回 SQL。"""
 
-        distance = sa.type_coerce(
-            visual_knowledge_items.c.embedding.op("<=>")(
-                sa.bindparam(
-                    "visual_query_embedding",
-                    value=query_vector,
-                    type_=Vector(vector_dimension),
-                )
-            ),
-            sa.Float(),
+        ann_distance = _cosine_distance_expression(
+            visual_knowledge_items.c.embedding,
+            parameter_name="visual_ann_query_embedding",
+            vector=query_vector,
+            vector_dimension=vector_dimension,
         )
-        statement = (
+        scope_conditions = [
+            visual_knowledge_items.c.index_status == "indexed",
+            visual_knowledge_items.c.embedding.is_not(None),
+            visual_knowledge_items.c.embedding_dimensions == vector_dimension,
+            visual_knowledge_items.c.embedding_model == embedding_model,
+        ]
+        if account_id is not None:
+            scope_conditions.append(visual_knowledge_items.c.account_id == account_id)
+        if candidate_id is not None:
+            scope_conditions.append(visual_knowledge_items.c.candidate_id == candidate_id)
+        if entity_types:
+            scope_conditions.append(long_texts.c.entity_type.in_(entity_types))
+        ann_candidates = (
             sa.select(
                 visual_knowledge_items.c.id.label("visual_item_id"),
                 visual_knowledge_items.c.source_label,
@@ -486,7 +599,7 @@ class PgVectorKnowledgeBase:
                 long_texts.c.entity_type,
                 long_texts.c.entity_id,
                 long_texts.c.text,
-                distance.label("distance"),
+                visual_knowledge_items.c.embedding,
             )
             .select_from(
                 visual_knowledge_items.join(
@@ -494,22 +607,33 @@ class PgVectorKnowledgeBase:
                     visual_knowledge_items.c.long_text_id == long_texts.c.id,
                 )
             )
-            .where(
-                visual_knowledge_items.c.index_status == "indexed",
-                visual_knowledge_items.c.embedding.is_not(None),
-                visual_knowledge_items.c.embedding_dimensions == vector_dimension,
-                visual_knowledge_items.c.embedding_model == embedding_model,
+            .where(*scope_conditions)
+            .order_by(ann_distance.asc())
+            .limit(_ann_candidate_limit(candidate_limit))
+            .cte("visual_ann_candidates")
+            .prefix_with("MATERIALIZED", dialect="postgresql")
+        )
+        exact_distance = _full_precision_cosine_distance_expression(
+            ann_candidates.c.embedding,
+            parameter_name="visual_exact_query_embedding",
+            vector=query_vector,
+            vector_dimension=vector_dimension,
+        )
+        return (
+            sa.select(
+                ann_candidates.c.visual_item_id,
+                ann_candidates.c.source_label,
+                ann_candidates.c.page_number,
+                ann_candidates.c.metadata_json,
+                ann_candidates.c.long_text_id,
+                ann_candidates.c.entity_type,
+                ann_candidates.c.entity_id,
+                ann_candidates.c.text,
+                exact_distance.label("distance"),
             )
-            .order_by(distance.asc())
+            .order_by(exact_distance.asc())
             .limit(candidate_limit)
         )
-        if account_id is not None:
-            statement = statement.where(visual_knowledge_items.c.account_id == account_id)
-        if candidate_id is not None:
-            statement = statement.where(visual_knowledge_items.c.candidate_id == candidate_id)
-        if entity_types:
-            statement = statement.where(long_texts.c.entity_type.in_(entity_types))
-        return statement
 
     def _rows_for_documents(self, documents: list[Document]) -> list[dict[str, Any]]:
         """先完成所有 Embedding 调用，再生成可在一个事务中写入的 chunk 行。"""

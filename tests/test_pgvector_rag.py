@@ -24,7 +24,11 @@ from job_hunting_agent.evals.rag_eval import (
 from job_hunting_agent.models import CandidateProfileInput
 from job_hunting_agent.pgvector_rag import (
     PgVectorKnowledgeBase,
+    _ann_candidate_limit,
+    _cosine_distance_expression,
     _extract_exact_retrieval_tokens,
+    _full_precision_cosine_distance_expression,
+    _indexed_vector_type,
     _merge_text_retrieval_rows,
 )
 from job_hunting_agent.rag import LocalHashEmbeddings
@@ -54,6 +58,41 @@ def test_exact_rows_share_the_text_top_k_budget_with_vector_rows() -> None:
     merged = _merge_text_retrieval_rows(vector_rows, exact_rows, limit=4)
 
     assert [item["long_text_id"] for item in merged] == [99, 1, 2, 3]
+
+
+def test_high_dimension_distance_uses_halfvec_without_changing_storage_column() -> None:
+    indexed_type = _indexed_vector_type(2560)
+    distance = _cosine_distance_expression(
+        rag_chunks.c.embedding,
+        parameter_name="query_embedding",
+        vector=[0.0] * 2560,
+        vector_dimension=2560,
+    )
+    compiled = str(distance.compile(dialect=sa.create_engine("postgresql+psycopg://").dialect))
+
+    assert str(indexed_type) == "HALFVEC(2560)"
+    assert "CAST(rag_chunks.embedding AS HALFVEC(2560))" in compiled
+
+
+def test_lower_dimension_distance_keeps_full_precision_vector_type() -> None:
+    assert str(_indexed_vector_type(384)) == "VECTOR(384)"
+
+
+def test_ann_candidate_limit_oversamples_defaults_and_caps_large_requests() -> None:
+    assert _ann_candidate_limit(10) == 200
+    assert _ann_candidate_limit(500) == 2_000
+
+
+def test_full_precision_rerank_keeps_vector_distance_after_halfvec_recall() -> None:
+    distance = _full_precision_cosine_distance_expression(
+        rag_chunks.c.embedding,
+        parameter_name="exact_query_embedding",
+        vector=[0.0] * 2560,
+        vector_dimension=2560,
+    )
+    compiled = str(distance.compile(dialect=sa.create_engine("postgresql+psycopg://").dialect))
+
+    assert "CAST(rag_chunks.embedding AS VECTOR(2560))" in compiled
 
 
 def test_pgvector_rebuilds_and_searches_only_the_requested_account(database_url):

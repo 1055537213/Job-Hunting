@@ -84,16 +84,28 @@ Embedding、模型身份和维度。
 1. 全量重建按账号原子替换；增量索引按 `long_text_id` 事务性替换整组 chunk，避免正文缩短或切分版本变化后残留旧尾块。
 2. 查询先按账号、Embedding 模型身份和向量维度过滤，再使用 pgvector 余弦距离召回；查询含高价值数字或带数字编号时，
    在同一个文字 Top-K 预算内补入 `ILIKE` 精确命中的候选。
-3. 删除长文本或候选人时，外键级联会删除对应派生 chunk。
-4. 自动化测试与 Web 使用同一 PostgreSQL + pgvector 后端，避免隐藏的回退实现。
+3. 2560 维正式向量以完整精度 `vector` 保存，迁移 `20260829_0020` 为文字和视觉证据创建
+   `halfvec(2560)` HNSW 表达式索引。查询先召回 200 个 ANN 候选，再按原始 `vector` 距离排序回
+   Retriever Top-K=10，避免为了索引维度限制永久降低存储精度。
+4. HNSW 使用 `m=32`、`ef_construction=128`、`ef_search=400`；这些值由 5 万和 10 万 Chunk 的
+   隔离规模门禁选出，更换向量模型、维度或主要语料分布后必须重新执行规模与业务质量评测。
+5. 删除长文本或候选人时，外键级联会删除对应派生 chunk。
+6. 自动化测试与 Web 使用同一 PostgreSQL + pgvector 后端，避免隐藏的回退实现。
 
 切分策略升级后，已有 `rag_chunks` 不会在应用启动时自动调用外部 Embedding 重建，
 避免发布过程产生不可控费用。应在维护窗口暂停该账号的新材料写入，排空其 RAG 索引任务后，
 再调用 `JobHuntingApp.rebuild_rag_index(account_id=...)`；重建结束后才能恢复写入。新写入或
 重新索引的长文本会直接使用当前 `chunking_version`。
 
-因为项目暂时允许更换 Embedding 模型和维度，当前没有建立 HNSW 或 IVFFlat 索引。数据量增长后，
-应先固定生产 Embedding 模型与维度，再通过新的 Alembic revision 为对应向量空间建立合适索引。
+HNSW 只覆盖当前正式的 2560 维向量空间。旧模型或其他维度仍可精确扫描，但不会错误复用 2560 维
+索引；切换正式 Embedding 前必须新建对应迁移、重建派生向量并重新执行：
+
+```powershell
+.\scripts\validate_rag_scale.ps1 `
+  -Python E:\Anaconda\python.exe `
+  -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent" `
+  -ChunkCounts "50000,100000"
+```
 
 ## 回退原则
 

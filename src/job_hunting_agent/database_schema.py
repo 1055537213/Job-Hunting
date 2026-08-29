@@ -1256,7 +1256,8 @@ sa.Index(
 sa.Index("idx_background_tasks_candidate", background_tasks.c.candidate_id, background_tasks.c.updated_at.desc())
 
 
-# RAG 分块是 long_texts 的派生索引。维度尚未锁定，因此本阶段不创建 HNSW/IVFFlat 索引。
+# RAG 分块是 long_texts 的派生索引。2560 维正式模型使用迁移维护的
+# halfvec 表达式 HNSW 索引；这里保留无 typmod 的原始 vector 列，以便重建期间兼容旧模型空间。
 rag_chunks = sa.Table(
     "rag_chunks",
     metadata,

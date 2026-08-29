@@ -279,6 +279,10 @@ docker compose --env-file .env -f compose.yaml -f compose.prod.yaml config --qui
 .\scripts\validate_rag_artifacts.ps1 `
   -Python E:\Anaconda\python.exe `
   -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent"
+.\scripts\validate_rag_scale.ps1 `
+  -Python E:\Anaconda\python.exe `
+  -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent" `
+  -ChunkCounts "50000,100000"
 .\scripts\security_scan.ps1
 ~~~
 
@@ -348,6 +352,25 @@ RAG 在重排前会对查询中明确写出的排除条件进行规则过滤，�
 `JOB_AGENT_RERANK_RELATIVE_SCORE_THRESHOLD` 调整，并且只能使用 development 集校准。对于包含尺寸、金额、编号等数值的查询，重排后还会优先保留与查询
 数值一致且具有相同语义锚点的候选，并将同对象但数值不一致的候选后置。上述规则只修正排序和过滤，
 不替代 Reranker，也不把评测集中的相似硬负样本误认为明确否定条件。
+
+pgvector 规模门禁使用独立 `UNLOGGED` 临时表生成确定性 2560 维语料，不调用付费模型、不写用户
+数据，结束后自动删表。完整向量继续保存在 `vector` 列；由于 pgvector 的普通 `vector` HNSW
+维度上限低于当前 2560 维模型，迁移只在 ANN 表达式索引中转换为 `halfvec(2560)`。线上查询先用
+HNSW 召回 `Top-K x 20` 个候选，再按原始完整精度向量排序回 Retriever Top-K=10，最后交给
+Reranker 输出 Top-N=5。当前索引参数为 `m=32`、`ef_construction=128`、`ef_search=400`。
+
+规模报告区分三类质量：`neighbor_recall` 是 ANN 与精确 Top-K 的 ID 交集，用于观察近似索引退化；
+`semantic_precision` 统计候选中语义相关项比例；`semantic_coverage` 检查每条查询的 Top-K 是否至少
+出现一条相关证据。后两项更接近 RAG 是否给 Reranker 提供了可用证据，不能把 ID 召回误写成最终
+答案准确率。本轮隔离结果如下：
+
+| Chunk | 精确扫描 P95 | HNSW P95 | ID 召回 | 语义精度 | 语义覆盖 | 20 并发 P95 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 50,000 | 109.3 ms | 25.3 ms | 0.845 | 1.000 | 1.000 | 143.2 ms |
+| 100,000 | 210.8 ms | 21.3 ms | 0.767 | 1.000 | 1.000 | 133.2 ms |
+
+这些数字只证明索引计划、延迟、并发、租户隔离和合成语义簇门禁；真实行业 Recall、Precision、
+nDCG、MRR、困难负样本和视觉证据仍以版本化黄金集与 GitHub 真实文件发布集为准。
 
 ### 7.5 单机生产基线
 
@@ -457,7 +480,7 @@ job_agent_intent_router_model_duration_seconds_bucket
 - [ ] 出现明确外部调用方后，在现有 MCP adapter 上增加鉴权、授权和 Server 生命周期。
 - [ ] 建立严格类型检查基线，逐步消化第三方 stub 和内部 Protocol 类型债务。
 - [ ] 完成目标生产服务器的 ClamAV 验收、渗透测试、灾难恢复演练和密钥轮换流程。
-- [ ] 根据正式 Embedding 模型评估 pgvector HNSW/IVFFlat 索引参数。
+- [x] 为 2560 维正式 Embedding 建立 halfvec HNSW 索引、完整精度二次排序和 5 万/10 万规模门禁。
 - [ ] 增加工业 PDF 表格/图注坐标、二进制 CAD 解析、父子 Chunk 和数值范围检索。
 - [ ] 增加真实线上演示环境和脱敏效果截图。
 

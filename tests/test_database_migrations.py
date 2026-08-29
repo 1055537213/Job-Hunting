@@ -91,6 +91,16 @@ def test_upgrade_database_creates_versioned_postgresql_schema(temporary_database
                     "WHERE e.extname = 'pg_trgm'"
                 )
             ).scalar_one()
+            rag_index_definitions = {
+                row.indexname: row.indexdef
+                for row in connection.execute(
+                    sa.text(
+                        "SELECT indexname, indexdef FROM pg_indexes "
+                        "WHERE schemaname = current_schema() "
+                        "AND tablename IN ('rag_chunks', 'visual_knowledge_items')"
+                    )
+                )
+            }
             candidate_columns = {
                 row[0]
                 for row in connection.execute(
@@ -149,6 +159,18 @@ def test_upgrade_database_creates_versioned_postgresql_schema(temporary_database
     assert version == latest_database_revision()
     assert vector_extension_schema == "public"
     assert trigram_extension_schema == "public"
+    assert "halfvec(2560)" in rag_index_definitions[
+        "idx_rag_chunks_embedding_halfvec_hnsw_2560"
+    ]
+    assert "m='32'" in rag_index_definitions[
+        "idx_rag_chunks_embedding_halfvec_hnsw_2560"
+    ]
+    assert "ef_construction='128'" in rag_index_definitions[
+        "idx_rag_chunks_embedding_halfvec_hnsw_2560"
+    ]
+    assert "halfvec_cosine_ops" in rag_index_definitions[
+        "idx_visual_knowledge_embedding_halfvec_hnsw_2560"
+    ]
     assert "content_fingerprint" in candidate_columns
     assert {"content_fingerprint", "import_method", "captured_at"}.issubset(job_columns)
     assert {"operator_account_id", "recharge_order_id"}.issubset(balance_ledger_columns)
