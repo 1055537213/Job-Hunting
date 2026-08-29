@@ -281,6 +281,24 @@ Apache-2.0 或 CC-BY-4.0 许可证；清单必须同时记录固定提交、文�
   -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent"
 ```
 
+评估 K/N 候选参数时增加：
+
+```powershell
+.\scripts\validate_rag_artifacts.ps1 `
+  -BenchmarkRole release `
+  -Python E:\Anaconda\python.exe `
+  -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent" `
+  -TuneParameters `
+  -TuneKValues "10,15,20,30" `
+  -TuneNValues "3,5" `
+  -TuningRepetitions 3
+```
+
+扫描过程只解析和索引一次材料，多轮按参数组合交错运行；只用 `development` 比较各组合相对
+当前线上基线的质量与核心召回/重排 P95，选型完成后才运行 `holdout`。2026-08-29 的三轮评测在质量不变的前提下将默认值从 `K=20/N=5` 调整为 `K=10/N=5`；后续每次换模型、切片规则或语料分布后都必须重新校准。报告另外统计视觉原图复查和
+端到端平均/P95。候选在留出集的质量门禁或端到端性能防回退门禁失败时，不能
+替换线上默认值。远程视觉复查可能产生长尾，正式变更至少需要多轮结果一致，不能根据一次最快值调参。
+
 下载器只根据清单生成 `raw.githubusercontent.com` 地址，并限制重定向主机、单文件大小和总
 下载量。全部下载内容在内存中复核大小与 SHA-256，通过后才进入现有项目采集入口；该入口再
 执行清单规划、敏感路径拒绝、本地 EICAR 检查、格式解析、OCR/多模态提取和视觉副本保存。

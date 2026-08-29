@@ -18,6 +18,7 @@ from job_hunting_agent.evals.rag_eval import (
     RAGEvalCase,
     RAGEvalThresholds,
 )
+from job_hunting_agent.evals.rag_parameter_tuning import RAGParameterCombination
 
 
 def _artifact(
@@ -73,9 +74,13 @@ def test_release_artifact_suite_has_hard_negatives_and_holdout() -> None:
     assert len(suite.artifacts) >= 30
     assert len(suite.cases) >= 25
     assert len({artifact.industry for artifact in suite.artifacts}) >= 6
-    assert max(int(case.top_n or 0) for case in suite.cases) / len(suite.artifacts) <= 0.2
+    assert (
+        max(int(case.top_n or 0) for case in suite.cases) / len(suite.artifacts) <= 0.2
+    )
     assert sum(bool(case.forbidden) for case in suite.cases) / len(suite.cases) >= 0.25
-    assert sum(case.split == "holdout" for case in suite.cases) / len(suite.cases) >= 0.2
+    assert (
+        sum(case.split == "holdout" for case in suite.cases) / len(suite.cases) >= 0.2
+    )
     assert suite.thresholds.min_mean_recall_at_1 > 0
     assert suite.thresholds.min_mean_ndcg_at_n > 0
 
@@ -236,6 +241,7 @@ def test_artifact_benchmark_runs_project_ingestion_and_cleans_up(database_url) -
                 query="artifactgoldenbeta",
                 expected=(EvidenceRef(source_label="construction/model.ifc"),),
                 top_n=1,
+                split="holdout",
             ),
         ),
         thresholds=RAGEvalThresholds(
@@ -251,9 +257,15 @@ def test_artifact_benchmark_runs_project_ingestion_and_cleans_up(database_url) -
     }
     engine = sa.create_engine(database_url)
     with engine.connect() as connection:
-        account_count_before = connection.scalar(sa.text("SELECT COUNT(*) FROM accounts"))
-        long_text_count_before = connection.scalar(sa.text("SELECT COUNT(*) FROM long_texts"))
-        chunk_count_before = connection.scalar(sa.text("SELECT COUNT(*) FROM rag_chunks"))
+        account_count_before = connection.scalar(
+            sa.text("SELECT COUNT(*) FROM accounts")
+        )
+        long_text_count_before = connection.scalar(
+            sa.text("SELECT COUNT(*) FROM long_texts")
+        )
+        chunk_count_before = connection.scalar(
+            sa.text("SELECT COUNT(*) FROM rag_chunks")
+        )
 
     result = run_github_artifact_benchmark(
         suite,
@@ -261,6 +273,8 @@ def test_artifact_benchmark_runs_project_ingestion_and_cleans_up(database_url) -
         embedding_mode="local_hash",
         visual_mode="disabled",
         fetcher=lambda artifact: content_by_id[artifact.id],
+        parameter_grid=(RAGParameterCombination(5, 1),),
+        tuning_repetitions=2,
     )
 
     assert result.all_passed
@@ -272,18 +286,41 @@ def test_artifact_benchmark_runs_project_ingestion_and_cleans_up(database_url) -
     assert result.visual_index_passed
     assert result.to_dict()["extraction_pass_rate"] == 1.0
     assert result.to_dict()["visual_index_passed"] is True
+    assert result.parameter_tuning is not None
+    assert result.parameter_tuning.recommended == RAGParameterCombination(5, 1)
+    assert result.parameter_tuning.passed
+    assert (
+        result.parameter_tuning.recommended_trial.aggregate_report.stage_latency_summary[
+            "retrieval_rerank"
+        ]["sample_count"]
+        == 2
+    )
     assert {item.file_kind for item in result.extraction_results} == {
         "source_text",
         "engineering_drawing",
     }
     assert all(item.visual_error_type is None for item in result.extraction_results)
-    assert next(
-        item for item in result.extraction_results if item.artifact_id == "construction-ifc"
-    ).extraction_method == "engineering_text"
+    assert (
+        next(
+            item
+            for item in result.extraction_results
+            if item.artifact_id == "construction-ifc"
+        ).extraction_method
+        == "engineering_text"
+    )
     with engine.connect() as connection:
-        assert connection.scalar(sa.text("SELECT COUNT(*) FROM accounts")) == account_count_before
-        assert connection.scalar(sa.text("SELECT COUNT(*) FROM long_texts")) == long_text_count_before
-        assert connection.scalar(sa.text("SELECT COUNT(*) FROM rag_chunks")) == chunk_count_before
+        assert (
+            connection.scalar(sa.text("SELECT COUNT(*) FROM accounts"))
+            == account_count_before
+        )
+        assert (
+            connection.scalar(sa.text("SELECT COUNT(*) FROM long_texts"))
+            == long_text_count_before
+        )
+        assert (
+            connection.scalar(sa.text("SELECT COUNT(*) FROM rag_chunks"))
+            == chunk_count_before
+        )
     engine.dispose()
 
 
@@ -297,3 +334,6 @@ def test_artifact_validation_script_uses_versioned_suite() -> None:
     assert "github_hard_negative_suite.json" in script
     assert 'ValidateSet("configured", "local_hash")' in script
     assert 'ValidateSet("configured", "disabled")' in script
+    assert "$TuneParameters" in script
+    assert '"--tune-parameters"' in script
+    assert '"--tuning-repetitions"' in script

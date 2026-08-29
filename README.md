@@ -313,9 +313,25 @@ OCR/多模态提取、长文本、pgvector 和检索指标链路。第三方原�
   -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent"
 ~~~
 
+扫描 Retriever Top-K 与 Reranker Top-N 参数时，复用同一次文件解析和索引：
+
+~~~powershell
+.\scripts\validate_rag_artifacts.ps1 `
+  -BenchmarkRole release `
+  -Python E:\Anaconda\python.exe `
+  -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent" `
+  -TuneParameters `
+  -TuneKValues "10,15,20,30" `
+  -TuneNValues "3,5" `
+  -TuningRepetitions 3
+~~~
+
 报告同时给出 `Recall@1/3/5`、最终 Top-N 的 Recall/Precision/nDCG、MRR、困难负样本命中率、行业
-分组和 `development/holdout` 分层。默认线上检索漏斗为 Retriever Top-K=20、Reranker 最终 Top-N=5；开发集可用于切片、Embedding、Rerank 和检索参数调优；
+分组和 `development/holdout` 分层。默认线上检索漏斗为 Retriever Top-K=10、Reranker 最终 Top-N=5；开发集可用于切片、Embedding、Rerank 和检索参数调优；
 保留集只用于阶段性验收，不能根据其中的失败问题逐条改查询或答案，否则会再次产生虚高结果。
+参数扫描会分别记录核心召回/重排、视觉原图复查和端到端的平均耗时与 P95；多轮测量按轮次交错运行，
+只使用 `development` 的核心检索 P95 选择候选，之后才比较候选与当前线上基线的 `holdout` 质量和端到端耗时。2026-08-29 的三轮跨行业真实材料评测中，`10/5` 与 `20/5` 质量一致，留出集端到端 P95 从 `2260.8 ms` 降至 `1879.8 ms`，因此默认值调整为 `10/5`。召回、排序、困难负样本或留出集平均/P95 延迟明显退化时，调参门禁失败，
+不得自动修改线上默认值。远程视觉复查存在长尾延迟，单轮推荐只能作为候选，正式变更前应重复测量。
 `VisualMode configured` 会额外校验视觉分析产物数量，建立图片向量索引，并通过线上 `app.search_rag`
 执行文字/图片混合召回和原图复核；报告中的 `visual_indexed` 必须与视觉项总数一致。`disabled` 只评估
 文本层和 OCR 文字，不能用于声明图片结构或空间关系的召回能力。
@@ -435,6 +451,7 @@ job_agent_intent_router_model_duration_seconds_bucket
 - [ ] 接入真实支付渠道、签名 Webhook、退款状态机和渠道对账。
 - [x] 建立首版隔离跨行业 RAG 黄金测试集，评估 Retriever Top-K、最终 Top-N、MRR、禁止召回和账号隔离。
 - [x] 建立固定 GitHub 提交和哈希的跨行业真实文件端到端 RAG 评测。
+- [x] 建立 K/N 开发集参数扫描、P95 统计、留出集质量与性能防回退门禁。
 - [ ] 持续扩充已授权的真实行业语料和难负样本，并按正式 Embedding 模型校准阈值。
 - [ ] 接入 Alertmanager 通知、OpenTelemetry Trace 和集中日志平台。
 - [ ] 出现明确外部调用方后，在现有 MCP adapter 上增加鉴权、授权和 Server 生命周期。

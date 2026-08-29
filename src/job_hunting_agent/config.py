@@ -17,7 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 DEFAULT_ENV_PATH = Path(".env")
 
 # RAG 采用标准两阶段漏斗：Retriever 先召回候选 Top-K，Reranker 再输出最终 Top-N。
-DEFAULT_RAG_RETRIEVAL_TOP_K = 20
+DEFAULT_RAG_RETRIEVAL_TOP_K = 10
 DEFAULT_RAG_RERANK_TOP_N = 5
 DEFAULT_RAG_RERANK_MIN_RELEVANCE_SCORE = 0.65
 DEFAULT_RAG_RERANK_RELATIVE_SCORE_THRESHOLD = 0.86
@@ -1588,11 +1588,17 @@ def load_rerank_settings(
             "JOB_AGENT_RAG_RETRIEVAL_TOP_K",
         )
     else:
-        legacy_candidate_multiplier = parse_positive_int(
-            get("JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER", default="4"),
-            "JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER",
-        )
-        retrieval_top_k = DEFAULT_RAG_RERANK_TOP_N * legacy_candidate_multiplier
+        raw_legacy_multiplier = get("JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER")
+        if raw_legacy_multiplier:
+            legacy_candidate_multiplier = parse_positive_int(
+                raw_legacy_multiplier,
+                "JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER",
+            )
+            retrieval_top_k = (
+                DEFAULT_RAG_RERANK_TOP_N * legacy_candidate_multiplier
+            )
+        else:
+            retrieval_top_k = DEFAULT_RAG_RETRIEVAL_TOP_K
     if retrieval_top_k > MAX_RAG_RETRIEVAL_TOP_K:
         raise ValueError(
             f"JOB_AGENT_RAG_RETRIEVAL_TOP_K 不能超过 {MAX_RAG_RETRIEVAL_TOP_K}"

@@ -10,6 +10,11 @@ param(
     [ValidateSet("configured", "disabled")]
     [string]$VisualMode = "configured",
     [switch]$NoRerank,
+    [switch]$TuneParameters,
+    [string]$TuneKValues = "10,15,20,30,40",
+    [string]$TuneNValues = "3,5",
+    [ValidateRange(1, 5)]
+    [int]$TuningRepetitions = 1,
     [string]$OutputDirectory = ""
 )
 
@@ -66,6 +71,17 @@ if ($DatabaseUrl) {
 if ($NoRerank) {
     $Arguments += "--no-rerank"
 }
+if ($TuneParameters) {
+    $Arguments += @(
+        "--tune-parameters",
+        "--tune-k-values",
+        $TuneKValues,
+        "--tune-n-values",
+        $TuneNValues,
+        "--tuning-repetitions",
+        $TuningRepetitions
+    )
+}
 
 $PreviousPythonPath = $env:PYTHONPATH
 try {
@@ -81,6 +97,8 @@ try {
     Write-Host "benchmark_role=$BenchmarkRole"
     Write-Host "embedding_mode=$EmbeddingMode"
     Write-Host "visual_mode=$VisualMode"
+    Write-Host "tune_parameters=$TuneParameters"
+    Write-Host "tuning_repetitions=$TuningRepetitions"
     Write-Host "report=$OutputPath"
     & $Python @Arguments
     $ExitCode = $LASTEXITCODE

@@ -14,7 +14,7 @@ import math
 import re
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Any, Protocol
@@ -212,6 +212,8 @@ class ProjectVisualAnalyzer:
         self.max_images_per_call = max_images_per_call
         self.batch_timeout_seconds = float(batch_timeout_seconds)
         self.total_timeout_seconds = float(total_timeout_seconds)
+        self._timed_out_calls: dict[int | None, threading.Thread] = {}
+        self._timed_out_calls_lock = threading.Lock()
 
     def analyze(
         self,
@@ -273,6 +275,13 @@ class ProjectVisualAnalyzer:
             return ProjectVisualAnalysisResult()
         if len({item.source_id for item in normalized}) != len(normalized):
             raise ProjectVisualAnalysisError("项目视觉输入包含重复 source_id。")
+        if self._has_active_timed_out_call(account_id):
+            logger.info("项目视觉分析仍有超时请求在后台结束，当前批次降级为本地解析。")
+            return ProjectVisualAnalysisResult(
+                failed_source_ids=[item.source_id for item in normalized],
+                status="failed",
+                error_type="ProjectVisualAnalysisBusy",
+            )
 
         findings: dict[str, ProjectVisualFinding] = {}
         failed: list[str] = []
@@ -309,6 +318,10 @@ class ProjectVisualAnalyzer:
                         timeout_seconds=min(
                             self.batch_timeout_seconds,
                             remaining_seconds,
+                        ),
+                        on_timeout=lambda worker: self._remember_timed_out_call(
+                            account_id,
+                            worker,
                         ),
                     )
                 except Exception as error:  # noqa: BLE001 - 上层必须能够回退到本地 OCR。
@@ -372,12 +385,33 @@ class ProjectVisualAnalyzer:
             error_type=error_type,
         )
 
+    def _has_active_timed_out_call(self, account_id: int | None) -> bool:
+        with self._timed_out_calls_lock:
+            worker = self._timed_out_calls.get(account_id)
+            if worker is None:
+                return False
+            if worker.is_alive():
+                return True
+            self._timed_out_calls.pop(account_id, None)
+            return False
+
+    def _remember_timed_out_call(
+        self,
+        account_id: int | None,
+        worker: threading.Thread,
+    ) -> None:
+        with self._timed_out_calls_lock:
+            current = self._timed_out_calls.get(account_id)
+            if current is None or not current.is_alive():
+                self._timed_out_calls[account_id] = worker
+
 
 def _invoke_with_timeout(
     model: BaseChatModel | object,
     messages: object,
     *,
     timeout_seconds: float,
+    on_timeout: Callable[[threading.Thread], None] | None = None,
 ) -> object:
     """为同步模型调用增加进程级硬截止，避免供应商流式连接无限等待。
 
@@ -403,6 +437,8 @@ def _invoke_with_timeout(
     worker.start()
     worker.join(max(0.0, timeout_seconds))
     if worker.is_alive():
+        if on_timeout is not None:
+            on_timeout(worker)
         raise ProjectVisualAnalysisTimeout(
             "项目视觉分析单批次超时，已回退到本地解析。"
         )

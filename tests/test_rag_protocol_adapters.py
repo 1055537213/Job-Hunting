@@ -87,6 +87,42 @@ def test_native_settings_load_explicit_protocols_and_mask_key(tmp_path):
     assert isinstance(build_reranker(env_file), HttpReranker)
 
 
+def test_rerank_settings_use_tuned_default_retrieval_top_k(tmp_path):
+    env_file = tmp_path / ".env"
+    write_native_env(env_file)
+    env_file.write_text(
+        env_file.read_text(encoding="utf-8").replace(
+            "JOB_AGENT_RAG_RETRIEVAL_TOP_K=20\n",
+            "",
+        ),
+        encoding="utf-8",
+    )
+
+    rerank = load_rerank_settings(env_file, environ={})
+
+    assert rerank is not None
+    assert rerank.retrieval_top_k == 10
+    assert rerank.candidate_multiplier == 2
+
+
+def test_rerank_settings_keep_explicit_legacy_candidate_multiplier(tmp_path):
+    env_file = tmp_path / ".env"
+    write_native_env(env_file)
+    env_file.write_text(
+        env_file.read_text(encoding="utf-8").replace(
+            "JOB_AGENT_RAG_RETRIEVAL_TOP_K=20",
+            "JOB_AGENT_RERANK_CANDIDATE_MULTIPLIER=6",
+        ),
+        encoding="utf-8",
+    )
+
+    rerank = load_rerank_settings(env_file, environ={})
+
+    assert rerank is not None
+    assert rerank.retrieval_top_k == 30
+    assert rerank.candidate_multiplier == 6
+
+
 def test_embedding_identity_separates_same_named_models_from_different_endpoints():
     """相同模型名但不同供应商端点的向量不能被 pgvector 当作同一语义空间。"""
 

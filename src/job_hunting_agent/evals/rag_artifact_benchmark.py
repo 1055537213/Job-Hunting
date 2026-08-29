@@ -22,6 +22,8 @@ import sqlalchemy as sa
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.config import (
     DEFAULT_ENV_PATH,
+    DEFAULT_RAG_RERANK_TOP_N,
+    DEFAULT_RAG_RETRIEVAL_TOP_K,
     load_database_settings,
     require_postgresql_database_url,
 )
@@ -30,9 +32,16 @@ from job_hunting_agent.evals.rag_benchmark import _eval_candidate_input
 from job_hunting_agent.evals.rag_eval import (
     RAGEvalCase,
     RAGEvalReport,
+    RAGSearchObservation,
     RAGEvalThresholds,
     evaluate_rag_cases,
     format_rag_eval_report,
+)
+from job_hunting_agent.evals.rag_parameter_tuning import (
+    RAGParameterCombination,
+    RAGParameterTuningResult,
+    evaluate_rag_parameter_grid,
+    format_rag_parameter_tuning_result,
 )
 from job_hunting_agent.file_scanning import LocalSafetyScanner
 from job_hunting_agent.pgvector_rag import PgVectorKnowledgeBase
@@ -82,22 +91,33 @@ class PinnedGitHubArtifact:
             raise ValueError(f"GitHub artifact {self.id!r} must declare a license.")
         normalized_source = normalize_manifest_path(self.source_path)
         normalized_relative = normalize_manifest_path(self.relative_path)
-        if normalized_source != self.source_path or normalized_relative != self.relative_path:
+        if (
+            normalized_source != self.source_path
+            or normalized_relative != self.relative_path
+        ):
             raise ValueError(f"GitHub artifact {self.id!r} paths must be normalized.")
         if not _COMMIT_PATTERN.fullmatch(self.commit_sha):
-            raise ValueError(f"GitHub artifact {self.id!r} must pin a 40-character commit.")
+            raise ValueError(
+                f"GitHub artifact {self.id!r} must pin a 40-character commit."
+            )
         if not _SHA256_PATTERN.fullmatch(self.sha256):
             raise ValueError(f"GitHub artifact {self.id!r} has an invalid SHA-256.")
         repository_parts = _github_repository_parts(self.repository_url)
         if repository_parts is None:
             raise ValueError(f"GitHub artifact {self.id!r} repository URL is invalid.")
         if self.size_bytes <= 0 or self.size_bytes > MAX_ARTIFACT_DOWNLOAD_BYTES:
-            raise ValueError(f"GitHub artifact {self.id!r} exceeds the download size policy.")
+            raise ValueError(
+                f"GitHub artifact {self.id!r} exceeds the download size policy."
+            )
         kind = project_file_kind(Path(self.relative_path))
         if kind == "unsupported":
-            raise ValueError(f"GitHub artifact {self.id!r} uses an unsupported file type.")
+            raise ValueError(
+                f"GitHub artifact {self.id!r} uses an unsupported file type."
+            )
         if self.size_bytes > MAX_FILE_BYTES_BY_KIND[kind]:
-            raise ValueError(f"GitHub artifact {self.id!r} exceeds its parser size policy.")
+            raise ValueError(
+                f"GitHub artifact {self.id!r} exceeds its parser size policy."
+            )
         if not self.media_type.strip() or len(self.media_type) > 128:
             raise ValueError(f"GitHub artifact {self.id!r} media type is invalid.")
         if any(not term.strip() for term in self.expected_terms):
@@ -118,7 +138,9 @@ class PinnedGitHubArtifact:
             license_spdx=str(payload.get("license_spdx") or "").strip(),
             size_bytes=int(payload.get("size_bytes") or 0),
             sha256=str(payload.get("sha256") or "").strip().lower(),
-            media_type=str(payload.get("media_type") or "application/octet-stream").strip(),
+            media_type=str(
+                payload.get("media_type") or "application/octet-stream"
+            ).strip(),
             expected_terms=tuple(str(item) for item in expected_terms),
             require_visual_analysis=bool(payload.get("require_visual_analysis", False)),
         )
@@ -126,7 +148,9 @@ class PinnedGitHubArtifact:
     @property
     def raw_url(self) -> str:
         owner, repository = _github_repository_parts(self.repository_url) or ("", "")
-        encoded_path = "/".join(quote(part, safe="") for part in self.source_path.split("/"))
+        encoded_path = "/".join(
+            quote(part, safe="") for part in self.source_path.split("/")
+        )
         return (
             f"https://raw.githubusercontent.com/{owner}/{repository}/"
             f"{self.commit_sha}/{encoded_path}"
@@ -155,7 +179,9 @@ class GitHubArtifactBenchmarkSuite:
         if not self.cases:
             raise ValueError("GitHub artifact benchmark must include retrieval cases.")
         if sum(item.size_bytes for item in self.artifacts) > MAX_ARTIFACT_TOTAL_BYTES:
-            raise ValueError("GitHub artifact benchmark exceeds its total download budget.")
+            raise ValueError(
+                "GitHub artifact benchmark exceeds its total download budget."
+            )
         artifact_ids = [item.id for item in self.artifacts]
         paths = [item.relative_path for item in self.artifacts]
         case_ids = [item.id for item in self.cases]
@@ -185,17 +211,25 @@ class GitHubArtifactBenchmarkSuite:
         """防止小型冒烟集被误标成可用于上线结论的正式集。"""
 
         if len(self.artifacts) < 30 or len(self.cases) < 25:
-            raise ValueError("Release artifact benchmark requires 30 artifacts and 25 cases.")
+            raise ValueError(
+                "Release artifact benchmark requires 30 artifacts and 25 cases."
+            )
         if len({item.industry for item in self.artifacts}) < 6:
-            raise ValueError("Release artifact benchmark must cover at least six industries.")
+            raise ValueError(
+                "Release artifact benchmark must cover at least six industries."
+            )
         if any(case.top_n is None for case in self.cases):
             raise ValueError("Release artifact benchmark cases must declare top_n.")
         max_top_n = max(int(case.top_n or 0) for case in self.cases)
         if max_top_n / len(self.artifacts) > 0.2:
-            raise ValueError("Release artifact benchmark top_n cannot exceed 20% of corpus.")
+            raise ValueError(
+                "Release artifact benchmark top_n cannot exceed 20% of corpus."
+            )
         forbidden_count = sum(bool(case.forbidden) for case in self.cases)
         if forbidden_count / len(self.cases) < 0.25:
-            raise ValueError("Release artifact benchmark requires forbidden hard negatives.")
+            raise ValueError(
+                "Release artifact benchmark requires forbidden hard negatives."
+            )
         holdout_count = sum(case.split == "holdout" for case in self.cases)
         if holdout_count / len(self.cases) < 0.2:
             raise ValueError("Release artifact benchmark requires a holdout split.")
@@ -237,6 +271,7 @@ class GitHubArtifactBenchmarkResult:
     completed_at: str
     extraction_results: tuple[ArtifactExtractionResult, ...]
     report: RAGEvalReport
+    parameter_tuning: RAGParameterTuningResult | None = None
 
     @property
     def extraction_pass_rate(self) -> float:
@@ -248,7 +283,10 @@ class GitHubArtifactBenchmarkResult:
     def visual_index_passed(self) -> bool:
         if self.visual_mode == "disabled":
             return True
-        return self.visual_item_count > 0 and self.visual_indexed_count == self.visual_item_count
+        return (
+            self.visual_item_count > 0
+            and self.visual_indexed_count == self.visual_item_count
+        )
 
     @property
     def all_passed(self) -> bool:
@@ -256,6 +294,7 @@ class GitHubArtifactBenchmarkResult:
             self.extraction_pass_count == self.artifact_count
             and self.visual_index_passed
             and self.report.all_passed
+            and (self.parameter_tuning is None or self.parameter_tuning.passed)
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -264,6 +303,11 @@ class GitHubArtifactBenchmarkResult:
         payload["extraction_pass_rate"] = self.extraction_pass_rate
         payload["visual_index_passed"] = self.visual_index_passed
         payload["report"] = self.report.to_dict()
+        payload["parameter_tuning"] = (
+            self.parameter_tuning.to_dict()
+            if self.parameter_tuning is not None
+            else None
+        )
         return payload
 
 
@@ -279,12 +323,19 @@ def load_github_artifact_benchmark_suite(
     raw_artifacts = list(payload.get("artifacts") or [])
     base_name = str(payload.get("base_artifacts_from") or "").strip()
     if base_name:
-        if Path(base_name).name != base_name or Path(base_name).suffix.lower() != ".json":
-            raise ValueError("GitHub artifact benchmark base suite must be a sibling JSON file.")
+        if (
+            Path(base_name).name != base_name
+            or Path(base_name).suffix.lower() != ".json"
+        ):
+            raise ValueError(
+                "GitHub artifact benchmark base suite must be a sibling JSON file."
+            )
         base_path = suite_path.parent / base_name
         base_payload = json.loads(base_path.read_text(encoding="utf-8"))
         if not isinstance(base_payload, Mapping):
-            raise ValueError("GitHub artifact benchmark base suite must be a JSON object.")
+            raise ValueError(
+                "GitHub artifact benchmark base suite must be a JSON object."
+            )
         base_artifacts = base_payload.get("artifacts")
         if not isinstance(base_artifacts, list):
             raise ValueError("GitHub artifact benchmark base artifacts must be a list.")
@@ -293,7 +344,9 @@ def load_github_artifact_benchmark_suite(
     if not isinstance(raw_artifacts, list) or not all(
         isinstance(item, Mapping) for item in raw_artifacts
     ):
-        raise ValueError("GitHub artifact benchmark artifacts must be a list of objects.")
+        raise ValueError(
+            "GitHub artifact benchmark artifacts must be a list of objects."
+        )
     if not isinstance(raw_cases, list) or not all(
         isinstance(item, Mapping) for item in raw_cases
     ):
@@ -306,7 +359,9 @@ def load_github_artifact_benchmark_suite(
         description=str(payload.get("description") or "").strip(),
         version=str(payload.get("version") or "1").strip(),
         benchmark_role=str(payload.get("benchmark_role") or "smoke").strip(),
-        artifacts=tuple(PinnedGitHubArtifact.from_mapping(item) for item in raw_artifacts),
+        artifacts=tuple(
+            PinnedGitHubArtifact.from_mapping(item) for item in raw_artifacts
+        ),
         cases=tuple(RAGEvalCase.from_mapping(item) for item in raw_cases),
         thresholds=RAGEvalThresholds.from_mapping(raw_thresholds),
     )
@@ -342,10 +397,14 @@ def verify_pinned_github_artifact(
     """校验下载结果，避免上游文件漂移或截断进入模型和知识库。"""
 
     if len(content) != artifact.size_bytes:
-        raise ValueError(f"GitHub artifact {artifact.id!r} size does not match the catalog.")
+        raise ValueError(
+            f"GitHub artifact {artifact.id!r} size does not match the catalog."
+        )
     digest = hashlib.sha256(content).hexdigest()
     if digest != artifact.sha256:
-        raise ValueError(f"GitHub artifact {artifact.id!r} SHA-256 does not match the catalog.")
+        raise ValueError(
+            f"GitHub artifact {artifact.id!r} SHA-256 does not match the catalog."
+        )
     return content
 
 
@@ -358,6 +417,8 @@ def run_github_artifact_benchmark(
     use_reranker: bool = True,
     visual_mode: str = "configured",
     fetcher: ArtifactFetcher = download_pinned_github_artifact,
+    parameter_grid: Sequence[RAGParameterCombination] = (),
+    tuning_repetitions: int = 1,
 ) -> GitHubArtifactBenchmarkResult:
     """经真实项目采集入口处理文件，写入 pgvector 后评测并级联清理。"""
 
@@ -406,7 +467,9 @@ def run_github_artifact_benchmark(
                 app.project_visual_analyzer = None
             elif any(item.require_visual_analysis for item in suite.artifacts):
                 if app.project_visual_analyzer is None:
-                    raise ValueError("Artifact suite requires enabled project visual analysis.")
+                    raise ValueError(
+                        "Artifact suite requires enabled project visual analysis."
+                    )
 
             manifest = [
                 ProjectManifestItem(
@@ -440,21 +503,27 @@ def run_github_artifact_benchmark(
                     account_id=account.id,
                 )
                 if processed.long_text_id is None:
-                    raise ValueError(f"GitHub artifact {artifact.id!r} produced no long text.")
+                    raise ValueError(
+                        f"GitHub artifact {artifact.id!r} produced no long text."
+                    )
                 long_text_ids.append(int(processed.long_text_id))
                 long_text = app.store.get_long_texts_by_ids(
                     [int(processed.long_text_id)],
                     account_id=account.id,
                 )[0]
                 missing_terms = tuple(
-                    term for term in artifact.expected_terms if term.casefold() not in long_text.text.casefold()
+                    term
+                    for term in artifact.expected_terms
+                    if term.casefold() not in long_text.text.casefold()
                 )
-                visual_status = str(
-                    processed.metadata.get("visual_analysis_status") or ""
-                ).strip() or None
-                visual_error_type = str(
-                    processed.metadata.get("visual_error_type") or ""
-                ).strip() or None
+                visual_status = (
+                    str(processed.metadata.get("visual_analysis_status") or "").strip()
+                    or None
+                )
+                visual_error_type = (
+                    str(processed.metadata.get("visual_error_type") or "").strip()
+                    or None
+                )
                 visual_items = app.store.list_visual_knowledge_items(
                     account_id=account.id,
                     project_collection_file_ids=[processed.id],
@@ -502,12 +571,37 @@ def run_github_artifact_benchmark(
                     ),
                     account_id=account.id,
                 )
-                def search_backend(case: RAGEvalCase, top_n: int) -> Sequence[object]:
-                    return knowledge_base.search(
+
+                def parameterized_search_backend(
+                    case: RAGEvalCase,
+                    retrieval_top_k: int,
+                    top_n: int,
+                ) -> RAGSearchObservation:
+                    core_started = time.perf_counter()
+                    results = knowledge_base.search(
                         case.query,
                         top_n=top_n,
                         entity_types=list(case.entity_types) or None,
                         account_id=account.id,
+                        retrieval_top_k=retrieval_top_k,
+                    )
+                    return RAGSearchObservation(
+                        hits=results,
+                        stage_durations_ms={
+                            "retrieval_rerank": (time.perf_counter() - core_started)
+                            * 1000,
+                            "visual_reinspection": 0.0,
+                        },
+                    )
+
+                def search_backend(
+                    case: RAGEvalCase,
+                    top_n: int,
+                ) -> RAGSearchObservation:
+                    return parameterized_search_backend(
+                        case,
+                        DEFAULT_RAG_RETRIEVAL_TOP_K,
+                        top_n,
                     )
             else:
                 app.index_rag_long_texts(
@@ -546,14 +640,67 @@ def run_github_artifact_benchmark(
                 else:
                     reranker = None
                 if use_reranker:
-                    def search_backend(case: RAGEvalCase, top_n: int) -> Sequence[object]:
-                        return app.search_rag(
+
+                    def parameterized_search_backend(
+                        case: RAGEvalCase,
+                        retrieval_top_k: int,
+                        top_n: int,
+                    ) -> RAGSearchObservation:
+                        root_request_id = (
+                            f"rag-artifact-search:{run_id}:{case.id}:"
+                            f"k{retrieval_top_k}:n{top_n}"
+                        )
+                        query_context = app.model_gateway.new_call_context(
+                            "embedding_query",
+                            account_id=account.id,
+                            candidate_id=candidate_id,
+                            root_request_id=root_request_id,
+                        )
+                        query_rerank_context = app.model_gateway.new_call_context(
+                            "rerank_query",
+                            account_id=account.id,
+                            candidate_id=candidate_id,
+                            root_request_id=root_request_id,
+                        )
+                        query_knowledge_base = app._rag_knowledge_base(
+                            embeddings=app.model_gateway.embeddings(query_context),
+                            reranker=app.model_gateway.reranker(query_rerank_context),
+                        )
+                        core_started = time.perf_counter()
+                        results = query_knowledge_base.search(
                             case.query,
                             top_n=top_n,
                             entity_types=list(case.entity_types) or None,
                             account_id=account.id,
                             candidate_id=candidate_id,
-                            root_request_id=f"rag-artifact-search:{run_id}:{case.id}",
+                            retrieval_top_k=retrieval_top_k,
+                        )
+                        core_duration_ms = (time.perf_counter() - core_started) * 1000
+                        visual_started = time.perf_counter()
+                        inspected = app._reinspect_visual_search_results(
+                            case.query,
+                            results,
+                            account_id=account.id,
+                            candidate_id=candidate_id,
+                        )
+                        return RAGSearchObservation(
+                            hits=inspected,
+                            stage_durations_ms={
+                                "retrieval_rerank": core_duration_ms,
+                                "visual_reinspection": (
+                                    time.perf_counter() - visual_started
+                                )
+                                * 1000,
+                            },
+                        )
+
+                    def search_backend(
+                        case: RAGEvalCase, top_n: int
+                    ) -> RAGSearchObservation:
+                        return parameterized_search_backend(
+                            case,
+                            DEFAULT_RAG_RETRIEVAL_TOP_K,
+                            top_n,
                         )
                 else:
                     knowledge_base = PgVectorKnowledgeBase(
@@ -562,25 +709,79 @@ def run_github_artifact_benchmark(
                         reranker=None,
                     )
 
-                    def search_backend(case: RAGEvalCase, top_n: int) -> Sequence[object]:
+                    def parameterized_search_backend(
+                        case: RAGEvalCase,
+                        retrieval_top_k: int,
+                        top_n: int,
+                    ) -> RAGSearchObservation:
+                        core_started = time.perf_counter()
                         results = knowledge_base.search(
                             case.query,
                             top_n=top_n,
                             entity_types=list(case.entity_types) or None,
                             account_id=account.id,
                             candidate_id=candidate_id,
+                            retrieval_top_k=retrieval_top_k,
                         )
-                        return app._reinspect_visual_search_results(
+                        core_duration_ms = (time.perf_counter() - core_started) * 1000
+                        visual_started = time.perf_counter()
+                        inspected = app._reinspect_visual_search_results(
                             case.query,
                             results,
                             account_id=account.id,
                             candidate_id=candidate_id,
                         )
-            report = evaluate_rag_cases(
-                suite.cases,
-                search_backend,
-                thresholds=suite.thresholds,
-            )
+                        return RAGSearchObservation(
+                            hits=inspected,
+                            stage_durations_ms={
+                                "retrieval_rerank": core_duration_ms,
+                                "visual_reinspection": (
+                                    time.perf_counter() - visual_started
+                                )
+                                * 1000,
+                            },
+                        )
+
+                    def search_backend(
+                        case: RAGEvalCase, top_n: int
+                    ) -> RAGSearchObservation:
+                        return parameterized_search_backend(
+                            case,
+                            DEFAULT_RAG_RETRIEVAL_TOP_K,
+                            top_n,
+                        )
+
+            parameter_tuning: RAGParameterTuningResult | None = None
+            if parameter_grid:
+                baseline = RAGParameterCombination(
+                    DEFAULT_RAG_RETRIEVAL_TOP_K,
+                    DEFAULT_RAG_RERANK_TOP_N,
+                )
+                parameter_tuning = evaluate_rag_parameter_grid(
+                    suite.cases,
+                    parameterized_search_backend,
+                    combinations=parameter_grid,
+                    baseline=baseline,
+                    thresholds=suite.thresholds,
+                    measurement_repetitions=tuning_repetitions,
+                )
+                baseline_results = {
+                    result.id: result
+                    for result in (
+                        *parameter_tuning.baseline_development_report.case_results,
+                        *parameter_tuning.baseline_holdout_report.case_results,
+                    )
+                }
+                report = RAGEvalReport(
+                    [baseline_results[case.id] for case in suite.cases],
+                    suite.thresholds,
+                )
+            else:
+                report = evaluate_rag_cases(
+                    suite.cases,
+                    search_backend,
+                    thresholds=suite.thresholds,
+                )
             return GitHubArtifactBenchmarkResult(
                 suite_name=suite.name,
                 suite_version=suite.version,
@@ -606,6 +807,7 @@ def run_github_artifact_benchmark(
                 completed_at=datetime.now(UTC).isoformat(timespec="seconds"),
                 extraction_results=tuple(extraction_results),
                 report=report,
+                parameter_tuning=parameter_tuning,
             )
         finally:
             if app is not None:
@@ -650,7 +852,10 @@ def format_github_artifact_benchmark_result(
         ),
         f"duration_seconds={result.duration_seconds:.3f}",
     ]
-    return "\n".join(header + extraction_lines + [format_rag_eval_report(result.report)])
+    sections = header + extraction_lines + [format_rag_eval_report(result.report)]
+    if result.parameter_tuning is not None:
+        sections.append(format_rag_parameter_tuning_result(result.parameter_tuning))
+    return "\n".join(sections)
 
 
 def write_github_artifact_benchmark_report(
@@ -684,8 +889,53 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="configured",
     )
     parser.add_argument("--no-rerank", action="store_true")
+    parser.add_argument(
+        "--tune-parameters",
+        action="store_true",
+        help="Tune K/N on development cases, then verify the selection on holdout.",
+    )
+    parser.add_argument(
+        "--tune-k-values",
+        default="10,15,20,30,40",
+        help="Comma-separated Retriever Top-K values.",
+    )
+    parser.add_argument(
+        "--tune-n-values",
+        default="3,5",
+        help="Comma-separated Reranker Top-N values.",
+    )
+    parser.add_argument(
+        "--tuning-repetitions",
+        type=int,
+        default=1,
+        help="Measurement rounds per K/N pair (1-5).",
+    )
     parser.add_argument("--output", help="Optional JSON report path.")
     args = parser.parse_args(argv)
+
+    parameter_grid: tuple[RAGParameterCombination, ...] = ()
+    if args.tune_parameters:
+        if not 1 <= args.tuning_repetitions <= 5:
+            parser.error("--tuning-repetitions must be between 1 and 5.")
+        try:
+            k_values = _parse_positive_int_list(
+                args.tune_k_values,
+                "--tune-k-values",
+            )
+            n_values = _parse_positive_int_list(
+                args.tune_n_values,
+                "--tune-n-values",
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        parameter_grid = tuple(
+            RAGParameterCombination(retrieval_top_k, rerank_top_n)
+            for retrieval_top_k in k_values
+            for rerank_top_n in n_values
+            if retrieval_top_k >= rerank_top_n
+        )
+        if not parameter_grid:
+            parser.error("The tuning grid must contain at least one pair with K >= N.")
 
     database_url = args.database_url or require_postgresql_database_url(
         load_database_settings(args.env_file)
@@ -697,6 +947,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         embedding_mode=args.embedding_mode,
         use_reranker=not args.no_rerank,
         visual_mode=args.visual_mode,
+        parameter_grid=parameter_grid,
+        tuning_repetitions=args.tuning_repetitions,
     )
     print(format_github_artifact_benchmark_result(result))
     if args.output:
@@ -709,12 +961,32 @@ def _github_repository_parts(repository_url: str) -> tuple[str, str] | None:
     parsed = urlsplit(repository_url)
     if parsed.scheme != "https" or parsed.hostname != "github.com":
         return None
-    if parsed.query or parsed.fragment or parsed.username or parsed.password or parsed.port:
+    if (
+        parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+        or parsed.port
+    ):
         return None
     parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) != 2 or not all(_GITHUB_PART_PATTERN.fullmatch(part) for part in parts):
+    if len(parts) != 2 or not all(
+        _GITHUB_PART_PATTERN.fullmatch(part) for part in parts
+    ):
         return None
     return parts[0], parts[1].removesuffix(".git")
+
+
+def _parse_positive_int_list(raw: str, option_name: str) -> tuple[int, ...]:
+    try:
+        values = tuple(dict.fromkeys(int(item.strip()) for item in raw.split(",")))
+    except ValueError as error:
+        raise ValueError(
+            f"{option_name} must contain comma-separated integers."
+        ) from error
+    if not values or any(value <= 0 for value in values):
+        raise ValueError(f"{option_name} must contain positive integers.")
+    return values
 
 
 class _RawGitHubRedirectHandler(HTTPRedirectHandler):
@@ -723,7 +995,9 @@ class _RawGitHubRedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
         target = urlsplit(newurl)
         if target.scheme != "https" or target.hostname != "raw.githubusercontent.com":
-            raise HTTPError(newurl, code, "redirect target is not approved", headers, fp)
+            raise HTTPError(
+                newurl, code, "redirect target is not approved", headers, fp
+            )
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -734,7 +1008,9 @@ class _DisabledTaskQueue:
         return None
 
     def enqueue(self, task_key: str) -> None:
-        raise RuntimeError(f"Artifact benchmark must not enqueue background task {task_key!r}.")
+        raise RuntimeError(
+            f"Artifact benchmark must not enqueue background task {task_key!r}."
+        )
 
 
 if __name__ == "__main__":

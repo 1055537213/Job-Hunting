@@ -189,6 +189,47 @@ def test_project_visual_analyzer_has_a_hard_timeout_for_hung_model_calls() -> No
     assert finished.wait(timeout=1)
 
 
+def test_project_visual_analyzer_does_not_stack_calls_behind_timed_out_request() -> None:
+    gateway = RecordingGateway(visual_response())
+    release = threading.Event()
+    started = threading.Event()
+    invocation_count = 0
+
+    def slow_invoke(_messages: object) -> AIMessage:
+        nonlocal invocation_count
+        invocation_count += 1
+        started.set()
+        release.wait(timeout=1)
+        return visual_response()
+
+    gateway.model.invoke = slow_invoke  # type: ignore[method-assign]
+    analyzer = ProjectVisualAnalyzer(
+        gateway,
+        batch_timeout_seconds=0.01,
+        total_timeout_seconds=0.02,
+    )
+
+    first = analyzer.analyze(
+        [ProjectVisualInput("image-1", "charts/first.png", png_bytes(), "")],
+        account_id=7,
+        candidate_id=11,
+    )
+    assert started.wait(timeout=1)
+    second = analyzer.analyze(
+        [ProjectVisualInput("image-2", "charts/second.png", png_bytes(), "")],
+        account_id=7,
+        candidate_id=11,
+    )
+
+    assert first.error_type == "ProjectVisualAnalysisTimeout"
+    assert second.status == "failed"
+    assert second.error_type == "ProjectVisualAnalysisBusy"
+    assert second.failed_source_ids == ["image-2"]
+    assert invocation_count == 1
+
+    release.set()
+
+
 def test_project_visual_analyzer_records_usage_before_rejecting_bad_json() -> None:
     gateway = RecordingGateway(
         AIMessage(

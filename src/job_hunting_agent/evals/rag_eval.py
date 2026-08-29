@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -20,7 +21,19 @@ from job_hunting_agent.models import RAGSearchResult
 
 DEFAULT_TOP_N = 5
 
-SearchBackend = Callable[["RAGEvalCase", int], Sequence[object]]
+
+@dataclass(frozen=True)
+class RAGSearchObservation:
+    """Search results with optional eval-only stage timings."""
+
+    hits: Sequence[object]
+    stage_durations_ms: Mapping[str, float] = field(default_factory=dict)
+
+
+SearchBackend = Callable[
+    ["RAGEvalCase", int],
+    Sequence[object] | RAGSearchObservation,
+]
 
 
 @dataclass(frozen=True)
@@ -68,12 +81,8 @@ class RAGEvalThresholds:
                     values.get("min_mean_ndcg_at_k", 0.0),
                 )
             ),
-            min_mean_reciprocal_rank=float(
-                values.get("min_mean_reciprocal_rank", 0.0)
-            ),
-            max_forbidden_case_rate=float(
-                values.get("max_forbidden_case_rate", 0.0)
-            ),
+            min_mean_reciprocal_rank=float(values.get("min_mean_reciprocal_rank", 0.0)),
+            max_forbidden_case_rate=float(values.get("max_forbidden_case_rate", 0.0)),
         )
 
 
@@ -164,9 +173,7 @@ class RetrievedEvidence:
             entity_id=int(value.entity_id),
             chunk_index=int(getattr(value, "chunk_index", 0)),
             distance=_optional_float(getattr(value, "distance", None)),
-            relevance_score=_optional_float(
-                getattr(value, "relevance_score", None)
-            ),
+            relevance_score=_optional_float(getattr(value, "relevance_score", None)),
             content=str(getattr(value, "content", "")),
         )
 
@@ -216,7 +223,9 @@ class RAGEvalCase:
             query=query,
             expected=tuple(expected),
             forbidden=tuple(forbidden),
-            entity_types=tuple(str(item) for item in payload.get("entity_types", []) or []),
+            entity_types=tuple(
+                str(item) for item in payload.get("entity_types", []) or []
+            ),
             top_n=_optional_int(payload.get("top_n", payload.get("top_k"))),
             min_recall=min_recall,
             tags=tuple(
@@ -250,6 +259,8 @@ class RAGEvalCaseResult:
     passed: bool
     tags: tuple[str, ...] = ()
     split: str = "development"
+    duration_ms: float = 0.0
+    stage_durations_ms: dict[str, float] = field(default_factory=dict)
     hits: list[RetrievedEvidence] = field(default_factory=list)
 
 
@@ -309,9 +320,58 @@ class RAGEvalReport:
     @property
     def forbidden_case_rate(self) -> float:
         return _mean(
-            1.0 if result.forbidden_hit_count else 0.0
-            for result in self.case_results
+            1.0 if result.forbidden_hit_count else 0.0 for result in self.case_results
         )
+
+    @property
+    def mean_latency_ms(self) -> float:
+        return _mean(result.duration_ms for result in self.case_results)
+
+    @property
+    def p50_latency_ms(self) -> float:
+        return _percentile(
+            [result.duration_ms for result in self.case_results],
+            0.50,
+        )
+
+    @property
+    def p95_latency_ms(self) -> float:
+        return _percentile(
+            [result.duration_ms for result in self.case_results],
+            0.95,
+        )
+
+    @property
+    def max_latency_ms(self) -> float:
+        return max(
+            (result.duration_ms for result in self.case_results),
+            default=0.0,
+        )
+
+    @property
+    def stage_latency_summary(self) -> dict[str, dict[str, float | int]]:
+        stage_names = sorted(
+            {
+                stage
+                for result in self.case_results
+                for stage in result.stage_durations_ms
+            }
+        )
+        summary: dict[str, dict[str, float | int]] = {}
+        for stage in stage_names:
+            values = [
+                result.stage_durations_ms[stage]
+                for result in self.case_results
+                if stage in result.stage_durations_ms
+            ]
+            summary[stage] = {
+                "sample_count": len(values),
+                "mean_ms": _mean(values),
+                "p50_ms": _percentile(values, 0.50),
+                "p95_ms": _percentile(values, 0.95),
+                "max_ms": max(values, default=0.0),
+            }
+        return summary
 
     @property
     def quality_gate_failures(self) -> tuple[str, ...]:
@@ -374,9 +434,7 @@ class RAGEvalReport:
             metrics[tag] = {
                 "case_count": len(results),
                 "passed_count": sum(1 for result in results if result.passed),
-                "mean_recall_at_n": _mean(
-                    result.recall_at_n for result in results
-                ),
+                "mean_recall_at_n": _mean(result.recall_at_n for result in results),
                 "mean_recall_at_1": _mean(result.recall_at_1 for result in results),
                 "mean_recall_at_3": _mean(result.recall_at_3 for result in results),
                 "mean_recall_at_5": _mean(result.recall_at_5 for result in results),
@@ -388,8 +446,12 @@ class RAGEvalReport:
                     result.reciprocal_rank for result in results
                 ),
                 "forbidden_case_rate": _mean(
-                    1.0 if result.forbidden_hit_count else 0.0
-                    for result in results
+                    1.0 if result.forbidden_hit_count else 0.0 for result in results
+                ),
+                "mean_latency_ms": _mean(result.duration_ms for result in results),
+                "p95_latency_ms": _percentile(
+                    [result.duration_ms for result in results],
+                    0.95,
                 ),
             }
         return metrics
@@ -402,7 +464,9 @@ class RAGEvalReport:
             metrics[split] = {
                 "case_count": len(results),
                 "passed_count": sum(result.passed for result in results),
-                "case_pass_rate": _mean(1.0 if result.passed else 0.0 for result in results),
+                "case_pass_rate": _mean(
+                    1.0 if result.passed else 0.0 for result in results
+                ),
                 "mean_recall_at_1": _mean(result.recall_at_1 for result in results),
                 "mean_recall_at_3": _mean(result.recall_at_3 for result in results),
                 "mean_recall_at_5": _mean(result.recall_at_5 for result in results),
@@ -414,8 +478,12 @@ class RAGEvalReport:
                     result.reciprocal_rank for result in results
                 ),
                 "forbidden_case_rate": _mean(
-                    1.0 if result.forbidden_hit_count else 0.0
-                    for result in results
+                    1.0 if result.forbidden_hit_count else 0.0 for result in results
+                ),
+                "mean_latency_ms": _mean(result.duration_ms for result in results),
+                "p95_latency_ms": _percentile(
+                    [result.duration_ms for result in results],
+                    0.95,
                 ),
             }
         return metrics
@@ -434,6 +502,11 @@ class RAGEvalReport:
             "mean_ndcg_at_n": self.mean_ndcg_at_n,
             "mean_reciprocal_rank": self.mean_reciprocal_rank,
             "forbidden_case_rate": self.forbidden_case_rate,
+            "mean_latency_ms": self.mean_latency_ms,
+            "p50_latency_ms": self.p50_latency_ms,
+            "p95_latency_ms": self.p95_latency_ms,
+            "max_latency_ms": self.max_latency_ms,
+            "stage_latency_summary": self.stage_latency_summary,
             "thresholds": asdict(self.thresholds),
             "quality_gate_passed": not self.quality_gate_failures,
             "quality_gate_failures": list(self.quality_gate_failures),
@@ -448,17 +521,34 @@ def evaluate_rag_cases(
     search_backend: SearchBackend,
     *,
     top_n: int = DEFAULT_TOP_N,
+    override_top_n: int | None = None,
     thresholds: RAGEvalThresholds | None = None,
 ) -> RAGEvalReport:
-    """Run golden retrieval cases against a RAG search backend."""
+    """Run golden retrieval cases against a RAG search backend.
+
+    ``override_top_n`` is reserved for controlled parameter experiments. Normal
+    regression runs continue to respect a case-specific ``top_n`` value.
+    """
 
     results: list[RAGEvalCaseResult] = []
     for case in cases:
-        case_top_n = max(1, int(case.top_n or top_n))
+        requested_top_n = override_top_n if override_top_n is not None else case.top_n
+        case_top_n = max(1, int(requested_top_n or top_n))
+        search_started = time.perf_counter()
+        raw_observation = search_backend(case, case_top_n)
+        if isinstance(raw_observation, RAGSearchObservation):
+            raw_hits = raw_observation.hits
+            stage_durations_ms = {
+                str(stage): max(0.0, float(duration))
+                for stage, duration in raw_observation.stage_durations_ms.items()
+            }
+        else:
+            raw_hits = raw_observation
+            stage_durations_ms = {}
         hits = [
-            RetrievedEvidence.from_object(item)
-            for item in list(search_backend(case, case_top_n))[:case_top_n]
+            RetrievedEvidence.from_object(item) for item in list(raw_hits)[:case_top_n]
         ]
+        duration_ms = (time.perf_counter() - search_started) * 1000
         expected_ranks = [_first_match_rank(ref, hits) for ref in case.expected]
         found_ranks = [rank for rank in expected_ranks if rank is not None]
         recall = len(found_ranks) / len(case.expected)
@@ -469,9 +559,7 @@ def evaluate_rag_cases(
         ndcg_at_n = _ndcg_at_n(found_ranks, len(case.expected), case_top_n)
         reciprocal_rank = 1 / min(found_ranks) if found_ranks else 0.0
         forbidden_hits = [
-            hit
-            for hit in hits
-            if any(ref.matches(hit) for ref in case.forbidden)
+            hit for hit in hits if any(ref.matches(hit) for ref in case.forbidden)
         ]
         results.append(
             RAGEvalCaseResult(
@@ -491,6 +579,8 @@ def evaluate_rag_cases(
                 passed=recall >= case.min_recall and not forbidden_hits,
                 tags=case.tags,
                 split=case.split,
+                duration_ms=duration_ms,
+                stage_durations_ms=stage_durations_ms,
                 hits=hits,
             )
         )
@@ -522,8 +612,22 @@ def format_rag_eval_report(report: RAGEvalReport) -> str:
         f"ndcg_at_n={report.mean_ndcg_at_n:.3f}",
         f"mrr={report.mean_reciprocal_rank:.3f}",
         f"forbidden_case_rate={report.forbidden_case_rate:.3f}",
+        f"latency_mean_ms={report.mean_latency_ms:.1f}",
+        f"latency_p95_ms={report.p95_latency_ms:.1f}",
         f"quality_gate={'PASS' if report.all_passed else 'FAIL'}",
     ]
+    lines.extend(
+        " ".join(
+            [
+                f"stage={stage}",
+                f"samples={metrics['sample_count']}",
+                f"mean_ms={metrics['mean_ms']:.1f}",
+                f"p95_ms={metrics['p95_ms']:.1f}",
+                f"max_ms={metrics['max_ms']:.1f}",
+            ]
+        )
+        for stage, metrics in report.stage_latency_summary.items()
+    )
     lines.extend(f"gate_failure={failure}" for failure in report.quality_gate_failures)
     for split, metrics in report.metrics_by_split.items():
         lines.append(
@@ -539,6 +643,7 @@ def format_rag_eval_report(report: RAGEvalReport) -> str:
                     f"ndcg={metrics['mean_ndcg_at_n']:.3f}",
                     f"mrr={metrics['mean_reciprocal_rank']:.3f}",
                     f"forbidden_rate={metrics['forbidden_case_rate']:.3f}",
+                    f"latency_p95_ms={metrics['p95_latency_ms']:.1f}",
                 ]
             )
         )
@@ -555,6 +660,7 @@ def format_rag_eval_report(report: RAGEvalReport) -> str:
                     f"ndcg={result.ndcg_at_n:.3f}",
                     f"rr={result.reciprocal_rank:.3f}",
                     f"forbidden_hits={result.forbidden_hit_count}",
+                    f"latency_ms={result.duration_ms:.1f}",
                 ]
             )
         )
@@ -587,19 +693,29 @@ def write_example_cases(path: str | Path) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run RAG retrieval golden-case evaluation.")
+    parser = argparse.ArgumentParser(
+        description="Run RAG retrieval golden-case evaluation."
+    )
     parser.add_argument("--cases", help="Path to RAG eval cases JSON.")
-    parser.add_argument("--env-file", default=".env", help="Environment file used by JobHuntingApp.")
+    parser.add_argument(
+        "--env-file", default=".env", help="Environment file used by JobHuntingApp."
+    )
     parser.add_argument("--database-url", help="Override PostgreSQL database URL.")
-    parser.add_argument("--account-id", type=int, help="Restrict retrieval to one account.")
+    parser.add_argument(
+        "--account-id", type=int, help="Restrict retrieval to one account."
+    )
     parser.add_argument(
         "--top-n",
         type=int,
         default=DEFAULT_TOP_N,
         help="Default final reranked result count.",
     )
-    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
-    parser.add_argument("--write-example", help="Write an editable eval case template and exit.")
+    parser.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+    parser.add_argument(
+        "--write-example", help="Write an editable eval case template and exit."
+    )
     args = parser.parse_args(argv)
 
     if args.write_example:
@@ -633,7 +749,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0 if report.all_passed else 1
 
 
-def _first_match_rank(ref: EvidenceRef, hits: Sequence[RetrievedEvidence]) -> int | None:
+def _first_match_rank(
+    ref: EvidenceRef, hits: Sequence[RetrievedEvidence]
+) -> int | None:
     for index, hit in enumerate(hits, start=1):
         if ref.matches(hit):
             return index
@@ -689,6 +807,23 @@ def _mean(values: Sequence[float] | Any) -> float:
     if not materialized:
         return 0.0
     return sum(materialized) / len(materialized)
+
+
+def _percentile(values: Sequence[float], quantile: float) -> float:
+    """Return a linearly interpolated percentile for small eval samples."""
+
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return 0.0
+    if len(ordered) == 1:
+        return ordered[0]
+    position = max(0.0, min(1.0, quantile)) * (len(ordered) - 1)
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
 def _required_int(payload: Mapping[str, object], key: str) -> int:
