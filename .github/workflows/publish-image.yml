@@ -1,0 +1,227 @@
+name: Publish release image
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-image-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'master' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      TRIVY_IMAGE: aquasec/trivy@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
+
+    steps:
+      - name: Check out the exact CI commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the CI commit still belongs to master
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "${HEAD_SHA}" ]]
+          git merge-base --is-ancestor "${HEAD_SHA}" origin/master
+
+      - name: Resolve immutable image reference
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${HEAD_SHA:0:12}"
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          VERSION_REF="${IMAGE_NAME}:sha-${SHORT_SHA}"
+          MASTER_REF="${IMAGE_NAME}:master"
+          {
+            echo "name=${IMAGE_NAME}"
+            echo "version_ref=${VERSION_REF}"
+            echo "master_ref=${MASTER_REF}"
+            echo "version=sha-${SHORT_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Refuse to overwrite an existing version tag
+        id: existing
+        env:
+          VERSION_REF: ${{ steps.image.outputs.version_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker manifest inspect "$VERSION_REF" >/dev/null 2>&1; then
+            docker pull "$VERSION_REF"
+            EXISTING_REVISION="$(docker image inspect "$VERSION_REF" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+            if [[ "$EXISTING_REVISION" != "$HEAD_SHA" ]]; then
+              echo "Refusing to overwrite ${VERSION_REF}: existing revision ${EXISTING_REVISION} does not match ${HEAD_SHA}." >&2
+              exit 1
+            fi
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the release image
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          VERSION_REF: ${{ steps.image.outputs.version_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build \
+            --pull \
+            --no-cache \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${HEAD_SHA}" \
+            --label "org.opencontainers.image.version=${VERSION_REF##*:}" \
+            --tag "${VERSION_REF}" \
+            .
+
+      - name: Record container findings and SBOM
+        env:
+          VERSION_REF: ${{ steps.image.outputs.version_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/trivy-cache" release-reports
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
+            -v "$PWD/release-reports:/reports" \
+            "$TRIVY_IMAGE" image \
+            --quiet \
+            --scanners vuln \
+            --pkg-types os \
+            --severity HIGH,CRITICAL \
+            --format json \
+            --output /reports/container-vulnerabilities.json \
+            "$VERSION_REF"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
+            -v "$PWD/release-reports:/reports" \
+            "$TRIVY_IMAGE" image \
+            --quiet \
+            --format cyclonedx \
+            --output /reports/image-sbom.cdx.json \
+            "$VERSION_REF"
+
+      - name: Enforce fixable high and critical vulnerability gate
+        env:
+          VERSION_REF: ${{ steps.image.outputs.version_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
+            "$TRIVY_IMAGE" image \
+            --quiet \
+            --scanners vuln \
+            --pkg-types os \
+            --ignore-unfixed \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            "$VERSION_REF"
+
+      - name: Push the immutable version tag
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          VERSION_REF: ${{ steps.image.outputs.version_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "${VERSION_REF}"
+
+      - name: Update the master convenience tag
+        env:
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_REF: ${{ steps.image.outputs.version_ref }}
+          MASTER_REF: ${{ steps.image.outputs.master_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CURRENT_MASTER_SHA="$(curl --fail --silent --show-error --retry 3 \
+            --header "Authorization: Bearer ${GH_API_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/master" | jq -er '.sha')"
+          if [[ "$CURRENT_MASTER_SHA" != "${HEAD_SHA}" ]]; then
+            echo "Skipping the master convenience tag because ${HEAD_SHA} is no longer the current master head."
+            exit 0
+          fi
+          docker tag "${VERSION_REF}" "${MASTER_REF}"
+          docker push "${MASTER_REF}"
+
+      - name: Resolve the published digest
+        id: published
+        env:
+          VERSION_REF: ${{ steps.image.outputs.version_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIGEST="$(docker buildx imagetools inspect "$VERSION_REF" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          test -n "$DIGEST"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Write release image metadata
+        env:
+          VERSION_REF: ${{ steps.image.outputs.version_ref }}
+          DIGEST: ${{ steps.published.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-reports
+          cat > release-reports/release-image.json <<EOF
+          {
+            "image": "${VERSION_REF}",
+            "digest": "${DIGEST}",
+            "commit_sha": "${HEAD_SHA}",
+            "source": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}",
+            "workflow_run_id": "${GITHUB_RUN_ID}"
+          }
+          EOF
+          {
+            echo "### Release image published"
+            echo ""
+            echo "- Image: \`${VERSION_REF}\`"
+            echo "- Digest: \`${DIGEST}\`"
+            echo "- Commit: \`${HEAD_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-image-${{ github.event.workflow_run.head_sha }}
+          path: release-reports/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Log out of GitHub Container Registry
+        if: always()
+        shell: bash
+        run: docker logout ghcr.io >/dev/null 2>&1 || true

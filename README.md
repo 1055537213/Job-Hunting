@@ -401,6 +401,12 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 第一次启动前还要创建对象存储 bucket，并先执行 `docker compose ... run --rm migrate` 或让
 Compose 的 `migrate` 服务完成迁移。生产环境的模拟充值接口会关闭，真实支付仍待后续接入。
 
+仓库已经接入受控 CD：`master` 的 CI 成功后，`.github/workflows/publish-image.yml` 会对精确
+提交重新构建和扫描镜像，并发布 `ghcr.io/<owner>/<repo>:sha-<commit 前 12 位>`；
+`.github/workflows/deploy-production.yml` 只允许手动输入完整提交 SHA 和确认词 `DEPLOY`，并通过
+GitHub `production` Environment 等待人工批准。部署端使用固定 SSH 主机指纹、迁移前数据库备份、
+服务健康检查和上一版本镜像回退；生产 `.env` 始终保留在服务器，不会由 Actions 上传。
+
 生产上线前至少完成数据库迁移、健康检查、备份恢复演练、文件扫描验收和安全扫描。详细规则见 docs/learning/production-release.md。
 
 ## 8. 接口文档（如果是后端项目）

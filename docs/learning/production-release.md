@@ -161,6 +161,87 @@ docker compose -f compose.yaml -f compose.prod.yaml ps
 发布顺序由 Compose 保证：PostgreSQL 健康后执行 Alembic，ClamAV 健康后才启动 Web 和
 Worker，迁移成功且 Web 健康后 Caddy 才接收外部流量。
 
+## GitHub Actions CD
+
+项目使用两个独立工作流完成受控持续交付：
+
+- `.github/workflows/publish-image.yml`：只监听名为 `CI` 的工作流。仅当 `master` 的 `push`
+  对应 CI 成功后，才检出该次 CI 的精确提交，重新构建并扫描镜像，然后发布到 GHCR。
+- `.github/workflows/deploy-production.yml`：只允许管理员手动触发，并绑定 GitHub 的
+  `production Environment`。输入完整 40 位提交 SHA 和确认词 `DEPLOY` 后，工作流才会等待
+  Environment 审批并部署。
+
+发布镜像包含两个标签：
+
+- `sha-<commit 前 12 位>`：版本标签，部署工作流只使用这个标签，并通过镜像 OCI
+  `org.opencontainers.image.revision` 再次核对完整提交 SHA。
+- `master`：方便查看最新构建，不作为生产部署依据，因为它会随新提交移动。
+
+镜像发布工作流在获得 GHCR 写权限前不会运行仓库测试代码。它会对即将推送的镜像再次执行
+Trivy 高危/严重漏洞门禁并生成 CycloneDX SBOM；门禁失败时不会登录或推送镜像。发布结果、
+镜像 digest、漏洞报告和 SBOM 会作为 Actions artifact 保留 30 天。
+
+### GitHub Environment 配置
+
+在仓库 `Settings -> Environments` 中创建 `production` Environment，并设置：
+
+1. Required reviewers：选择有权批准生产发布的管理员。
+2. Deployment branches：仅允许 `master`。
+3. Environment secrets：
+   - `DEPLOY_HOST`：服务器域名或 IPv4 地址。
+   - `DEPLOY_PORT`：SSH 端口；留空时使用 `22`。
+   - `DEPLOY_USER`：部署账号，必须能够直接执行 Docker 和 Docker Compose。
+   - `DEPLOY_SSH_PRIVATE_KEY`：只供 Actions 使用的部署私钥。
+   - `DEPLOY_KNOWN_HOSTS`：预先核对过指纹的 SSH known_hosts 记录。
+4. Environment variable：
+   - `DEPLOY_PATH`：服务器部署根目录，例如 `/opt/job-hunting-agent`。路径不得包含空格。
+
+`DEPLOY_KNOWN_HOSTS` 应在可信运维电脑上生成，并通过服务器控制台或云厂商控制台核对指纹后
+再保存。部署工作流不会运行动态 `ssh-keyscan`，也不会关闭 `StrictHostKeyChecking`，避免在
+部署时无条件信任被替换的服务器。
+
+### 服务器首次准备
+
+服务器必须已安装 Docker Engine 和 Docker Compose plugin，部署账号必须拥有目标目录和
+Docker 权限。先创建共享配置目录：
+
+```bash
+sudo mkdir -p /opt/job-hunting-agent/shared
+sudo chown -R <deploy-user>:<deploy-user> /opt/job-hunting-agent
+chmod 700 /opt/job-hunting-agent/shared
+```
+
+将完整生产配置保存为 `/opt/job-hunting-agent/shared/.env` 并设置权限：
+
+```bash
+chmod 600 /opt/job-hunting-agent/shared/.env
+```
+
+该文件需要包含 `.env.example` 的模型与业务配置，以及 `deploy/env.production.example` 的
+生产配置。`JOB_AGENT_IMAGE` 可以保留一个合法占位值，部署脚本会在每次 Compose 调用时用
+已验证的版本镜像覆盖它。工作流不会上传生产 `.env`，模型 API Key、SMTP 密码、数据库密码、
+Redis 密码和对象存储密钥始终只保存在服务器共享目录。
+
+### 手动部署
+
+1. 在 `Publish release image` 工作流中确认目标提交已成功发布。
+2. 打开 `Deploy production`，选择 `Run workflow`。
+3. 输入目标提交的完整 40 位 SHA，并在确认字段输入 `DEPLOY`。
+4. GitHub 创建待审批 deployment 后，由 `production Environment` 的 reviewer 审批。
+
+部署工作流会依次验证提交属于 `master`、拉取 `sha-<commit 前 12 位>` 镜像、核对完整 OCI
+revision、验证固定 SSH 主机指纹、上传 Compose/Caddy/Prometheus 配置，并通过加密 SSH 通道
+直接传输已验证镜像。服务器不需要长期保存 GHCR Token。
+
+服务器端 `scripts/deploy_production.sh` 会在已有 PostgreSQL 运行时创建迁移前 custom-format
+数据库备份，然后执行 Compose 配置校验、Alembic 迁移和服务更新。只有 Web 健康且 Worker、
+Beat、Caddy、Prometheus 均在运行后，`current` 软链接和当前镜像状态才会更新。失败时会尝试
+恢复上一版配置和镜像；数据库迁移不会自动反向执行，应使用迁移前备份和正式恢复流程处理不兼容
+迁移。首次部署没有上一版本时，脚本会停止已部分启动的应用服务，但保留数据库和对象存储卷。
+
+这套 CD 不替代完整备份。自动部署只创建 PostgreSQL 迁移前备份；MinIO 对象和数据库联合备份、
+异机保存以及 RPO/RTO 仍按本文件的“备份”和“恢复演练”章节执行。
+
 ## 指标和告警
 
 Prometheus 每 15 秒从 Compose 内部的 Web 副本采集一次低敏请求指标，默认保留 15 天。

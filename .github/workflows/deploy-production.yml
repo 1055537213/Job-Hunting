@@ -1,0 +1,215 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full 40-character commit SHA already published by the release-image workflow
+        required: true
+        type: string
+      confirmation:
+        description: Type DEPLOY to confirm the production deployment
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: production
+    env:
+      COMMIT_SHA: ${{ inputs.commit_sha }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+
+    steps:
+      - name: Validate deployment request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${CONFIRMATION}" == "DEPLOY" ]]
+          [[ "${COMMIT_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ -n "${DEPLOY_HOST}" && "${DEPLOY_HOST}" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]
+          [[ -n "${DEPLOY_USER}" && "${DEPLOY_USER}" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]]
+          DEPLOY_PORT="${DEPLOY_PORT:-22}"
+          [[ "${DEPLOY_PORT}" =~ ^[0-9]+$ ]]
+          (( DEPLOY_PORT >= 1 && DEPLOY_PORT <= 65535 ))
+          [[ -n "${DEPLOY_PATH}" && "${DEPLOY_PATH}" =~ ^/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)+$ ]]
+          [[ -n "${DEPLOY_SSH_PRIVATE_KEY}" ]]
+          [[ -n "${DEPLOY_KNOWN_HOSTS}" ]]
+
+      - name: Check out the requested release commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the commit belongs to master
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "${COMMIT_SHA}" ]]
+          git merge-base --is-ancestor "${COMMIT_SHA}" origin/master
+
+      - name: Resolve the published image
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${COMMIT_SHA:0:12}"
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          IMAGE_REF="${IMAGE_NAME}:sha-${SHORT_SHA}"
+          RELEASE_ID="sha-${SHORT_SHA}"
+          {
+            echo "ref=${IMAGE_REF}"
+            echo "release_id=${RELEASE_ID}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in and verify the immutable image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker pull "${IMAGE_REF}"
+          IMAGE_REVISION="$(docker image inspect "${IMAGE_REF}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+          [[ "${IMAGE_REVISION}" == "${COMMIT_SHA}" ]]
+
+      - name: Configure pinned SSH host trust
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" | tr -d '\r' > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" | tr -d '\r' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
+
+      - name: Verify the production host prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${DEPLOY_PORT:-22}"
+          TARGET="${DEPLOY_USER}@${DEPLOY_HOST}"
+          ssh \
+            -i "$HOME/.ssh/deploy_key" \
+            -p "$PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$TARGET" \
+            'set -eu; docker version >/dev/null; docker compose version >/dev/null'
+
+      - name: Upload the deployment bundle
+        env:
+          RELEASE_ID: ${{ steps.image.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${DEPLOY_PORT:-22}"
+          TARGET="${DEPLOY_USER}@${DEPLOY_HOST}"
+          BUNDLE="$RUNNER_TEMP/job-agent-deploy.tar.gz"
+          REMOTE_BUNDLE="/tmp/job-agent-deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
+          RELEASE_DIR="${DEPLOY_PATH}/releases/${RELEASE_ID}"
+          tar -czf "$BUNDLE" \
+            compose.yaml \
+            compose.prod.yaml \
+            deploy/Caddyfile \
+            deploy/prometheus \
+            scripts/deploy_production.sh
+          ssh \
+            -i "$HOME/.ssh/deploy_key" \
+            -p "$PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$TARGET" \
+            "set -eu; mkdir -p '${RELEASE_DIR}' '${DEPLOY_PATH}/shared' '${DEPLOY_PATH}/state' '${DEPLOY_PATH}/backups'; rm -f '${REMOTE_BUNDLE}'"
+          scp \
+            -i "$HOME/.ssh/deploy_key" \
+            -P "$PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$BUNDLE" \
+            "${TARGET}:${REMOTE_BUNDLE}"
+          ssh \
+            -i "$HOME/.ssh/deploy_key" \
+            -p "$PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$TARGET" \
+            "set -eu; tar -xzf '${REMOTE_BUNDLE}' -C '${RELEASE_DIR}'; rm -f '${REMOTE_BUNDLE}'; chmod 700 '${RELEASE_DIR}/scripts/deploy_production.sh'"
+
+      - name: Transfer the verified release image
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${DEPLOY_PORT:-22}"
+          TARGET="${DEPLOY_USER}@${DEPLOY_HOST}"
+          docker save "${IMAGE_REF}" | gzip -1 | ssh \
+            -i "$HOME/.ssh/deploy_key" \
+            -p "$PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$TARGET" \
+            'gzip -d | docker load >/dev/null'
+
+      - name: Deploy and verify production
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          RELEASE_ID: ${{ steps.image.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${DEPLOY_PORT:-22}"
+          TARGET="${DEPLOY_USER}@${DEPLOY_HOST}"
+          ssh \
+            -i "$HOME/.ssh/deploy_key" \
+            -p "$PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$TARGET" \
+            "bash '${DEPLOY_PATH}/releases/${RELEASE_ID}/scripts/deploy_production.sh' '${DEPLOY_PATH}' '${RELEASE_ID}' '${IMAGE_REF}'"
+
+      - name: Record deployment summary
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          RELEASE_ID: ${{ steps.image.outputs.release_id }}
+        shell: bash
+        run: |
+          {
+            echo "### Production deployment completed"
+            echo ""
+            echo "- Environment: \`production\`"
+            echo "- Release: \`${RELEASE_ID}\`"
+            echo "- Image: \`${IMAGE_REF}\`"
+            echo "- Commit: \`${COMMIT_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove temporary credentials
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$HOME/.ssh/deploy_key"
+          docker logout ghcr.io >/dev/null 2>&1 || true
