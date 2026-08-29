@@ -283,8 +283,17 @@ docker compose --env-file .env -f compose.yaml -f compose.prod.yaml config --qui
   -Python E:\Anaconda\python.exe `
   -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent" `
   -ChunkCounts "50000,100000"
+.\scripts\validate_e2e_load.ps1 `
+  -Profile full `
+  -Python E:\Anaconda\python.exe
 .\scripts\security_scan.ps1
 ~~~
+
+端到端负载脚本使用随机 PostgreSQL schema、随机 Celery 队列和确定性模型替身，覆盖真实
+HTTP、Cookie/CSRF、SSE、pgvector、Redis/Celery、任务轮询和 Worker 停启恢复，不调用外部
+模型，也不污染现有账号。`smoke` 使用 1/5 并发，`full` 使用 1/5/10/20/50 并发；低敏报告
+写入 `data/eval-reports/`。具体边界和故障场景见
+[端到端负载与故障测试](docs/learning/e2e-load-testing.md)。
 
 RAG 评测使用 `evals/rag/golden_suite.json` 中的固定跨行业语料。脚本会创建两个临时账号，
 在真实 PostgreSQL/pgvector 中索引后统计最终 Top-N 的 Recall、Precision、nDCG、MRR、禁止召回率和标签分组指标，再自动

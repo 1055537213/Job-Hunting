@@ -230,6 +230,20 @@ Worker，等待 Beat 把任务从 `running` 原子回收为 `queued`，再启动
 这项演练验证的是恢复链路，不等同于真实简历导出压力测试。上线前仍应使用接近生产大小的
 文件和并发量，另外测量大文件、模型超时、Redis 重启以及多个 Worker 同时消费时的 RTO/RPO。
 
+上线前还应执行整条 API、SSE、pgvector 和 Celery 链路的分档负载验收：
+
+```powershell
+.\scripts\validate_e2e_load.ps1 `
+  -Profile full `
+  -RequestsPerUser 2 `
+  -Python E:\Anaconda\python.exe
+```
+
+该脚本固定覆盖 1/5/10/20/50 并发，创建随机 PostgreSQL schema 和专用 Celery 队列，使用
+确定性模型替身避免外部费用，并验证 CSRF、账号隔离、重复写入、SSE 故障事件以及 Worker
+停止后积压任务的恢复。报告和完整执行边界见
+[端到端负载与故障测试](e2e-load-testing.md)。
+
 ## RAG 召回质量门禁
 
 固定黄金集位于 `evals/rag/golden_suite.json`，覆盖软件、工业图纸、公差数值、PDF 表格、
