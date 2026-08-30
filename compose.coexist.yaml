@@ -19,6 +19,39 @@ services:
     environment:
       JOB_AGENT_OTEL_ENABLED: "false"
 
+  coexist-https:
+    image: "${JOB_AGENT_COEXIST_NGINX_IMAGE:-nginx:1.30.4-alpine3.24@sha256:97d490c12ba55b4946b01546d1c3ed324e8d41ab1c9fcb2a616aa470620e5b46}"
+    restart: unless-stopped
+    environment:
+      JOB_AGENT_PUBLIC_IP: "${JOB_AGENT_PUBLIC_IP:?set JOB_AGENT_PUBLIC_IP in .env}"
+      NGINX_ENVSUBST_FILTER: "JOB_AGENT_PUBLIC_IP"
+    ports:
+      - "0.0.0.0:8443:8443"
+    volumes:
+      - ./deploy/nginx/coexist-ip-https.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - type: bind
+        source: "${JOB_AGENT_LETSENCRYPT_DIR:-/etc/letsencrypt}"
+        target: /etc/letsencrypt
+        read_only: true
+    depends_on:
+      web:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget --no-check-certificate --quiet --output-document=- https://127.0.0.1:8443/api/health >/dev/null 2>&1
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+
   prometheus:
     ports: !override
       - "127.0.0.1:${JOB_AGENT_COEXIST_PROMETHEUS_PORT:-19090}:9090"
@@ -32,8 +65,8 @@ services:
       - "127.0.0.1:${JOB_AGENT_COEXIST_ALERTMANAGER_PORT:-19093}:9093"
 
   # These services remain available through explicit profiles, but are not
-  # started by the coexist deployment. The host's shared edge proxy will route
-  # to the loopback-only Web port after the application passes acceptance.
+  # started by the coexist deployment. The dedicated coexist HTTPS edge owns
+  # only port 8443, so the existing application's public edge remains intact.
   reverse-proxy:
     profiles: ["standalone-edge"]
 

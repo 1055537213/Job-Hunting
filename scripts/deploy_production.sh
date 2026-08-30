@@ -45,6 +45,7 @@ docker compose version >/dev/null
 [[ -f "${RELEASE_DIR}/compose.prod.yaml" ]]
 if [[ "$DEPLOY_TOPOLOGY" == "coexist" ]]; then
   [[ -f "${RELEASE_DIR}/compose.coexist.yaml" ]]
+  [[ -f "${RELEASE_DIR}/deploy/nginx/coexist-ip-https.conf.template" ]]
 fi
 [[ -f "${RELEASE_DIR}/deploy/Caddyfile" ]]
 [[ -f "${RELEASE_DIR}/deploy/prometheus/prometheus.yml" ]]
@@ -223,6 +224,28 @@ verify_coexist_web_binding() {
     >/dev/null
 }
 
+verify_coexist_https_endpoint() {
+  local binding public_ip
+
+  binding="$(compose_active port coexist-https 8443)"
+  if [[ "$binding" != "0.0.0.0:8443" ]]; then
+    echo "Coexist HTTPS must bind to 0.0.0.0:8443; received: ${binding}" >&2
+    return 1
+  fi
+  public_ip="$(
+    compose_active exec -T coexist-https sh -ec \
+      'printf "%s" "$JOB_AGENT_PUBLIC_IP"'
+  )"
+  if [[ ! "$public_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "Coexist HTTPS public IP is invalid: ${public_ip}" >&2
+    return 1
+  fi
+  curl --fail --silent --show-error --max-time 15 \
+    --resolve "${public_ip}:8443:127.0.0.1" \
+    "https://${public_ip}:8443/api/health" \
+    >/dev/null
+}
+
 remove_inactive_coexist_services() {
   local -a inactive_services=(reverse-proxy loki tempo alloy grafana)
 
@@ -247,6 +270,12 @@ wait_for_active_topology_services() {
   fi
   if [[ "$ACTIVE_TOPOLOGY" == "coexist" ]]; then
     if ! verify_coexist_web_binding; then
+      return 1
+    fi
+    if ! wait_for_healthy_service coexist-https 180; then
+      return 1
+    fi
+    if ! verify_coexist_https_endpoint; then
       return 1
     fi
   fi

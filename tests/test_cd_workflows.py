@@ -29,6 +29,7 @@ def _production_compose_config(*extra_files: str) -> dict:
             "JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY": "test-access-key",
             "JOB_AGENT_OBJECT_STORAGE_SECRET_KEY": "test-secret-key",
             "JOB_AGENT_POSTGRES_PASSWORD": "test-postgres-password",
+            "JOB_AGENT_PUBLIC_IP": "203.0.113.10",
             "JOB_AGENT_REDIS_PASSWORD": "test-redis-password",
             "JOB_AGENT_SMTP_FROM_EMAIL": "sender@example.invalid",
             "JOB_AGENT_SMTP_HOST": "smtp.example.invalid",
@@ -67,6 +68,7 @@ def test_coexist_topology_keeps_only_lightweight_services_and_loopback_web():
         "alertmanager-config",
         "beat",
         "clamav",
+        "coexist-https",
         "migrate",
         "minio",
         "postgres",
@@ -84,6 +86,27 @@ def test_coexist_topology_keeps_only_lightweight_services_and_loopback_web():
             "protocol": "tcp",
         }
     ]
+    assert config["services"]["coexist-https"]["ports"] == [
+        {
+            "mode": "ingress",
+            "target": 8443,
+            "published": "8443",
+            "host_ip": "0.0.0.0",
+            "protocol": "tcp",
+        }
+    ]
+    assert config["services"]["coexist-https"]["environment"] == {
+        "JOB_AGENT_PUBLIC_IP": "203.0.113.10",
+        "NGINX_ENVSUBST_FILTER": "JOB_AGENT_PUBLIC_IP",
+    }
+    assert config["services"]["coexist-https"]["depends_on"]["web"] == {
+        "condition": "service_healthy",
+        "required": True,
+    }
+    assert {
+        volume["target"]: volume
+        for volume in config["services"]["coexist-https"]["volumes"]
+    }["/etc/letsencrypt"]["read_only"] is True
     for service in ("web", "worker", "beat"):
         assert config["services"][service]["environment"]["JOB_AGENT_OTEL_ENABLED"] == "false"
 
@@ -118,6 +141,7 @@ def test_production_deployment_exposes_an_explicit_coexist_topology():
         'ACTIVE_TOPOLOGY="$DEPLOY_TOPOLOGY"',
         'if [[ "$ACTIVE_TOPOLOGY" == "coexist" ]]',
         '"${ACTIVE_RELEASE_DIR}/compose.coexist.yaml"',
+        '"${RELEASE_DIR}/deploy/nginx/coexist-ip-https.conf.template"',
     ):
         assert required in script
 
@@ -176,6 +200,41 @@ def test_coexist_deployment_verifies_the_loopback_web_endpoint():
     assert "Required command is unavailable for coexist topology: curl" in script
 
 
+def test_coexist_deployment_verifies_the_public_ip_https_endpoint():
+    script = (ROOT / "scripts" / "deploy_production.sh").read_text(
+        encoding="utf-8"
+    )
+
+    for required in (
+        "verify_coexist_https_endpoint",
+        "compose_active port coexist-https 8443",
+        'if [[ "$binding" != "0.0.0.0:8443" ]]',
+        "wait_for_healthy_service coexist-https 180",
+        'compose_active exec -T coexist-https sh -ec',
+        '--resolve "${public_ip}:8443:127.0.0.1"',
+        '"https://${public_ip}:8443/api/health"',
+    ):
+        assert required in script
+
+
+def test_coexist_certificate_reload_hook_targets_only_the_https_edge():
+    hook = ROOT / "scripts" / "reload_coexist_https.sh"
+
+    assert hook.exists()
+    script = hook.read_text(encoding="utf-8")
+    for required in (
+        "set -Eeuo pipefail",
+        'APP_ROOT="${1:-/opt/job-hunting-agent}"',
+        '"${STATE_DIR}/current-image"',
+        "compose.coexist.yaml",
+        "ps -q coexist-https",
+        "exec -T coexist-https nginx -t",
+        "exec -T coexist-https nginx -s reload",
+    ):
+        assert required in script
+    assert "restart" not in script
+
+
 def test_coexist_deployment_removes_only_inactive_job_agent_containers():
     script = (ROOT / "scripts" / "deploy_production.sh").read_text(
         encoding="utf-8"
@@ -203,6 +262,11 @@ def test_production_guide_and_template_document_the_coexist_topology():
     for required in (
         "compose.coexist.yaml",
         "127.0.0.1:18081",
+        "0.0.0.0:8443",
+        "https://121.40.128.252:8443",
+        "--preferred-profile shortlived",
+        "--ip-address 121.40.128.252",
+        "/.well-known/acme-challenge/",
         "Loki、Tempo、Alloy 和 Grafana",
         "先完成回环地址验收",
         "topology` 选择 `coexist",
@@ -213,6 +277,8 @@ def test_production_guide_and_template_document_the_coexist_topology():
         "JOB_AGENT_COEXIST_PROMETHEUS_PORT=19090",
         "JOB_AGENT_COEXIST_ALERTMANAGER_PORT=19093",
         "JOB_AGENT_COEXIST_PROMETHEUS_RETENTION=7d",
+        "JOB_AGENT_PUBLIC_IP=replace-with-public-ip",
+        "JOB_AGENT_LETSENCRYPT_DIR=/etc/letsencrypt",
     ):
         assert required in template
     assert "JOB_AGENT_COEXIST_WEB_PORT" not in template
@@ -257,6 +323,7 @@ def test_ci_validates_all_github_actions_workflows():
     ) in workflow
     assert 'docker run --rm -v "$PWD:/repo" -w /repo "$ACTIONLINT_IMAGE"' in workflow
     assert "-f compose.prod.yaml -f compose.coexist.yaml config --quiet" in workflow
+    assert "JOB_AGENT_PUBLIC_IP: 203.0.113.10" in workflow
 
 
 def test_production_deployment_requires_manual_confirmation_and_environment():

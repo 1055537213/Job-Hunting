@@ -179,7 +179,7 @@
 ├─ compose.yaml                # 基础开发拓扑
 ├─ compose.dev.yaml            # 源码挂载和热更新覆盖
 ├─ compose.prod.yaml           # 单机生产覆盖
-├─ compose.coexist.yaml        # 同机轻量共存覆盖，仅暴露回环 Web 和核心观测服务
+├─ compose.coexist.yaml        # 同机轻量共存覆盖，回环 Web 加独立公网 IP HTTPS 入口
 ├─ compose.*-test.yaml         # 多副本、恢复、文件扫描和验收覆盖
 ├─ Dockerfile                  # Web/Worker/Beat/Migrate 共用镜像
 ├─ pyproject.toml              # 包元数据、入口命令和测试配置
@@ -407,13 +407,17 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 ~~~
 
 同一服务器已有其他项目占用 `80/443` 时，使用轻量共存拓扑。它将 Web 绑定到
-`127.0.0.1:18081`，保留 ClamAV、Prometheus 和 Alertmanager，默认不启动项目内 Caddy、
-Loki、Tempo、Alloy 与 Grafana：
+`127.0.0.1:18081`，并由独立轻量 Nginx 在 `0.0.0.0:8443` 提供公网 IP HTTPS。该拓扑保留
+ClamAV、Prometheus 和 Alertmanager，默认不启动项目内 Caddy、Loki、Tempo、Alloy 与 Grafana：
 
 ~~~powershell
 docker compose -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml config --quiet
 docker compose -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml up -d --no-build
 ~~~
+
+生产 `.env` 需要设置 `JOB_AGENT_PUBLIC_IP`，并将 `JOB_AGENT_PUBLIC_BASE_URL` 配置为
+`https://<公网 IP>:8443`。宿主机证书默认从 `/etc/letsencrypt` 只读挂载；首次签发、自动续期和
+旧 Nginx 的 HTTP-01 验证目录配置见 `docs/learning/production-release.md`。
 
 生产模板位于 `deploy/env.production.example`。它不会覆盖模型供应商配置，部署时应先从
 `.env.example` 复制模型和业务配置，再用生产模板中的值替换开发项；`JOB_AGENT_DOMAIN`、

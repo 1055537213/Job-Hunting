@@ -7,8 +7,8 @@
 - `compose.prod.yaml`：生产覆盖配置，移除业务内部服务的公网端口，使用独立生产数据卷，
   通过 Caddy 暴露 HTTPS，并启动仅绑定服务器回环地址的 Prometheus。
 - `compose.coexist.yaml`：同一服务器已有其他项目时使用的轻量生产覆盖。Web 只绑定
-  `127.0.0.1:18081`，保留核心业务、ClamAV、Prometheus 和 Alertmanager，默认不启动
-  Caddy、Loki、Tempo、Alloy 和 Grafana。
+  `127.0.0.1:18081`，独立 Nginx 在 `0.0.0.0:8443` 提供公网 IP HTTPS，保留核心业务、
+  ClamAV、Prometheus 和 Alertmanager，默认不启动 Caddy、Loki、Tempo、Alloy 和 Grafana。
 
 ## 同机轻量共存拓扑
 
@@ -29,6 +29,9 @@ docker compose \
 - PostgreSQL、Redis、MinIO 和 ClamAV 只存在于 `job-hunting-agent-production` 内部网络和独立数据卷。
 - Web 默认映射为 `127.0.0.1:18081:8000`，不能直接从公网访问；Prometheus 和
   Alertmanager 分别使用 `127.0.0.1:19090` 与 `127.0.0.1:19093`。
+- `coexist-https` 使用独立 Nginx 监听 `0.0.0.0:8443`，读取宿主机
+  `/etc/letsencrypt/live/<公网 IP>/` 下的证书并转发到内部 Web。阿里云安全组只需新增 TCP
+  `8443`，不能开放内部的 `18081`、`19090` 或 `19093`。
 - 保留 Web、Worker、Beat、PostgreSQL、Redis、MinIO、ClamAV、Prometheus 和 Alertmanager。
 - Loki、Tempo、Alloy 和 Grafana 归入显式 profile，默认不启动；应用同时关闭 OTEL 导出，
   Prometheus 指标仍然保留七天。
@@ -37,17 +40,74 @@ docker compose \
 
 管理员通过 `Deploy production` 工作流部署时，将 `topology` 选择 `coexist`。远端脚本会记录
 本次拓扑，失败回滚时恢复上一版本自己的拓扑，并要求先完成回环地址验收：只有宿主机能够访问
-`http://127.0.0.1:18081/api/health` 后才算部署成功。应用通过验收后，再由独立共享反向代理把目标
-域名转发到该回环端口；在完成共享入口配置前，不应对公网开放 `18081`。
+`http://127.0.0.1:18081/api/health`，并且 `https://<公网 IP>:8443/api/health` 的证书和响应均
+通过检查后才算部署成功。公网用户最终通过 `https://<公网 IP>:8443` 访问，不应对公网开放
+`18081`。
 
 共存模式的 Web 固定使用 `127.0.0.1:18081`，避免共享代理与应用配置发生漂移。Prometheus、
 Alertmanager 端口和 Prometheus 保留周期可在生产 `.env` 中覆盖：
 
 ```dotenv
+JOB_AGENT_PUBLIC_IP=121.40.128.252
+JOB_AGENT_LETSENCRYPT_DIR=/etc/letsencrypt
+JOB_AGENT_PUBLIC_BASE_URL=https://121.40.128.252:8443
 JOB_AGENT_COEXIST_PROMETHEUS_PORT=19090
 JOB_AGENT_COEXIST_ALERTMANAGER_PORT=19093
 JOB_AGENT_COEXIST_PROMETHEUS_RETENTION=7d
 ```
+
+### 公网 IP HTTPS 证书
+
+Let's Encrypt 的 IP 证书是短期证书。签发与续期仍需要通过 HTTP-01 在公网 `80` 端口提供
+`/.well-known/acme-challenge/`，但不需要停止旧项目。先在旧项目 Nginx 的 `server` 中加入：
+
+```nginx
+location ^~ /.well-known/acme-challenge/ {
+    root /var/www/letsencrypt;
+    default_type text/plain;
+    try_files $uri =404;
+}
+```
+
+同时给旧项目 Nginx 容器添加只读挂载：
+
+```yaml
+volumes:
+  - /var/lib/letsencrypt:/var/www/letsencrypt:ro
+```
+
+重建旧 Nginx 后，先验证挑战目录确实能从公网读取，再签发证书：
+
+```bash
+sudo install -d -m 755 /var/lib/letsencrypt/.well-known/acme-challenge
+printf '%s\n' job-agent-acme-probe | sudo tee \
+  /var/lib/letsencrypt/.well-known/acme-challenge/job-agent-probe >/dev/null
+curl --fail http://121.40.128.252/.well-known/acme-challenge/job-agent-probe
+
+sudo certbot certonly \
+  --non-interactive \
+  --agree-tos \
+  --email <告警邮箱> \
+  --preferred-profile shortlived \
+  --webroot -w /var/lib/letsencrypt \
+  --ip-address 121.40.128.252 \
+  --cert-name 121.40.128.252
+```
+
+Certbot 必须为支持 IP 证书的当前版本。签发后确认
+`/etc/letsencrypt/live/121.40.128.252/fullchain.pem` 和 `privkey.pem` 存在，再执行第一次共存部署。
+部署成功后，把平滑重载脚本接入 Certbot 的 deploy hook，并验证自动续期：
+
+```bash
+sudo ln -sfn \
+  /opt/job-hunting-agent/current/scripts/reload_coexist_https.sh \
+  /etc/letsencrypt/renewal-hooks/deploy/job-agent-coexist-https
+sudo certbot renew --dry-run
+```
+
+该 hook 只校验并平滑重载 `coexist-https`，不会重启 Web、Worker、数据库或旧项目。生产 `.env`
+必须保持 `JOB_AGENT_COOKIE_SECURE=true`，公开地址必须是
+`JOB_AGENT_PUBLIC_BASE_URL=https://121.40.128.252:8443`。
 
 ## 首次准备
 
