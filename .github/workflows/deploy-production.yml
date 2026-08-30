@@ -53,6 +53,9 @@ jobs:
           [[ "${DEPLOY_TOPOLOGY}" == "standalone" || "${DEPLOY_TOPOLOGY}" == "coexist" ]]
           [[ "${COMMIT_SHA}" =~ ^[0-9a-f]{40}$ ]]
           [[ -n "${DEPLOY_HOST}" && "${DEPLOY_HOST}" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]
+          if [[ "${DEPLOY_TOPOLOGY}" == "coexist" ]]; then
+            [[ "${DEPLOY_HOST}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+          fi
           [[ -n "${DEPLOY_USER}" && "${DEPLOY_USER}" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]]
           DEPLOY_PORT="${DEPLOY_PORT:-22}"
           [[ "${DEPLOY_PORT}" =~ ^[0-9]+$ ]]
@@ -139,7 +142,8 @@ jobs:
           BUNDLE_FILES=(compose.yaml compose.prod.yaml deploy scripts/deploy_production.sh)
           if [[ "${DEPLOY_TOPOLOGY}" == "coexist" ]]; then
             [[ -f compose.coexist.yaml ]]
-            BUNDLE_FILES+=(compose.coexist.yaml)
+            [[ -f scripts/reload_coexist_https.sh ]]
+            BUNDLE_FILES+=(compose.coexist.yaml scripts/reload_coexist_https.sh)
           fi
           tar -czf "$BUNDLE" "${BUNDLE_FILES[@]}"
           ssh \
@@ -205,6 +209,15 @@ jobs:
             -o StrictHostKeyChecking=yes \
             "$TARGET" \
             "bash '${DEPLOY_PATH}/releases/${RELEASE_ID}/scripts/deploy_production.sh' '${DEPLOY_PATH}' '${RELEASE_ID}' '${IMAGE_REF}'${TOPOLOGY_ARGUMENT}"
+
+      - name: Verify coexist public HTTPS
+        if: inputs.topology == 'coexist'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 20 \
+            "https://${DEPLOY_HOST}:8443/api/health" \
+            >/dev/null
 
       - name: Record deployment summary
         env:

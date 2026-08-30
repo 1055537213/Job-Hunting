@@ -48,9 +48,9 @@ docker compose \
 Alertmanager 端口和 Prometheus 保留周期可在生产 `.env` 中覆盖：
 
 ```dotenv
-JOB_AGENT_PUBLIC_IP=121.40.128.252
+JOB_AGENT_PUBLIC_IP=<PUBLIC_IP>
 JOB_AGENT_LETSENCRYPT_DIR=/etc/letsencrypt
-JOB_AGENT_PUBLIC_BASE_URL=https://121.40.128.252:8443
+JOB_AGENT_PUBLIC_BASE_URL=https://<PUBLIC_IP>:8443
 JOB_AGENT_COEXIST_PROMETHEUS_PORT=19090
 JOB_AGENT_COEXIST_ALERTMANAGER_PORT=19093
 JOB_AGENT_COEXIST_PROMETHEUS_RETENTION=7d
@@ -59,7 +59,8 @@ JOB_AGENT_COEXIST_PROMETHEUS_RETENTION=7d
 ### 公网 IP HTTPS 证书
 
 Let's Encrypt 的 IP 证书是短期证书。签发与续期仍需要通过 HTTP-01 在公网 `80` 端口提供
-`/.well-known/acme-challenge/`，但不需要停止旧项目。先在旧项目 Nginx 的 `server` 中加入：
+`/.well-known/acme-challenge/`，但不需要停止旧项目。该 `location` 必须加入处理公网 IP Host 的
+默认 `80` 端口 `server` 中：
 
 ```nginx
 location ^~ /.well-known/acme-challenge/ {
@@ -76,38 +77,54 @@ volumes:
   - /var/lib/letsencrypt:/var/www/letsencrypt:ro
 ```
 
-重建旧 Nginx 后，先验证挑战目录确实能从公网读取，再签发证书：
+重建旧 Nginx 后，先安装支持 IP 证书的 Certbot。Ubuntu 24.04 的旧 apt 包不满足要求，使用
+当前 Snap 版本，并确认输出为 `Certbot 5.4.0` 或更高版本：
 
 ```bash
+sudo apt-get remove -y certbot
+sudo snap install certbot --classic
+sudo ln -sfn /snap/bin/certbot /usr/local/bin/certbot
+certbot --version
+```
+
+然后验证挑战目录确实能从公网读取，再签发证书：
+
+```bash
+PUBLIC_IP="<PUBLIC_IP>"
+ACME_EMAIL="<ALERT_EMAIL>"
 sudo install -d -m 755 /var/lib/letsencrypt/.well-known/acme-challenge
 printf '%s\n' job-agent-acme-probe | sudo tee \
   /var/lib/letsencrypt/.well-known/acme-challenge/job-agent-probe >/dev/null
-curl --fail http://121.40.128.252/.well-known/acme-challenge/job-agent-probe
+curl --fail "http://${PUBLIC_IP}/.well-known/acme-challenge/job-agent-probe"
 
 sudo certbot certonly \
   --non-interactive \
   --agree-tos \
-  --email <告警邮箱> \
+  --email "$ACME_EMAIL" \
   --preferred-profile shortlived \
   --webroot -w /var/lib/letsencrypt \
-  --ip-address 121.40.128.252 \
-  --cert-name 121.40.128.252
+  --ip-address "$PUBLIC_IP" \
+  --cert-name "$PUBLIC_IP"
 ```
 
 Certbot 必须为支持 IP 证书的当前版本。签发后确认
-`/etc/letsencrypt/live/121.40.128.252/fullchain.pem` 和 `privkey.pem` 存在，再执行第一次共存部署。
+`/etc/letsencrypt/live/<PUBLIC_IP>/fullchain.pem` 和 `privkey.pem` 存在，再执行第一次共存部署。
 部署成功后，把平滑重载脚本接入 Certbot 的 deploy hook，并验证自动续期：
 
 ```bash
 sudo ln -sfn \
   /opt/job-hunting-agent/current/scripts/reload_coexist_https.sh \
   /etc/letsencrypt/renewal-hooks/deploy/job-agent-coexist-https
-sudo certbot renew --dry-run
+sudo systemctl enable --now snap.certbot.renew.timer
+sudo systemctl is-active snap.certbot.renew.timer
+sudo certbot renew --dry-run --run-deploy-hooks
 ```
 
 该 hook 只校验并平滑重载 `coexist-https`，不会重启 Web、Worker、数据库或旧项目。生产 `.env`
 必须保持 `JOB_AGENT_COOKIE_SECURE=true`，公开地址必须是
-`JOB_AGENT_PUBLIC_BASE_URL=https://121.40.128.252:8443`。
+`JOB_AGENT_PUBLIC_BASE_URL=https://<PUBLIC_IP>:8443`。在阿里云安全组中增加入方向 TCP `8443`；
+公开服务通常使用来源 `0.0.0.0/0`，同时保留公网 TCP `80` 供 HTTP-01 续期。部署工作流还会从
+GitHub 托管运行器访问 `https://<PUBLIC_IP>:8443/api/health`，用于验证公网路由、安全组和证书。
 
 ## 首次准备
 

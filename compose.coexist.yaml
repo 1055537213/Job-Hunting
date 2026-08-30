@@ -23,6 +23,7 @@ services:
     image: "${JOB_AGENT_COEXIST_NGINX_IMAGE:-nginx:1.30.4-alpine3.24@sha256:97d490c12ba55b4946b01546d1c3ed324e8d41ab1c9fcb2a616aa470620e5b46}"
     restart: unless-stopped
     environment:
+      JOB_AGENT_PUBLIC_BASE_URL: "${JOB_AGENT_PUBLIC_BASE_URL:?set JOB_AGENT_PUBLIC_BASE_URL in .env}"
       JOB_AGENT_PUBLIC_IP: "${JOB_AGENT_PUBLIC_IP:?set JOB_AGENT_PUBLIC_IP in .env}"
       NGINX_ENVSUBST_FILTER: "JOB_AGENT_PUBLIC_IP"
     ports:
@@ -30,8 +31,12 @@ services:
     volumes:
       - ./deploy/nginx/coexist-ip-https.conf.template:/etc/nginx/templates/default.conf.template:ro
       - type: bind
-        source: "${JOB_AGENT_LETSENCRYPT_DIR:-/etc/letsencrypt}"
-        target: /etc/letsencrypt
+        source: "${JOB_AGENT_LETSENCRYPT_DIR:-/etc/letsencrypt}/live/${JOB_AGENT_PUBLIC_IP}"
+        target: "/etc/letsencrypt/live/${JOB_AGENT_PUBLIC_IP}"
+        read_only: true
+      - type: bind
+        source: "${JOB_AGENT_LETSENCRYPT_DIR:-/etc/letsencrypt}/archive/${JOB_AGENT_PUBLIC_IP}"
+        target: "/etc/letsencrypt/archive/${JOB_AGENT_PUBLIC_IP}"
         read_only: true
     depends_on:
       web:

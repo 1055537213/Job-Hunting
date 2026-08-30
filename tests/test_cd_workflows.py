@@ -29,6 +29,7 @@ def _production_compose_config(*extra_files: str) -> dict:
             "JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY": "test-access-key",
             "JOB_AGENT_OBJECT_STORAGE_SECRET_KEY": "test-secret-key",
             "JOB_AGENT_POSTGRES_PASSWORD": "test-postgres-password",
+            "JOB_AGENT_PUBLIC_BASE_URL": "https://203.0.113.10:8443",
             "JOB_AGENT_PUBLIC_IP": "203.0.113.10",
             "JOB_AGENT_REDIS_PASSWORD": "test-redis-password",
             "JOB_AGENT_SMTP_FROM_EMAIL": "sender@example.invalid",
@@ -96,6 +97,7 @@ def test_coexist_topology_keeps_only_lightweight_services_and_loopback_web():
         }
     ]
     assert config["services"]["coexist-https"]["environment"] == {
+        "JOB_AGENT_PUBLIC_BASE_URL": "https://203.0.113.10:8443",
         "JOB_AGENT_PUBLIC_IP": "203.0.113.10",
         "NGINX_ENVSUBST_FILTER": "JOB_AGENT_PUBLIC_IP",
     }
@@ -103,10 +105,16 @@ def test_coexist_topology_keeps_only_lightweight_services_and_loopback_web():
         "condition": "service_healthy",
         "required": True,
     }
-    assert {
+    coexist_volumes = {
         volume["target"]: volume
         for volume in config["services"]["coexist-https"]["volumes"]
-    }["/etc/letsencrypt"]["read_only"] is True
+    }
+    for target in (
+        "/etc/letsencrypt/live/203.0.113.10",
+        "/etc/letsencrypt/archive/203.0.113.10",
+    ):
+        assert coexist_volumes[target]["read_only"] is True
+    assert "/etc/letsencrypt" not in coexist_volumes
     for service in ("web", "worker", "beat"):
         assert config["services"][service]["environment"]["JOB_AGENT_OTEL_ENABLED"] == "false"
 
@@ -126,7 +134,7 @@ def test_production_deployment_exposes_an_explicit_coexist_topology():
         "- coexist",
         "DEPLOY_TOPOLOGY: ${{ inputs.topology }}",
         "BUNDLE_FILES=(compose.yaml compose.prod.yaml deploy scripts/deploy_production.sh)",
-        "BUNDLE_FILES+=(compose.coexist.yaml)",
+        "BUNDLE_FILES+=(compose.coexist.yaml scripts/reload_coexist_https.sh)",
         "compose.coexist.yaml",
         'TOPOLOGY_ARGUMENT=""',
         "TOPOLOGY_ARGUMENT=\" 'coexist'\"",
@@ -142,6 +150,7 @@ def test_production_deployment_exposes_an_explicit_coexist_topology():
         'if [[ "$ACTIVE_TOPOLOGY" == "coexist" ]]',
         '"${ACTIVE_RELEASE_DIR}/compose.coexist.yaml"',
         '"${RELEASE_DIR}/deploy/nginx/coexist-ip-https.conf.template"',
+        '"${RELEASE_DIR}/scripts/reload_coexist_https.sh"',
     ):
         assert required in script
 
@@ -156,6 +165,9 @@ def test_production_deployment_restores_and_persists_the_release_topology():
         '"${STATE_DIR}/current-topology"',
         'ACTIVE_TOPOLOGY="$PREVIOUS_TOPOLOGY"',
         'topology_files_exist "$PREVIOUS_RELEASE" "$PREVIOUS_TOPOLOGY"',
+        "coexist_https_available",
+        '[[ -f "${ACTIVE_RELEASE_DIR}/deploy/nginx/coexist-ip-https.conf.template" ]]',
+        "if coexist_https_available; then",
         '"${STATE_DIR}/current-topology.tmp"',
         'mv "${STATE_DIR}/current-topology.tmp" "${STATE_DIR}/current-topology"',
     ):
@@ -211,6 +223,8 @@ def test_coexist_deployment_verifies_the_public_ip_https_endpoint():
         'if [[ "$binding" != "0.0.0.0:8443" ]]',
         "wait_for_healthy_service coexist-https 180",
         'compose_active exec -T coexist-https sh -ec',
+        'expected_public_base_url="https://${public_ip}:8443"',
+        'if [[ "$public_base_url" != "$expected_public_base_url" ]]',
         '--resolve "${public_ip}:8443:127.0.0.1"',
         '"https://${public_ip}:8443/api/health"',
     ):
@@ -263,15 +277,20 @@ def test_production_guide_and_template_document_the_coexist_topology():
         "compose.coexist.yaml",
         "127.0.0.1:18081",
         "0.0.0.0:8443",
-        "https://121.40.128.252:8443",
+        "https://<PUBLIC_IP>:8443",
+        "snap install certbot --classic",
+        "Certbot 5.4.0",
         "--preferred-profile shortlived",
-        "--ip-address 121.40.128.252",
+        '--ip-address "$PUBLIC_IP"',
+        "snap.certbot.renew.timer",
+        "renew --dry-run --run-deploy-hooks",
         "/.well-known/acme-challenge/",
         "Loki、Tempo、Alloy 和 Grafana",
         "先完成回环地址验收",
         "topology` 选择 `coexist",
     ):
         assert required in guide
+    assert "121.40.128.252" not in guide
 
     for required in (
         "JOB_AGENT_COEXIST_PROMETHEUS_PORT=19090",
@@ -324,6 +343,10 @@ def test_ci_validates_all_github_actions_workflows():
     assert 'docker run --rm -v "$PWD:/repo" -w /repo "$ACTIONLINT_IMAGE"' in workflow
     assert "-f compose.prod.yaml -f compose.coexist.yaml config --quiet" in workflow
     assert "JOB_AGENT_PUBLIC_IP: 203.0.113.10" in workflow
+    assert "JOB_AGENT_PUBLIC_BASE_URL: https://203.0.113.10:8443" in workflow
+    assert "Validate coexist Nginx HTTPS configuration" in workflow
+    assert "coexist-ip-https.conf.template:/etc/nginx/templates/default.conf.template:ro" in workflow
+    assert "nginx -t" in workflow
 
 
 def test_production_deployment_requires_manual_confirmation_and_environment():
@@ -343,6 +366,7 @@ def test_production_deployment_requires_manual_confirmation_and_environment():
         "DEPLOY_KNOWN_HOSTS",
         "StrictHostKeyChecking=yes",
         "docker save \"${IMAGE_REF}\"",
+        '"https://${DEPLOY_HOST}:8443/api/health"',
         "BUNDLE_FILES=(compose.yaml compose.prod.yaml deploy scripts/deploy_production.sh)",
         "scripts/deploy_production.sh",
     ):

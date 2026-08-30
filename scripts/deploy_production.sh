@@ -46,6 +46,7 @@ docker compose version >/dev/null
 if [[ "$DEPLOY_TOPOLOGY" == "coexist" ]]; then
   [[ -f "${RELEASE_DIR}/compose.coexist.yaml" ]]
   [[ -f "${RELEASE_DIR}/deploy/nginx/coexist-ip-https.conf.template" ]]
+  [[ -x "${RELEASE_DIR}/scripts/reload_coexist_https.sh" ]]
 fi
 [[ -f "${RELEASE_DIR}/deploy/Caddyfile" ]]
 [[ -f "${RELEASE_DIR}/deploy/prometheus/prometheus.yml" ]]
@@ -92,6 +93,11 @@ topology_files_exist() {
   if [[ "$topology" == "coexist" ]]; then
     [[ -f "${release_dir}/compose.coexist.yaml" ]] || return 1
   fi
+}
+
+coexist_https_available() {
+  [[ "$ACTIVE_TOPOLOGY" == "coexist" ]] || return 1
+  [[ -f "${ACTIVE_RELEASE_DIR}/deploy/nginx/coexist-ip-https.conf.template" ]]
 }
 
 if [[ -L "$CURRENT_LINK" ]]; then
@@ -225,7 +231,7 @@ verify_coexist_web_binding() {
 }
 
 verify_coexist_https_endpoint() {
-  local binding public_ip
+  local binding expected_public_base_url public_base_url public_ip
 
   binding="$(compose_active port coexist-https 8443)"
   if [[ "$binding" != "0.0.0.0:8443" ]]; then
@@ -236,8 +242,17 @@ verify_coexist_https_endpoint() {
     compose_active exec -T coexist-https sh -ec \
       'printf "%s" "$JOB_AGENT_PUBLIC_IP"'
   )"
+  public_base_url="$(
+    compose_active exec -T coexist-https sh -ec \
+      'printf "%s" "$JOB_AGENT_PUBLIC_BASE_URL"'
+  )"
   if [[ ! "$public_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     echo "Coexist HTTPS public IP is invalid: ${public_ip}" >&2
+    return 1
+  fi
+  expected_public_base_url="https://${public_ip}:8443"
+  if [[ "$public_base_url" != "$expected_public_base_url" ]]; then
+    echo "JOB_AGENT_PUBLIC_BASE_URL must be ${expected_public_base_url}; received: ${public_base_url}" >&2
     return 1
   fi
   curl --fail --silent --show-error --max-time 15 \
@@ -272,11 +287,13 @@ wait_for_active_topology_services() {
     if ! verify_coexist_web_binding; then
       return 1
     fi
-    if ! wait_for_healthy_service coexist-https 180; then
-      return 1
-    fi
-    if ! verify_coexist_https_endpoint; then
-      return 1
+    if coexist_https_available; then
+      if ! wait_for_healthy_service coexist-https 180; then
+        return 1
+      fi
+      if ! verify_coexist_https_endpoint; then
+        return 1
+      fi
     fi
   fi
 
