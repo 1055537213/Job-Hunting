@@ -129,8 +129,7 @@ jobs:
           tar -czf "$BUNDLE" \
             compose.yaml \
             compose.prod.yaml \
-            deploy/Caddyfile \
-            deploy/prometheus \
+            deploy \
             scripts/deploy_production.sh
           ssh \
             -i "$HOME/.ssh/deploy_key" \

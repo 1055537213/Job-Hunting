@@ -38,6 +38,11 @@ docker compose version >/dev/null
 [[ -f "${RELEASE_DIR}/deploy/Caddyfile" ]]
 [[ -f "${RELEASE_DIR}/deploy/prometheus/prometheus.yml" ]]
 [[ -f "${RELEASE_DIR}/deploy/prometheus/alerts.yml" ]]
+[[ -f "${RELEASE_DIR}/deploy/alertmanager/alertmanager.example.yml" ]]
+[[ -f "${RELEASE_DIR}/deploy/alloy/config.alloy" ]]
+[[ -f "${RELEASE_DIR}/deploy/loki/loki.yml" ]]
+[[ -f "${RELEASE_DIR}/deploy/tempo/tempo.yml" ]]
+[[ -f "${RELEASE_DIR}/deploy/grafana/provisioning/datasources/datasources.yml" ]]
 
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
 chmod 600 "$SHARED_ENV"
@@ -128,6 +133,39 @@ wait_for_running_service() {
   return 1
 }
 
+wait_for_completed_service() {
+  local service="$1"
+  local timeout_seconds="${2:-120}"
+  local deadline=$((SECONDS + timeout_seconds))
+  local ids status exit_code
+
+  while (( SECONDS < deadline )); do
+    ids="$(compose_active ps -a -q "$service")"
+    if [[ -n "$ids" ]]; then
+      while IFS= read -r container_id; do
+        [[ -n "$container_id" ]] || continue
+        status="$(docker inspect --format '{{.State.Status}}' "$container_id")"
+        if [[ "$status" == "exited" ]]; then
+          exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$container_id")"
+          if [[ "$exit_code" == "0" ]]; then
+            return 0
+          fi
+          echo "Service ${service} failed with exit code ${exit_code}." >&2
+          return 1
+        fi
+        if [[ "$status" == "dead" ]]; then
+          echo "Service ${service} entered terminal state: ${status}" >&2
+          return 1
+        fi
+      done <<< "$ids"
+    fi
+    sleep 2
+  done
+
+  echo "Timed out waiting for completed service: ${service}" >&2
+  return 1
+}
+
 backup_database_if_running() {
   local postgres_id backup_file temporary_file
   postgres_id="$(compose_active ps -q postgres || true)"
@@ -163,7 +201,9 @@ rollback_previous_release() {
   fi
 
   echo "No previous release is available; stopping partially started application services." >&2
-  compose_active stop web worker beat reverse-proxy prometheus >/dev/null 2>&1 || true
+  compose_active stop \
+    web worker beat reverse-proxy prometheus alertmanager loki tempo alloy grafana \
+    >/dev/null 2>&1 || true
   return 1
 }
 
@@ -190,11 +230,17 @@ backup_database_if_running
 
 DEPLOYMENT_STARTED=1
 compose_active up -d --no-build --pull missing --remove-orphans
+wait_for_completed_service alertmanager-config 120
 wait_for_healthy_service web 300
 wait_for_running_service worker 180
 wait_for_running_service beat 180
 wait_for_running_service reverse-proxy 180
 wait_for_running_service prometheus 180
+wait_for_running_service alertmanager 180
+wait_for_running_service loki 180
+wait_for_running_service tempo 180
+wait_for_running_service alloy 180
+wait_for_running_service grafana 180
 
 ln -sfnT "$RELEASE_DIR" "$CURRENT_LINK"
 printf '%s\n' "$IMAGE_REF" > "${STATE_DIR}/current-image.tmp"

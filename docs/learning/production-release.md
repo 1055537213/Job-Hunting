@@ -255,15 +255,16 @@ target；查询和告警按 `job="job-hunting-agent-web"` 聚合，排障时仍�
 `job_agent_intent_router_model_duration_seconds` 观察直达率、回退原因、超时率与耗时分位数。
 标签集合由代码固定，不包含用户消息、账号、prompt、工具参数或 request ID。
 
-Caddy 会对公网 `/internal/*` 请求直接返回 404。Prometheus 页面只监听服务器的
-`127.0.0.1:9090`，可从运维电脑建立 SSH 端口转发后访问：
+Caddy 会对公网 `/internal/*` 请求直接返回 404。Prometheus、Grafana 和 Alertmanager 页面
+只监听服务器回环地址，可从运维电脑建立 SSH 端口转发后访问：
 
 ```powershell
-ssh -L 9090:127.0.0.1:9090 <server-user>@<server-host>
+ssh -L 3000:127.0.0.1:3000 -L 9090:127.0.0.1:9090 -L 9093:127.0.0.1:9093 <server-user>@<server-host>
 ```
 
-浏览器打开 `http://127.0.0.1:9090/targets` 检查采集目标，打开
-`http://127.0.0.1:9090/alerts` 检查告警规则。当前规则覆盖：
+浏览器打开 `http://127.0.0.1:3000` 联合查询指标、日志和 Trace；打开
+`http://127.0.0.1:9090/targets` 检查采集目标，打开 `http://127.0.0.1:9090/alerts`
+检查告警规则，或打开 `http://127.0.0.1:9093` 查看通知分组。当前规则覆盖：
 
 - Web 连续两分钟无法采集。
 - 五分钟内至少五次 5xx，且错误比例持续高于 5%。
@@ -271,9 +272,16 @@ ssh -L 9090:127.0.0.1:9090 <server-user>@<server-host>
 - 十分钟内限流或 CSRF 拦截达到二十次，或 Redis 限流后端在五分钟内影响请求。
 - 全部 Web 副本当前处理请求总数持续五分钟达到二十个。
 
-规则文件位于 `deploy/prometheus/alerts.yml`。它们当前会在 Prometheus 中进入 pending 或
-firing 状态，但不会自动向外发送通知；正式确定值班渠道后再接入 Alertmanager，避免把测试
-告警发送到真实联系人。
+规则文件位于 `deploy/prometheus/alerts.yml`。Prometheus 把 pending 之后的 firing/resolved
+状态发送给 Alertmanager；Alertmanager 复用 `.env` 中的 SMTP 账号，并向
+`JOB_AGENT_ALERT_EMAIL_TO` 发送分组、去重和恢复邮件。运行时配置由应用镜像生成到受限命名卷，
+SMTP 密码不提交到 Git。上线前要使用测试告警验证收件地址，避免只验证账号邮件而遗漏告警通道。
+
+Alloy 采集生产 Compose 容器的标准输出并发送到 Loki；Web、SQLAlchemy 与 Celery 的
+OpenTelemetry span 经 Alloy 发送到 Tempo。JSON 日志和 Trace 通过 `trace_id` 关联，默认 Trace
+采样率为 10%。HTTP Trace 不记录查询参数、请求头、正文、Cookie 或模型提示词。Loki 保留 14 天，
+Tempo 保留 7 天；二者当前使用单机本地卷，不属于业务备份。完整边界见
+`docs/learning/observability.md`。
 
 配置修改后先校验：
 

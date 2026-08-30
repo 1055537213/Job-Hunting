@@ -88,6 +88,8 @@ def build_celery_app(settings: TaskQueueSettings) -> Any:
         task_acks_late=True,
         task_reject_on_worker_lost=True,
         worker_prefetch_multiplier=1,
+        worker_hijack_root_logger=False,
+        worker_redirect_stdouts=False,
         broker_connection_retry_on_startup=True,
         timezone="Asia/Shanghai",
         enable_utc=True,

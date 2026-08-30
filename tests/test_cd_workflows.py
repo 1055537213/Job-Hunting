@@ -65,6 +65,7 @@ def test_production_deployment_requires_manual_confirmation_and_environment():
         "DEPLOY_KNOWN_HOSTS",
         "StrictHostKeyChecking=yes",
         "docker save \"${IMAGE_REF}\"",
+        "deploy \\",
         "scripts/deploy_production.sh",
     ):
         assert required in workflow
@@ -90,6 +91,14 @@ def test_remote_deployment_validates_health_and_can_restore_previous_release():
         "wait_for_running_service worker",
         "wait_for_running_service beat",
         "wait_for_running_service reverse-proxy",
+        "wait_for_completed_service alertmanager-config",
+        "wait_for_running_service alertmanager",
+        "wait_for_running_service loki",
+        "wait_for_running_service tempo",
+        "wait_for_running_service alloy",
+        "wait_for_running_service grafana",
+        "deploy/alloy/config.alloy",
+        "deploy/grafana/provisioning/datasources/datasources.yml",
         "rollback_previous_release",
         "current-image",
         "ln -sfnT",

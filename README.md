@@ -22,7 +22,7 @@
 - 将确认事实和长文本材料建立账号隔离的 pgvector 索引，支持可追溯检索。
 - 通过 Agent 对话完成档案维护、职位匹配和材料整理；复杂任务交给 Celery Worker。
 - 生成独立的职位定制简历版本，不覆盖候选人原始事实和原始简历。
-- 记录模型 Token 用量、余额变化、工具轨迹、审计事件和低敏 Prometheus 指标。
+- 记录模型 Token 用量、余额变化、工具轨迹和审计事件，并通过 Prometheus、Loki、Tempo、Grafana 和 Alertmanager 观测运行状态。
 
 核心数据边界：PostgreSQL 是权威事实源，pgvector 是可重建的派生索引，Redis 负责任务传递、共享限流和并发租约。
 
@@ -37,6 +37,8 @@
 | ReDoc | http://127.0.0.1:8000/redoc | 只读接口文档 |
 | 健康检查 | http://127.0.0.1:8000/api/health | 数据库、队列、存储和模型摘要 |
 | Prometheus | http://127.0.0.1:9090 | 仅绑定本机回环地址 |
+| Grafana | http://127.0.0.1:3000 | 生产环境通过 SSH 隧道查看指标、日志和 Trace |
+| Alertmanager | http://127.0.0.1:9093 | 生产环境通过 SSH 隧道查看告警路由 |
 
 如果要补充演示图，建议只提交脱敏后的界面截图，不要把 .env、用户简历、数据库导出、对象存储文件或验收报告提交到仓库。
 
@@ -83,7 +85,8 @@
 
 - Token 用量记录、余额扣减、充值订单、支付事件、管理员补款和追加式资金流水。
 - Redis 共享限流、模型/截图并发租约和多 Web 副本运行基础。
-- Prometheus 请求指标、意图路由指标、管理员工具轨迹和审计日志。
+- Prometheus 请求指标、Loki 集中日志、Tempo 分布式 Trace、Grafana 联合排障和 Alertmanager 邮件通知。
+- JSON 日志与 Trace 共享 `trace_id`，但不采集请求正文、查询参数、Cookie、API Key 或模型提示词。
 - 备份恢复、Worker 故障恢复、ClamAV 文件扫描和安全扫描验收脚本。
 
 ## 4. 技术栈（后端 / 前端 / 数据库 / 部署）
@@ -108,7 +111,11 @@
 - PostgreSQL 16 + pgvector：结构化事实、任务、审计、账务和长文本登记
 - MinIO 或 S3-compatible 对象存储：原始简历、导出文件和安全视觉派生文件
 - Redis：Celery Broker、共享限流和并发租约
-- Prometheus：低敏运行指标
+- Prometheus：低敏运行指标和告警判定
+- Loki + Alloy：Docker 集中日志和 14 天保留
+- Tempo + OpenTelemetry：Web、SQLAlchemy 与 Celery Trace，默认采样 10%、保留 7 天
+- Grafana：统一查询指标、日志和 Trace
+- Alertmanager：告警聚合、去重和 SMTP 邮件通知
 - Caddy：生产 HTTPS 反向代理
 - Docker Compose：开发、验收、恢复演练和单机生产部署
 
@@ -127,7 +134,7 @@
 4. **后台任务可恢复**：任务状态以 PostgreSQL 为准，Redis 只传递任务键；幂等键和原子认领避免重复执行、重复扣费和重复导出。
 5. **多模态证据链**：职位截图、项目图片和有限复杂 PDF 页面能够进入 OCR、视觉分析和视觉向量检索，同时保留来源定位；对图号、尺寸、公差等含数字术语提供精确补召回，避免只依赖向量相似度。
 6. **轻量意图路由可控降级**：小模型只负责低风险、高置信度直达；对历史指代、多个意图、修改确认和身份缺失等风险场景保留主 Agent。
-7. **生产基线可验收**：提供迁移门禁、备份恢复、Worker 崩溃恢复、多副本、文件扫描、Prometheus 和容器漏洞验收入口。
+7. **生产基线可验收**：提供迁移门禁、备份恢复、Worker 崩溃恢复、多副本、文件扫描、负载测试、可观测性和容器漏洞验收入口。
 8. **计费事实可追溯**：供应商 usage、调用 ID、充值幂等键、管理员原因和余额流水能够关联排查。
 
 ## 6. 目录结构说明（项目文件夹介绍）
@@ -161,11 +168,13 @@
 │  ├─ rate_limiting.py         # 内存/Redis 滑动窗口限流
 │  ├─ concurrency_control.py   # 全局与账号级并发租约
 │  ├─ file_scanning.py         # 本地安全扫描和 ClamAV 边界
+│  ├─ observability.py          # JSON 日志、脱敏和 OpenTelemetry Trace
+│  ├─ observability_config.py   # 运行时生成 Alertmanager 密钥配置
 │  └─ web_static/              # 前端页面、脚本、样式和 Vue 运行时
 ├─ alembic/                    # 数据库迁移
 ├─ tests/                      # Python 单元/集成测试和前端回归测试
 ├─ scripts/                    # 基准、备份恢复、扩容、扫描和企业验收脚本
-├─ deploy/                     # Caddy、Prometheus 和生产环境模板
+├─ deploy/                     # Caddy、Prometheus、Grafana、Loki、Tempo、Alloy 和生产模板
 ├─ docs/                       # ADR、架构决策、运行学习文档和发布基线
 ├─ compose.yaml                # 基础开发拓扑
 ├─ compose.dev.yaml            # 源码挂载和热更新覆盖
@@ -265,6 +274,7 @@ $env:JOB_AGENT_POSTGRES_PASSWORD='replace-with-a-long-url-safe-password'
 $env:JOB_AGENT_IMAGE='ghcr.io/your-org/job-hunting-agent:release-tag'
 $env:JOB_AGENT_DOMAIN='agent.example.com'
 $env:JOB_AGENT_TLS_EMAIL='ops@example.com'
+$env:JOB_AGENT_GRAFANA_ADMIN_PASSWORD='replace-with-a-long-random-password'
 docker compose --env-file .env -f compose.yaml -f compose.prod.yaml config --quiet
 ~~~
 
@@ -396,8 +406,8 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
 
 生产模板位于 `deploy/env.production.example`。它不会覆盖模型供应商配置，部署时应先从
 `.env.example` 复制模型和业务配置，再用生产模板中的值替换开发项；`JOB_AGENT_DOMAIN`、
-`JOB_AGENT_TLS_EMAIL`、`JOB_AGENT_PUBLIC_BASE_URL` 和 SMTP 配置必须使用真实生产值。
-生产 Compose 会使用带密码的 PostgreSQL、Redis、ClamAV、MinIO、Caddy 和 Prometheus，
+`JOB_AGENT_TLS_EMAIL`、`JOB_AGENT_PUBLIC_BASE_URL`、`JOB_AGENT_ALERT_EMAIL_TO`、Grafana 密码和 SMTP 配置必须使用真实生产值。
+生产 Compose 会使用带密码的 PostgreSQL、Redis、ClamAV、MinIO、Caddy、Prometheus、Loki、Tempo、Alloy、Grafana 和 Alertmanager，
 第一次启动前还要创建对象存储 bucket，并先执行 `docker compose ... run --rm migrate` 或让
 Compose 的 `migrate` 服务完成迁移。生产环境的模拟充值接口会关闭，真实支付仍待后续接入。
 
@@ -491,7 +501,7 @@ job_agent_intent_router_model_duration_seconds_bucket
 - [x] 建立固定 GitHub 提交和哈希的跨行业真实文件端到端 RAG 评测。
 - [x] 建立 K/N 开发集参数扫描、P95 统计、留出集质量与性能防回退门禁。
 - [ ] 持续扩充已授权的真实行业语料和难负样本，并按正式 Embedding 模型校准阈值。
-- [ ] 接入 Alertmanager 通知、OpenTelemetry Trace 和集中日志平台。
+- [x] 接入 Alertmanager 邮件通知、OpenTelemetry Trace、Loki 集中日志和 Grafana 联合排障。
 - [ ] 出现明确外部调用方后，在现有 MCP adapter 上增加鉴权、授权和 Server 生命周期。
 - [ ] 建立严格类型检查基线，逐步消化第三方 stub 和内部 Protocol 类型债务。
 - [ ] 完成目标生产服务器的 ClamAV 验收、渗透测试、灾难恢复演练和密钥轮换流程。

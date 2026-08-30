@@ -84,6 +84,8 @@ def test_web_reload_uses_an_importable_factory_and_watches_requested_directory(m
                     "port": 8123,
                     "reload": True,
                     "reload_dirs": [str(watch_dir)],
+                    "log_config": None,
+                    "access_log": False,
                 },
             )
         ]

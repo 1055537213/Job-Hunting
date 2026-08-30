@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import secrets
 import threading
@@ -136,6 +135,17 @@ def install_web_hardening(
         except Exception:  # noqa: BLE001 - 统一生成不泄露异常正文的 500 响应。
             status_code = 500
             outcome = "exception"
+            logger.exception(
+                "Unhandled web request",
+                extra={
+                    "event": "http_request_exception",
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": route_template(request),
+                    "status_code": status_code,
+                    "outcome": outcome,
+                },
+            )
             response = JSONResponse(
                 {"detail": "服务器内部错误。", "request_id": request_id},
                 status_code=500,
@@ -152,7 +162,7 @@ def install_web_hardening(
                 duration_ms=duration_ms,
                 outcome=outcome,
             )
-            log_access(request, status_code, duration_ms)
+            log_access(request, status_code, duration_ms, outcome=outcome)
 
 
 class RequestMetrics:
@@ -573,7 +583,13 @@ def resolve_client_identity(
     return resolved or client_identity(request)
 
 
-def log_access(request: Request, status_code: int, duration_ms: int) -> None:
+def log_access(
+    request: Request,
+    status_code: int,
+    duration_ms: int,
+    *,
+    outcome: str,
+) -> None:
     """输出不含请求正文的结构化访问日志。"""
 
     account = getattr(request.state, "account", None)
@@ -581,10 +597,11 @@ def log_access(request: Request, status_code: int, duration_ms: int) -> None:
         "event": "http_request",
         "request_id": getattr(request.state, "request_id", ""),
         "method": request.method,
-        "path": request.url.path,
+        "path": route_template(request),
         "status_code": status_code,
         "duration_ms": duration_ms,
+        "outcome": outcome,
     }
     if account is not None and getattr(account, "id", None) is not None:
         payload["account_id"] = int(account.id)
-    logger.info(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    logger.info("HTTP request completed", extra=payload)

@@ -205,6 +205,23 @@ class WebSecuritySettings:
 
 
 @dataclass(frozen=True)
+class ObservabilitySettings:
+    """结构化日志和分布式追踪配置。
+
+    日志只写到标准输出，由部署侧采集；Trace 通过内部 OTLP 端点发送。业务请求
+    不依赖遥测后端成功响应，因此 Loki、Tempo 或 Alloy 故障不会阻断用户请求。
+    """
+
+    environment: str = "development"
+    log_format: str = "console"
+    log_level: str = "INFO"
+    tracing_enabled: bool = False
+    otlp_traces_endpoint: str = "http://alloy:4318/v1/traces"
+    trace_sample_ratio: float = 0.1
+    export_timeout_seconds: float = 5.0
+
+
+@dataclass(frozen=True)
 class AccountLifecycleSettings:
     """注册验证、协议留痕和账号找回配置。"""
 
@@ -1178,6 +1195,84 @@ def load_web_security_settings(
             "启用 Redis 请求限流时必须配置 JOB_AGENT_RATE_LIMIT_REDIS_URL。"
         )
     return settings
+
+
+def load_observability_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> ObservabilitySettings:
+    """读取日志与 Trace 配置，并为生产环境提供保守默认值。"""
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(key: str, default: str | None = None) -> str | None:
+        value = environment.get(key) or file_values.get(key)
+        return value if value not in {None, ""} else default
+
+    runtime_environment = (
+        get("JOB_AGENT_ENVIRONMENT", "development") or "development"
+    ).strip().lower()
+    if runtime_environment not in {"development", "test", "production"}:
+        raise ValueError(
+            "JOB_AGENT_ENVIRONMENT 只能是 development、test 或 production"
+        )
+
+    log_format = (
+        get(
+            "JOB_AGENT_LOG_FORMAT",
+            "json" if runtime_environment == "production" else "console",
+        )
+        or "console"
+    ).strip().lower()
+    if log_format not in {"console", "json"}:
+        raise ValueError("JOB_AGENT_LOG_FORMAT 只能是 console 或 json")
+
+    log_level = (get("JOB_AGENT_LOG_LEVEL", "INFO") or "INFO").strip().upper()
+    if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+        raise ValueError(
+            "JOB_AGENT_LOG_LEVEL 只能是 DEBUG、INFO、WARNING、ERROR 或 CRITICAL"
+        )
+
+    sample_ratio = parse_non_negative_float(
+        get("JOB_AGENT_OTEL_TRACE_SAMPLE_RATIO", "0.1"),
+        "JOB_AGENT_OTEL_TRACE_SAMPLE_RATIO",
+    )
+    if sample_ratio > 1:
+        raise ValueError("JOB_AGENT_OTEL_TRACE_SAMPLE_RATIO 必须在 0 到 1 之间")
+
+    endpoint = (
+        get(
+            "JOB_AGENT_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "http://alloy:4318/v1/traces",
+        )
+        or ""
+    ).strip()
+    parsed_endpoint = urlsplit(endpoint)
+    if parsed_endpoint.scheme not in {"http", "https"} or not parsed_endpoint.netloc:
+        raise ValueError(
+            "JOB_AGENT_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT 必须是 http(s) URL"
+        )
+    if parsed_endpoint.username or parsed_endpoint.password:
+        raise ValueError("OTLP Trace 地址不能在 URL 中包含账号或密码")
+
+    return ObservabilitySettings(
+        environment=runtime_environment,
+        log_format=log_format,
+        log_level=log_level,
+        tracing_enabled=parse_bool(
+            get(
+                "JOB_AGENT_OTEL_ENABLED",
+                "true" if runtime_environment == "production" else "false",
+            )
+        ),
+        otlp_traces_endpoint=endpoint,
+        trace_sample_ratio=sample_ratio,
+        export_timeout_seconds=parse_positive_float(
+            get("JOB_AGENT_OTEL_EXPORT_TIMEOUT_SECONDS", "5"),
+            "JOB_AGENT_OTEL_EXPORT_TIMEOUT_SECONDS",
+        ),
+    )
 
 
 def masked_web_security_settings(settings: WebSecuritySettings) -> dict[str, object]:

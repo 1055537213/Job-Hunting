@@ -86,6 +86,7 @@ from .config import (
     load_file_scanning_settings,
     load_llm_settings,
     load_object_storage_settings,
+    load_observability_settings,
     load_project_visual_analysis_settings,
     load_rerank_settings,
     load_task_queue_settings,
@@ -104,6 +105,7 @@ from .config import (
     masked_web_security_settings,
     require_postgresql_database_url,
 )
+from .observability import configure_logging, configure_tracing, install_http_tracing
 from .deduplication import DuplicateResourceError
 from .file_scanning import FileInfectedError, FileScannerUnavailableError
 from .github_project import GitHubRepositoryError
@@ -2717,6 +2719,11 @@ def create_web_app(
             raise HTTPException(status_code=404, detail="工具调用记录不存在。") from error
         return {"trace": serialize_tool_trace_detail(trace)}
 
+    install_http_tracing(
+        web_app,
+        settings=load_observability_settings(env_path),
+        service_name="job-hunting-web",
+    )
     return web_app
 
 
@@ -3746,6 +3753,9 @@ def create_reloadable_web_app() -> FastAPI:
     """
 
     env_file = os.environ.get(WEB_RELOAD_ENV_FILE_ENV, ".env")
+    observability_settings = load_observability_settings(env_file)
+    configure_logging(observability_settings, service_name="job-hunting-web")
+    configure_tracing(observability_settings, service_name="job-hunting-web")
     database_settings = load_database_settings(env_file)
     try:
         database_url = require_postgresql_database_url(database_settings)
@@ -3790,6 +3800,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
+    observability_settings = load_observability_settings(args.env_file)
+    configure_logging(observability_settings, service_name="job-hunting-web")
+    configure_tracing(observability_settings, service_name="job-hunting-web")
+
     try:
         database_url = require_postgresql_database_url(load_database_settings(args.env_file))
     except ValueError as error:
@@ -3807,6 +3821,8 @@ def main(argv: list[str] | None = None) -> None:
             port=args.port,
             reload=True,
             reload_dirs=reload_dirs,
+            log_config=None,
+            access_log=False,
         )
         return
 
@@ -3818,6 +3834,8 @@ def main(argv: list[str] | None = None) -> None:
         ),
         host=args.host,
         port=args.port,
+        log_config=None,
+        access_log=False,
     )
 
 

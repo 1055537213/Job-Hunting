@@ -128,7 +128,8 @@ http://127.0.0.1:9090
 ```
 
 第二个地址是本地 Prometheus。`/targets` 用于确认 Web 采集目标是否为 `UP`，`/alerts`
-用于查看五条请求告警当前处于 inactive、pending 还是 firing。Alertmanager 暂未启用。
+用于查看请求告警当前处于 inactive、pending 还是 firing。Loki、Tempo、Grafana 和
+Alertmanager 只在 `compose.prod.yaml` 中启用，避免日常开发额外占用内存。
 
 ## 本机直接运行 Python
 
@@ -225,5 +226,5 @@ docker compose -f compose.yaml -f compose.dev.yaml restart web
 - `JOB_AGENT_DOCKER_BASE_IMAGE`、`JOB_AGENT_POSTGRES_IMAGE`、`JOB_AGENT_MINIO_IMAGE` 和
   `JOB_AGENT_REDIS_IMAGE` 仅解决镜像下载问题；覆盖默认摘要后必须重新扫描最终镜像。
 - 当前 Redis/Worker 已完成队列基础设施、系统探针、公开 GitHub 项目分析、扫描 PDF OCR 和简历 RAG 增量索引；
-  单机生产覆盖、HTTPS 反向代理、Prometheus 指标告警、备份恢复和 Worker 故障演练脚本也已有可执行基线。
-  仍未完成的是实际支付接入、Alertmanager 通知、高可用部署和生产容量验收。
+  单机生产覆盖、HTTPS 反向代理、Prometheus 指标、集中日志、Trace、告警邮件、备份恢复和
+  Worker 故障演练脚本已有可执行基线。仍未完成的是实际支付接入、高可用部署和生产容量验收。

@@ -10,7 +10,12 @@ import argparse
 from pathlib import Path
 
 from .background_tasks import register_background_tasks
-from .config import DEFAULT_ENV_PATH, load_task_queue_settings
+from .config import (
+    DEFAULT_ENV_PATH,
+    load_observability_settings,
+    load_task_queue_settings,
+)
+from .observability import configure_logging, configure_tracing
 from .task_queue import TaskQueueError, build_celery_app, maintenance_queue_name
 
 
@@ -42,6 +47,9 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.concurrency <= 0:
         raise SystemExit("--concurrency 必须大于 0。")
+    observability_settings = load_observability_settings(args.env_file)
+    configure_logging(observability_settings, service_name="job-hunting-worker")
+    configure_tracing(observability_settings, service_name="job-hunting-worker")
     try:
         settings = load_task_queue_settings(args.env_file)
         queue_name = (

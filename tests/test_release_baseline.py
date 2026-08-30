@@ -23,6 +23,11 @@ def test_ci_runs_quality_checks_and_builds_release_image():
         "docker compose --env-file .env.example -f compose.yaml config --quiet",
         "prom/prometheus:v3.13.1",
         "check config /etc/prometheus/prometheus.yml",
+        "grafana/alloy:v1.18.0",
+        "grafana/loki:3.7.4",
+        "grafana/tempo:2.10.5",
+        "prom/alertmanager:v0.32.1",
+        "check-config /etc/alertmanager/alertmanager.yml",
         "docker build --pull --no-cache --tag job-hunting-agent:ci .",
         'PIP_AUDIT_VERSION: "2.10.1"',
         "python -m pip_audit",
@@ -153,7 +158,7 @@ def test_prometheus_scrape_and_alerting_baseline_is_present():
     assert "type: A" in config
     assert "port: 8000" in config
     assert "refresh_interval: 5s" in config
-    assert "static_configs:" not in config
+    assert 'targets: ["alertmanager:9093"]' in config
     assert "/etc/prometheus/alerts.yml" in config
     for alert_name in (
         "JobAgentWebDown",

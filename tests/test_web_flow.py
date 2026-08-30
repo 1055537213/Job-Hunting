@@ -668,18 +668,17 @@ def test_web_hardening_adds_request_id_security_headers_and_access_log(caplog) -
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
     assert "script-src 'self' 'unsafe-eval'" in response.headers["content-security-policy"]
     records = [
-        json.loads(record.getMessage())
+        record
         for record in caplog.records
         if record.name == "job_hunting_agent.web.access"
     ]
-    assert {
-        "event": "http_request",
-        "request_id": "request-test-123",
-        "method": "GET",
-        "path": "/",
-        "status_code": 200,
-    }.items() <= records[-1].items()
-    assert "body" not in records[-1]
+    assert records[-1].event == "http_request"
+    assert records[-1].request_id == "request-test-123"
+    assert records[-1].method == "GET"
+    assert records[-1].path == "/"
+    assert records[-1].status_code == 200
+    assert records[-1].outcome == "handled"
+    assert not hasattr(records[-1], "body")
 
 
 def test_web_hardening_keeps_request_id_and_security_headers_on_unhandled_500() -> None:

@@ -99,6 +99,7 @@ jobs:
           JOB_AGENT_IMAGE: job-hunting-agent:ci
           JOB_AGENT_DOMAIN: agent.example.com
           JOB_AGENT_TLS_EMAIL: ops@example.com
+          JOB_AGENT_GRAFANA_ADMIN_PASSWORD: ci-grafana-password
         run: >-
           docker compose --env-file .env.example
           -f compose.yaml -f compose.prod.yaml config --quiet
@@ -109,6 +110,27 @@ jobs:
           -v "$PWD/deploy/prometheus:/etc/prometheus:ro"
           prom/prometheus:v3.13.1
           check config /etc/prometheus/prometheus.yml
+
+      - name: Validate observability configurations
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/deploy/alloy/config.alloy:/etc/alloy/config.alloy:ro" \
+            grafana/alloy:v1.18.0 \
+            validate /etc/alloy/config.alloy
+          docker run --rm \
+            -v "$PWD/deploy/loki/loki.yml:/etc/loki/loki.yml:ro" \
+            grafana/loki:3.7.4 \
+            -verify-config=true -config.file=/etc/loki/loki.yml
+          docker run --rm \
+            -v "$PWD/deploy/tempo/tempo.yml:/etc/tempo/tempo.yml:ro" \
+            grafana/tempo:2.10.5 \
+            -config.file=/etc/tempo/tempo.yml -config.verify=true
+          docker run --rm --entrypoint /bin/amtool \
+            -v "$PWD/deploy/alertmanager/alertmanager.example.yml:/etc/alertmanager/alertmanager.yml:ro" \
+            prom/alertmanager:v0.32.1 \
+            check-config /etc/alertmanager/alertmanager.yml
 
       - name: Build release image
         run: docker build --pull --no-cache --tag job-hunting-agent:ci .

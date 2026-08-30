@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .config import load_observability_settings
+from .observability import configure_logging, configure_tracing
 from .task_queue import TaskQueueError
 from .worker import create_worker_app
 
@@ -16,6 +18,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
+
+    observability_settings = load_observability_settings(args.env_file)
+    configure_logging(observability_settings, service_name="job-hunting-beat")
+    configure_tracing(observability_settings, service_name="job-hunting-beat")
 
     try:
         celery_app = create_worker_app(Path(args.env_file))

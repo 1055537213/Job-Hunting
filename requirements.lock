@@ -80,6 +80,8 @@ fastapi==0.141.1
     # via job-hunting-agent (pyproject.toml)
 flatbuffers==25.12.19
     # via onnxruntime
+googleapis-common-protos==1.75.2
+    # via opentelemetry-exporter-otlp-proto-http
 greenlet==3.5.5
     # via sqlalchemy
 h11==0.16.0
@@ -165,6 +167,41 @@ openai==3.1.0
     # via langchain-openai
 opencv-python==5.0.0.93
     # via rapidocr
+opentelemetry-api==1.44.0
+    # via
+    #   job-hunting-agent (pyproject.toml)
+    #   opentelemetry-exporter-otlp-proto-http
+    #   opentelemetry-instrumentation
+    #   opentelemetry-instrumentation-celery
+    #   opentelemetry-instrumentation-sqlalchemy
+    #   opentelemetry-sdk
+    #   opentelemetry-semantic-conventions
+opentelemetry-exporter-otlp-proto-common==1.44.0
+    # via opentelemetry-exporter-otlp-proto-http
+opentelemetry-exporter-otlp-proto-http==1.44.0
+    # via job-hunting-agent (pyproject.toml)
+opentelemetry-instrumentation==0.65b0
+    # via
+    #   opentelemetry-instrumentation-celery
+    #   opentelemetry-instrumentation-sqlalchemy
+opentelemetry-instrumentation-celery==0.65b0
+    # via job-hunting-agent (pyproject.toml)
+opentelemetry-instrumentation-sqlalchemy==0.65b0
+    # via job-hunting-agent (pyproject.toml)
+opentelemetry-proto==1.44.0
+    # via
+    #   opentelemetry-exporter-otlp-proto-common
+    #   opentelemetry-exporter-otlp-proto-http
+opentelemetry-sdk==1.44.0
+    # via
+    #   job-hunting-agent (pyproject.toml)
+    #   opentelemetry-exporter-otlp-proto-http
+opentelemetry-semantic-conventions==0.65b0
+    # via
+    #   opentelemetry-instrumentation
+    #   opentelemetry-instrumentation-celery
+    #   opentelemetry-instrumentation-sqlalchemy
+    #   opentelemetry-sdk
 orjson==3.12.0
     # via
     #   langgraph-sdk
@@ -177,6 +214,8 @@ packaging==26.3
     #   langchain-core
     #   langsmith
     #   onnxruntime
+    #   opentelemetry-instrumentation
+    #   opentelemetry-instrumentation-sqlalchemy
 pdfminer-six==20260107
     # via pdfplumber
 pdfplumber==0.11.10
@@ -192,7 +231,10 @@ pillow==12.3.0
 prompt-toolkit==3.0.53
     # via click-repl
 protobuf==7.35.1
-    # via onnxruntime
+    # via
+    #   googleapis-common-protos
+    #   onnxruntime
+    #   opentelemetry-proto
 psycopg==3.3.4
     # via job-hunting-agent (pyproject.toml)
 psycopg-binary==3.3.4
@@ -231,7 +273,9 @@ pyyaml==6.0.3
 rapidocr==3.9.2
     # via job-hunting-agent (pyproject.toml)
 redis==6.4.0
-    # via kombu
+    # via
+    #   job-hunting-agent (pyproject.toml)
+    #   kombu
 regex==2026.7.19
     # via tiktoken
 reportlab==5.0.0
@@ -239,6 +283,7 @@ reportlab==5.0.0
 requests==2.34.2
     # via
     #   langsmith
+    #   opentelemetry-exporter-otlp-proto-http
     #   rapidocr
     #   requests-toolbelt
     #   tiktoken
@@ -284,6 +329,10 @@ typing-extensions==4.16.0
     #   langchain-protocol
     #   langsmith
     #   openai
+    #   opentelemetry-api
+    #   opentelemetry-exporter-otlp-proto-http
+    #   opentelemetry-sdk
+    #   opentelemetry-semantic-conventions
     #   psycopg
     #   pydantic
     #   pydantic-core
@@ -323,6 +372,10 @@ websockets==15.0.1
     # via
     #   langgraph-sdk
     #   langsmith
+wrapt==2.3.0
+    # via
+    #   opentelemetry-instrumentation
+    #   opentelemetry-instrumentation-sqlalchemy
 xxhash==4.0.0
     # via
     #   langgraph

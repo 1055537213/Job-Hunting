@@ -69,6 +69,10 @@ services:
     image: "${JOB_AGENT_IMAGE:?set JOB_AGENT_IMAGE in .env}"
     environment:
       JOB_AGENT_ENVIRONMENT: production
+      JOB_AGENT_LOG_FORMAT: json
+      JOB_AGENT_OTEL_ENABLED: "true"
+      JOB_AGENT_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://alloy:4318/v1/traces"
+      JOB_AGENT_OTEL_TRACE_SAMPLE_RATIO: "${JOB_AGENT_OTEL_TRACE_SAMPLE_RATIO:-0.1}"
       JOB_AGENT_COOKIE_SECURE: "true"
       # 生产 Web 不暴露宿主机端口，只接受内部 Caddy/Prometheus 流量；允许 Uvicorn
       # 使用 Caddy 重写后的 X-Forwarded-For，避免所有访客共享代理容器 IP 限额。
@@ -96,6 +100,10 @@ services:
     image: "${JOB_AGENT_IMAGE:?set JOB_AGENT_IMAGE in .env}"
     environment:
       JOB_AGENT_ENVIRONMENT: production
+      JOB_AGENT_LOG_FORMAT: json
+      JOB_AGENT_OTEL_ENABLED: "true"
+      JOB_AGENT_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://alloy:4318/v1/traces"
+      JOB_AGENT_OTEL_TRACE_SAMPLE_RATIO: "${JOB_AGENT_OTEL_TRACE_SAMPLE_RATIO:-0.1}"
       JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}:${JOB_AGENT_POSTGRES_PASSWORD:?set JOB_AGENT_POSTGRES_PASSWORD in .env}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
       JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET: "false"
       JOB_AGENT_FILE_SCAN_BACKEND: clamav
@@ -116,6 +124,10 @@ services:
     image: "${JOB_AGENT_IMAGE:?set JOB_AGENT_IMAGE in .env}"
     environment:
       JOB_AGENT_ENVIRONMENT: production
+      JOB_AGENT_LOG_FORMAT: json
+      JOB_AGENT_OTEL_ENABLED: "true"
+      JOB_AGENT_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://alloy:4318/v1/traces"
+      JOB_AGENT_OTEL_TRACE_SAMPLE_RATIO: "${JOB_AGENT_OTEL_TRACE_SAMPLE_RATIO:-0.1}"
       JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}:${JOB_AGENT_POSTGRES_PASSWORD:?set JOB_AGENT_POSTGRES_PASSWORD in .env}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
 
   reverse-proxy:
@@ -146,11 +158,139 @@ services:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus_prod_data:/prometheus
+    depends_on:
+      alertmanager:
+        condition: service_started
     deploy:
       resources:
         limits:
           cpus: "1.0"
           memory: 1G
+
+  alertmanager-config:
+    build: !reset null
+    image: "${JOB_AGENT_IMAGE:?set JOB_AGENT_IMAGE in .env}"
+    user: "0:0"
+    restart: "no"
+    entrypoint: ["python", "-m", "job_hunting_agent.observability_config"]
+    command:
+      - "--env-file"
+      - "/app/.env"
+      - "--output"
+      - "/alertmanager/alertmanager.yml"
+      - "--owner-uid"
+      - "65534"
+      - "--owner-gid"
+      - "65534"
+    volumes:
+      - ./.env:/app/.env:ro
+      - alertmanager_config:/alertmanager
+
+  alertmanager:
+    image: "${JOB_AGENT_ALERTMANAGER_IMAGE:-prom/alertmanager:v0.32.1}"
+    user: "65534:65534"
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    ports:
+      - "127.0.0.1:${JOB_AGENT_ALERTMANAGER_PORT:-9093}:9093"
+    volumes:
+      - alertmanager_config:/etc/alertmanager:ro
+      - alertmanager_prod_data:/alertmanager
+    depends_on:
+      alertmanager-config:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  loki:
+    image: "${JOB_AGENT_LOKI_IMAGE:-grafana/loki:3.7.4}"
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yml"]
+    expose:
+      - "3100"
+    volumes:
+      - ./deploy/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_prod_data:/loki
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  tempo:
+    image: "${JOB_AGENT_TEMPO_IMAGE:-grafana/tempo:2.10.5}"
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yml"]
+    expose:
+      - "3200"
+      - "4317"
+    volumes:
+      - ./deploy/tempo/tempo.yml:/etc/tempo/tempo.yml:ro
+      - tempo_prod_data:/var/tempo
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  alloy:
+    image: "${JOB_AGENT_ALLOY_IMAGE:-grafana/alloy:v1.18.0}"
+    user: "0:0"
+    restart: unless-stopped
+    read_only: true
+    command:
+      - "run"
+      - "--server.http.listen-addr=0.0.0.0:12345"
+      - "--storage.path=/var/lib/alloy/data"
+      - "/etc/alloy/config.alloy"
+    expose:
+      - "12345"
+      - "4317"
+      - "4318"
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./deploy/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_prod_data:/var/lib/alloy/data
+    depends_on:
+      - loki
+      - tempo
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  grafana:
+    image: "${JOB_AGENT_GRAFANA_IMAGE:-grafana/grafana:13.1.4}"
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: "${JOB_AGENT_GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${JOB_AGENT_GRAFANA_ADMIN_PASSWORD:?set JOB_AGENT_GRAFANA_ADMIN_PASSWORD in .env}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports:
+      - "127.0.0.1:${JOB_AGENT_GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_prod_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
 
 volumes:
   postgres_prod_data:
@@ -167,6 +307,18 @@ volumes:
     name: job-hunting-agent-production_prometheus_prod_data
   clamav_prod_data:
     name: job-hunting-agent-production_clamav_prod_data
+  alertmanager_config:
+    name: job-hunting-agent-production_alertmanager_config
+  alertmanager_prod_data:
+    name: job-hunting-agent-production_alertmanager_prod_data
+  loki_prod_data:
+    name: job-hunting-agent-production_loki_prod_data
+  tempo_prod_data:
+    name: job-hunting-agent-production_tempo_prod_data
+  alloy_prod_data:
+    name: job-hunting-agent-production_alloy_prod_data
+  grafana_prod_data:
+    name: job-hunting-agent-production_grafana_prod_data
 
 networks:
   default:
