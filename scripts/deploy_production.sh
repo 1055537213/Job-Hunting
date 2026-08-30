@@ -59,7 +59,6 @@ fi
 
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
 chmod 600 "$SHARED_ENV"
-ln -sfnT "$SHARED_ENV" "${RELEASE_DIR}/.env"
 
 ACTIVE_RELEASE_DIR="$RELEASE_DIR"
 ACTIVE_IMAGE="$IMAGE_REF"
@@ -80,7 +79,10 @@ compose_active() {
       -f "${ACTIVE_RELEASE_DIR}/compose.coexist.yaml"
     )
   fi
-  COMPOSE_PROFILES="" JOB_AGENT_IMAGE="$ACTIVE_IMAGE" docker compose \
+  COMPOSE_PROFILES="" \
+    JOB_AGENT_IMAGE="$ACTIVE_IMAGE" \
+    JOB_AGENT_RUNTIME_ENV_FILE="$SHARED_ENV" \
+    docker compose \
     "${compose_arguments[@]}" \
     "$@"
 }
@@ -337,10 +339,6 @@ rollback_previous_release() {
     ACTIVE_RELEASE_DIR="$PREVIOUS_RELEASE"
     ACTIVE_IMAGE="$PREVIOUS_IMAGE"
     ACTIVE_TOPOLOGY="$PREVIOUS_TOPOLOGY"
-    if ! ln -sfnT "$SHARED_ENV" "${ACTIVE_RELEASE_DIR}/.env"; then
-      echo "Rollback could not restore the production environment link." >&2
-      return 1
-    fi
     if ! compose_active config --quiet; then
       echo "Rollback Compose configuration validation failed." >&2
       return 1
@@ -379,6 +377,8 @@ on_deployment_error() {
   set +e
   echo "Production deployment failed for ${RELEASE_ID}." >&2
   compose_active ps >&2 || true
+  echo "Recent initialization logs:" >&2
+  compose_active logs --no-color --tail 200 migrate alertmanager-config web >&2 || true
   if (( DEPLOYMENT_STARTED == 1 )); then
     if ! rollback_previous_release; then
       echo "Rollback failed; previous release was not restored." >&2

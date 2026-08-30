@@ -32,6 +32,7 @@ def _production_compose_config(*extra_files: str) -> dict:
             "JOB_AGENT_PUBLIC_BASE_URL": "https://203.0.113.10:8443",
             "JOB_AGENT_PUBLIC_IP": "203.0.113.10",
             "JOB_AGENT_REDIS_PASSWORD": "test-redis-password",
+            "JOB_AGENT_RUNTIME_ENV_FILE": ".env.example",
             "JOB_AGENT_SMTP_FROM_EMAIL": "sender@example.invalid",
             "JOB_AGENT_SMTP_HOST": "smtp.example.invalid",
             "JOB_AGENT_SMTP_PASSWORD": "test-smtp-password",
@@ -117,6 +118,21 @@ def test_coexist_topology_keeps_only_lightweight_services_and_loopback_web():
     assert "/etc/letsencrypt" not in coexist_volumes
     for service in ("web", "worker", "beat"):
         assert config["services"][service]["environment"]["JOB_AGENT_OTEL_ENABLED"] == "false"
+
+
+def test_production_runtime_env_is_injected_without_mounting_host_secret_file():
+    config = _production_compose_config("compose.coexist.yaml")
+
+    for service in ("migrate", "web", "worker", "beat", "alertmanager-config"):
+        mounted_targets = {
+            volume["target"] for volume in config["services"][service].get("volumes", [])
+        }
+        assert "/app/.env" not in mounted_targets
+
+    for service in ("web", "worker", "beat", "alertmanager-config"):
+        environment = config["services"][service]["environment"]
+        assert "JOB_AGENT_LLM_PROVIDER" in environment
+        assert "JOB_AGENT_LLM_API_KEY" in environment
 
 
 def test_production_deployment_exposes_an_explicit_coexist_topology():

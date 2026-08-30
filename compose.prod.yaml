@@ -61,12 +61,19 @@ services:
   migrate:
     build: !reset null
     image: "${JOB_AGENT_IMAGE:?set JOB_AGENT_IMAGE in .env}"
+    # 生产密钥文件在宿主机保持 0600；迁移只需要下方显式注入的数据库 URL，
+    # 不把宿主机文件直接挂载给镜像内的非 root 用户。
+    volumes: !reset []
     environment:
       JOB_AGENT_DATABASE_URL: "postgresql+psycopg://${JOB_AGENT_POSTGRES_USER:-job_agent}:${JOB_AGENT_POSTGRES_PASSWORD:?set JOB_AGENT_POSTGRES_PASSWORD in .env}@postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
 
   web:
     build: !reset null
     image: "${JOB_AGENT_IMAGE:?set JOB_AGENT_IMAGE in .env}"
+    # Compose 在宿主机读取私有配置并注入环境；容器不直接读取 0600 的宿主机文件。
+    env_file:
+      - "${JOB_AGENT_RUNTIME_ENV_FILE:-./.env}"
+    volumes: !reset []
     environment:
       JOB_AGENT_ENVIRONMENT: production
       JOB_AGENT_LOG_FORMAT: json
@@ -98,6 +105,9 @@ services:
   worker:
     build: !reset null
     image: "${JOB_AGENT_IMAGE:?set JOB_AGENT_IMAGE in .env}"
+    env_file:
+      - "${JOB_AGENT_RUNTIME_ENV_FILE:-./.env}"
+    volumes: !reset []
     environment:
       JOB_AGENT_ENVIRONMENT: production
       JOB_AGENT_LOG_FORMAT: json
@@ -122,6 +132,9 @@ services:
   beat:
     build: !reset null
     image: "${JOB_AGENT_IMAGE:?set JOB_AGENT_IMAGE in .env}"
+    env_file:
+      - "${JOB_AGENT_RUNTIME_ENV_FILE:-./.env}"
+    volumes: !reset []
     environment:
       JOB_AGENT_ENVIRONMENT: production
       JOB_AGENT_LOG_FORMAT: json
@@ -170,6 +183,8 @@ services:
   alertmanager-config:
     build: !reset null
     image: "${JOB_AGENT_IMAGE:?set JOB_AGENT_IMAGE in .env}"
+    env_file:
+      - "${JOB_AGENT_RUNTIME_ENV_FILE:-./.env}"
     user: "0:0"
     restart: "no"
     entrypoint: ["python", "-m", "job_hunting_agent.observability_config"]
@@ -182,8 +197,7 @@ services:
       - "65534"
       - "--owner-gid"
       - "65534"
-    volumes:
-      - ./.env:/app/.env:ro
+    volumes: !override
       - alertmanager_config:/alertmanager
 
   alertmanager:

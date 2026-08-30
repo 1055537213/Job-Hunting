@@ -95,6 +95,7 @@ jobs:
       - name: Validate production Compose configuration
         env:
           JOB_AGENT_REDIS_PASSWORD: ci-redis-password
+          JOB_AGENT_RUNTIME_ENV_FILE: .env.example
           JOB_AGENT_POSTGRES_PASSWORD: ci-postgres-password
           JOB_AGENT_IMAGE: job-hunting-agent:ci
           JOB_AGENT_DOMAIN: agent.example.com
