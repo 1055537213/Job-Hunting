@@ -1,0 +1,49 @@
+# Isolated alert-delivery acceptance stack. No service publishes host ports.
+services:
+  mailpit:
+    image: "${JOB_AGENT_MAILPIT_IMAGE:-axllent/mailpit:v1.30.6@sha256:7f33095f80e901f6ad08028f06ca284aa58fe84942be5496008d041d3b9f4d4d}"
+    restart: "no"
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+      MP_MAX_MESSAGES: "20"
+    expose:
+      - "1025"
+      - "8025"
+    tmpfs:
+      - /data
+
+  alertmanager:
+    image: "${JOB_AGENT_ALERTMANAGER_IMAGE:-prom/alertmanager:v0.32.1}"
+    restart: "no"
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    expose:
+      - "9093"
+    volumes:
+      - "${JOB_AGENT_OBSERVABILITY_RUNTIME_DIR:?set JOB_AGENT_OBSERVABILITY_RUNTIME_DIR}/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro"
+    tmpfs:
+      - /alertmanager
+    depends_on:
+      - mailpit
+
+  prometheus:
+    image: "${JOB_AGENT_PROMETHEUS_IMAGE:-prom/prometheus:v3.13.1}"
+    restart: "no"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/tmp/prometheus"
+      - "--web.enable-lifecycle"
+    expose:
+      - "9090"
+    volumes:
+      - "${JOB_AGENT_OBSERVABILITY_RUNTIME_DIR:?set JOB_AGENT_OBSERVABILITY_RUNTIME_DIR}/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+      - "${JOB_AGENT_OBSERVABILITY_RUNTIME_DIR:?set JOB_AGENT_OBSERVABILITY_RUNTIME_DIR}/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro"
+    depends_on:
+      - alertmanager
+
+  probe:
+    image: "${JOB_AGENT_OBSERVABILITY_ACCEPTANCE_IMAGE:?set JOB_AGENT_OBSERVABILITY_ACCEPTANCE_IMAGE}"
+    restart: "no"
+    profiles: ["probe"]

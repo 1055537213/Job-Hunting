@@ -38,6 +38,8 @@ services:
     environment:
       JOB_AGENT_ENVIRONMENT: production
       JOB_AGENT_COOKIE_SECURE: "true"
+      JOB_AGENT_PUBLIC_BASE_URL: https://file-scan-acceptance.invalid
+      JOB_AGENT_ACCOUNT_ACTION_SECRET: file-scan-acceptance-account-action-secret
       JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET: "true"
       JOB_AGENT_FILE_SCAN_BACKEND: clamav
       JOB_AGENT_FILE_SCAN_HOST: clamav

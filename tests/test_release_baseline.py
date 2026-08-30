@@ -244,9 +244,37 @@ def test_backup_and_restore_scripts_require_safe_operational_guards():
     assert "ports: !reset []" in overlay
     assert '"down", "-v", "--remove-orphans"' in drill
     assert "manifest_tamper_rejected" in drill
+    assert "missing_manifest_rejected" in drill
+    assert "postgres_dump_tamper_rejected" in drill
+    assert "queued_task_state_restored" in drill
     assert "post_backup_database_change_removed" in drill
     assert "post_backup_object_removed" in drill
     assert "recovery_time_objective_observed_seconds" in drill
     assert "docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build" in guide
     assert "RPO" in guide
     assert "RTO" in guide
+
+
+def test_local_release_acceptance_pack_covers_recovery_uploads_and_alert_delivery():
+    orchestrator = (ROOT / "scripts" / "validate_local_release.ps1").read_text(
+        encoding="utf-8"
+    )
+    alert_script = (ROOT / "scripts" / "validate_alert_delivery.ps1").read_text(
+        encoding="utf-8"
+    )
+    alert_overlay = (ROOT / "compose.observability-test.yaml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "validate_backup_restore.ps1" in orchestrator
+    assert "validate_file_scanning.ps1" in orchestrator
+    assert "validate_alert_delivery.ps1" in orchestrator
+    assert "tests/test_upload_security.py" in orchestrator
+    assert "local-release-report.json" in orchestrator
+    assert "JobAgentLocalAlertDeliveryAcceptance" in alert_script
+    assert "api/v1/messages" in alert_script
+    assert "smtp_require_tls=False" in alert_script
+    assert 'tests_passed = $TestsPassed' in alert_script
+    assert 'tests_passed = $TestsPassed' in orchestrator
+    assert "axllent/mailpit:v1.30.6" in alert_overlay
+    assert "ports:" not in alert_overlay

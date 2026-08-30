@@ -49,6 +49,14 @@ data/file-scan-drills/<run-id>/file-scan-report.json
 报告记录固定 ClamAV 镜像摘要、引擎版本、daily 数据库版本、签名数量、真实构建时间，以及
 正常文件、EICAR、服务故障、服务恢复和清理结果。报告不保存文件正文、对象存储凭证或 `.env`。
 
+上传边界的快速回归测试位于 `tests/test_upload_security.py`，不需要启动 ClamAV，覆盖项目归档的
+路径穿越、软链接、重复路径、条目数量、解压大小和断点续传签名校验。它会在本地发布验收包中先执行；
+只改动归档校验或上传边界时，也可以单独运行：
+
+```powershell
+python -m pytest -q tests/test_upload_security.py
+```
+
 ## 生产操作
 
 - 生产 Compose 固定使用 ClamAV 1.4 LTS 的最新安全补丁镜像摘要。

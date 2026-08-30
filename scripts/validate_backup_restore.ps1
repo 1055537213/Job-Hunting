@@ -43,12 +43,16 @@ $backupDirectory = $null
 $failure = $null
 $cleanupSucceeded = $false
 $checks = [ordered]@{
+    missing_manifest_rejected = $false
+    postgres_dump_tamper_rejected = $false
     manifest_tamper_rejected = $false
+    services_untouched_after_preflight_failure = $false
     postgres_snapshot_restored = $false
     post_backup_database_change_removed = $false
     minio_object_restored = $false
     post_backup_object_removed = $false
     current_migration_applied = $false
+    queued_task_state_restored = $false
 }
 
 function Invoke-Docker {
@@ -138,6 +142,25 @@ with engine.begin() as conn:
             "display_name": "Backup restore drill",
         },
     ).scalar_one()
+    conn.execute(
+        text(
+            "INSERT INTO background_tasks ("
+            "task_key, account_id, task_type, status, progress, attempt, max_attempts, "
+            "idempotency_key, payload_json, result_json, created_at, updated_at"
+            ") VALUES ("
+            ":task_key, :account_id, 'rag_index', 'queued', 0, 0, 3, "
+            ":idempotency_key, CAST(:payload AS JSONB), CAST(:result AS JSONB), "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP"
+            ")"
+        ),
+        {
+            "task_key": os.environ["RECOVERY_TASK_KEY"],
+            "account_id": account_id,
+            "idempotency_key": os.environ["RECOVERY_TASK_KEY"],
+            "payload": '{"long_text_ids":[1]}',
+            "result": '{}',
+        },
+    )
 
 client = boto3.client(
     "s3",
@@ -157,7 +180,11 @@ client.put_object(
     Body=os.environ["RECOVERY_SEED_CONTENT"].encode("utf-8"),
     ContentType="text/plain",
 )
-print(json.dumps({"account_id": account_id, "bucket": bucket}, ensure_ascii=False))
+print(json.dumps({
+    "account_id": account_id,
+    "bucket": bucket,
+    "task_key": os.environ["RECOVERY_TASK_KEY"],
+}, ensure_ascii=False))
 '@
 
 $mutateCode = @'
@@ -178,6 +205,17 @@ with engine.begin() as conn:
             "email": os.environ["RECOVERY_POST_EMAIL"],
             "password_hash": "post-backup-not-a-real-password-hash",
             "display_name": "Post-backup record",
+        },
+    )
+    conn.execute(
+        text(
+            "UPDATE background_tasks SET status = 'succeeded', progress = 100, "
+            "result_json = CAST(:result AS JSONB), finished_at = CURRENT_TIMESTAMP, "
+            "updated_at = CURRENT_TIMESTAMP WHERE task_key = :task_key"
+        ),
+        {
+            "task_key": os.environ["RECOVERY_TASK_KEY"],
+            "result": '{"mutated_after_backup":true}',
         },
     )
 
@@ -212,6 +250,13 @@ with engine.connect() as conn:
         {"email": os.environ["RECOVERY_POST_EMAIL"]},
     ).scalar_one()
     revision = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+    task = conn.execute(
+        text(
+            "SELECT status, progress, result_json FROM background_tasks "
+            "WHERE task_key = :task_key"
+        ),
+        {"task_key": os.environ["RECOVERY_TASK_KEY"]},
+    ).mappings().one()
 
 client = boto3.client(
     "s3",
@@ -236,6 +281,9 @@ print(json.dumps({
     "revision": revision,
     "seed_content": seed_content,
     "post_object_absent": post_object_absent,
+    "task_status": task["status"],
+    "task_progress": int(task["progress"]),
+    "task_result": task["result_json"],
 }, ensure_ascii=False))
 '@
 
@@ -244,12 +292,14 @@ $postEmail = "recovery-post-$suffix@example.invalid"
 $seedKey = "recovery-drill/$suffix/snapshot.txt"
 $postKey = "recovery-drill/$suffix/post-backup.txt"
 $seedContent = "job-agent-recovery-snapshot-$suffix"
+$taskKey = "recovery-task-$suffix"
 $probeEnvironment = @{
     RECOVERY_SEED_EMAIL = $seedEmail
     RECOVERY_POST_EMAIL = $postEmail
     RECOVERY_SEED_KEY = $seedKey
     RECOVERY_POST_KEY = $postKey
     RECOVERY_SEED_CONTENT = $seedContent
+    RECOVERY_TASK_KEY = $taskKey
 }
 
 New-Item -ItemType Directory -Force -Path $runPath | Out-Null
@@ -281,9 +331,48 @@ try {
     }
     $backupDirectory = $backupDirectories[0].FullName
 
-    Write-Host "==> Proving a tampered archive is rejected before services are touched"
+    Write-Host "==> Proving missing and tampered backup evidence is rejected before services are touched"
     Invoke-Compose -Arguments @("up", "-d", "postgres", "minio")
     Wait-ForInfrastructure
+    $manifestPath = Join-Path $backupDirectory "manifest.json"
+    $validManifestPath = "$manifestPath.valid"
+    Move-Item -LiteralPath $manifestPath -Destination $validManifestPath
+    try {
+        & $restoreScript -BackupDirectory $backupDirectory -ProjectName $projectName -ComposeFiles $composeFiles -ConfirmRestore -KeepServicesStopped
+        throw "The restore script accepted a backup without manifest.json."
+    }
+    catch {
+        if ($_.Exception.Message -notmatch "Missing backup file") {
+            throw
+        }
+        $checks.missing_manifest_rejected = $true
+    }
+    finally {
+        Move-Item -LiteralPath $validManifestPath -Destination $manifestPath
+    }
+    Wait-ForInfrastructure
+
+    $dumpPath = Join-Path $backupDirectory "postgres.dump"
+    $validDumpPath = "$dumpPath.valid"
+    Move-Item -LiteralPath $dumpPath -Destination $validDumpPath
+    Copy-Item -LiteralPath $validDumpPath -Destination $dumpPath
+    Add-Content -LiteralPath $dumpPath -Value "tamper" -NoNewline
+    try {
+        & $restoreScript -BackupDirectory $backupDirectory -ProjectName $projectName -ComposeFiles $composeFiles -ConfirmRestore -KeepServicesStopped
+        throw "The restore script accepted a tampered PostgreSQL dump."
+    }
+    catch {
+        if ($_.Exception.Message -notmatch "SHA-256 mismatch") {
+            throw
+        }
+        $checks.postgres_dump_tamper_rejected = $true
+    }
+    finally {
+        Remove-Item -LiteralPath $dumpPath -Force
+        Move-Item -LiteralPath $validDumpPath -Destination $dumpPath
+    }
+    Wait-ForInfrastructure
+
     $archivePath = Join-Path $backupDirectory "minio-data.tar.gz"
     $validArchivePath = "$archivePath.valid"
     Move-Item -LiteralPath $archivePath -Destination $validArchivePath
@@ -304,6 +393,7 @@ try {
         Move-Item -LiteralPath $validArchivePath -Destination $archivePath
     }
     Wait-ForInfrastructure
+    $checks.services_untouched_after_preflight_failure = $true
 
     Write-Host "==> Mutating both stores after the backup point"
     $null = Invoke-ProbePython -Code $mutateCode -Environment $probeEnvironment
@@ -324,14 +414,21 @@ try {
     $checks.minio_object_restored = [string]$verification.seed_content -ceq $seedContent
     $checks.post_backup_object_removed = [bool]$verification.post_object_absent
     $checks.current_migration_applied = -not [string]::IsNullOrWhiteSpace([string]$verification.revision)
+    $checks.queued_task_state_restored = (
+        [string]$verification.task_status -ceq "queued" -and
+        [int]$verification.task_progress -eq 0 -and
+        (@($verification.task_result.PSObject.Properties).Count -eq 0)
+    )
     $failedChecks = @($checks.GetEnumerator() | Where-Object { -not $_.Value })
     if ($failedChecks.Count -gt 0) {
         throw "Recovery verification failed: $($failedChecks.Name -join ', ')"
     }
 
     Write-Host "Backup manifest tamper protection: PASS"
+    Write-Host "Backup missing-file and PostgreSQL dump tamper protection: PASS"
     Write-Host "PostgreSQL snapshot restore: PASS"
     Write-Host "MinIO object restore: PASS"
+    Write-Host "Queued background-task state restore: PASS"
     Write-Host "Backup/restore recovery drill passed. RTO=${recoverySeconds}s"
 }
 catch {

@@ -212,6 +212,11 @@ def test_alertmanager_config_uses_smtp_secret_without_logging_it(tmp_path: Path)
     assert config["receivers"][0]["email_configs"][0]["force_implicit_tls"] is True
     assert config["receivers"][0]["email_configs"][0]["send_resolved"] is True
 
+    local_acceptance = json.loads(
+        render_alertmanager_config(settings, smtp_require_tls=False)
+    )
+    assert local_acceptance["global"]["smtp_require_tls"] is False
+
 
 def test_production_observability_stack_is_private_and_bounded() -> None:
     compose = (ROOT / "compose.prod.yaml").read_text(encoding="utf-8")

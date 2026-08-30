@@ -502,3 +502,28 @@ Redis 不进入备份。它只承载可重建的队列和缓存，任务权威�
 Alembic revision，最后输出 `data/recovery-drills/<run>/recovery-report.json` 并删除隔离卷。
 报告中的 `recovery_time_objective_observed_seconds` 是本机本次演练 RTO；
 `operational_rpo_measured=false` 表示脚本不能代替按正式备份频率计算生产 RPO。
+
+## 本地发布验收包
+
+在推送到目标服务器前，可以用一个入口串行执行不触碰开发数据的本地发布验收包：
+
+```powershell
+.\scripts\validate_local_release.ps1 -Python E:\Anaconda\python.exe
+```
+
+验收包包含四步：
+
+- `tests/test_upload_security.py`：路径穿越、软链接、重复归一化路径、归档条目数量和解压大小上限、断点续传扩展名/签名校验。
+- `validate_backup_restore.ps1`：PostgreSQL + MinIO 真实快照恢复、篡改/缺失文件拒绝、迁移版本和排队任务状态。
+- `validate_file_scanning.ps1`：ClamAV 病毒库新鲜度、正常文件、EICAR、扫描服务故障/恢复和隔离清理。
+- `validate_alert_delivery.ps1`：Prometheus 告警进入 FIRING 和 RESOLVED，Alertmanager 通过隔离 Mailpit 完成两封 SMTP 通知投递。
+
+每次演练使用独立 Compose 项目、临时凭证和命名卷，不发布宿主机端口；成功或失败都会留下低敏报告，
+统一报告位于 `data/local-release-drills/<run>/local-release-report.json`，子步骤报告也位于同一目录。
+默认会删除隔离容器、网络和卷。只有排障时才使用 `-KeepEnvironments`，排障结束后应按报告中的项目名手动
+执行 `docker compose down -v --remove-orphans`。
+
+告警步骤中的 Mailpit 只在隔离 Docker 网络内接收测试邮件，不读取生产 SMTP 配置，也不会向真实收件地址
+发送邮件。它证明的是规则、Prometheus reload、Alertmanager 路由和恢复通知能够连通；目标服务器首次部署后，
+仍必须使用真实 SMTP 和 `JOB_AGENT_ALERT_EMAIL_TO` 做一次受控收件验收。该本地包也不能替代服务器容量、HTTPS、
+异机备份、密钥轮换和真实模型/RAG 发布集验收。

@@ -33,6 +33,16 @@ Alertmanager 从运行时 `.env` 生成配置，真实 SMTP 密码不会进入 G
 
 当前告警覆盖 Web 不可用、5xx 比例、平均响应过慢、安全拦截、并发压力、并发保护后端故障和容量饱和。SMTP 本身故障时邮件无法送达，因此真实上线后仍应补一个独立于本机和 SMTP 的外部可用性探针。
 
+本地可以用隔离 Mailpit 验证告警投递链路，不需要真实收件地址：
+
+```powershell
+.\scripts\validate_alert_delivery.ps1 -Image job-hunting-agent:local-release-acceptance -SkipBuild
+```
+
+脚本会让 Prometheus 先触发测试规则，再 reload 为恢复状态，并检查 Alertmanager 向 Mailpit 投递
+`FIRING` 与 `RESOLVED` 两封邮件。Mailpit 不发布宿主机端口，测试完成后连同临时卷自动删除；该结果不代表
+目标服务器的真实 SMTP、DNS、TLS 或收件箱已经验收。
+
 ## 访问方式
 
 Grafana、Prometheus 和 Alertmanager 只绑定服务器 `127.0.0.1`。在运维电脑建立隧道：

@@ -281,6 +281,7 @@ docker compose --env-file .env -f compose.yaml -f compose.prod.yaml config --qui
 专项验收脚本：
 
 ~~~powershell
+.\scripts\validate_local_release.ps1 -Python E:\Anaconda\python.exe
 .\scripts\validate_multi_replica.ps1
 .\scripts\validate_worker_recovery.ps1
 .\scripts\validate_backup_restore.ps1
@@ -502,6 +503,7 @@ job_agent_intent_router_model_duration_seconds_bucket
 - [x] 建立 K/N 开发集参数扫描、P95 统计、留出集质量与性能防回退门禁。
 - [ ] 持续扩充已授权的真实行业语料和难负样本，并按正式 Embedding 模型校准阈值。
 - [x] 接入 Alertmanager 邮件通知、OpenTelemetry Trace、Loki 集中日志和 Grafana 联合排障。
+- [x] 建立隔离本地发布验收包，覆盖上传攻击边界、备份恢复、ClamAV 和 Alertmanager 投递链路。
 - [ ] 出现明确外部调用方后，在现有 MCP adapter 上增加鉴权、授权和 Server 生命周期。
 - [ ] 建立严格类型检查基线，逐步消化第三方 stub 和内部 Protocol 类型债务。
 - [ ] 完成目标生产服务器的 ClamAV 验收、渗透测试、灾难恢复演练和密钥轮换流程。

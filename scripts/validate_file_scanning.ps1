@@ -5,6 +5,7 @@ param(
     [int]$MaximumDefinitionAgeHours = 48,
     [ValidateRange(120, 900)]
     [int]$TimeoutSeconds = 420,
+    [string]$EvidenceRoot = "data/file-scan-drills",
     [switch]$SkipBuild,
     [switch]$KeepEnvironment
 )
@@ -21,7 +22,13 @@ $AcceptanceCompose = Join-Path $Root "compose.file-scan-test.yaml"
 $RunId = "{0}-{1}" -f (Get-Date -Format "yyyyMMdd-HHmmss"), $PID
 $ProjectName = "job-agent-file-scan-$($RunId.ToLowerInvariant())"
 $ComposeFiles = @("-p", $ProjectName, "-f", $BaseCompose, "-f", $AcceptanceCompose)
-$ReportDirectory = Join-Path $Root "data/file-scan-drills/$RunId"
+$EvidenceBase = if ([IO.Path]::IsPathRooted($EvidenceRoot)) {
+    [IO.Path]::GetFullPath($EvidenceRoot)
+}
+else {
+    [IO.Path]::GetFullPath((Join-Path $Root $EvidenceRoot))
+}
+$ReportDirectory = Join-Path $EvidenceBase $RunId
 $ReportPath = Join-Path $ReportDirectory "file-scan-report.json"
 $ClamAVImage = "clamav/clamav:1.4.6@sha256:761f6c99b8d9134b39431f8c200189cda749b17310091561bfa8b732f32bfada"
 
@@ -42,6 +49,7 @@ $OutageResult = $null
 $RecoveryResult = $null
 $CleanupResult = $null
 $FailureMessage = $null
+$TestsPassed = $false
 
 function Invoke-Compose {
     param([Parameter(Mandatory)][string[]]$Arguments)
@@ -80,15 +88,18 @@ function Wait-ServiceHealthy {
     $deadline = [DateTime]::UtcNow.AddSeconds($Timeout)
     do {
         $containerId = (
-            Invoke-ComposeOutput -Arguments @("ps", "-q", $Service) |
+            Invoke-ComposeOutput -Arguments @("ps", "-a", "-q", $Service) |
                 Select-Object -First 1
         )
         if ($containerId) {
-            $status = (& docker inspect --format "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}" $containerId).Trim()
-            if ($LASTEXITCODE -eq 0 -and $status -eq "healthy") {
+            $state = (& docker inspect --format "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}" $containerId).Trim()
+            $stateParts = $state -split "\|", 2
+            $containerStatus = $stateParts[0]
+            $healthStatus = $stateParts[1]
+            if ($containerStatus -eq "running" -and $healthStatus -eq "healthy") {
                 return
             }
-            if ($status -in @("exited", "dead")) {
+            if ($containerStatus -in @("exited", "dead")) {
                 throw "$Service exited before becoming healthy."
             }
         }
@@ -534,6 +545,7 @@ try {
         JOB_AGENT_ACCEPTANCE_ARTIFACT_IDS = $artifactIds
     }
     Write-Host "Database and object-storage quarantine cleanup: PASS"
+    $TestsPassed = $true
 }
 catch {
     $FailureMessage = $_.Exception.Message
@@ -556,7 +568,8 @@ finally {
         scanner_outage = $OutageResult
         scanner_recovery = $RecoveryResult
         cleanup = $CleanupResult
-        success = [string]::IsNullOrWhiteSpace($FailureMessage)
+        tests_passed = $TestsPassed
+        success = $TestsPassed -and [string]::IsNullOrWhiteSpace($FailureMessage)
         error = $FailureMessage
     }
     $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $ReportPath -Encoding UTF8

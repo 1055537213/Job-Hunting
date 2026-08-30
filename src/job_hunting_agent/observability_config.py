@@ -55,8 +55,15 @@ def load_alertmanager_settings(
     )
 
 
-def render_alertmanager_config(settings: AlertmanagerSettings) -> str:
-    """生成 JSON 形式的 YAML 配置，避免用字符串替换处理 SMTP 密钥。"""
+def render_alertmanager_config(
+    settings: AlertmanagerSettings,
+    *,
+    smtp_require_tls: bool = True,
+) -> str:
+    """生成 JSON 形式的 YAML 配置，避免用字符串替换处理 SMTP 密钥。
+
+    生产入口始终使用默认的 TLS 要求；显式关闭只供隔离的 Mailpit 验收脚本使用。
+    """
 
     config = {
         "global": {
@@ -65,7 +72,7 @@ def render_alertmanager_config(settings: AlertmanagerSettings) -> str:
             "smtp_from": settings.smtp_from_email,
             "smtp_auth_username": settings.smtp_username,
             "smtp_auth_password": settings.smtp_password,
-            "smtp_require_tls": True,
+            "smtp_require_tls": smtp_require_tls,
         },
         "route": {
             "receiver": "operations-email",

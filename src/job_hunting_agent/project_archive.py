@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import re
 import zipfile
 from collections import Counter
 from dataclasses import dataclass, field
@@ -94,7 +95,9 @@ class ProjectArchiveVisualArtifact:
 def validate_project_archive_upload(filename: str, content: bytes) -> str:
     """校验上传文件名和压缩包体积，返回安全展示用文件名。"""
 
-    normalized = Path(str(filename or "").strip()).name
+    raw_filename = str(filename or "").strip().replace("\\", "/")
+    normalized = Path(raw_filename).name
+    normalized = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", normalized).strip(" .")
     if not normalized or Path(normalized).suffix.lower() != PROJECT_ARCHIVE_SUFFIX:
         raise ProjectArchiveError("项目文件必须是 ZIP 压缩包。")
     if not content:
