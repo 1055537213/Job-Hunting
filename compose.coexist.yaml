@@ -1,0 +1,50 @@
+# Shared-host production overlay. Use after compose.prod.yaml when another
+# application already owns the server's public edge ports:
+# docker compose -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml up -d --no-build
+
+services:
+  web:
+    environment:
+      # The lightweight topology keeps Prometheus metrics but does not start the
+      # Loki/Tempo/Alloy trace and log pipeline.
+      JOB_AGENT_OTEL_ENABLED: "false"
+    ports: !override
+      - "127.0.0.1:18081:8000"
+
+  worker:
+    environment:
+      JOB_AGENT_OTEL_ENABLED: "false"
+
+  beat:
+    environment:
+      JOB_AGENT_OTEL_ENABLED: "false"
+
+  prometheus:
+    ports: !override
+      - "127.0.0.1:${JOB_AGENT_COEXIST_PROMETHEUS_PORT:-19090}:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${JOB_AGENT_COEXIST_PROMETHEUS_RETENTION:-7d}"
+
+  alertmanager:
+    ports: !override
+      - "127.0.0.1:${JOB_AGENT_COEXIST_ALERTMANAGER_PORT:-19093}:9093"
+
+  # These services remain available through explicit profiles, but are not
+  # started by the coexist deployment. The host's shared edge proxy will route
+  # to the loopback-only Web port after the application passes acceptance.
+  reverse-proxy:
+    profiles: ["standalone-edge"]
+
+  loki:
+    profiles: ["full-observability"]
+
+  tempo:
+    profiles: ["full-observability"]
+
+  alloy:
+    profiles: ["full-observability"]
+
+  grafana:
+    profiles: ["full-observability"]

@@ -2,18 +2,26 @@
 
 set -Eeuo pipefail
 
-if [[ $# -ne 3 ]]; then
-  echo "Usage: deploy_production.sh <app-root> <release-id> <image-ref>" >&2
+if [[ $# -lt 3 || $# -gt 4 ]]; then
+  echo "Usage: deploy_production.sh <app-root> <release-id> <image-ref> [standalone|coexist]" >&2
   exit 2
 fi
 
 APP_ROOT="$1"
 RELEASE_ID="$2"
 IMAGE_REF="$3"
+DEPLOY_TOPOLOGY="${4:-standalone}"
 
 [[ "$APP_ROOT" =~ ^/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)+$ ]]
 [[ "$RELEASE_ID" =~ ^sha-[0-9a-f]{12}$ ]]
 [[ "$IMAGE_REF" =~ ^ghcr\.io/[a-z0-9._/-]+:sha-[0-9a-f]{12}$ ]]
+case "$DEPLOY_TOPOLOGY" in
+  standalone | coexist) ;;
+  *)
+    echo "Unsupported deployment topology: ${DEPLOY_TOPOLOGY}" >&2
+    exit 2
+    ;;
+esac
 
 RELEASE_DIR="${APP_ROOT}/releases/${RELEASE_ID}"
 SHARED_ENV="${APP_ROOT}/shared/.env"
@@ -35,6 +43,9 @@ docker compose version >/dev/null
 }
 [[ -f "${RELEASE_DIR}/compose.yaml" ]]
 [[ -f "${RELEASE_DIR}/compose.prod.yaml" ]]
+if [[ "$DEPLOY_TOPOLOGY" == "coexist" ]]; then
+  [[ -f "${RELEASE_DIR}/compose.coexist.yaml" ]]
+fi
 [[ -f "${RELEASE_DIR}/deploy/Caddyfile" ]]
 [[ -f "${RELEASE_DIR}/deploy/prometheus/prometheus.yml" ]]
 [[ -f "${RELEASE_DIR}/deploy/prometheus/alerts.yml" ]]
@@ -50,16 +61,36 @@ ln -sfnT "$SHARED_ENV" "${RELEASE_DIR}/.env"
 
 ACTIVE_RELEASE_DIR="$RELEASE_DIR"
 ACTIVE_IMAGE="$IMAGE_REF"
+ACTIVE_TOPOLOGY="$DEPLOY_TOPOLOGY"
 PREVIOUS_RELEASE=""
 PREVIOUS_IMAGE=""
+PREVIOUS_TOPOLOGY="standalone"
 DEPLOYMENT_STARTED=0
 
 compose_active() {
-  JOB_AGENT_IMAGE="$ACTIVE_IMAGE" docker compose \
-    --env-file "$SHARED_ENV" \
-    -f "${ACTIVE_RELEASE_DIR}/compose.yaml" \
-    -f "${ACTIVE_RELEASE_DIR}/compose.prod.yaml" \
+  local -a compose_arguments=(
+    --env-file "$SHARED_ENV"
+    -f "${ACTIVE_RELEASE_DIR}/compose.yaml"
+    -f "${ACTIVE_RELEASE_DIR}/compose.prod.yaml"
+  )
+  if [[ "$ACTIVE_TOPOLOGY" == "coexist" ]]; then
+    compose_arguments+=(
+      -f "${ACTIVE_RELEASE_DIR}/compose.coexist.yaml"
+    )
+  fi
+  COMPOSE_PROFILES="" JOB_AGENT_IMAGE="$ACTIVE_IMAGE" docker compose \
+    "${compose_arguments[@]}" \
     "$@"
+}
+
+topology_files_exist() {
+  local release_dir="$1"
+  local topology="$2"
+
+  [[ -f "${release_dir}/compose.yaml" && -f "${release_dir}/compose.prod.yaml" ]] || return 1
+  if [[ "$topology" == "coexist" ]]; then
+    [[ -f "${release_dir}/compose.coexist.yaml" ]] || return 1
+  fi
 }
 
 if [[ -L "$CURRENT_LINK" ]]; then
@@ -67,6 +98,19 @@ if [[ -L "$CURRENT_LINK" ]]; then
 fi
 if [[ -f "${STATE_DIR}/current-image" ]]; then
   PREVIOUS_IMAGE="$(<"${STATE_DIR}/current-image")"
+fi
+if [[ -f "${STATE_DIR}/current-topology" ]]; then
+  PREVIOUS_TOPOLOGY="$(<"${STATE_DIR}/current-topology")"
+  if [[ "$PREVIOUS_TOPOLOGY" != "standalone" && "$PREVIOUS_TOPOLOGY" != "coexist" ]]; then
+    echo "Invalid stored deployment topology: ${PREVIOUS_TOPOLOGY}" >&2
+    exit 1
+  fi
+fi
+if [[ "$DEPLOY_TOPOLOGY" == "coexist" || "$PREVIOUS_TOPOLOGY" == "coexist" ]]; then
+  command -v curl >/dev/null 2>&1 || {
+    echo "Required command is unavailable for coexist topology: curl" >&2
+    exit 1
+  }
 fi
 
 wait_for_healthy_service() {
@@ -166,6 +210,62 @@ wait_for_completed_service() {
   return 1
 }
 
+verify_coexist_web_binding() {
+  local binding
+
+  binding="$(compose_active port web 8000)"
+  if [[ "$binding" != "127.0.0.1:18081" ]]; then
+    echo "Coexist Web must bind to 127.0.0.1:18081; received: ${binding}" >&2
+    return 1
+  fi
+  curl --fail --silent --show-error --max-time 10 \
+    "http://${binding}/api/health" \
+    >/dev/null
+}
+
+remove_inactive_coexist_services() {
+  local -a inactive_services=(reverse-proxy loki tempo alloy grafana)
+
+  if ! compose_active stop "${inactive_services[@]}" >/dev/null; then
+    echo "Failed to stop services that are inactive in coexist topology." >&2
+    return 1
+  fi
+  if ! compose_active rm --force --stop "${inactive_services[@]}" >/dev/null; then
+    echo "Failed to remove services that are inactive in coexist topology." >&2
+    return 1
+  fi
+}
+
+wait_for_active_topology_services() {
+  local service
+
+  if ! wait_for_completed_service alertmanager-config 120; then
+    return 1
+  fi
+  if ! wait_for_healthy_service web 300; then
+    return 1
+  fi
+  if [[ "$ACTIVE_TOPOLOGY" == "coexist" ]]; then
+    if ! verify_coexist_web_binding; then
+      return 1
+    fi
+  fi
+
+  for service in worker beat prometheus alertmanager; do
+    if ! wait_for_running_service "$service" 180; then
+      return 1
+    fi
+  done
+
+  if [[ "$ACTIVE_TOPOLOGY" == "standalone" ]]; then
+    for service in reverse-proxy loki tempo alloy grafana; do
+      if ! wait_for_running_service "$service" 180; then
+        return 1
+      fi
+    done
+  fi
+}
+
 backup_database_if_running() {
   local postgres_id backup_file temporary_file
   postgres_id="$(compose_active ps -q postgres || true)"
@@ -186,16 +286,36 @@ backup_database_if_running() {
 
 rollback_previous_release() {
   if [[ -n "$PREVIOUS_RELEASE" && -n "$PREVIOUS_IMAGE" \
-      && -f "${PREVIOUS_RELEASE}/compose.yaml" \
-      && -f "${PREVIOUS_RELEASE}/compose.prod.yaml" ]]; then
+      ]] && topology_files_exist "$PREVIOUS_RELEASE" "$PREVIOUS_TOPOLOGY"; then
     echo "Restoring previous release ${PREVIOUS_RELEASE} with image ${PREVIOUS_IMAGE}" >&2
     ACTIVE_RELEASE_DIR="$PREVIOUS_RELEASE"
     ACTIVE_IMAGE="$PREVIOUS_IMAGE"
-    ln -sfnT "$SHARED_ENV" "${ACTIVE_RELEASE_DIR}/.env"
-    compose_active config --quiet
-    compose_active up -d --no-build --pull missing --remove-orphans
-    wait_for_healthy_service web 300
-    ln -sfnT "$PREVIOUS_RELEASE" "$CURRENT_LINK"
+    ACTIVE_TOPOLOGY="$PREVIOUS_TOPOLOGY"
+    if ! ln -sfnT "$SHARED_ENV" "${ACTIVE_RELEASE_DIR}/.env"; then
+      echo "Rollback could not restore the production environment link." >&2
+      return 1
+    fi
+    if ! compose_active config --quiet; then
+      echo "Rollback Compose configuration validation failed." >&2
+      return 1
+    fi
+    if [[ "$ACTIVE_TOPOLOGY" == "coexist" ]]; then
+      if ! remove_inactive_coexist_services; then
+        return 1
+      fi
+    fi
+    if ! compose_active up -d --no-build --pull missing --remove-orphans; then
+      echo "Rollback could not start the previous release." >&2
+      return 1
+    fi
+    if ! wait_for_active_topology_services; then
+      echo "Rollback services did not become ready." >&2
+      return 1
+    fi
+    if ! ln -sfnT "$PREVIOUS_RELEASE" "$CURRENT_LINK"; then
+      echo "Rollback could not restore the current release link." >&2
+      return 1
+    fi
     echo "Previous application release restored. Database migrations were not reversed." >&2
     return 0
   fi
@@ -214,7 +334,9 @@ on_deployment_error() {
   echo "Production deployment failed for ${RELEASE_ID}." >&2
   compose_active ps >&2 || true
   if (( DEPLOYMENT_STARTED == 1 )); then
-    rollback_previous_release || true
+    if ! rollback_previous_release; then
+      echo "Rollback failed; previous release was not restored." >&2
+    fi
   fi
   exit "$exit_code"
 }
@@ -229,27 +351,26 @@ compose_active config --quiet
 backup_database_if_running
 
 DEPLOYMENT_STARTED=1
+if [[ "$ACTIVE_TOPOLOGY" == "coexist" ]]; then
+  remove_inactive_coexist_services
+fi
 compose_active up -d --no-build --pull missing --remove-orphans
-wait_for_completed_service alertmanager-config 120
-wait_for_healthy_service web 300
-wait_for_running_service worker 180
-wait_for_running_service beat 180
-wait_for_running_service reverse-proxy 180
-wait_for_running_service prometheus 180
-wait_for_running_service alertmanager 180
-wait_for_running_service loki 180
-wait_for_running_service tempo 180
-wait_for_running_service alloy 180
-wait_for_running_service grafana 180
+wait_for_active_topology_services
 
 ln -sfnT "$RELEASE_DIR" "$CURRENT_LINK"
 printf '%s\n' "$IMAGE_REF" > "${STATE_DIR}/current-image.tmp"
 mv "${STATE_DIR}/current-image.tmp" "${STATE_DIR}/current-image"
 printf '%s\n' "$RELEASE_ID" > "${STATE_DIR}/current-release.tmp"
 mv "${STATE_DIR}/current-release.tmp" "${STATE_DIR}/current-release"
+printf '%s\n' "$DEPLOY_TOPOLOGY" > "${STATE_DIR}/current-topology.tmp"
+mv "${STATE_DIR}/current-topology.tmp" "${STATE_DIR}/current-topology"
 date -u +%Y-%m-%dT%H:%M:%SZ > "${STATE_DIR}/last-deployed-at.tmp"
 mv "${STATE_DIR}/last-deployed-at.tmp" "${STATE_DIR}/last-deployed-at"
-chmod 600 "${STATE_DIR}/current-image" "${STATE_DIR}/current-release" "${STATE_DIR}/last-deployed-at"
+chmod 600 \
+  "${STATE_DIR}/current-image" \
+  "${STATE_DIR}/current-release" \
+  "${STATE_DIR}/current-topology" \
+  "${STATE_DIR}/last-deployed-at"
 
 DEPLOYMENT_STARTED=0
 trap - ERR

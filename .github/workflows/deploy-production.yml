@@ -11,6 +11,14 @@ on:
         description: Type DEPLOY to confirm the production deployment
         required: true
         type: string
+      topology:
+        description: Select standalone for a dedicated host or coexist for a shared lightweight host
+        required: true
+        default: standalone
+        type: choice
+        options:
+          - standalone
+          - coexist
 
 permissions:
   contents: read
@@ -28,6 +36,7 @@ jobs:
     env:
       COMMIT_SHA: ${{ inputs.commit_sha }}
       CONFIRMATION: ${{ inputs.confirmation }}
+      DEPLOY_TOPOLOGY: ${{ inputs.topology }}
       DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
       DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
@@ -41,6 +50,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "${CONFIRMATION}" == "DEPLOY" ]]
+          [[ "${DEPLOY_TOPOLOGY}" == "standalone" || "${DEPLOY_TOPOLOGY}" == "coexist" ]]
           [[ "${COMMIT_SHA}" =~ ^[0-9a-f]{40}$ ]]
           [[ -n "${DEPLOY_HOST}" && "${DEPLOY_HOST}" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]
           [[ -n "${DEPLOY_USER}" && "${DEPLOY_USER}" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]]
@@ -126,11 +136,12 @@ jobs:
           BUNDLE="$RUNNER_TEMP/job-agent-deploy.tar.gz"
           REMOTE_BUNDLE="/tmp/job-agent-deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
           RELEASE_DIR="${DEPLOY_PATH}/releases/${RELEASE_ID}"
-          tar -czf "$BUNDLE" \
-            compose.yaml \
-            compose.prod.yaml \
-            deploy \
-            scripts/deploy_production.sh
+          BUNDLE_FILES=(compose.yaml compose.prod.yaml deploy scripts/deploy_production.sh)
+          if [[ "${DEPLOY_TOPOLOGY}" == "coexist" ]]; then
+            [[ -f compose.coexist.yaml ]]
+            BUNDLE_FILES+=(compose.coexist.yaml)
+          fi
+          tar -czf "$BUNDLE" "${BUNDLE_FILES[@]}"
           ssh \
             -i "$HOME/.ssh/deploy_key" \
             -p "$PORT" \
@@ -182,6 +193,10 @@ jobs:
           set -euo pipefail
           PORT="${DEPLOY_PORT:-22}"
           TARGET="${DEPLOY_USER}@${DEPLOY_HOST}"
+          TOPOLOGY_ARGUMENT=""
+          if [[ "${DEPLOY_TOPOLOGY}" == "coexist" ]]; then
+            TOPOLOGY_ARGUMENT=" 'coexist'"
+          fi
           ssh \
             -i "$HOME/.ssh/deploy_key" \
             -p "$PORT" \
@@ -189,7 +204,7 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             "$TARGET" \
-            "bash '${DEPLOY_PATH}/releases/${RELEASE_ID}/scripts/deploy_production.sh' '${DEPLOY_PATH}' '${RELEASE_ID}' '${IMAGE_REF}'"
+            "bash '${DEPLOY_PATH}/releases/${RELEASE_ID}/scripts/deploy_production.sh' '${DEPLOY_PATH}' '${RELEASE_ID}' '${IMAGE_REF}'${TOPOLOGY_ARGUMENT}"
 
       - name: Record deployment summary
         env:
@@ -204,6 +219,7 @@ jobs:
             echo "- Release: \`${RELEASE_ID}\`"
             echo "- Image: \`${IMAGE_REF}\`"
             echo "- Commit: \`${COMMIT_SHA}\`"
+            echo "- Topology: \`${DEPLOY_TOPOLOGY}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove temporary credentials

@@ -100,9 +100,11 @@ jobs:
           JOB_AGENT_DOMAIN: agent.example.com
           JOB_AGENT_TLS_EMAIL: ops@example.com
           JOB_AGENT_GRAFANA_ADMIN_PASSWORD: ci-grafana-password
-        run: >-
-          docker compose --env-file .env.example
-          -f compose.yaml -f compose.prod.yaml config --quiet
+        run: |
+          docker compose --env-file .env.example \
+            -f compose.yaml -f compose.prod.yaml config --quiet
+          docker compose --env-file .env.example \
+            -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml config --quiet
 
       - name: Validate Prometheus configuration and alert rules
         run: >-

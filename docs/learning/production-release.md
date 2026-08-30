@@ -6,6 +6,48 @@
 - `compose.dev.yaml`：仅供本地开发，包含源码挂载和 Web 热更新。
 - `compose.prod.yaml`：生产覆盖配置，移除业务内部服务的公网端口，使用独立生产数据卷，
   通过 Caddy 暴露 HTTPS，并启动仅绑定服务器回环地址的 Prometheus。
+- `compose.coexist.yaml`：同一服务器已有其他项目时使用的轻量生产覆盖。Web 只绑定
+  `127.0.0.1:18081`，保留核心业务、ClamAV、Prometheus 和 Alertmanager，默认不启动
+  Caddy、Loki、Tempo、Alloy 和 Grafana。
+
+## 同机轻量共存拓扑
+
+当服务器的 `80/443` 已由其他项目或共享反向代理占用时，不能直接启动独占生产拓扑。
+共存拓扑在 `compose.prod.yaml` 之后追加 `compose.coexist.yaml`：
+
+```bash
+docker compose \
+  --env-file .env \
+  -f compose.yaml \
+  -f compose.prod.yaml \
+  -f compose.coexist.yaml \
+  config --quiet
+```
+
+该拓扑遵循以下约束：
+
+- PostgreSQL、Redis、MinIO 和 ClamAV 只存在于 `job-hunting-agent-production` 内部网络和独立数据卷。
+- Web 默认映射为 `127.0.0.1:18081:8000`，不能直接从公网访问；Prometheus 和
+  Alertmanager 分别使用 `127.0.0.1:19090` 与 `127.0.0.1:19093`。
+- 保留 Web、Worker、Beat、PostgreSQL、Redis、MinIO、ClamAV、Prometheus 和 Alertmanager。
+- Loki、Tempo、Alloy 和 Grafana 归入显式 profile，默认不启动；应用同时关闭 OTEL 导出，
+  Prometheus 指标仍然保留七天。
+- 当前项目自带的 Caddy 归入 `standalone-edge` profile，默认不启动，因此不会抢占同机旧项目的
+  `80/443`。
+
+管理员通过 `Deploy production` 工作流部署时，将 `topology` 选择 `coexist`。远端脚本会记录
+本次拓扑，失败回滚时恢复上一版本自己的拓扑，并要求先完成回环地址验收：只有宿主机能够访问
+`http://127.0.0.1:18081/api/health` 后才算部署成功。应用通过验收后，再由独立共享反向代理把目标
+域名转发到该回环端口；在完成共享入口配置前，不应对公网开放 `18081`。
+
+共存模式的 Web 固定使用 `127.0.0.1:18081`，避免共享代理与应用配置发生漂移。Prometheus、
+Alertmanager 端口和 Prometheus 保留周期可在生产 `.env` 中覆盖：
+
+```dotenv
+JOB_AGENT_COEXIST_PROMETHEUS_PORT=19090
+JOB_AGENT_COEXIST_ALERTMANAGER_PORT=19093
+JOB_AGENT_COEXIST_PROMETHEUS_RETENTION=7d
+```
 
 ## 首次准备
 
@@ -135,8 +177,9 @@
     无法提供严格的端到端 exactly-once，邮件内容应保持幂等且允许极少量重复送达。协议正文和
     版本号必须由实际运营主体审核，版本更新时只修改版本号不足以替代重新获取用户同意。
 
-生产覆盖不会向宿主机发布 Web 端口，只有 Caddy 和内部采集服务可以访问它，因此
-`FORWARDED_ALLOW_IPS=*` 只在该覆盖配置中启用。不要把这个设置复制到直接暴露 Uvicorn 的开发环境。
+独占生产拓扑不会向宿主机发布 Web 端口，只有 Caddy 和内部采集服务可以访问它。共存拓扑则仅
+发布固定的 `127.0.0.1:18081` 回环地址，供宿主机上的共享反向代理访问。这两种生产拓扑都会启用
+`FORWARDED_ALLOW_IPS=*`；不要把这个设置复制到直接暴露 Uvicorn 的开发环境。
 
 生产 `.env` 只保存于服务器受限目录，不提交 Git，不复制进镜像。
 
@@ -234,10 +277,13 @@ revision、验证固定 SSH 主机指纹、上传 Compose/Caddy/Prometheus 配�
 直接传输已验证镜像。服务器不需要长期保存 GHCR Token。
 
 服务器端 `scripts/deploy_production.sh` 会在已有 PostgreSQL 运行时创建迁移前 custom-format
-数据库备份，然后执行 Compose 配置校验、Alembic 迁移和服务更新。只有 Web 健康且 Worker、
-Beat、Caddy、Prometheus 均在运行后，`current` 软链接和当前镜像状态才会更新。失败时会尝试
-恢复上一版配置和镜像；数据库迁移不会自动反向执行，应使用迁移前备份和正式恢复流程处理不兼容
-迁移。首次部署没有上一版本时，脚本会停止已部分启动的应用服务，但保留数据库和对象存储卷。
+数据库备份，然后执行 Compose 配置校验、Alembic 迁移和服务更新。两种拓扑都要求 Web 健康且
+Worker、Beat、Prometheus、Alertmanager 正常运行；独占拓扑还会等待 Caddy、Loki、Tempo、Alloy
+和 Grafana，共存拓扑则校验 Web 只能绑定 `127.0.0.1:18081`。全部验收通过后，`current` 软链接和
+当前镜像状态才会更新。失败时会尝试恢复上一版配置、镜像及其拓扑；只有旧版本的 Compose 校验、
+容器启动和全部服务验收均成功，脚本才会报告恢复成功。数据库迁移不会自动反向执行，应使用迁移前
+备份和正式恢复流程处理不兼容迁移。首次部署没有上一版本时，脚本会停止已部分启动的应用服务，但
+保留数据库和对象存储卷。
 
 这套 CD 不替代完整备份。自动部署只创建 PostgreSQL 迁移前备份；MinIO 对象和数据库联合备份、
 异机保存以及 RPO/RTO 仍按本文件的“备份”和“恢复演练”章节执行。
@@ -255,8 +301,8 @@ target；查询和告警按 `job="job-hunting-agent-web"` 聚合，排障时仍�
 `job_agent_intent_router_model_duration_seconds` 观察直达率、回退原因、超时率与耗时分位数。
 标签集合由代码固定，不包含用户消息、账号、prompt、工具参数或 request ID。
 
-Caddy 会对公网 `/internal/*` 请求直接返回 404。Prometheus、Grafana 和 Alertmanager 页面
-只监听服务器回环地址，可从运维电脑建立 SSH 端口转发后访问：
+独占拓扑中的 Caddy 会对公网 `/internal/*` 请求直接返回 404。Prometheus、Grafana 和
+Alertmanager 页面只监听服务器回环地址，可从运维电脑建立 SSH 端口转发后访问：
 
 ```powershell
 ssh -L 3000:127.0.0.1:3000 -L 9090:127.0.0.1:9090 -L 9093:127.0.0.1:9093 <server-user>@<server-host>
@@ -264,7 +310,11 @@ ssh -L 3000:127.0.0.1:3000 -L 9090:127.0.0.1:9090 -L 9093:127.0.0.1:9093 <server
 
 浏览器打开 `http://127.0.0.1:3000` 联合查询指标、日志和 Trace；打开
 `http://127.0.0.1:9090/targets` 检查采集目标，打开 `http://127.0.0.1:9090/alerts`
-检查告警规则，或打开 `http://127.0.0.1:9093` 查看通知分组。当前规则覆盖：
+检查告警规则，或打开 `http://127.0.0.1:9093` 查看通知分组。
+
+共存拓扑默认不启动 Grafana、Loki、Tempo 和 Alloy，Prometheus 与 Alertmanager 的回环端口分别
+为 `19090` 和 `19093`。此时把上述 SSH 转发目标改为对应端口，并直接使用 Prometheus 和
+Alertmanager 页面进行检查。当前规则覆盖：
 
 - Web 连续两分钟无法采集。
 - 五分钟内至少五次 5xx，且错误比例持续高于 5%。

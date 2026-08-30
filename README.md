@@ -179,6 +179,7 @@
 ├─ compose.yaml                # 基础开发拓扑
 ├─ compose.dev.yaml            # 源码挂载和热更新覆盖
 ├─ compose.prod.yaml           # 单机生产覆盖
+├─ compose.coexist.yaml        # 同机轻量共存覆盖，仅暴露回环 Web 和核心观测服务
 ├─ compose.*-test.yaml         # 多副本、恢复、文件扫描和验收覆盖
 ├─ Dockerfile                  # Web/Worker/Beat/Migrate 共用镜像
 ├─ pyproject.toml              # 包元数据、入口命令和测试配置
@@ -403,6 +404,15 @@ Copy-Item .env.example .env
 $env:JOB_AGENT_IMAGE='ghcr.io/your-org/job-hunting-agent:release-tag'
 docker compose -f compose.yaml -f compose.prod.yaml config --quiet
 docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
+~~~
+
+同一服务器已有其他项目占用 `80/443` 时，使用轻量共存拓扑。它将 Web 绑定到
+`127.0.0.1:18081`，保留 ClamAV、Prometheus 和 Alertmanager，默认不启动项目内 Caddy、
+Loki、Tempo、Alloy 与 Grafana：
+
+~~~powershell
+docker compose -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml config --quiet
+docker compose -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml up -d --no-build
 ~~~
 
 生产模板位于 `deploy/env.production.example`。它不会覆盖模型供应商配置，部署时应先从
