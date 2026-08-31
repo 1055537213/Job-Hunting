@@ -256,6 +256,7 @@ def test_coexist_certificate_reload_hook_targets_only_the_https_edge():
         "set -Eeuo pipefail",
         'APP_ROOT="${1:-/opt/job-hunting-agent}"',
         '"${STATE_DIR}/current-image"',
+        'JOB_AGENT_RUNTIME_ENV_FILE="$SHARED_ENV"',
         "compose.coexist.yaml",
         "ps -q coexist-https",
         "exec -T coexist-https nginx -t",

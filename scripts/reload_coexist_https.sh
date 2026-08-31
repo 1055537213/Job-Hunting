@@ -25,7 +25,10 @@ ACTIVE_IMAGE="$(<"${STATE_DIR}/current-image")"
 [[ "$ACTIVE_IMAGE" =~ ^ghcr\.io/[a-z0-9._/-]+:sha-[0-9a-f]{12}$ ]]
 
 compose_current() {
-  COMPOSE_PROFILES="" JOB_AGENT_IMAGE="$ACTIVE_IMAGE" docker compose \
+  COMPOSE_PROFILES="" \
+    JOB_AGENT_IMAGE="$ACTIVE_IMAGE" \
+    JOB_AGENT_RUNTIME_ENV_FILE="$SHARED_ENV" \
+    docker compose \
     --env-file "$SHARED_ENV" \
     -f "${CURRENT_DIR}/compose.yaml" \
     -f "${CURRENT_DIR}/compose.prod.yaml" \
