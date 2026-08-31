@@ -696,6 +696,28 @@ textarea:disabled {
   line-height: 1.15;
 }
 
+.profile-summary-title-row {
+  align-items: center;
+}
+
+.profile-summary-refresh {
+  flex: 0 0 auto;
+}
+
+.profile-summary-refresh svg {
+  width: 1rem;
+  height: 1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.profile-summary-error {
+  margin-block: var(--space-xs) 0;
+}
+
 .count-chip,
 .score-chip {
   flex: 0 0 auto;
@@ -3075,19 +3097,39 @@ textarea:focus-visible,
 .profile-account-panel {
   min-width: 0;
   display: grid;
-  align-content: start;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 22rem;
   gap: var(--space-md);
+}
+
+.profile-account-panel-head {
+  align-items: center;
+  min-height: var(--size-control);
+}
+
+.profile-account-panel-body {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .profile-account-actions {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-xs);
+  margin-block-start: auto;
 }
 
 .profile-account-form {
-  display: grid;
+  min-height: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
   gap: var(--space-sm);
+}
+
+.profile-account-form > button {
+  margin-block-start: auto;
 }
 
 .profile-danger-panel {
@@ -3978,6 +4020,7 @@ textarea:focus-visible,
   .admin-tool-workspace { grid-template-columns: 1fr; }
   .admin-tool-list { max-block-size: min(18rem, 36svh); }
   .profile-account-grid { grid-template-columns: 1fr; }
+  .profile-account-panel { min-height: 0; }
 }
 
 @media (max-width: 40rem) {

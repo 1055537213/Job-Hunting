@@ -254,11 +254,27 @@
           </section>
 
           <section class="panel panel-summary" aria-labelledby="profileSummaryTitle">
-            <div class="panel-title-row">
+            <div class="panel-title-row profile-summary-title-row">
               <div>
                 <p class="eyebrow">Structured Snapshot</p>
                 <h2 id="profileSummaryTitle" class="panel-title">当前档案摘要</h2>
               </div>
+              <button
+                class="ghost-button compact profile-summary-refresh"
+                type="button"
+                :disabled="!currentProfileId || refreshingProfileSummary"
+                :data-state="refreshingProfileSummary ? 'loading' : 'idle'"
+                @click="refreshProfileSummary"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M20 11a8 8 0 1 0 2 5.3" />
+                  <path d="M20 5v6h-6" />
+                </svg>
+                <span>{{ refreshingProfileSummary ? "刷新中" : "刷新摘要" }}</span>
+              </button>
+            </div>
+            <div v-if="profileSummaryError" class="inline-error profile-summary-error" role="alert">
+              {{ profileSummaryError }}
             </div>
             <pre class="summary-box">{{ profileSummary }}</pre>
           </section>
@@ -1263,35 +1279,45 @@
 
           <section class="profile-account-grid" aria-label="账号安全与数据管理">
             <article class="panel profile-account-panel">
-              <div class="panel-title-row">
+              <div class="panel-title-row profile-account-panel-head">
                 <div><p class="eyebrow">Account Security</p><h2 class="panel-title">账号安全</h2></div>
                 <span class="profile-simulation-badge">{{ auth.account?.email_verified_at ? "邮箱已验证" : "邮箱未验证" }}</span>
               </div>
-              <p class="profile-panel-lede">{{ auth.account?.email }}</p>
-              <div class="profile-account-actions">
-                <button v-if="!auth.account?.email_verified_at" class="ghost-button compact" type="button" :disabled="accountActionLoading" @click="resendVerification">重发验证邮件</button>
-                <button class="ghost-button compact" type="button" :disabled="accountActionLoading" @click="downloadAccountExport">导出我的数据</button>
-                <button class="ghost-button compact" type="button" :disabled="accountActionLoading" @click="logoutAll">退出所有设备</button>
+              <div class="profile-account-panel-body">
+                <p class="profile-panel-lede">{{ auth.account?.email }}</p>
+                <div class="profile-account-actions">
+                  <button v-if="!auth.account?.email_verified_at" class="ghost-button compact" type="button" :disabled="accountActionLoading" @click="resendVerification">重发验证邮件</button>
+                  <button class="ghost-button compact" type="button" :disabled="accountActionLoading" @click="downloadAccountExport">导出我的数据</button>
+                  <button class="ghost-button compact" type="button" :disabled="accountActionLoading" @click="logoutAll">退出所有设备</button>
+                </div>
               </div>
             </article>
 
             <article class="panel profile-account-panel">
-              <div><p class="eyebrow">Password</p><h2 class="panel-title">修改密码</h2></div>
-              <form class="profile-account-form" @submit.prevent="changeAccountPassword">
-                <label class="field-group" for="currentAccountPassword"><span>当前密码</span><input id="currentAccountPassword" v-model="accountPasswordForm.currentPassword" class="field" type="password" autocomplete="current-password" required /></label>
-                <label class="field-group" for="newAccountPassword"><span>新密码</span><input id="newAccountPassword" v-model="accountPasswordForm.newPassword" class="field" type="password" autocomplete="new-password" minlength="8" required /></label>
-                <button class="primary-button" type="submit" :disabled="accountActionLoading">修改并重新登录</button>
-              </form>
+              <div class="panel-title-row profile-account-panel-head">
+                <div><p class="eyebrow">Password</p><h2 class="panel-title">修改密码</h2></div>
+              </div>
+              <div class="profile-account-panel-body">
+                <form class="profile-account-form" @submit.prevent="changeAccountPassword">
+                  <label class="field-group" for="currentAccountPassword"><span>当前密码</span><input id="currentAccountPassword" v-model="accountPasswordForm.currentPassword" class="field" type="password" autocomplete="current-password" required /></label>
+                  <label class="field-group" for="newAccountPassword"><span>新密码</span><input id="newAccountPassword" v-model="accountPasswordForm.newPassword" class="field" type="password" autocomplete="new-password" minlength="8" required /></label>
+                  <button class="primary-button" type="submit" :disabled="accountActionLoading">修改并重新登录</button>
+                </form>
+              </div>
             </article>
 
             <article class="panel profile-account-panel profile-danger-panel">
-              <div><p class="eyebrow">Delete Account</p><h2 class="panel-title">注销账号</h2></div>
-              <p class="profile-panel-lede">求职档案、项目、简历和知识库内容将被删除；依法需要保留的财务事实会匿名保存。</p>
-              <form class="profile-account-form" @submit.prevent="deleteMyAccount">
-                <label class="field-group" for="deleteAccountPassword"><span>当前密码</span><input id="deleteAccountPassword" v-model="accountDeleteForm.currentPassword" class="field" type="password" autocomplete="current-password" required /></label>
-                <label class="field-group" for="deleteAccountConfirmation"><span>输入“注销账号”</span><input id="deleteAccountConfirmation" v-model.trim="accountDeleteForm.confirmation" class="field" type="text" autocomplete="off" required /></label>
-                <button class="danger-button" type="submit" :disabled="accountActionLoading || accountDeleteForm.confirmation !== '注销账号'">永久注销</button>
-              </form>
+              <div class="panel-title-row profile-account-panel-head">
+                <div><p class="eyebrow">Delete Account</p><h2 class="panel-title">注销账号</h2></div>
+              </div>
+              <div class="profile-account-panel-body">
+                <p class="profile-panel-lede">求职档案、项目、简历和知识库内容将被删除；依法需要保留的财务事实会匿名保存。</p>
+                <form class="profile-account-form" @submit.prevent="deleteMyAccount">
+                  <label class="field-group" for="deleteAccountPassword"><span>当前密码</span><input id="deleteAccountPassword" v-model="accountDeleteForm.currentPassword" class="field" type="password" autocomplete="current-password" required /></label>
+                  <label class="field-group" for="deleteAccountConfirmation"><span>输入“注销账号”</span><input id="deleteAccountConfirmation" v-model.trim="accountDeleteForm.confirmation" class="field" type="text" autocomplete="off" required /></label>
+                  <button class="danger-button" type="submit" :disabled="accountActionLoading || accountDeleteForm.confirmation !== '注销账号'">永久注销</button>
+                </form>
+              </div>
             </article>
           </section>
           <div v-if="accountActionMessage" class="inline-error" :class="{ 'is-success': accountActionSuccess }" role="status">{{ accountActionMessage }}</div>

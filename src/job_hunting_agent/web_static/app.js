@@ -269,6 +269,8 @@ if (!window.Vue) {
         loadingProfiles: false,
         creatingProfile: false,
         deletingProfileId: 0,
+        refreshingProfileSummary: false,
+        profileSummaryError: "",
         loadingJobs: false,
         deletingJobId: 0,
         importingJob: false,
@@ -2450,6 +2452,22 @@ if (!window.Vue) {
         }
         const data = await this.requestJson(`/api/profiles/${this.currentProfileId}`);
         this.updateProfileInState(data.profile);
+      },
+
+      /** 只刷新档案摘要所依赖的当前档案，不重新加载整个工作台。 */
+      async refreshProfileSummary() {
+        if (!this.currentProfileId || this.refreshingProfileSummary) {
+          return;
+        }
+        this.refreshingProfileSummary = true;
+        this.profileSummaryError = "";
+        try {
+          await this.refreshCurrentProfile();
+        } catch (error) {
+          this.profileSummaryError = error.message || "档案摘要刷新失败，请稍后重试。";
+        } finally {
+          this.refreshingProfileSummary = false;
+        }
       },
 
       /** 恢复当前候选人的聊天历史。 */

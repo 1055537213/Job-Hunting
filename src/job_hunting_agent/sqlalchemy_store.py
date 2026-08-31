@@ -8,6 +8,7 @@ PostgreSQL 行为，不再存在其他数据库运行或测试分支。
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time
@@ -143,7 +144,12 @@ class SQLAlchemyStore(RepositoryStore):
     def __init__(self, database_url: str):
         super().__init__()
         self.database_url = normalize_database_url(database_url)
-        self.engine = sa.create_engine(self.database_url, pool_pre_ping=True)
+        engine_options: dict[str, Any] = {"pool_pre_ping": True}
+        # 全量测试会创建很多短生命周期的 App；测试连接不能让每个 Engine
+        # 各自保留一个空闲池，否则长测试会耗尽 PostgreSQL 的连接上限。
+        if os.environ.get("JOB_AGENT_TEST_DATABASE_URL"):
+            engine_options["poolclass"] = sa.pool.NullPool
+        self.engine = sa.create_engine(self.database_url, **engine_options)
 
     def connect(self) -> RepositoryConnection:
         """返回一次短生命周期的 SQLAlchemy 事务连接。"""

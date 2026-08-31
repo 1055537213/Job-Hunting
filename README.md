@@ -2,538 +2,401 @@
 
 [![CI](https://github.com/1055537213/Job-Hunting/actions/workflows/ci.yml/badge.svg)](https://github.com/1055537213/Job-Hunting/actions/workflows/ci.yml)
 
-一个面向求职准备场景的多账号 Agent 工作台。项目把候选人档案、职位信息、项目证据、简历文件和对话记忆组织成可追溯的数据链路，再通过 LangChain Agent、RAG 和 Celery 后台任务完成职位匹配、材料整理和定制简历生成。
+一个面向求职准备场景的多账号 Agent 工作台。系统把候选人档案、职位、项目证据、简历文件和对话记忆组织成可追溯的数据链路，再通过 LangChain Agent、RAG 和 Celery 后台任务完成资料整理、职位匹配和定制简历生成。
 
-> 项目遵循“候选人主动提供、系统分析、候选人确认、再用于求职表达”的边界。系统不会自动登录招聘平台、抓取隐藏接口、自动投递或自动发送招聘消息。
+系统只处理用户主动提供或授权的内容，不登录招聘平台、不抓取隐藏接口、不自动投递，也不自动向招聘方发送消息。
 
-## 1. 项目简介（是什么 + 解决什么问题）
+## 1. 项目简介
 
 ### 1.1 项目是什么
 
-求职助手 Agent 是一个带有账号隔离、候选人档案管理、职位导入、项目证据分析、RAG 检索、简历生成和后台任务能力的模块化单体应用。
+求职助手 Agent 是一个带有账号隔离、候选人档案、职位导入、项目证据分析、RAG 检索、简历生成、余额计费和管理后台的模块化单体应用。
+
+前端使用同一套静态资源按路径切换认证页、工作台、个人中心和管理员后台；后端由 FastAPI 提供页面、API 和 SSE 流式对话接口。
 
 ### 1.2 项目解决什么问题
 
-求职资料通常分散在简历、职位描述、项目文档和聊天记录中；直接让模型自由生成，又容易把推断内容误当成候选人的真实经历。本项目解决以下问题：
+求职者的资料通常分散在简历、职位描述、项目代码、工业 PDF、图片和聊天记录中。直接让模型自由生成，容易出现事实污染、重复记录和无法追溯的问题。本项目重点解决：
 
-- 用结构化档案保存学历、经历、技能、求职方向、城市和薪资偏好。
-- 接收候选人主动带回的职位文本或截图，解析成可比较的职位信息。
-- 分析公开 GitHub 仓库或候选人授权的本地项目材料，先形成待确认的项目经历卡片。
-- 将确认事实和长文本材料建立账号隔离的 pgvector 索引，支持可追溯检索。
-- 通过 Agent 对话完成档案维护、职位匹配和材料整理；复杂任务交给 Celery Worker。
-- 生成独立的职位定制简历版本，不覆盖候选人原始事实和原始简历。
-- 记录模型 Token 用量、余额变化、工具轨迹和审计事件，并通过 Prometheus、Loki、Tempo、Grafana 和 Alertmanager 观测运行状态。
+- 以结构化档案保存学历、经历、技能熟练度、求职方向、城市和薪资偏好。
+- 通过职位文本或截图导入可比较的职位信息。
+- 分析用户主动提供的公开 GitHub 项目，并先生成待确认的项目经历卡片。
+- 处理代码、PDF、图片、表格、DOCX 等多种项目材料，保留来源定位和证据关系。
+- 把确认后的事实和长文本建立账号隔离的 pgvector 索引，支持可追溯检索。
+- 使用 Agent 对话完成档案维护、职位匹配、材料整理和简历生成。
+- 记录 Token 用量、余额流水、工具轨迹、后台任务和管理员审计事件。
 
-核心数据边界：PostgreSQL 是权威事实源，pgvector 是可重建的派生索引，Redis 负责任务传递、共享限流和并发租约。
+数据边界如下：PostgreSQL 是结构化事实和任务状态的权威来源；pgvector 是可重建的派生索引；MinIO/S3 保存二进制对象；Redis 负责 Celery 消息、共享限流和并发租约。
 
-## 2. 在线演示 / 效果截图（可选加分）
+## 2. 在线演示 / 效果截图
 
-当前没有公开线上演示地址，也没有把本地运行截图作为仓库资产提交。启动本地环境后可以访问：
+当前没有公开演示站点，也没有把用户数据或未脱敏运行截图提交到仓库。启动本地环境后可访问：
 
-| 页面 | 地址 | 说明 |
+| 页面或服务 | 地址 | 用途 |
 | --- | --- | --- |
-| 求职助手工作台 | http://127.0.0.1:8000/ | 登录、候选人档案、职位、项目和对话 |
-| FastAPI 文档 | http://127.0.0.1:8000/docs | Swagger API 文档 |
-| ReDoc | http://127.0.0.1:8000/redoc | 只读接口文档 |
-| 健康检查 | http://127.0.0.1:8000/api/health | 数据库、队列、存储和模型摘要 |
-| Prometheus | http://127.0.0.1:9090 | 仅绑定本机回环地址 |
-| Grafana | http://127.0.0.1:3000 | 生产环境通过 SSH 隧道查看指标、日志和 Trace |
-| Alertmanager | http://127.0.0.1:9093 | 生产环境通过 SSH 隧道查看告警路由 |
+| 认证页 | `http://127.0.0.1:8000/login` | 登录、注册、邮箱验证和密码找回 |
+| 工作台 | `http://127.0.0.1:8000/` | 档案、职位、项目、对话和简历 |
+| 个人中心 | `http://127.0.0.1:8000/profile` | 余额、模拟充值、消费流水和账号安全 |
+| 管理后台 | `http://127.0.0.1:8000/admin` | 用量与账号、请求观测、审计和工具轨迹 |
+| FastAPI 文档 | `http://127.0.0.1:8000/docs` | Swagger API 文档 |
+| ReDoc | `http://127.0.0.1:8000/redoc` | 只读接口文档 |
+| 健康检查 | `http://127.0.0.1:8000/api/health` | 检查数据库、队列、对象存储和模型摘要 |
 
-如果要补充演示图，建议只提交脱敏后的界面截图，不要把 .env、用户简历、数据库导出、对象存储文件或验收报告提交到仓库。
+同一服务器已有其他项目占用 `80/443` 时，生产共存拓扑默认使用 `https://<公网IP>:8443`，不会占用旧项目的默认端口。
 
-## 3. 功能清单（列点式）
+如需补充截图，只能提交脱敏后的界面截图；不要提交 `.env`、用户简历、数据库导出、对象存储原件或评测运行数据。
+
+## 3. 功能清单
 
 ### 账号与安全
 
-- 多账号隔离、候选人档案归属校验和 Session Cookie。
-- 可选邮箱验证、密码重置、协议版本留痕和账号注销。
+- 多账号隔离、Session Cookie 和资源归属校验。
+- 注册、登录、邮箱验证、密码重置、修改密码和账号注销。
 - Argon2id 密码哈希、CSRF、防重放、请求限流、安全响应头和请求 ID。
-- 账号数据导出、密码修改、全部设备退出和匿名化删除。
+- 账号数据导出、全部设备退出和账号删除后的关联数据清理。
+- 管理员启用/停用账号，并保留管理员审计事件。
 
 ### 候选人档案与 Agent
 
-- 管理学历、工作经历、项目经历、技能熟练度、目标方向、城市和薪资偏好。
-- 对话上下文恢复、历史压缩和 SSE 流式回复。
-- 可选轻量意图路由器：仅对高置信度只读请求直达，歧义指代、多步骤、修改/确认表达、低置信度、超时和异常全部回退主 Agent。
-- 路由直达次数、超时次数、固定回退原因和模型延迟直方图接入 Prometheus。
-- 13 个 Agent 工具统一注册在 ToolRegistry；LangChain、直达路由、审计和可选 MCP adapter 共享名称、Schema、风险和执行元数据。
+- 管理教育经历、工作经历、项目经历、技能熟练度、目标方向和城市偏好。
+- 通过对话补充或修改档案，支持技能同义词和大小写规范化去重。
+- 对话历史保存、会话恢复、历史压缩和 SSE 流式回复。
+- 轻量意图路由只处理高置信度低风险请求；修改、确认、指代、多步骤和异常场景回退主 Agent。
+- 工具调用按任务记录，前端只展示用户需要的状态，不展示内部工具名、数据库 ID 或字段名。
 
 ### 职位与匹配
 
-- 粘贴职位文本导入，或上传职位截图进行多模态识别后复审。
-- 职位字段解析、技能要求分类、重复导入检测和账号级数据隔离。
-- 基于学历、经验、技能、城市、薪资和硬性限制进行可解释匹配与排序。
+- 粘贴职位文本或上传职位截图进行导入。
+- 规则解析职位字段，并可用模型辅助分类技能要求。
+- 账号范围内的重复职位检测和删除清理。
+- 根据学历、经验、技能、城市、薪资和硬性限制计算可解释匹配结果。
 
 ### 项目证据与知识库
 
-- 公开 GitHub 仓库安全归档、默认分支快照和项目分析。
-- 本地目录清单预扫描、哈希校验、分批上传、断点恢复和取消清理。
-- 文本、代码、PDF、图片、CSV/XLSX、DOCX/PPTX 等来源分流提取。
-- 项目分析结果先生成待确认卡片，候选人确认后才进入求职表达和 RAG。
-- RAG 采用语义优先切分：按标题、段落、列表、代码块、表格和 PDF 页边界组织 Chunk，只有超长语义块才按句子和硬长度上限兜底拆分。
-- 文字向量与视觉向量混合召回；视觉命中可以有限重开原图进行当前问题复核。
+- 公开 GitHub 仓库只读分析，固定提交和哈希后再处理。
+- 本地项目采用“清单/哈希预扫描 + 按需分批传输”，避免一次性上传整个目录。
+- 对代码、文本、PDF、图片、CSV/XLSX、DOCX/PPTX 等材料分流提取。
+- 项目分析结果先生成待确认卡片；用户确认后才进入候选人事实和 RAG。
+- 文本 Chunk 按标题、段落、列表、代码块、表格和 PDF 页边界组织，过长内容才使用句子和长度上限兜底切分。
+- 文字向量与视觉向量混合召回；查询中的否定条件、数值和多步骤意图会在检索后进行规则处理。
+- 删除项目时同步清理项目卡片、长文本、视觉知识项、对象存储对象和向量索引。
 
 ### 简历与后台任务
 
-- DOCX、文字 PDF 和扫描 PDF 简历导入。
-- OCR、RAG 索引、GitHub 分析、项目归档分析和职位定制简历导出由 Worker 执行。
-- 任务具备幂等键、原子认领、进度、有限重试、错误摘要和失联回收。
-- 生成的职位定制 DOCX/PDF 独立保存，不覆盖原始简历。
+- 导入 DOCX、文字 PDF 和扫描 PDF 简历。
+- OCR、GitHub 分析、项目归档分析、RAG 索引和职位定制简历由 Worker 执行。
+- 后台任务具备幂等键、原子认领、进度、有限重试、错误摘要和失联回收。
+- 生成的 DOCX/PDF 作为独立版本保存，不覆盖原始简历。
 
-### 计费与运维
+### 计费与管理
 
-- Token 用量记录、余额扣减、充值订单、支付事件、管理员补款和追加式资金流水。
-- Redis 共享限流、模型/截图并发租约和多 Web 副本运行基础。
-- Prometheus 请求指标、Loki 集中日志、Tempo 分布式 Trace、Grafana 联合排障和 Alertmanager 邮件通知。
-- JSON 日志与 Trace 共享 `trace_id`，但不采集请求正文、查询参数、Cookie、API Key 或模型提示词。
-- 备份恢复、Worker 故障恢复、ClamAV 文件扫描和安全扫描验收脚本。
+- 按模型实际 Token 用量记录消费并从余额扣减。
+- 个人中心提供本地模拟充值；生产环境关闭模拟充值，真实支付仍是后续工作。
+- 管理员可以为指定账号人工补款，并记录原因和审计事件。
+- 管理后台显示余额、Token 明细、工具调用、请求观测、账号邮件投递和管理员审计。
+- Token 明细、工具调用和余额流水都采用分页查询，按保留规则清理过期记录。
 
-## 4. 技术栈（后端 / 前端 / 数据库 / 部署）
+### 运维与可观测性
+
+- Prometheus 请求指标和五类基础告警：Web 不可用、5xx 比例过高、响应过慢、安全拦截突增、高并发。
+- Alertmanager 聚合告警并通过 SMTP 发送邮件。
+- Loki + Alloy 集中收集 Docker 日志，Tempo + OpenTelemetry 保存 Trace，Grafana 统一查看。
+- PostgreSQL/MinIO 备份恢复、Worker 故障恢复、ClamAV 文件扫描和安全扫描验收脚本。
+
+## 4. 技术栈
 
 ### 后端
 
-- Python 3.12
+- Python 3.12.13
 - FastAPI + Uvicorn
-- LangChain / LangGraph Agent
+- LangChain Agent + LangGraph Checkpointer
 - Celery + Redis
 - SQLAlchemy + Alembic
-- pgvector
+- PostgreSQL 16 + pgvector
 
 ### 前端
 
-- 原生 HTML、CSS、JavaScript
-- Vue 3 Global Build（随 src/job_hunting_agent/web_static/vendor/ 提供）
-- SSE 流式聊天
+- Vue 3 Global Build，运行时文件随仓库提供
+- 原生 HTML、CSS 和 JavaScript
+- SSE 流式对话
+- 路径视图：`/login`、`/`、`/profile`、`/admin`
 
-### 数据与基础设施
+### 数据库与基础设施
 
-- PostgreSQL 16 + pgvector：结构化事实、任务、审计、账务和长文本登记
-- MinIO 或 S3-compatible 对象存储：原始简历、导出文件和安全视觉派生文件
-- Redis：Celery Broker、共享限流和并发租约
-- Prometheus：低敏运行指标和告警判定
-- Loki + Alloy：Docker 集中日志和 14 天保留
-- Tempo + OpenTelemetry：Web、SQLAlchemy 与 Celery Trace，默认采样 10%、保留 7 天
-- Grafana：统一查询指标、日志和 Trace
-- Alertmanager：告警聚合、去重和 SMTP 邮件通知
-- Caddy：生产 HTTPS 反向代理
-- Docker Compose：开发、验收、恢复演练和单机生产部署
+- PostgreSQL：账号、档案、职位、项目、长文本、向量、任务、账务、审计和用量事实。
+- MinIO/S3-compatible：简历原件、导出文件、项目原件和视觉派生对象。
+- Redis：Celery Broker、共享限流、并发租约和短期运行状态。
+- ClamAV：生产上传文件和项目归档的病毒扫描。
+- Prometheus：指标采集、查询和告警规则。
+- Alertmanager：告警聚合、去重、恢复通知和 SMTP 投递。
+- Loki、Alloy、Tempo、OpenTelemetry、Grafana：日志、Trace 和可视化排障。
+- Caddy：独占服务器生产 HTTPS；Nginx：共享服务器 `8443` IP HTTPS 共存入口。
+- Docker Compose：开发、生产、共存、恢复、负载和观测验收拓扑。
 
 ### 质量与安全
 
-- Ruff、Pytest、Python compileall、Node 前端回归测试
-- pip-audit、Trivy、CycloneDX SBOM
-- ClamAV 生产文件扫描
-- CI 位于 .github/workflows/ci.yml
+- Pytest、Ruff、`compileall`、Node 前端回归测试。
+- pip-audit、Trivy 和 CycloneDX SBOM。
+- CI 固定运行时版本、锁定依赖和关键容器镜像摘要。
 
-## 5. 项目亮点（体现你做了什么，有何价值）
+## 5. 项目亮点
 
-1. **事实与推断分离**：模型推断的项目职责、技能和成果不会自动变成候选人事实，降低简历夸大和事实污染风险。
-2. **Agent 工具接口统一**：ToolRegistry 统一参数校验、执行、错误码和结果 envelope；LangChain 与轻量直达路由调用同一个 handler，避免双实现漂移。
-3. **多租户隔离贯穿全链路**：数据库查询、对象键、RAG 检索、后台任务、工具轨迹、余额和审计事件都携带账号归属。
-4. **后台任务可恢复**：任务状态以 PostgreSQL 为准，Redis 只传递任务键；幂等键和原子认领避免重复执行、重复扣费和重复导出。
-5. **多模态证据链**：职位截图、项目图片和有限复杂 PDF 页面能够进入 OCR、视觉分析和视觉向量检索，同时保留来源定位；对图号、尺寸、公差等含数字术语提供精确补召回，避免只依赖向量相似度。
-6. **轻量意图路由可控降级**：小模型只负责低风险、高置信度直达；对历史指代、多个意图、修改确认和身份缺失等风险场景保留主 Agent。
-7. **生产基线可验收**：提供迁移门禁、备份恢复、Worker 崩溃恢复、多副本、文件扫描、负载测试、可观测性和容器漏洞验收入口。
-8. **计费事实可追溯**：供应商 usage、调用 ID、充值幂等键、管理员原因和余额流水能够关联排查。
+1. **事实与推断分离**：模型只能提出项目摘要或表达方式，结构化事实必须经过工具和用户确认。
+2. **统一工具边界**：ToolRegistry 是 Agent、直达路由、审计和协议适配器共享的唯一工具目录，避免多套实现漂移。
+3. **多租户隔离贯穿全链路**：数据库、对象键、RAG 查询、后台任务、余额和审计事件都校验账号归属。
+4. **任务可恢复且可幂等**：Redis 只传递受控任务键，PostgreSQL 保存任务事实，避免重复执行、重复扣费和重复导出。
+5. **多模态证据链**：职位截图、项目图片和复杂 PDF 页面可经过 OCR、视觉分析和视觉向量检索，并保留来源定位。
+6. **检索漏斗可调优**：Retriever 先取 Top-K 候选，再由 Reranker 取最终 Top-N；当前线上默认值为 `K=10`、`N=5`。
+7. **生产发布可回退**：CI 成功后才发布不可变 GHCR 镜像；生产部署要求完整提交 SHA、人工确认、迁移前备份和健康检查。
+8. **可观测且低敏**：日志和 Trace 共享 `trace_id`，但不采集请求正文、Cookie、API Key、模型提示词或用户文件原文。
 
-## 6. 目录结构说明（项目文件夹介绍）
+## 6. 目录结构说明
 
-~~~text
+```text
 .
 ├─ src/job_hunting_agent/
-│  ├─ web.py                  # FastAPI API、页面入口、SSE 和鉴权
-│  ├─ agent.py                # LangChain Agent、提示词、对话记忆和路由编排
-│  ├─ app.py                  # 业务门面与模块编排
-│  ├─ tool_registry.py        # 工具定义、上下文、统一结果和执行接口
-│  ├─ job_hunting_tools.py    # 13 个求职工具的唯一注册位置
-│  ├─ langchain_tool_adapter.py # ToolRegistry 到 LangChain 的 adapter
-│  ├─ mcp_tool_adapter.py     # 可选 MCP 定义/结果 adapter，不启动 Server
+│  ├─ web.py                  # FastAPI 页面、API、SSE、鉴权和管理接口
+│  ├─ agent.py                # LangChain Agent、系统提示词、记忆和路由编排
+│  ├─ app.py                  # 业务服务门面和模块编排
+│  ├─ tool_registry.py        # 工具定义、校验、执行和统一结果契约
+│  ├─ job_hunting_tools.py    # 求职领域工具的唯一注册位置
+│  ├─ langchain_tool_adapter.py # ToolRegistry 到 LangChain 的适配器
+│  ├─ mcp_tool_adapter.py     # MCP 兼容结构适配器，不启动 MCP Server
 │  ├─ models.py               # 领域记录、输入模型和结果模型
-│  ├─ storage.py              # 领域仓储与事务逻辑
-│  ├─ sqlalchemy_store.py     # PostgreSQL Store 实现与迁移版本检查
+│  ├─ storage.py              # 数据库无关的仓储和事务逻辑
+│  ├─ sqlalchemy_store.py     # PostgreSQL 仓储实现
 │  ├─ database_schema.py      # SQLAlchemy 表、约束和索引
-│  ├─ config.py               # .env 和运行时配置读取
+│  ├─ config.py               # `.env` 和运行时配置
 │  ├─ model_gateway.py        # 模型调用、usage、重试、并发和计费边界
-│  ├─ intent_router.py        # 轻量路由、风险门禁、超时和路由指标
-│  ├─ rag.py                  # Embedding、Rerank 和切片协议
-│  ├─ pgvector_rag.py         # 文字 RAG 索引、检索和删除
-│  ├─ pgvector_visual.py      # 视觉向量写入与校验
-│  ├─ project_*.py             # GitHub、本地目录和项目证据处理
+│  ├─ rag.py                  # Embedding、Rerank、切片和检索协议
+│  ├─ pgvector_rag.py         # 文本 RAG 索引、检索和删除
+│  ├─ pgvector_visual.py      # 视觉知识项向量写入和校验
+│  ├─ project_*.py             # GitHub、本地项目和项目证据处理
 │  ├─ resume_*.py              # 简历解析、写作和 DOCX/PDF 导出
-│  ├─ task_registry.py         # 独立后台任务目录和 Worker 分发接口
-│  ├─ background_tasks.py      # 后台任务 handler、Celery 注册、重试和回收
-│  ├─ worker.py / beat.py      # Worker 和 Beat 入口
+│  ├─ task_registry.py         # 后台任务定义和执行注册表
+│  ├─ background_tasks.py      # Celery 任务、重试和失联回收
+│  ├─ worker.py / beat.py      # Worker 和定时任务入口
 │  ├─ account_*.py / auth.py   # 账号生命周期、邮件 Outbox 和认证
-│  ├─ rate_limiting.py         # 内存/Redis 滑动窗口限流
-│  ├─ concurrency_control.py   # 全局与账号级并发租约
-│  ├─ file_scanning.py         # 本地安全扫描和 ClamAV 边界
-│  ├─ observability.py          # JSON 日志、脱敏和 OpenTelemetry Trace
-│  ├─ observability_config.py   # 运行时生成 Alertmanager 密钥配置
+│  ├─ observability*.py        # 日志、Trace、指标和告警配置
+│  ├─ file_scanning.py         # 本地扫描和 ClamAV 边界
 │  └─ web_static/              # 前端页面、脚本、样式和 Vue 运行时
-├─ alembic/                    # 数据库迁移
-├─ tests/                      # Python 单元/集成测试和前端回归测试
-├─ scripts/                    # 基准、备份恢复、扩容、扫描和企业验收脚本
-├─ deploy/                     # Caddy、Prometheus、Grafana、Loki、Tempo、Alloy 和生产模板
-├─ docs/                       # ADR、架构决策、运行学习文档和发布基线
+├─ alembic/                    # Alembic 数据库迁移
+├─ tests/                      # Python 测试和前端回归测试
+├─ evals/rag/                  # RAG 黄金集、困难负样本和真实文件评测清单
+├─ scripts/                    # 备份、恢复、负载、安全和企业验收脚本
+├─ deploy/                     # Caddy、Nginx、Prometheus、观测和生产模板
+├─ docs/                       # ADR、架构决策、运行和发布文档
 ├─ compose.yaml                # 基础开发拓扑
 ├─ compose.dev.yaml            # 源码挂载和热更新覆盖
 ├─ compose.prod.yaml           # 单机生产覆盖
-├─ compose.coexist.yaml        # 同机轻量共存覆盖，回环 Web 加独立公网 IP HTTPS 入口
-├─ compose.*-test.yaml         # 多副本、恢复、文件扫描和验收覆盖
+├─ compose.coexist.yaml        # 同机轻量共存覆盖
+├─ compose.*-test.yaml         # 恢复、扫描、观测、扩容和验收覆盖
 ├─ Dockerfile                  # Web/Worker/Beat/Migrate 共用镜像
 ├─ pyproject.toml              # 包元数据、入口命令和测试配置
 ├─ requirements.lock           # 运行时锁定依赖
 └─ .env.example                # 脱敏配置模板
-~~~
+```
 
-## 7. 运行步骤（一步一步写）
+## 7. 运行步骤
 
 ### 7.1 环境要求
 
 - Docker Desktop 或 Docker Engine + Compose v2
 - Git
-- Python 3.12（宿主机测试可选）
-- Node.js 22（前端回归测试可选）
-- 一个 OpenAI-compatible Chat 模型配置
+- Python 3.12（宿主机测试）
+- Node.js 22（前端回归测试）
+- 一个 OpenAI-compatible Chat、Embedding 和可选 Rerank/视觉模型配置
 
 ### 7.2 获取代码并配置环境变量
 
-~~~powershell
+```powershell
 git clone https://github.com/1055537213/Job-Hunting.git
-cd Job-Hunting
+Set-Location Job-Hunting
 Copy-Item .env.example .env
-~~~
+```
 
-至少修改 .env 中的以下配置：
+本地至少填写模型和运行时密码：
 
-~~~dotenv
-JOB_AGENT_LLM_PROVIDER=your-provider
+```dotenv
+JOB_AGENT_LLM_PROVIDER=your-chat-provider
 JOB_AGENT_LLM_MODEL=your-chat-model
 JOB_AGENT_LLM_API_KEY=your-api-key
 JOB_AGENT_LLM_BASE_URL=https://api.example.com/v1
 JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY=your-minio-access-key
 JOB_AGENT_OBJECT_STORAGE_SECRET_KEY=your-minio-secret
-JOB_AGENT_REDIS_PASSWORD=your-redis-password
-~~~
+JOB_AGENT_REDIS_PASSWORD=your-strong-redis-password
+```
 
-本地开发默认使用 JOB_AGENT_ACCOUNT_EMAIL_BACKEND=console、关闭强制邮箱验证，并使用本地对象存储/限流配置。生产环境必须使用独立 Secret、HTTPS、SMTP、ClamAV 和 Redis。
+本地开发默认使用回环地址、控制台邮件、本地文件扫描和开发数据库认证。生产配置请以 `deploy/env.production.example` 为模板，必须使用独立密钥、密码认证 PostgreSQL、Redis、ClamAV、SMTP 和 HTTPS。
+
+不要把 `.env`、服务器密钥、真实邮箱密码、模型 API Key 或生产备份提交到 Git。
 
 ### 7.3 启动开发环境
 
-~~~powershell
+```powershell
 docker compose -f compose.yaml -f compose.dev.yaml up -d --build
 docker compose -f compose.yaml -f compose.dev.yaml ps
-~~~
+```
 
-访问 http://127.0.0.1:8000/。查看日志：
+访问 `http://127.0.0.1:8000/`。查看日志：
 
-~~~powershell
+```powershell
 docker compose -f compose.yaml -f compose.dev.yaml logs --tail 100 web worker beat
-~~~
+```
 
-停止服务但保留数据卷：
+修改前端后，开发覆盖会挂载 `src/` 并启用 Uvicorn reload；浏览器仍显示旧资源时执行硬刷新。停止服务但保留数据卷：
 
-~~~powershell
+```powershell
 docker compose -f compose.yaml -f compose.dev.yaml down
-~~~
+```
 
-只有确认需要删除本地 PostgreSQL、MinIO、Redis 和 Prometheus 数据时，才执行：
-
-~~~powershell
-docker compose -f compose.yaml -f compose.dev.yaml down -v
-~~~
+只有确认要删除本地 PostgreSQL、MinIO、Redis 和 Prometheus 数据时，才执行 `down -v`。
 
 ### 7.4 本地质量检查
 
-~~~powershell
+```powershell
 ruff check src tests alembic
-E:\Anaconda\python.exe -m compileall -q src tests alembic
-E:\Anaconda\python.exe -m pytest -q
-~~~
-
-前端回归测试：
-
-~~~powershell
+python -m compileall -q src tests alembic
+python -m pytest -q
 Get-ChildItem tests -Filter 'frontend_*.mjs' | ForEach-Object { node $_.FullName }
-~~~
+```
 
-配置和 Prometheus 检查：
+Compose 配置检查：
 
-~~~powershell
+```powershell
 $env:JOB_AGENT_REDIS_PASSWORD='ci-redis-password'
 docker compose --env-file .env.example -f compose.yaml config --quiet
-docker run --rm --entrypoint /bin/promtool -v "$((Get-Location).Path)/deploy/prometheus:/etc/prometheus:ro" prom/prometheus:v3.13.1 check config /etc/prometheus/prometheus.yml
-~~~
+docker compose --env-file .env.example -f compose.yaml -f compose.prod.yaml config --quiet
+docker compose --env-file .env.example -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml config --quiet
+```
 
-生产 Compose 配置检查还需要显式提供镜像、数据库密码和域名变量。CI 会执行同样的配置解析，
-但不会启动生产服务或申请证书：
+专项验收入口：
 
-~~~powershell
-$env:JOB_AGENT_REDIS_PASSWORD='replace-with-a-long-redis-password'
-$env:JOB_AGENT_POSTGRES_PASSWORD='replace-with-a-long-url-safe-password'
-$env:JOB_AGENT_IMAGE='ghcr.io/your-org/job-hunting-agent:release-tag'
-$env:JOB_AGENT_DOMAIN='agent.example.com'
-$env:JOB_AGENT_TLS_EMAIL='ops@example.com'
-$env:JOB_AGENT_GRAFANA_ADMIN_PASSWORD='replace-with-a-long-random-password'
-docker compose --env-file .env -f compose.yaml -f compose.prod.yaml config --quiet
-~~~
-
-专项验收脚本：
-
-~~~powershell
-.\scripts\validate_local_release.ps1 -Python E:\Anaconda\python.exe
-.\scripts\validate_multi_replica.ps1
-.\scripts\validate_worker_recovery.ps1
+```powershell
+.\scripts\validate_local_release.ps1
 .\scripts\validate_backup_restore.ps1
 .\scripts\validate_file_scanning.ps1
-.\scripts\validate_rag_retrieval.ps1 -Python E:\Anaconda\python.exe
-.\scripts\validate_rag_artifacts.ps1 `
-  -Python E:\Anaconda\python.exe `
-  -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent"
-.\scripts\validate_rag_scale.ps1 `
-  -Python E:\Anaconda\python.exe `
-  -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent" `
-  -ChunkCounts "50000,100000"
-.\scripts\validate_e2e_load.ps1 `
-  -Profile full `
-  -Python E:\Anaconda\python.exe
+.\scripts\validate_multi_replica.ps1
+.\scripts\validate_worker_recovery.ps1
+.\scripts\validate_rag_retrieval.ps1
+.\scripts\validate_rag_artifacts.ps1
+.\scripts\validate_e2e_load.ps1 -Profile smoke
 .\scripts\security_scan.ps1
-~~~
+```
 
-端到端负载脚本使用随机 PostgreSQL schema、随机 Celery 队列和确定性模型替身，覆盖真实
-HTTP、Cookie/CSRF、SSE、pgvector、Redis/Celery、任务轮询和 Worker 停启恢复，不调用外部
-模型，也不污染现有账号。`smoke` 使用 1/5 并发，`full` 使用 1/5/10/20/50 并发；低敏报告
-写入 `data/eval-reports/`。具体边界和故障场景见
-[端到端负载与故障测试](docs/learning/e2e-load-testing.md)。
+RAG 正式发布集必须在上线前使用真实 Embedding、视觉模型和 Reranker 重新测量。`local_hash` 只用于验证评测管线，不代表语义召回质量。
 
-RAG 评测使用 `evals/rag/golden_suite.json` 中的固定跨行业语料。脚本会创建两个临时账号，
-在真实 PostgreSQL/pgvector 中索引后统计最终 Top-N 的 Recall、Precision、nDCG、MRR、禁止召回率和标签分组指标，再自动
-删除临时数据。默认使用 `.env` 中配置的正式 Embedding 与可选 Rerank，报告写入已忽略的
-`data/eval-reports/`；`-EmbeddingMode local_hash` 只用于验证评测管线，不能代表语义召回质量。
+### 7.5 生产部署
 
-真实文件评测分为两层。默认 `evals/rag/github_artifact_suite.json` 只有 12 份材料，定位是检查
-下载、扫描、OCR/多模态、入库、检索和清理是否连通的冒烟集，不能作为上线准确率结论。正式
-门禁使用 `evals/rag/github_hard_negative_suite.json`，扩充到 33 份材料和 33 条问题，加入同系列
-工业图纸、施工基线/当前/变化图、关联财务表、相近医疗模块、相似设计海报和物流输入输出。
-正式集的 `Top 5` 仅占语料 15.2%，31 条问题声明困难负样本，12 条属于保留验收集。
+生产部署使用通过 CI 的不可变镜像，不在服务器上直接从源码临时构建。完整生产拓扑使用 `compose.prod.yaml`，同机已有其他项目占用 `80/443` 时使用共存拓扑：
 
-两套清单都固定 GitHub 仓库、40 位提交、文件大小、SHA-256 和许可证。运行时才从
-`raw.githubusercontent.com` 下载，下载结果先校验，再经过项目清单规划、本地恶意内容检查、
-OCR/多模态提取、长文本、pgvector 和检索指标链路。第三方原文件不会写入仓库；评测结束会
-删除临时账号、余额流水、提取文字、向量和视觉副本，只在 `data/eval-reports/` 保留低敏报告。
+```bash
+docker compose --env-file /opt/job-hunting-agent/shared/.env \
+  -f /opt/job-hunting-agent/current/compose.yaml \
+  -f /opt/job-hunting-agent/current/compose.prod.yaml \
+  -f /opt/job-hunting-agent/current/compose.coexist.yaml \
+  config --quiet
+```
 
-默认同时使用当前 `.env` 的视觉模型、Embedding 和 Rerank，会产生真实模型费用。只有检查
-评测程序本身时才使用 `-EmbeddingMode local_hash -VisualMode disabled`；该模式不能形成上线
-质量结论。宿主机 `.env` 没有 `JOB_AGENT_DATABASE_URL` 时必须显式传 `-DatabaseUrl`；容器内的
-`postgres` 主机名不能直接用于宿主机脚本。上游仓库文件即使在相同路径被替换，也会因提交或
-内容摘要不匹配而在模型调用前失败。
+共存拓扑的公网入口是 `https://<公网IP>:8443`，应用 Web 只绑定服务器回环地址 `127.0.0.1:18081`。阿里云安全组只开放业务需要的 `8443` 和证书 HTTP-01 续期需要的 `80`，不要开放 `18081`、Prometheus 或 Alertmanager 端口。
 
-正式发布前执行困难集：
+仓库已经接入受控 CD：
 
-~~~powershell
-.\scripts\validate_rag_artifacts.ps1 `
-  -BenchmarkRole release `
-  -Python E:\Anaconda\python.exe `
-  -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent"
-~~~
+1. 推送到 `master` 后，`CI` 执行 Python、前端、Compose、配置和安全检查。
+2. CI 成功后，`Publish release image` 重新构建并扫描精确提交，发布 `ghcr.io/<owner>/<repo>:sha-<提交前12位>`。
+3. 管理员手动启动 `Deploy production`，填写完整 40 位提交 SHA、确认词 `DEPLOY`，并选择 `coexist` 或 `standalone`。
+4. GitHub `production` Environment 审批通过后，工作流通过固定 SSH 指纹上传部署包和镜像，在服务器上执行迁移、备份、健康检查和失败回滚。
 
-扫描 Retriever Top-K 与 Reranker Top-N 参数时，复用同一次文件解析和索引：
+服务器上的生产 `.env` 保留在 `shared/.env`，不由 GitHub Actions 上传。首次部署前必须准备对象存储 bucket、生产密钥、证书和 GitHub Actions 所需的 SSH/Environment 配置。详细步骤见 [生产发布与恢复基线](docs/learning/production-release.md)。
 
-~~~powershell
-.\scripts\validate_rag_artifacts.ps1 `
-  -BenchmarkRole release `
-  -Python E:\Anaconda\python.exe `
-  -DatabaseUrl "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent" `
-  -TuneParameters `
-  -TuneKValues "10,15,20,30" `
-  -TuneNValues "3,5" `
-  -TuningRepetitions 3
-~~~
+## 8. 接口文档
 
-报告同时给出 `Recall@1/3/5`、最终 Top-N 的 Recall/Precision/nDCG、MRR、困难负样本命中率、行业
-分组和 `development/holdout` 分层。默认线上检索漏斗为 Retriever Top-K=10、Reranker 最终 Top-N=5；开发集可用于切片、Embedding、Rerank 和检索参数调优；
-保留集只用于阶段性验收，不能根据其中的失败问题逐条改查询或答案，否则会再次产生虚高结果。
-参数扫描会分别记录核心召回/重排、视觉原图复查和端到端的平均耗时与 P95；多轮测量按轮次交错运行，
-只使用 `development` 的核心检索 P95 选择候选，之后才比较候选与当前线上基线的 `holdout` 质量和端到端耗时。2026-08-29 的三轮跨行业真实材料评测中，`10/5` 与 `20/5` 质量一致，留出集端到端 P95 从 `2260.8 ms` 降至 `1879.8 ms`，因此默认值调整为 `10/5`。召回、排序、困难负样本或留出集平均/P95 延迟明显退化时，调参门禁失败，
-不得自动修改线上默认值。远程视觉复查存在长尾延迟，单轮推荐只能作为候选，正式变更前应重复测量。
-`VisualMode configured` 会额外校验视觉分析产物数量，建立图片向量索引，并通过线上 `app.search_rag`
-执行文字/图片混合召回和原图复核；报告中的 `visual_indexed` 必须与视觉项总数一致。`disabled` 只评估
-文本层和 OCR 文字，不能用于声明图片结构或空间关系的召回能力。
-
-RAG 在重排前会对查询中明确写出的排除条件进行规则过滤，例如“不要返回基线图”；过滤范围包含
-来源路径和已提取证据正文。向量召回和重排使用移除否定从句后的正向查询，原始查询只用于结果过滤，
-避免“不要返回的对象”反而污染语义相似度。明确包含“从……到……”“比较……并找到……”或“联合查询”
-的多步骤问题会最多拆成 4 条阶段查询，每个阶段先取最佳证据，再合并去重，普通问题不会增加检索次数。
-重排输入还会附带低敏的来源文件名、证据类型和页码，帮助模型区分同领域的表格、报告、图片和模块文件，
-但最终返回给业务层的正文保持不变。Reranker 原始相关性分数会随证据写入评测报告，仅用于同一次重排
-内的相对置信度校准，不作为跨模型通用的事实可信度。默认最高分低于 `0.65` 时返回空结果，其余候选
-需达到本次最高分的 `86%`；Top-N 因此是最大返回数而不是必须凑满的数量，多步骤查询则按拆解阶段数
-保留必要证据。两个阈值可通过 `JOB_AGENT_RERANK_MIN_RELEVANCE_SCORE` 和
-`JOB_AGENT_RERANK_RELATIVE_SCORE_THRESHOLD` 调整，并且只能使用 development 集校准。对于包含尺寸、金额、编号等数值的查询，重排后还会优先保留与查询
-数值一致且具有相同语义锚点的候选，并将同对象但数值不一致的候选后置。上述规则只修正排序和过滤，
-不替代 Reranker，也不把评测集中的相似硬负样本误认为明确否定条件。
-
-pgvector 规模门禁使用独立 `UNLOGGED` 临时表生成确定性 2560 维语料，不调用付费模型、不写用户
-数据，结束后自动删表。完整向量继续保存在 `vector` 列；由于 pgvector 的普通 `vector` HNSW
-维度上限低于当前 2560 维模型，迁移只在 ANN 表达式索引中转换为 `halfvec(2560)`。线上查询先用
-HNSW 召回 `Top-K x 20` 个候选，再按原始完整精度向量排序回 Retriever Top-K=10，最后交给
-Reranker 输出 Top-N=5。当前索引参数为 `m=32`、`ef_construction=128`、`ef_search=400`。
-
-规模报告区分三类质量：`neighbor_recall` 是 ANN 与精确 Top-K 的 ID 交集，用于观察近似索引退化；
-`semantic_precision` 统计候选中语义相关项比例；`semantic_coverage` 检查每条查询的 Top-K 是否至少
-出现一条相关证据。后两项更接近 RAG 是否给 Reranker 提供了可用证据，不能把 ID 召回误写成最终
-答案准确率。本轮隔离结果如下：
-
-| Chunk | 精确扫描 P95 | HNSW P95 | ID 召回 | 语义精度 | 语义覆盖 | 20 并发 P95 |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 50,000 | 109.3 ms | 25.3 ms | 0.845 | 1.000 | 1.000 | 143.2 ms |
-| 100,000 | 210.8 ms | 21.3 ms | 0.767 | 1.000 | 1.000 | 133.2 ms |
-
-这些数字只证明索引计划、延迟、并发、租户隔离和合成语义簇门禁；真实行业 Recall、Precision、
-nDCG、MRR、困难负样本和视觉证据仍以版本化黄金集与 GitHub 真实文件发布集为准。
-
-### 7.5 单机生产基线
-
-生产部署必须使用正式 .env、独立数据卷、预创建对象存储 bucket、不可变镜像标签和 HTTPS 域名：
-
-~~~powershell
-Copy-Item .env.example .env
-# 将 deploy/env.production.example 中的生产项合并到 .env，并填写模型、SMTP、数据库、Redis、对象存储和域名密钥。
-# JOB_AGENT_IMAGE 必须指向已经通过 CI 构建和扫描的不可变镜像标签。
-$env:JOB_AGENT_IMAGE='ghcr.io/your-org/job-hunting-agent:release-tag'
-docker compose -f compose.yaml -f compose.prod.yaml config --quiet
-docker compose -f compose.yaml -f compose.prod.yaml up -d --no-build
-~~~
-
-同一服务器已有其他项目占用 `80/443` 时，使用轻量共存拓扑。它将 Web 绑定到
-`127.0.0.1:18081`，并由独立轻量 Nginx 在 `0.0.0.0:8443` 提供公网 IP HTTPS。该拓扑保留
-ClamAV、Prometheus 和 Alertmanager，默认不启动项目内 Caddy、Loki、Tempo、Alloy 与 Grafana：
-
-~~~powershell
-docker compose -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml config --quiet
-docker compose -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml up -d --no-build
-~~~
-
-生产 `.env` 需要设置 `JOB_AGENT_PUBLIC_IP`，并将 `JOB_AGENT_PUBLIC_BASE_URL` 配置为
-`https://<公网 IP>:8443`。宿主机证书默认从 `/etc/letsencrypt` 只读挂载；首次签发、自动续期和
-旧 Nginx 的 HTTP-01 验证目录配置见 `docs/learning/production-release.md`。
-
-生产模板位于 `deploy/env.production.example`。它不会覆盖模型供应商配置，部署时应先从
-`.env.example` 复制模型和业务配置，再用生产模板中的值替换开发项；`JOB_AGENT_DOMAIN`、
-`JOB_AGENT_TLS_EMAIL`、`JOB_AGENT_PUBLIC_BASE_URL`、`JOB_AGENT_ALERT_EMAIL_TO`、Grafana 密码和 SMTP 配置必须使用真实生产值。
-生产 Compose 会使用带密码的 PostgreSQL、Redis、ClamAV、MinIO、Caddy、Prometheus、Loki、Tempo、Alloy、Grafana 和 Alertmanager，
-第一次启动前还要创建对象存储 bucket，并先执行 `docker compose ... run --rm migrate` 或让
-Compose 的 `migrate` 服务完成迁移。生产环境的模拟充值接口会关闭，真实支付仍待后续接入。
-
-仓库已经接入受控 CD：`master` 的 CI 成功后，`.github/workflows/publish-image.yml` 会对精确
-提交重新构建和扫描镜像，并发布 `ghcr.io/<owner>/<repo>:sha-<commit 前 12 位>`；
-`.github/workflows/deploy-production.yml` 只允许手动输入完整提交 SHA 和确认词 `DEPLOY`，并通过
-GitHub `production` Environment 等待人工批准。部署端使用固定 SSH 主机指纹、迁移前数据库备份、
-服务健康检查和上一版本镜像回退；生产 `.env` 始终保留在服务器，不会由 Actions 上传。
-
-生产上线前至少完成数据库迁移、健康检查、备份恢复演练、文件扫描验收和安全扫描。详细规则见 docs/learning/production-release.md。
-
-## 8. 接口文档（如果是后端项目）
-
-启动 Web 后，完整接口以 FastAPI 生成的 /docs 和 /redoc 为准。主要接口如下：
+启动 Web 后，以 `/docs` 和 `/redoc` 生成的接口为准。主要接口如下：
 
 | 模块 | 方法与路径 | 说明 |
 | --- | --- | --- |
-| 认证 | POST /api/auth/register | 注册账号 |
-| 认证 | POST /api/auth/login | 登录并设置 Session |
-| 认证 | POST /api/auth/verify-email | 消费邮箱验证令牌 |
-| 认证 | POST /api/auth/password-reset/request | 请求密码重置 |
-| 账号 | GET /api/account/export | 导出本人数据 |
-| 账号 | POST /api/account/delete | 删除或匿名化账号数据 |
-| 档案 | GET/POST /api/profiles | 列出或创建候选人档案 |
-| 对话 | POST /api/chat/stream | SSE Agent 对话 |
-| 职位 | POST /api/jobs | 导入职位文本 |
-| 职位 | POST /api/jobs/screenshots | 导入职位截图 |
-| 匹配 | GET /api/matches/{candidate_id} | 返回职位匹配结果 |
-| 项目 | POST /api/projects/github | 提交公开 GitHub 项目分析 |
-| 项目 | POST /api/projects/local/manifest | 提交本地项目文件清单 |
-| 项目 | POST /api/projects/{record_id}/confirm | 确认项目经历卡片 |
-| 简历 | POST /api/resumes/upload | 上传原始简历 |
-| 简历 | POST /api/resumes/{artifact_id}/tailor | 提交职位定制简历任务 |
-| 简历 | GET /api/resumes/{artifact_id}/download | 下载简历文件 |
-| 任务 | GET /api/tasks/{task_key} | 查询后台任务状态 |
-| RAG | GET /api/rag/search | 账号隔离的检索接口 |
-| 运维 | GET /api/health | 健康检查 |
-| 运维 | GET /internal/metrics | Prometheus 指标，不加入公开 API 文档 |
+| 认证 | `POST /api/auth/register` | 注册账号 |
+| 认证 | `POST /api/auth/login` | 登录并设置 Session |
+| 认证 | `POST /api/auth/verify-email` | 消费邮箱验证令牌 |
+| 认证 | `POST /api/auth/password-reset/request` | 请求密码重置 |
+| 账号 | `GET /api/account/export` | 导出本人数据 |
+| 账号 | `POST /api/account/delete` | 删除或匿名化账号数据 |
+| 档案 | `GET/POST /api/profiles` | 列出或创建候选人档案 |
+| 对话 | `POST /api/chat/stream` | SSE Agent 对话 |
+| 职位 | `POST /api/jobs` | 导入职位文本 |
+| 职位 | `POST /api/jobs/screenshots` | 导入职位截图 |
+| 匹配 | `GET /api/matches/{candidate_id}` | 返回职位匹配结果 |
+| 项目 | `POST /api/projects/github` | 提交公开 GitHub 项目分析 |
+| 项目 | `POST /api/projects/local/manifest` | 提交本地项目文件清单 |
+| 项目 | `POST /api/projects/{record_id}/confirm` | 确认项目经历卡片 |
+| 简历 | `POST /api/resumes/upload` | 上传原始简历 |
+| 简历 | `POST /api/resumes/{artifact_id}/tailor` | 提交职位定制简历任务 |
+| 任务 | `GET /api/tasks/{task_key}` | 查询后台任务状态 |
+| RAG | `GET /api/rag/search` | 账号隔离的检索接口 |
+| 运维 | `GET /api/health` | 健康检查 |
+| 运维 | `GET /internal/metrics` | Prometheus 指标，仅供内网抓取 |
 
-已登录的写操作需要同源 Cookie 和 X-CSRF-Token；管理接口要求管理员角色；资源接口会校验账号归属。/internal/metrics 只应由内网 Prometheus 抓取，不应通过公网反向代理暴露。
+已登录的写操作需要同源 Cookie 和 `X-CSRF-Token`；管理接口要求管理员角色；所有资源接口都会校验账号归属。`/internal/metrics` 不应通过公网反向代理暴露。
 
 ## 9. 常见问题（FAQ）
 
-### 为什么访问 localhost:8000 失败？
+### 为什么访问 `localhost:8000` 失败？
 
-部分 Windows 环境会优先解析 IPv6 ::1。请使用 http://127.0.0.1:8000。
+部分 Windows 环境会把 `localhost` 解析到 IPv6 `::1`，而服务只监听 IPv4。请使用 `http://127.0.0.1:8000`。
 
 ### 修改前端后为什么没有变化？
 
-确认使用了 compose.dev.yaml。它会挂载 src/ 并开启 Uvicorn reload；浏览器仍有缓存时执行硬刷新。
+开发时必须使用 `compose.dev.yaml`，它会挂载源码并启用 reload；然后执行浏览器硬刷新。生产镜像中的前端修改则需要重新提交、通过 CI、发布镜像并部署新版本。
 
-### 为什么登录返回 403？
+### 为什么登录或写操作返回 403？
 
-如果启用了邮箱验证，必须先消费验证邮件中的令牌；如果启用了协议同意，注册请求还必须带正确的条款和隐私版本。测试环境应使用独立临时配置，不要直接继承生产式 .env 开关。
+可能是邮箱验证未完成、协议版本不一致、Session 失效或 CSRF Token 缺失。先重新加载页面获取当前 CSRF Cookie，再重试写操作。
 
-### 为什么模型请求失败？
+### 为什么模型请求失败或提示余额不足？
 
-检查 JOB_AGENT_LLM_PROVIDER、JOB_AGENT_LLM_MODEL、API Key、Base URL 和余额配置。模型失败会经过超时、有限重试和熔断策略，详细原因查看 Web 日志和管理员工具轨迹。
+检查模型 provider、模型名、API Key、Base URL 和账号余额。余额不足时统一提示“余额不足，请先充值后重试。”；模型超时、限流和熔断错误属于不同的运行状态。
 
 ### 为什么职位或项目没有立即完成？
 
-OCR、GitHub 分析、RAG 索引和简历导出在队列开启时由 Worker 执行。检查 worker、beat、Redis 和 GET /api/tasks/{task_key}。
+OCR、GitHub 分析、项目归档、RAG 索引和简历导出在队列开启时由 Worker 执行。检查 `worker`、`beat`、Redis，并通过 `GET /api/tasks/{task_key}` 查看任务状态和错误摘要。
 
-### 删除项目会不会留下向量或对象文件？
+### 删除项目后为什么不能马上重新导入？
 
-正常删除流程会按项目/候选人归属清理数据库记录、长文本、视觉派生文件、对象存储对象和对应 pgvector 索引；如失败，应先查看任务轨迹和数据库状态，不要手工直接删除生产卷。
+删除会清理数据库、长文本、视觉派生对象、对象存储和向量索引；若此前任务仍在运行，清理可能需要等待任务结束。重新导入时必须使用新的任务状态，不能复用已取消任务的临时文件。
 
-### 如何查看意图路由效果？
+### 当前 RAG 的 Top-K 和 Top-N 是多少？
 
-访问管理端请求观测，或在 Prometheus 查询：
+默认 Retriever Top-K 为 `10`，Reranker 最终 Top-N 为 `5`。流程是“全量知识库 -> Retriever 候选 -> 完整精度 Top-K -> Reranker Top-N -> Agent”。K/N 只能依据 development 集的召回质量、困难负样本和 P95 延迟调优，不能根据 holdout 问题逐条修改。
 
-~~~promql
-job_agent_intent_router_direct_total
-job_agent_intent_router_fallback_total
-job_agent_intent_router_timeouts_total
-job_agent_intent_router_model_duration_seconds_bucket
-~~~
+### 项目是否运行 MCP Server 或自动投递？
 
-### 项目现在是否已经运行 MCP Server？
+当前没有运行 MCP Server。`mcp_tool_adapter.py` 只提供兼容结构；内部工具由 ToolRegistry 和 LangChain Agent 使用。系统也不会自动登录招聘平台、自动投递或自动联系 HR。
 
-没有。内部 ToolRegistry 是唯一工具实现，当前 LangChain Agent 和轻量路由都在进程内调用它。mcp_tool_adapter.py 只负责生成 MCP 兼容的 inputSchema、outputSchema、annotations 和 CallToolResult，默认仅导出只读工具；只有出现外部 Agent、独立进程或跨语言调用需求时，才需要在它之上启动 MCP Server。
+### 生产共存部署如何访问？
 
-### 系统会自动帮我投递或联系 HR 吗？
+使用 `https://<公网IP>:8443`。`18081` 只供服务器本机回环检查，Prometheus 和 Alertmanager 只绑定回环地址。旧项目继续使用原来的 `80/443`，两套项目通过端口和独立 Compose 项目隔离。
 
-不会。系统只处理候选人主动带回的内容、分析和草稿生成；投递、发送消息和承诺类信息必须由候选人自行确认和执行。
-
-## 10. TODO / 未来计划（体现成长）
+## 10. TODO / 未来计划
 
 - [ ] 接入真实支付渠道、签名 Webhook、退款状态机和渠道对账。
-- [x] 建立首版隔离跨行业 RAG 黄金测试集，评估 Retriever Top-K、最终 Top-N、MRR、禁止召回和账号隔离。
-- [x] 建立固定 GitHub 提交和哈希的跨行业真实文件端到端 RAG 评测。
-- [x] 建立 K/N 开发集参数扫描、P95 统计、留出集质量与性能防回退门禁。
-- [ ] 持续扩充已授权的真实行业语料和难负样本，并按正式 Embedding 模型校准阈值。
-- [x] 接入 Alertmanager 邮件通知、OpenTelemetry Trace、Loki 集中日志和 Grafana 联合排障。
-- [x] 建立隔离本地发布验收包，覆盖上传攻击边界、备份恢复、ClamAV 和 Alertmanager 投递链路。
-- [ ] 出现明确外部调用方后，在现有 MCP adapter 上增加鉴权、授权和 Server 生命周期。
-- [ ] 建立严格类型检查基线，逐步消化第三方 stub 和内部 Protocol 类型债务。
-- [ ] 完成目标生产服务器的 ClamAV 验收、渗透测试、灾难恢复演练和密钥轮换流程。
-- [x] 为 2560 维正式 Embedding 建立 halfvec HNSW 索引、完整精度二次排序和 5 万/10 万规模门禁。
-- [ ] 增加工业 PDF 表格/图注坐标、二进制 CAD 解析、父子 Chunk 和数值范围检索。
-- [ ] 增加真实线上演示环境和脱敏效果截图。
+- [x] 建立跨行业 RAG 黄金集、困难负样本和真实文件评测集。
+- [x] 建立 Retriever Top-K / Reranker Top-N 参数扫描、P95 统计和质量防回退门禁。
+- [ ] 持续扩充经过授权的真实行业语料，并按正式模型重新校准阈值。
+- [x] 接入 Prometheus、Alertmanager、OpenTelemetry、Loki、Tempo 和 Grafana。
+- [x] 建立备份恢复、Worker 恢复、ClamAV 和告警投递验收脚本。
+- [ ] 在出现明确外部调用方后，为 MCP adapter 增加鉴权、授权和 Server 生命周期。
+- [ ] 建立更严格的类型检查基线并消化类型债务。
+- [ ] 完成生产服务器的渗透测试、灾难恢复演练、密钥轮换和容量基线。
+- [ ] 增加工业 PDF 表格/图注坐标、父子 Chunk、数值范围检索和 CAD 解析能力。
+- [ ] 建立公开线上演示环境和脱敏效果截图。
 
-已完成的企业化能力以代码、测试和验收脚本为准，包括邮箱生命周期、对象存储、知识资产、视觉证据、任务恢复、备份恢复、文件扫描、多副本限流、Prometheus 指标和轻量意图路由。
+## 11. 联系方式 / 声明
 
-## 11. 联系方式 / 声明（可选）
-
-- GitHub 仓库：https://github.com/1055537213/Job-Hunting
-- Issue 反馈：https://github.com/1055537213/Job-Hunting/issues
-- 架构边界：CONTEXT.md
-- 决策记录：DECISION_MAP.md
-- ADR：docs/adr/
-- 发布与恢复：docs/learning/production-release.md
+- GitHub 仓库：<https://github.com/1055537213/Job-Hunting>
+- Issue 反馈：<https://github.com/1055537213/Job-Hunting/issues>
+- 架构边界：[CONTEXT.md](CONTEXT.md)
+- 决策记录：[DECISION_MAP.md](DECISION_MAP.md)
+- ADR：[docs/adr/](docs/adr/)
+- 发布与恢复：[docs/learning/production-release.md](docs/learning/production-release.md)
 
 本项目仅提供求职准备、信息整理和材料生成辅助，不保证职位匹配结果、面试结果或录用结果。候选人应对提交给招聘平台的内容、真实性、隐私授权和最终发送行为负责。

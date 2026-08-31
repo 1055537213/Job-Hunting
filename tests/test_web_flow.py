@@ -1340,6 +1340,11 @@ def test_web_profile_form_uses_city_picker_and_auth_copy(tmp_path):
     assert "cityPickerOpen: false" in script
     assert 'activeCityProvince: "hot"' in script
     assert 'v-for="city in profileForm.preferredCities"' in home
+    assert 'class="ghost-button compact profile-summary-refresh"' in home
+    assert '@click="refreshProfileSummary"' in home
+    assert "async refreshProfileSummary()" in script
+    assert "await this.refreshCurrentProfile()" in script
+    assert ".profile-summary-refresh" in styles
     assert "preferred_cities: [...this.profileForm.preferredCities]" in script
     assert 'addPreferredCity(cityValue = "")' in script
     assert "togglePreferredCity(cityValue)" in script
