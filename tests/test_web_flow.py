@@ -2114,7 +2114,7 @@ def test_web_chat_can_use_langchain_agent_mode(tmp_path):
 
     assert chat.status_code == 200, chat.text
     assert chat.json()["mode"] == "langchain_agent"
-    assert chat.json()["display_reply"] == "我已经通过 Agent 工具保存了你的资料。"
+    assert chat.json()["display_reply"] == "已更新当前候选人档案：学历、工作经验、技能。"
     assert {"used_tools", "tool_outputs", "usage", "result"}.isdisjoint(chat.json())
     account_id = client.get("/api/auth/me").json()["account"]["id"]
     session_id = f"account-{account_id}-candidate-{candidate_id}"
