@@ -60,6 +60,18 @@ class ToolCallingFakeChatModel(FakeMessagesListChatModel):
         return self
 
 
+class TimeoutAfterToolCallingFakeChatModel(ToolCallingFakeChatModel):
+    """测试工具已经执行后，模型收尾调用超时的生产故障。"""
+
+    generate_calls: int = 0
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.generate_calls += 1
+        if self.generate_calls >= 2:
+            raise TimeoutError("Request timed out.")
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
 class RecordingToolCallingFakeChatModel(ToolCallingFakeChatModel):
     """测试用假模型：记录每次真正传给模型的消息列表。"""
 
@@ -141,6 +153,125 @@ def test_langchain_agent_can_call_ingest_tool_and_update_profile(tmp_path, accou
     assert profile.skills["Python"] == "待确认"
     assert any(item["tool_name"] == "ingest_candidate_message" for item in result.tool_outputs)
     assert any("FastAPI" in item.content for item in rag_results)
+
+
+def test_stream_chat_keeps_success_when_final_model_call_times_out(tmp_path, account_id):
+    """工具已保存资料后，收尾模型超时不能让整轮对话变成失败。"""
+
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="收尾超时测试",
+            status="待补充",
+            education="大专",
+            experience_years=0,
+            skills={},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+    model = TimeoutAfterToolCallingFakeChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "timeout-after-tool",
+                        "name": "ingest_candidate_message",
+                        "args": {
+                            "message": "我会 Python，求职方向是算法工程师。",
+                            "auto_rag": False,
+                        },
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    )
+    agent = JobHuntingAgent(app, model=model)
+
+    events = list(
+        agent.stream_chat(
+            "请更新我的技能和求职方向。",
+            candidate_id=candidate_id,
+            session_id="stream-timeout-after-tool",
+            use_tool_llm=False,
+            auto_rag=False,
+            account_id=account_id,
+        )
+    )
+
+    final = next(event for event in events if event["type"] == "final")
+    result = final["result"]
+    profile = app.get_candidate_profile(candidate_id, account_id=account_id)
+
+    assert result.used_tools == ["ingest_candidate_message"]
+    assert result.tool_outputs[0]["status"] == "success"
+    assert "保存" in result.reply or "更新" in result.reply
+    assert profile.skills["Python"] == "待确认"
+    assert profile.target_directions == ["算法工程"]
+
+
+def test_chat_keeps_success_when_final_model_call_times_out(tmp_path, account_id):
+    """非流式 Agent 入口也不能丢失已经成功写入的资料。"""
+
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="非流式收尾超时测试",
+            status="待补充",
+            education="大专",
+            experience_years=0,
+            skills={},
+            preferred_cities=[],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=[],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+    model = TimeoutAfterToolCallingFakeChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "chat-timeout-after-tool",
+                        "name": "ingest_candidate_message",
+                        "args": {
+                            "message": "我会 Python，求职方向是算法工程师。",
+                            "auto_rag": False,
+                        },
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    )
+    agent = JobHuntingAgent(app, model=model)
+
+    result = agent.chat(
+        "请更新我的技能和求职方向。",
+        candidate_id=candidate_id,
+        session_id="chat-timeout-after-tool",
+        use_tool_llm=False,
+        auto_rag=False,
+        account_id=account_id,
+    )
+    profile = app.get_candidate_profile(candidate_id, account_id=account_id)
+
+    assert result.used_tools == ["ingest_candidate_message"]
+    assert result.tool_outputs[0]["status"] == "success"
+    assert "保存" in result.reply or "更新" in result.reply
+    assert profile.skills["Python"] == "待确认"
+    assert profile.target_directions == ["算法工程"]
 
 
 def test_agent_rag_tool_always_scopes_search_to_current_candidate(account_id, monkeypatch):

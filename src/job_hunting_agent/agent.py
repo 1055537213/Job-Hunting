@@ -214,43 +214,34 @@ class JobHuntingAgent:
             return direct_result
         self.routing_metrics.record_decision(route_decision, direct_executed=False)
         main_agent_started_at = time.monotonic()
-        result = self.graph.invoke(
-            {"messages": turn_messages},
-            config={
-                "configurable": {
-                    "thread_id": scoped_thread_id(
-                        account_id,
-                        candidate_id,
-                        resolved_session_id,
-                    )
-                },
-                "metadata": {"account_id": account_id},
-            },
-            context={
-                "candidate_id": candidate_id,
-                "account_id": account_id,
-                "session_id": resolved_session_id,
-                "use_tool_llm": use_tool_llm and self.tool_llm_available,
-                "default_auto_rag": auto_rag,
-                "root_request_id": root_request_id,
-            },
-        )
-        messages = list(result.get("messages", []))
-        usage = self.model_gateway.record_chat_messages(
-            operation="agent_chat",
-            messages=messages,
+        messages, tool_outputs, reply, streamed_usage = self._collect_main_agent_stream(
+            turn_messages,
             account_id=account_id,
             candidate_id=candidate_id,
             session_id=resolved_session_id,
+            use_tool_llm=use_tool_llm,
+            auto_rag=auto_rag,
             root_request_id=root_request_id,
         )
+        usage = self.model_gateway.record_chat_usage_summary(
+            self.model_gateway.new_call_context(
+                "agent_chat",
+                account_id=account_id,
+                candidate_id=candidate_id,
+                session_id=resolved_session_id,
+                root_request_id=root_request_id,
+                call_id=f"{root_request_id}-agent_chat-aggregated",
+                authorize_spend=False,
+            ),
+            streamed_usage,
+        )
         chat_result = AgentChatResult(
-            reply=extract_final_reply(messages),
+            reply=reply,
             candidate_id=candidate_id,
             session_id=resolved_session_id,
             mode="langchain_agent",
             used_tools=collect_used_tools(messages),
-            tool_outputs=collect_tool_outputs(messages),
+            tool_outputs=tool_outputs,
             usage=merge_usage_summaries(route_decision.usage if route_decision else {}, usage),
             root_request_id=root_request_id,
             routing=build_routing_summary(
@@ -326,76 +317,85 @@ class JobHuntingAgent:
         streamed_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         active_tool_names: set[str] = set()
 
-        for stream_item in self.graph.stream(
-            {"messages": turn_messages},
-            config={
-                "configurable": {
-                    "thread_id": scoped_thread_id(
-                        account_id,
-                        candidate_id,
-                        resolved_session_id,
-                    )
+        try:
+            for stream_item in self.graph.stream(
+                {"messages": turn_messages},
+                config={
+                    "configurable": {
+                        "thread_id": scoped_thread_id(
+                            account_id,
+                            candidate_id,
+                            resolved_session_id,
+                        )
+                    },
+                    "metadata": {"account_id": account_id},
                 },
-                "metadata": {"account_id": account_id},
-            },
-            context={
-                "candidate_id": candidate_id,
-                "account_id": account_id,
-                "session_id": resolved_session_id,
-                "use_tool_llm": use_tool_llm and self.tool_llm_available,
-                "default_auto_rag": auto_rag,
-                "root_request_id": root_request_id,
-            },
-            stream_mode="messages",
-        ):
-            streamed_message = unpack_stream_message(stream_item)
-            if streamed_message is None:
-                continue
+                context={
+                    "candidate_id": candidate_id,
+                    "account_id": account_id,
+                    "session_id": resolved_session_id,
+                    "use_tool_llm": use_tool_llm and self.tool_llm_available,
+                    "default_auto_rag": auto_rag,
+                    "root_request_id": root_request_id,
+                },
+                stream_mode="messages",
+            ):
+                streamed_message = unpack_stream_message(stream_item)
+                if streamed_message is None:
+                    continue
 
-            if isinstance(streamed_message, ToolMessage):
-                tool_and_final_messages.append(streamed_message)
-                tool_name = streamed_message.name or "unknown_tool"
-                # 某些模型不会在 AIMessageChunk 中携带完整 tool call 名称；
-                # 收到 ToolMessage 时补发开始事件，保证前端不会只看到“完成”。
-                if tool_name not in active_tool_names:
-                    active_tool_names.add(tool_name)
-                    yield {"type": "step_started", "name": tool_name}
-                tool_output = tool_message_to_output(streamed_message)
-                active_tool_names.discard(tool_name)
-                yield {
-                    "type": "step_completed",
-                    "name": tool_name,
-                    "data": tool_output.get("data"),
-                }
-                continue
-
-            if isinstance(streamed_message, AIMessageChunk):
-                merge_usage(streamed_usage, extract_usage_metadata(streamed_message))
-                for tool_name in extract_tool_call_names(streamed_message):
+                if isinstance(streamed_message, ToolMessage):
+                    tool_and_final_messages.append(streamed_message)
+                    tool_name = streamed_message.name or "unknown_tool"
+                    # 某些模型不会在 AIMessageChunk 中携带完整 tool call 名称；
+                    # 收到 ToolMessage 时补发开始事件，保证前端不会只看到“完成”。
                     if tool_name not in active_tool_names:
                         active_tool_names.add(tool_name)
                         yield {"type": "step_started", "name": tool_name}
-                token = extract_stream_token(streamed_message)
-                if token:
-                    streamed_reply_parts.append(token)
-                    yield {"type": "token", "content": token}
-                continue
+                    tool_output = tool_message_to_output(streamed_message)
+                    active_tool_names.discard(tool_name)
+                    yield {
+                        "type": "step_completed",
+                        "name": tool_name,
+                        "data": tool_output.get("data"),
+                    }
+                    continue
 
-            if isinstance(streamed_message, AIMessage):
-                # FakeChatModel 等测试模型可能一次性给出完整 AIMessage，而不是 AIMessageChunk。
-                tool_and_final_messages.append(streamed_message)
-                for tool_name in extract_tool_call_names(streamed_message):
-                    if tool_name not in active_tool_names:
-                        active_tool_names.add(tool_name)
-                        yield {"type": "step_started", "name": tool_name}
-                token = extract_stream_token(streamed_message)
-                if token and not streamed_message.tool_calls:
-                    streamed_reply_parts.append(token)
-                    yield {"type": "token", "content": token}
+                if isinstance(streamed_message, AIMessageChunk):
+                    merge_usage(streamed_usage, extract_usage_metadata(streamed_message))
+                    for tool_name in extract_tool_call_names(streamed_message):
+                        if tool_name not in active_tool_names:
+                            active_tool_names.add(tool_name)
+                            yield {"type": "step_started", "name": tool_name}
+                    token = extract_stream_token(streamed_message)
+                    if token:
+                        streamed_reply_parts.append(token)
+                        yield {"type": "token", "content": token}
+                    continue
 
-        reply = extract_final_reply(tool_and_final_messages)
-        if reply.startswith("本轮没有生成") and streamed_reply_parts:
-            reply = "".join(streamed_reply_parts).strip()
+                if isinstance(streamed_message, AIMessage):
+                    # FakeChatModel 等测试模型可能一次性给出完整 AIMessage，而不是 AIMessageChunk。
+                    tool_and_final_messages.append(streamed_message)
+                    for tool_name in extract_tool_call_names(streamed_message):
+                        if tool_name not in active_tool_names:
+                            active_tool_names.add(tool_name)
+                            yield {"type": "step_started", "name": tool_name}
+                    token = extract_stream_token(streamed_message)
+                    if token and not streamed_message.tool_calls:
+                        streamed_reply_parts.append(token)
+                        yield {"type": "token", "content": token}
+        except Exception:
+            # 工具已经成功写入后，最后一次模型调用只负责组织自然语言收尾；
+            # 收尾超时不能回滚已经提交的业务结果，也不能把整轮任务标为失败。
+            tool_outputs = collect_tool_outputs(tool_and_final_messages)
+            reply = fallback_reply_from_tool_outputs(tool_outputs)
+            if reply is None:
+                raise
+        else:
+            tool_outputs = collect_tool_outputs(tool_and_final_messages)
+            reply = extract_final_reply(tool_and_final_messages)
+            if reply.startswith("本轮没有生成") and streamed_reply_parts:
+                reply = "".join(streamed_reply_parts).strip()
         usage = self.model_gateway.record_chat_usage_summary(
             self.model_gateway.new_call_context(
                 "agent_chat",
@@ -414,7 +414,7 @@ class JobHuntingAgent:
             session_id=resolved_session_id,
             mode="langchain_agent",
             used_tools=collect_used_tools(tool_and_final_messages),
-            tool_outputs=collect_tool_outputs(tool_and_final_messages),
+            tool_outputs=tool_outputs,
             usage=merge_usage_summaries(route_decision.usage if route_decision else {}, usage),
             root_request_id=root_request_id,
             routing=build_routing_summary(
@@ -497,6 +497,68 @@ class JobHuntingAgent:
                 total_latency_ms=elapsed_ms(turn_started_at),
             ),
         )
+
+    def _collect_main_agent_stream(
+        self,
+        turn_messages: list[BaseMessage],
+        *,
+        account_id: int | None,
+        candidate_id: int | None,
+        session_id: str,
+        use_tool_llm: bool,
+        auto_rag: bool,
+        root_request_id: str,
+    ) -> tuple[list[BaseMessage], list[dict[str, object]], str, dict[str, int]]:
+        """收集主 Agent 流并在收尾模型失败时保留已完成的工具结果。"""
+
+        messages: list[BaseMessage] = []
+        reply_parts: list[str] = []
+        usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        try:
+            for stream_item in self.graph.stream(
+                {"messages": turn_messages},
+                config={
+                    "configurable": {
+                        "thread_id": scoped_thread_id(account_id, candidate_id, session_id)
+                    },
+                    "metadata": {"account_id": account_id},
+                },
+                context={
+                    "candidate_id": candidate_id,
+                    "account_id": account_id,
+                    "session_id": session_id,
+                    "use_tool_llm": use_tool_llm and self.tool_llm_available,
+                    "default_auto_rag": auto_rag,
+                    "root_request_id": root_request_id,
+                },
+                stream_mode="messages",
+            ):
+                streamed_message = unpack_stream_message(stream_item)
+                if streamed_message is None:
+                    continue
+                if isinstance(streamed_message, AIMessageChunk):
+                    merge_usage(usage, extract_usage_metadata(streamed_message))
+                    token = extract_stream_token(streamed_message)
+                    if token:
+                        reply_parts.append(token)
+                    continue
+                messages.append(streamed_message)
+                if isinstance(streamed_message, AIMessage) and not streamed_message.tool_calls:
+                    token = extract_stream_token(streamed_message)
+                    if token:
+                        reply_parts.append(token)
+        except Exception:
+            tool_outputs = collect_tool_outputs(messages)
+            reply = fallback_reply_from_tool_outputs(tool_outputs)
+            if reply is None:
+                raise
+            return messages, tool_outputs, reply, usage
+
+        tool_outputs = collect_tool_outputs(messages)
+        reply = extract_final_reply(messages)
+        if reply.startswith("本轮没有生成") and reply_parts:
+            reply = "".join(reply_parts).strip()
+        return messages, tool_outputs, reply, usage
 
     def build_turn_messages(
         self,
@@ -785,6 +847,35 @@ def tool_message_to_output(message: ToolMessage) -> dict[str, object]:
     elif parsed is not None:
         item["data"] = parsed
     return item
+
+
+def fallback_reply_from_tool_outputs(tool_outputs: list[dict[str, object]]) -> str | None:
+    """从已成功的工具结果生成模型收尾失败时的业务回复。"""
+
+    if not tool_outputs:
+        return None
+    if any(
+        item.get("status") in {"failed", "rejected", "error"}
+        or (
+            isinstance(item.get("data"), dict)
+            and bool(item["data"].get("error"))
+        )
+        for item in tool_outputs
+        if isinstance(item, dict)
+    ):
+        return None
+
+    for item in reversed(tool_outputs):
+        if not isinstance(item, dict) or item.get("status") not in {"success", "queued"}:
+            continue
+        data = item.get("data")
+        if not isinstance(data, dict):
+            continue
+        reply = data.get("reply")
+        if isinstance(reply, str) and reply.strip():
+            return reply.strip()
+
+    return None
 
 
 def stringify_tool_message_content(content: Any) -> str:

@@ -2861,6 +2861,15 @@ def stream_web_chat_events(
             yield sse_event("task_failed", {"task_trace": serialize_user_task_trace(trace)})
             yield sse_event("error", {"detail": str(error)})
         except Exception as error:  # noqa: BLE001 - SSE 内统一返回可读错误事件。
+            web_logger.exception(
+                "agent stream failed",
+                extra={
+                    "event": "agent_stream_error",
+                    "root_request_id": root_request_id,
+                    "account_id": account_id,
+                    "candidate_id": payload.candidate_id,
+                },
+            )
             fail_task_trace(trace, str(error), trace_started_at)
             persist_tool_trace(
                 backend,

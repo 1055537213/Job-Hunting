@@ -44,6 +44,18 @@ class ToolCallingFakeChatModel(FakeMessagesListChatModel):
         return self
 
 
+class TimeoutAfterToolCallingFakeChatModel(ToolCallingFakeChatModel):
+    """模拟工具保存成功后，模型收尾调用超时。"""
+
+    generate_calls: int = 0
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.generate_calls += 1
+        if self.generate_calls >= 2:
+            raise TimeoutError("Request timed out.")
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
 class StreamingFakeChatModel(FakeListChatModel):
     """测试用流式假模型：用于验证 Web SSE 不会退化成单次完整输出。"""
 
@@ -2139,6 +2151,75 @@ def test_web_chat_can_use_langchain_agent_mode(tmp_path):
         params={"candidate_id": candidate_id, "session_id": session_id},
     ).json()["messages"]
     assert "routing" not in public_history[-1]["metadata"]
+
+
+def test_web_chat_stream_completes_when_final_model_call_times_out(tmp_path):
+    """资料已保存后，模型收尾超时也必须让网页任务正常完成。"""
+
+    agent_backend = JobHuntingApp()
+    agent_backend.initialize()
+    model = TimeoutAfterToolCallingFakeChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "web-timeout-after-tool",
+                        "name": "ingest_candidate_message",
+                        "args": {
+                            "message": "我会 Python，求职方向是算法工程师。",
+                            "auto_rag": False,
+                        },
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    )
+    backend_app = create_web_app(
+        chat_agent=JobHuntingAgent(
+            app=agent_backend,
+            model=model,
+        ),
+    )
+    client = login_test_account(TestClient(backend_app))
+    candidate_id = client.post(
+        "/api/profiles",
+        json={
+            "name": "网页收尾超时测试",
+            "status": "待补充",
+            "education": "大专",
+            "experience_years": 0,
+            "skills": {},
+            "preferred_cities": [],
+            "salary_floor_k": None,
+            "expected_salary_k": None,
+            "target_directions": [],
+            "unacceptable": [],
+        },
+    ).json()["candidate_id"]
+
+    response = client.post(
+        "/api/chat/stream",
+        json={
+            "candidate_id": candidate_id,
+            "message": "请更新我的技能和求职方向。",
+            "auto_rag": False,
+            "use_env_llm": True,
+            "session_id": "web-timeout-after-tool",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert "event: task_completed" in response.text
+    assert "event: task_failed" not in response.text
+    assert "Request timed out." not in response.text
+    assert "已更新当前候选人档案" in response.text
+    final_match = re.search(r"event: final\r?\ndata: (.+)", response.text)
+    assert final_match is not None
+    final_payload = json.loads(final_match.group(1))
+    assert final_payload["display_reply"] == "已更新当前候选人档案：技能、求职方向。"
+    assert client.get(f"/api/profiles/{candidate_id}").json()["profile"]["skills"]["Python"] == "待确认"
 
 
 def test_web_chat_stream_returns_sse_and_saves_history(tmp_path):
