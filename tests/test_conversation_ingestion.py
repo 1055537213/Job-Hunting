@@ -409,6 +409,42 @@ def test_rule_based_ingestion_saves_explicit_skill_proficiency(tmp_path, account
     assert profile.skills["Python"] == "精通"
 
 
+def test_rule_based_ingestion_applies_current_profile_update_wording(tmp_path, account_id):
+    """工作台中的完整修改指令应同时替换方向、城市和技能熟练度。"""
+
+    app = JobHuntingApp()
+    app.initialize()
+    candidate_id = app.save_candidate_profile(
+        CandidateProfileInput(
+            name="当前档案修改测试",
+            status="待补充",
+            education="本科",
+            experience_years=1,
+            skills={"Python": "待确认"},
+            preferred_cities=["上海"],
+            salary_floor_k=None,
+            expected_salary_k=None,
+            target_directions=["AI Agent 应用开发"],
+            unacceptable=[],
+        ),
+        account_id=account_id,
+    )
+
+    result = app.ingest_conversation_message(
+        candidate_id,
+        "请修改当前候选人档案：把求职方向改为后端开发，将 Python 熟练度设置为熟练，并把首选城市改为杭州。",
+        account_id=account_id,
+    )
+
+    profile = app.get_candidate_profile(candidate_id, account_id=account_id)
+    assert profile.skills["Python"] == "熟练"
+    assert profile.preferred_cities == ["杭州"]
+    assert profile.target_directions == ["后端开发"]
+    assert "skills" not in result.reply
+    assert "preferred_cities" not in result.reply
+    assert "target_directions" not in result.reply
+
+
 def test_llm_ingestion_uses_original_message_for_explicit_skill_proficiency(tmp_path, account_id):
     """LLM 即使把明确熟练度回传成待确认，也不能覆盖用户原话。"""
 

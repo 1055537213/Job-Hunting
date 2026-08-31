@@ -1910,11 +1910,45 @@ def test_web_chat_reply_does_not_expose_internal_execution_metadata(tmp_path):
         },
     )
 
-    assert rendered == "已为你更新档案。"
+    assert rendered == "已更新当前候选人档案：技能。"
     assert "ingest_candidate_message" not in rendered
     assert "保存字段" not in rendered
     assert "长文本 ID" not in rendered
     assert "RAG" not in rendered
+
+
+def test_web_chat_reply_prefers_successful_profile_update_result(tmp_path):
+    """档案更新完成后应展示确定性业务结果，不采用模型对内部实现的解释。"""
+
+    rendered = format_web_chat_reply(
+        mode="agent",
+        reply=(
+            "当前系统工具中没有直接修改档案字段的接口，"
+            "我调用了 `ingest_candidate_message` 并同步更新 RAG。"
+        ),
+        used_tools=["get_current_candidate_profile", "ingest_candidate_message"],
+        tool_outputs=[
+            {
+                "tool_name": "ingest_candidate_message",
+                "data": {
+                    "reply": "已保存你的原始资料，并自动更新：skills、preferred_cities、target_directions。",
+                    "saved_structured_fields": [
+                        "skills",
+                        "preferred_cities",
+                        "target_directions",
+                    ],
+                    "saved_long_text_ids": [28],
+                    "rag_update_mode": "incremental",
+                },
+            }
+        ],
+        rule_based_result=None,
+    )
+
+    assert rendered == "已更新当前候选人档案：技能、首选城市、求职方向。"
+    assert "ingest_candidate_message" not in rendered
+    assert "RAG" not in rendered
+    assert "skills" not in rendered
 
 
 def test_web_chat_history_hides_legacy_internal_execution_metadata(tmp_path):

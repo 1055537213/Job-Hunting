@@ -5109,14 +5109,14 @@ if (!window.Vue) {
         );
 
         return rendered.replace(
-          /\u0000MD_TOKEN_(\d+)\u0000/g,
+          /\u0000MDTOKEN(\d+)\u0000/g,
           (_, tokenIndex) => tokens[Number(tokenIndex)] || ""
         );
       },
 
       /** 保存需要暂时跳过 Markdown 二次处理的 HTML 片段。 */
       stashRenderedToken(tokens, html) {
-        const token = `\u0000MD_TOKEN_${tokens.length}\u0000`;
+        const token = `\u0000MDTOKEN${tokens.length}\u0000`;
         tokens.push(html);
         return token;
       },

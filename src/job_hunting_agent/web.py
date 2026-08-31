@@ -72,6 +72,7 @@ from .concurrency_control import (
     ConcurrencyController,
     ConcurrencyLimitExceeded,
 )
+from .conversation_ingestion import profile_field_labels
 from .config import (
     DEFAULT_RAG_RERANK_TOP_N,
     MAX_RAG_RERANK_TOP_N,
@@ -3673,8 +3674,23 @@ def format_web_chat_reply(
     这样刷新页面恢复历史时，用户看到的内容和当时聊天窗口里的内容一致。
     """
 
-    # 工具调用、保存字段和 RAG 状态只进入任务追踪与管理员审计，不进入聊天气泡。
-    # 保留参数是为了兼容已有调用方，但展示文本唯一来源是 Agent 自然语言回复。
+    # 档案入库工具已经返回了受控的落库结果。这里以实际保存结果生成回复，避免
+    # 模型误述接口能力，或把工具名、内部字段和 RAG 实现细节暴露给用户。
+    for item in reversed(tool_outputs):
+        if not isinstance(item, dict) or item.get("tool_name") != "ingest_candidate_message":
+            continue
+        data = item.get("data")
+        if not isinstance(data, dict) or data.get("error"):
+            continue
+        fields = data.get("saved_structured_fields")
+        if isinstance(fields, list) and fields:
+            labels = profile_field_labels([str(field) for field in fields])
+            return "已更新当前候选人档案：" + "、".join(labels) + "。"
+        long_text_ids = data.get("saved_long_text_ids")
+        if isinstance(long_text_ids, list) and long_text_ids:
+            return "已保存你补充的资料。"
+
+    # 其他工具仍使用 Agent 的自然语言结果；内部执行元数据只进入任务追踪和审计。
     return sanitize_web_chat_reply(reply)
 
 

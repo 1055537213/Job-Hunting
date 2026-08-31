@@ -73,4 +73,40 @@ assert.match(source, /event\.event === "task_started"/);
 assert.match(source, /event\.event === "step_completed"/);
 assert.match(source, /setMessageTaskTrace\(assistantMessage, data\.task_trace/);
 
+const extractObjectMethod = (signature, nextComment, replacement) => {
+  const methodStart = source.indexOf(signature);
+  const methodEnd = source.indexOf(nextComment, methodStart + 1);
+  assert.notEqual(methodStart, -1, `${signature} must exist`);
+  assert.notEqual(methodEnd, -1, `${signature} must have a following method comment`);
+  const extracted = source
+    .slice(methodStart, methodEnd)
+    .trim()
+    .replace(signature, replacement)
+    .replace(/,\s*$/, "");
+  return new Function(`return (${extracted})`)();
+};
+
+const renderInlineMarkdown = extractObjectMethod(
+  "renderInlineMarkdown(value) {",
+  "      /** 保存需要暂时跳过 Markdown 二次处理的 HTML 片段。 */",
+  "function renderInlineMarkdown(value) {",
+);
+const stashRenderedToken = extractObjectMethod(
+  "stashRenderedToken(tokens, html) {",
+  "      /** 判断一行是否开启新的 Markdown 块。 */",
+  "function stashRenderedToken(tokens, html) {",
+);
+const escapeHtml = extractObjectMethod(
+  "escapeHtml(value) {",
+  "      /** 读取 CSRF cookie，用于浏览器同源状态变更请求。 */",
+  "function escapeHtml(value) {",
+);
+const markdownContext = { escapeHtml, stashRenderedToken };
+const inlineCode = renderInlineMarkdown.call(
+  markdownContext,
+  "请调用 `ingest_candidate_message` 保存。",
+);
+assert.match(inlineCode, /<code>ingest_candidate_message<\/code>/);
+assert.doesNotMatch(inlineCode, /MD_?TOKEN/);
+
 console.log("frontend stream render regression: PASS");

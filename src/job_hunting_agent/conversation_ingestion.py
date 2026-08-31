@@ -49,6 +49,20 @@ SKILL_PROFICIENCY_LEVELS = (
     "没有",
 )
 
+PROFILE_FIELD_LABELS = {
+    "status": "档案状态",
+    "education": "学历",
+    "experience_years": "工作经验",
+    "skills": "技能",
+    "preferred_cities": "首选城市",
+    "acceptable_cities": "其他可接受城市",
+    "salary_floor_k": "薪资底线",
+    "expected_salary_k": "期望薪资",
+    "target_directions": "求职方向",
+    "unacceptable": "不可接受条件",
+    "preference_weights": "求职偏好",
+}
+
 
 def decide_conversation_ingestion(
     candidate: CandidateProfile,
@@ -259,7 +273,7 @@ def rule_based_decision(candidate: CandidateProfile, message: str) -> Conversati
     fields = patch_field_names(patch)
     reply = "已保存你的原始资料"
     if fields:
-        reply += "，并自动更新：" + "、".join(fields)
+        reply += "，并自动更新：" + "、".join(profile_field_labels(fields))
     reply += "。"
     return ConversationIngestionDecision(
         reply=reply,
@@ -320,7 +334,9 @@ def extract_explicit_skill_level(text: str, skill: str) -> str | None:
     patterns = (
         (
             rf"(?:我的|我对|对于|对)?\s*{skill_pattern}\s*(?:的\s*)?"
-            rf"(?:熟练度|熟练程度|掌握程度|水平)\s*(?:是|为|：|:)?\s*(?P<level>{level_pattern})"
+            rf"(?:熟练度|熟练程度|掌握程度|水平)\s*"
+            rf"(?:设置为|设置成|设定为|设定成|调整为|调整成|修改为|修改成|"
+            rf"改为|改成|设为|是|为|：|:)?\s*(?P<level>{level_pattern})"
         ),
         rf"(?P<level>{level_pattern})\s*(?:的\s*)?{skill_pattern}",
         rf"{skill_pattern}\s*(?:很|比较|非常)?\s*(?P<level>{level_pattern})",
@@ -527,6 +543,12 @@ def patch_field_names(patch: CandidateProfilePatch) -> list[str]:
     if patch.preference_weights:
         fields.append("preference_weights")
     return fields
+
+
+def profile_field_labels(fields: list[str]) -> list[str]:
+    """把内部档案字段转换成可直接展示给用户的中文名称。"""
+
+    return [PROFILE_FIELD_LABELS.get(field, "档案资料") for field in fields]
 
 
 def empty_to_none(value: Any) -> str | None:
