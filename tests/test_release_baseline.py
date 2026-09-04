@@ -255,6 +255,33 @@ def test_backup_and_restore_scripts_require_safe_operational_guards():
     assert "RTO" in guide
 
 
+def test_linux_production_recovery_drill_is_bundled_and_isolated():
+    script = (ROOT / "scripts" / "validate_production_recovery.sh").read_text(
+        encoding="utf-8"
+    )
+    workflow = (
+        ROOT / ".github" / "workflows" / "deploy-production.yml"
+    ).read_text(encoding="utf-8")
+
+    for required in (
+        '"BACKUP_AND_VALIDATE"',
+        'LOCK_DIR="${STATE_DIR}/production-recovery.lock"',
+        'RECOVERY_PREFIX="job-agent-recovery-${SUFFIX}"',
+        '"${MINIO_VOLUME}:/data:ro"',
+        'docker network create "$RECOVERY_NETWORK"',
+        'docker volume create "$RECOVERY_POSTGRES_VOLUME"',
+        'docker volume create "$RECOVERY_MINIO_VOLUME"',
+        '"production_data_modified": False',
+        '"isolated_restore_used_unique_volumes": True',
+        'PRODUCTION_QUIESCED=1',
+        'compose_production up -d --no-build',
+    ):
+        assert required in script
+    assert "docker volume rm" in script
+    assert "validate_production_recovery.sh" in workflow
+    assert "chmod 700" in workflow
+
+
 def test_local_release_acceptance_pack_covers_recovery_uploads_and_alert_delivery():
     orchestrator = (ROOT / "scripts" / "validate_local_release.ps1").read_text(
         encoding="utf-8"

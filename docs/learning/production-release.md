@@ -630,6 +630,19 @@ Alembic revision，最后输出 `data/recovery-drills/<run>/recovery-report.json
 报告中的 `recovery_time_objective_observed_seconds` 是本机本次演练 RTO；
 `operational_rpo_measured=false` 表示脚本不能代替按正式备份频率计算生产 RPO。
 
+目标 Linux 服务器部署后，使用随发布包上传的脚本创建一次真实生产快照并恢复到唯一命名的
+隔离容器和隔离卷。脚本要求显式确认词，会短暂停止公网入口、Web、Worker、Beat 和 MinIO，
+完成 PostgreSQL dump 与 MinIO 卷归档后立即恢复生产服务；恢复验证不会覆盖生产卷：
+
+```bash
+bash /opt/job-hunting-agent/current/scripts/validate_production_recovery.sh \
+  /opt/job-hunting-agent BACKUP_AND_VALIDATE
+```
+
+生产备份和低敏恢复报告保存在 `/opt/job-hunting-agent/backups/<UTC时间>-<随机后缀>/`。报告会
+比较账号、长文本、RAG chunk、对象数量和 Alembic revision，并记录本次演练耗时。该目录必须
+再同步到服务器之外的受控存储；只保存在同一块 ECS 系统盘不能抵御整机或磁盘故障。
+
 ## 本地发布验收包
 
 在推送到目标服务器前，可以用一个入口串行执行不触碰开发数据的本地发布验收包：

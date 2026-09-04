@@ -140,6 +140,7 @@ jobs:
           REMOTE_BUNDLE="/tmp/job-agent-deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
           RELEASE_DIR="${DEPLOY_PATH}/releases/${RELEASE_ID}"
           BUNDLE_FILES=(compose.yaml compose.prod.yaml deploy scripts/deploy_production.sh)
+          BUNDLE_FILES+=(scripts/validate_production_recovery.sh)
           if [[ "${DEPLOY_TOPOLOGY}" == "coexist" ]]; then
             [[ -f compose.coexist.yaml ]]
             [[ -f scripts/reload_coexist_https.sh ]]
@@ -169,7 +170,7 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             "$TARGET" \
-            "set -eu; tar -xzf '${REMOTE_BUNDLE}' -C '${RELEASE_DIR}'; rm -f '${REMOTE_BUNDLE}'; chmod 700 '${RELEASE_DIR}/scripts/deploy_production.sh'"
+            "set -eu; tar -xzf '${REMOTE_BUNDLE}' -C '${RELEASE_DIR}'; rm -f '${REMOTE_BUNDLE}'; chmod 700 '${RELEASE_DIR}/scripts/deploy_production.sh' '${RELEASE_DIR}/scripts/validate_production_recovery.sh'"
 
       - name: Transfer the verified release image
         env:
