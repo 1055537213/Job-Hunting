@@ -265,7 +265,7 @@ def test_linux_production_recovery_drill_is_bundled_and_isolated():
 
     for required in (
         '"BACKUP_AND_VALIDATE"',
-        'LOCK_DIR="${STATE_DIR}/production-recovery.lock"',
+        'LOCK_DIR="${STATE_DIR}/production-operation.lock"',
         'RECOVERY_PREFIX="job-agent-recovery-${SUFFIX}"',
         '"${MINIO_VOLUME}:/data:ro"',
         'docker network create "$RECOVERY_NETWORK"',
@@ -280,6 +280,50 @@ def test_linux_production_recovery_drill_is_bundled_and_isolated():
     assert "docker volume rm" in script
     assert "validate_production_recovery.sh" in workflow
     assert "chmod 700" in workflow
+
+
+def test_scheduled_backup_is_bundled_locked_and_offsite_verified():
+    script = (ROOT / "scripts" / "run_production_backup.sh").read_text(
+        encoding="utf-8"
+    )
+    installer = (
+        ROOT / "scripts" / "install_production_backup_timer.sh"
+    ).read_text(encoding="utf-8")
+    deploy_script = (ROOT / "scripts" / "deploy_production.sh").read_text(
+        encoding="utf-8"
+    )
+    workflow = (
+        ROOT / ".github" / "workflows" / "deploy-production.yml"
+    ).read_text(encoding="utf-8")
+    environment = (ROOT / "deploy" / "backup.env.example").read_text(
+        encoding="utf-8"
+    )
+
+    for required in (
+        'LOCK_DIR="${STATE_DIR}/production-operation.lock"',
+        'BACKUP_ROOT="${APP_ROOT}/backups/scheduled"',
+        'compose_production stop web worker beat',
+        'compose_production stop minio',
+        'python -m job_hunting_agent.backup_storage upload',
+        'JOB_AGENT_BACKUP_OFFSITE_ENABLED',
+        'JOB_AGENT_BACKUP_LOCAL_RETENTION_COUNT',
+        'JobAgentScheduledBackupFailed',
+        'last-scheduled-backup.json',
+        'BACKUP_ENV="${APP_ROOT}/shared/backup.env"',
+    ):
+        assert required in script
+    assert 'OPERATION_LOCK_DIR="${STATE_DIR}/production-operation.lock"' in deploy_script
+    assert "run_production_backup.sh" in workflow
+    assert "install_production_backup_timer.sh" in workflow
+    assert "OnCalendar=" in installer
+    assert "RandomizedDelaySec=15m" in installer
+    assert "Persistent=true" in installer
+    assert "NoNewPrivileges=true" in installer
+    assert "JOB_AGENT_BACKUP_OFFSITE_SERVER_SIDE_ENCRYPTION=AES256" in environment
+    assert "JOB_AGENT_BACKUP_OFFSITE_VERIFY_DOWNLOAD=true" in environment
+    assert "JOB_AGENT_BACKUP_OFFSITE_ACCESS_KEY" not in (
+        ROOT / "deploy" / "env.production.example"
+    ).read_text(encoding="utf-8")
 
 
 def test_local_release_acceptance_pack_covers_recovery_uploads_and_alert_delivery():

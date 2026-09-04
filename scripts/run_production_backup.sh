@@ -3,8 +3,8 @@
 set -Eeuo pipefail
 umask 077
 
-if [[ $# -ne 2 || "$2" != "BACKUP_AND_VALIDATE" ]]; then
-  echo "Usage: validate_production_recovery.sh <app-root> BACKUP_AND_VALIDATE" >&2
+if [[ $# -ne 2 || "$2" != "BACKUP" ]]; then
+  echo "Usage: run_production_backup.sh <app-root> BACKUP" >&2
   exit 2
 fi
 
@@ -12,16 +12,18 @@ APP_ROOT="$1"
 PROJECT_NAME="job-hunting-agent-production"
 CURRENT_LINK="${APP_ROOT}/current"
 SHARED_ENV="${APP_ROOT}/shared/.env"
+BACKUP_ENV="${APP_ROOT}/shared/backup.env"
 STATE_DIR="${APP_ROOT}/state"
-BACKUP_ROOT="${APP_ROOT}/backups"
+BACKUP_ROOT="${APP_ROOT}/backups/scheduled"
 LOCK_DIR="${STATE_DIR}/production-operation.lock"
+STATUS_PATH="${STATE_DIR}/last-scheduled-backup.json"
 
 [[ "$APP_ROOT" =~ ^/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)+$ ]] || {
   echo "Invalid application root: ${APP_ROOT}" >&2
   exit 2
 }
 
-for command_name in docker readlink sha256sum openssl python3 date; do
+for command_name in curl date docker openssl python3 readlink sha256sum stat; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "Required command is unavailable: ${command_name}" >&2
     exit 1
@@ -37,14 +39,20 @@ docker compose version >/dev/null
   echo "Production environment file is missing: ${SHARED_ENV}" >&2
   exit 1
 }
-[[ -f "${STATE_DIR}/current-image" ]] || {
-  echo "Current image state is missing." >&2
+[[ -f "$BACKUP_ENV" ]] || {
+  echo "Backup environment file is missing: ${BACKUP_ENV}" >&2
   exit 1
 }
-[[ -f "${STATE_DIR}/current-topology" ]] || {
-  echo "Current topology state is missing." >&2
+[[ "$(stat -c '%a' "$BACKUP_ENV")" == "600" ]] || {
+  echo "Backup environment file must use mode 600: ${BACKUP_ENV}" >&2
   exit 1
 }
+for state_file in current-image current-topology; do
+  [[ -f "${STATE_DIR}/${state_file}" ]] || {
+    echo "Current deployment state is missing: ${state_file}" >&2
+    exit 1
+  }
+done
 
 RELEASE_DIR="$(readlink -f "$CURRENT_LINK")"
 IMAGE_REF="$(<"${STATE_DIR}/current-image")"
@@ -82,69 +90,115 @@ compose_production() {
 }
 
 mkdir -p "$STATE_DIR" "$BACKUP_ROOT"
+chmod 700 "$STATE_DIR" "$BACKUP_ROOT"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  echo "Another production data operation is already active: ${LOCK_DIR}" >&2
+  echo "Another production data operation is active: ${LOCK_DIR}" >&2
   exit 1
 fi
 
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
 SUFFIX="$(openssl rand -hex 6)"
-BACKUP_DIR="${BACKUP_ROOT}/${STAMP}-${SUFFIX}"
-REPORT_PATH="${BACKUP_DIR}/restore-validation.json"
-POSTGRES_DUMP="${BACKUP_DIR}/postgres.dump"
-MINIO_ARCHIVE="${BACKUP_DIR}/minio-data.tar.gz"
-MANIFEST_PATH="${BACKUP_DIR}/manifest.json"
-RECOVERY_PREFIX="job-agent-recovery-${SUFFIX}"
-RECOVERY_POSTGRES="${RECOVERY_PREFIX}-postgres"
-RECOVERY_MINIO="${RECOVERY_PREFIX}-minio"
-RECOVERY_NETWORK="${RECOVERY_PREFIX}-network"
-RECOVERY_POSTGRES_VOLUME="${RECOVERY_PREFIX}-postgres-data"
-RECOVERY_MINIO_VOLUME="${RECOVERY_PREFIX}-minio-data"
+BACKUP_ID="${STAMP}-${SUFFIX}"
+PARTIAL_DIR="${BACKUP_ROOT}/.${BACKUP_ID}.partial"
+BACKUP_DIR="${BACKUP_ROOT}/${BACKUP_ID}"
+POSTGRES_DUMP="${PARTIAL_DIR}/postgres.dump"
+MINIO_ARCHIVE="${PARTIAL_DIR}/minio-data.tar.gz"
+MANIFEST_PATH="${PARTIAL_DIR}/manifest.json"
+UPLOAD_REPORT="${BACKUP_DIR}/offsite-upload.json"
 PRODUCTION_QUIESCED=0
-ISOLATED_CREATED=0
 FAILED_LINE=0
+STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 record_failure_line() {
   FAILED_LINE="$1"
 }
 trap 'record_failure_line "$LINENO"' ERR
 
-cleanup() {
-  local exit_code=$?
-  local restart_failed=0
-  set +e
-
-  if (( exit_code != 0 )) && [[ -d "$BACKUP_DIR" ]]; then
-    FAILED_LINE_VALUE="$FAILED_LINE" \
-      ISOLATED_CREATED_VALUE="$ISOLATED_CREATED" \
-      python3 - "$REPORT_PATH" <<'PY'
+write_status() {
+  local result="$1"
+  local completed_at="$2"
+  local offsite_status="$3"
+  local temporary="${STATUS_PATH}.tmp"
+  BACKUP_RESULT="$result" \
+    BACKUP_ID_VALUE="$BACKUP_ID" \
+    BACKUP_STARTED_AT="$STARTED_AT" \
+    BACKUP_COMPLETED_AT="$completed_at" \
+    BACKUP_OFFSITE_STATUS="$offsite_status" \
+    BACKUP_FAILED_LINE="$FAILED_LINE" \
+    python3 - "$temporary" <<'PY'
 import json
 import os
 import sys
 
-report = {
-    "result": "FAILED",
-    "failed_line": int(os.environ.get("FAILED_LINE_VALUE", "0")),
-    "production_data_modified": False,
-    "isolated_restore_used_unique_volumes": os.environ.get("ISOLATED_CREATED_VALUE") == "1",
-    "note": "Inspect the command output. Production restart is attempted before the script exits.",
+payload = {
+    "schema_version": 1,
+    "result": os.environ["BACKUP_RESULT"],
+    "backup_id": os.environ["BACKUP_ID_VALUE"],
+    "started_at": os.environ["BACKUP_STARTED_AT"],
+    "completed_at": os.environ["BACKUP_COMPLETED_AT"],
+    "offsite_status": os.environ["BACKUP_OFFSITE_STATUS"],
+    "failed_line": int(os.environ["BACKUP_FAILED_LINE"]),
+    "target_rpo_hours": 24,
 }
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
-    json.dump(report, handle, ensure_ascii=True, indent=2)
+    json.dump(payload, handle, ensure_ascii=True, indent=2)
     handle.write("\n")
 PY
-    chmod 600 "$REPORT_PATH" >/dev/null 2>&1 || true
-  fi
+  chmod 600 "$temporary"
+  mv "$temporary" "$STATUS_PATH"
+}
 
-  if (( ISOLATED_CREATED == 1 )); then
-    [[ "$RECOVERY_PREFIX" =~ ^job-agent-recovery-[0-9a-f]{12}$ ]] || {
-      echo "Refusing cleanup for unexpected recovery prefix: ${RECOVERY_PREFIX}" >&2
-      exit 1
-    }
-    docker rm -f "$RECOVERY_POSTGRES" "$RECOVERY_MINIO" >/dev/null 2>&1 || true
-    docker volume rm "$RECOVERY_POSTGRES_VOLUME" "$RECOVERY_MINIO_VOLUME" >/dev/null 2>&1 || true
-    docker network rm "$RECOVERY_NETWORK" >/dev/null 2>&1 || true
+post_backup_alert() {
+  local state="$1"
+  local alertmanager_id port ends_at summary description payload
+
+  alertmanager_id="$(compose_production ps -q alertmanager 2>/dev/null || true)"
+  [[ -n "$alertmanager_id" ]] || return 0
+  port="$(docker port "$alertmanager_id" 9093/tcp 2>/dev/null | head -n 1 | awk -F: '{print $NF}')"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 0
+  if [[ "$state" == "firing" ]]; then
+    ends_at="$(date -u -d '+24 hours' +%Y-%m-%dT%H:%M:%SZ)"
+    summary="Job Hunting Agent scheduled backup failed"
+    description="Backup ${BACKUP_ID} failed. Inspect systemctl status job-agent-backup.service and ${STATUS_PATH}."
+  else
+    ends_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    summary="Job Hunting Agent scheduled backup recovered"
+    description="Backup ${BACKUP_ID} completed successfully."
   fi
+  payload="$({
+    ALERT_ENDS_AT="$ends_at" \
+      ALERT_SUMMARY="$summary" \
+      ALERT_DESCRIPTION="$description" \
+      python3 - <<'PY'
+import json
+import os
+
+print(json.dumps([{
+    "labels": {
+        "alertname": "JobAgentScheduledBackupFailed",
+        "environment": "production",
+        "service": "backup",
+        "severity": "critical",
+    },
+    "annotations": {
+        "summary": os.environ["ALERT_SUMMARY"],
+        "description": os.environ["ALERT_DESCRIPTION"],
+    },
+    "endsAt": os.environ["ALERT_ENDS_AT"],
+}], ensure_ascii=True))
+PY
+  })"
+  curl --fail --silent --show-error --max-time 10 \
+    -H 'Content-Type: application/json' \
+    --data-binary "$payload" \
+    "http://127.0.0.1:${port}/api/v2/alerts" \
+    >/dev/null || true
+}
+
+cleanup() {
+  local exit_code=$?
+  local restart_failed=0
+  set +e
 
   if (( PRODUCTION_QUIESCED == 1 )); then
     echo "==> Restoring production services"
@@ -153,7 +207,13 @@ PY
       restart_failed=1
     fi
   fi
-
+  if (( exit_code != 0 || restart_failed == 1 )); then
+    write_status "FAILED" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "FAILED" || true
+    post_backup_alert firing
+    if [[ -d "$PARTIAL_DIR" && "$(readlink -f "$PARTIAL_DIR")" == "${BACKUP_ROOT}/"* ]]; then
+      rm -rf --one-file-system -- "$PARTIAL_DIR"
+    fi
+  fi
   rmdir "$LOCK_DIR" >/dev/null 2>&1 || true
   if (( restart_failed == 1 )); then
     exit 1
@@ -161,25 +221,6 @@ PY
   exit "$exit_code"
 }
 trap cleanup EXIT
-
-wait_for_container() {
-  local container_name="$1"
-  local check_command="$2"
-  local deadline=$((SECONDS + 180))
-
-  while (( SECONDS < deadline )); do
-    if docker exec "$container_name" sh -ec "$check_command" >/dev/null 2>&1; then
-      return 0
-    fi
-    if [[ "$(docker inspect --format '{{.State.Status}}' "$container_name" 2>/dev/null || true)" =~ ^(exited|dead)$ ]]; then
-      docker logs "$container_name" >&2 || true
-      return 1
-    fi
-    sleep 2
-  done
-  echo "Timed out waiting for container: ${container_name}" >&2
-  return 1
-}
 
 wait_for_production_service() {
   local service="$1"
@@ -208,6 +249,33 @@ wait_for_production_service() {
   return 1
 }
 
+read_image_setting() {
+  local name="$1"
+  local default_value="$2"
+  docker run --rm --env-file "$BACKUP_ENV" "$IMAGE_REF" \
+    python -c 'import os, sys; print(os.environ.get(sys.argv[1], sys.argv[2]))' \
+    "$name" "$default_value"
+}
+
+prune_local_backups() {
+  local keep="$1"
+  local index directory name
+  local -a directories=()
+
+  mapfile -t directories < <(
+    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d \
+      -name '20??????-??????-????????????' -printf '%f\n' | sort -r
+  )
+  for (( index=keep; index<${#directories[@]}; index++ )); do
+    name="${directories[$index]}"
+    [[ "$name" =~ ^20[0-9]{6}-[0-9]{6}-[0-9a-f]{12}$ ]] || continue
+    directory="${BACKUP_ROOT}/${name}"
+    [[ -f "${directory}/COMPLETE" ]] || continue
+    [[ "$(readlink -f "$directory")" == "${BACKUP_ROOT}/"* ]] || continue
+    rm -rf --one-file-system -- "$directory"
+  done
+}
+
 echo "==> Validating the active production topology"
 compose_production config --quiet
 POSTGRES_ID="$(compose_production ps -q postgres)"
@@ -219,13 +287,11 @@ WEB_ID="$(compose_production ps -q web | head -n 1)"
 }
 
 POSTGRES_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$POSTGRES_ID")"
-MINIO_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$MINIO_ID")"
 MINIO_VOLUME="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$MINIO_ID")"
 POSTGRES_USER="$(docker exec "$POSTGRES_ID" printenv POSTGRES_USER)"
 POSTGRES_DB="$(docker exec "$POSTGRES_ID" printenv POSTGRES_DB)"
 OBJECT_BUCKET="$(docker exec "$WEB_ID" printenv JOB_AGENT_OBJECT_STORAGE_BUCKET)"
-
-[[ -n "$POSTGRES_IMAGE" && -n "$MINIO_IMAGE" && -n "$MINIO_VOLUME" ]] || {
+[[ -n "$POSTGRES_IMAGE" && -n "$MINIO_VOLUME" ]] || {
   echo "Could not resolve production images or the MinIO volume." >&2
   exit 1
 }
@@ -245,17 +311,15 @@ AVAILABLE_KB="$(df -Pk "$APP_ROOT" | awk 'NR == 2 {print $4}')"
   echo "Could not determine numeric storage requirements." >&2
   exit 1
 }
-REQUIRED_BYTES=$((DATABASE_BYTES * 2 + MINIO_BYTES * 3 + 536870912))
+REQUIRED_BYTES=$((DATABASE_BYTES + MINIO_BYTES * 2 + 268435456))
 AVAILABLE_BYTES=$((AVAILABLE_KB * 1024))
 if (( AVAILABLE_BYTES < REQUIRED_BYTES )); then
-  echo "Insufficient disk space for backup and isolated restore. Required=${REQUIRED_BYTES}, available=${AVAILABLE_BYTES}." >&2
+  echo "Insufficient disk space. Required=${REQUIRED_BYTES}, available=${AVAILABLE_BYTES}." >&2
   exit 1
 fi
 
-mkdir -p "$BACKUP_DIR"
-chmod 700 "$BACKUP_DIR"
-STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-STARTED_EPOCH="$(date +%s)"
+mkdir "$PARTIAL_DIR"
+chmod 700 "$PARTIAL_DIR"
 
 echo "==> Entering a brief production maintenance window"
 PRODUCTION_QUIESCED=1
@@ -266,7 +330,7 @@ else
 fi
 compose_production stop web worker beat
 
-REMOTE_DUMP="/tmp/job-agent-${STAMP}-${SUFFIX}.dump"
+REMOTE_DUMP="/tmp/job-agent-${BACKUP_ID}.dump"
 docker exec "$POSTGRES_ID" pg_dump \
   --format=custom --no-owner --no-acl \
   -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f "$REMOTE_DUMP"
@@ -277,7 +341,7 @@ ACCOUNT_COUNT="$(docker exec "$POSTGRES_ID" psql -U "$POSTGRES_USER" -d "$POSTGR
 LONG_TEXT_COUNT="$(docker exec "$POSTGRES_ID" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc 'SELECT COUNT(*) FROM long_texts')"
 RAG_CHUNK_COUNT="$(docker exec "$POSTGRES_ID" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc 'SELECT COUNT(*) FROM rag_chunks')"
 ALEMBIC_REVISION="$(docker exec "$POSTGRES_ID" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc 'SELECT version_num FROM alembic_version')"
-OBJECT_COUNT="$(docker exec "$MINIO_ID" sh -ec 'mc alias set recovery-source http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; mc ls --recursive --json "recovery-source/$1" | wc -l' sh "$OBJECT_BUCKET")"
+OBJECT_COUNT="$(docker exec "$MINIO_ID" sh -ec 'mc alias set backup-source http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; mc ls --recursive --json "backup-source/$1" | wc -l' sh "$OBJECT_BUCKET")"
 [[ "$ACCOUNT_COUNT" =~ ^[0-9]+$ && "$LONG_TEXT_COUNT" =~ ^[0-9]+$ && "$RAG_CHUNK_COUNT" =~ ^[0-9]+$ && "$OBJECT_COUNT" =~ ^[0-9]+$ ]] || {
   echo "Snapshot counters are invalid." >&2
   exit 1
@@ -295,13 +359,16 @@ docker run --rm --entrypoint sh \
 
 POSTGRES_SHA256="$(sha256sum "$POSTGRES_DUMP" | awk '{print $1}')"
 MINIO_SHA256="$(sha256sum "$MINIO_ARCHIVE" | awk '{print $1}')"
+COMPLETED_SNAPSHOT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 python3 - "$MANIFEST_PATH" <<PY
 import json
 import sys
 
 manifest = {
-    "schema_version": 2,
+    "schema_version": 3,
+    "backup_id": "${BACKUP_ID}",
     "created_at": "${STARTED_AT}",
+    "snapshot_completed_at": "${COMPLETED_SNAPSHOT_AT}",
     "compose_project": "${PROJECT_NAME}",
     "release": "$(basename "$RELEASE_DIR")",
     "topology": "${TOPOLOGY}",
@@ -317,8 +384,9 @@ manifest = {
     "rag_chunk_count": int("${RAG_CHUNK_COUNT}"),
     "object_count": int("${OBJECT_COUNT}"),
     "alembic_revision": "${ALEMBIC_REVISION}",
+    "target_rpo_hours": 24,
     "redis_backup": False,
-    "note": "Redis contains rebuildable queue and protection state and is intentionally excluded.",
+    "note": "Redis contains rebuildable queue and protection state and is excluded.",
 }
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(manifest, handle, ensure_ascii=True, indent=2)
@@ -328,11 +396,9 @@ chmod 600 "$POSTGRES_DUMP" "$MINIO_ARCHIVE" "$MANIFEST_PATH"
 
 echo "==> Leaving the production maintenance window"
 compose_production up -d --no-build
-wait_for_production_service postgres
-wait_for_production_service minio
-wait_for_production_service web
-wait_for_production_service worker
-wait_for_production_service beat
+for service in postgres minio web worker beat; do
+  wait_for_production_service "$service"
+done
 if [[ "$TOPOLOGY" == "coexist" ]]; then
   wait_for_production_service coexist-https
 else
@@ -340,94 +406,49 @@ else
 fi
 PRODUCTION_QUIESCED=0
 
-echo "==> Verifying backup hashes before isolated restore"
 [[ "$(sha256sum "$POSTGRES_DUMP" | awk '{print $1}')" == "$POSTGRES_SHA256" ]]
 [[ "$(sha256sum "$MINIO_ARCHIVE" | awk '{print $1}')" == "$MINIO_SHA256" ]]
+touch "${PARTIAL_DIR}/COMPLETE"
+chmod 600 "${PARTIAL_DIR}/COMPLETE"
+mv "$PARTIAL_DIR" "$BACKUP_DIR"
 
-echo "==> Creating isolated recovery containers and volumes"
-ISOLATED_CREATED=1
-docker network create "$RECOVERY_NETWORK" >/dev/null
-docker volume create "$RECOVERY_POSTGRES_VOLUME" >/dev/null
-docker volume create "$RECOVERY_MINIO_VOLUME" >/dev/null
+OFFSITE_ENABLED="$(read_image_setting JOB_AGENT_BACKUP_OFFSITE_ENABLED false)"
+OFFSITE_ENABLED="${OFFSITE_ENABLED,,}"
+OFFSITE_STATUS="DISABLED"
+case "$OFFSITE_ENABLED" in
+  1 | true | yes | on) OFFSITE_ENABLED=true ;;
+  0 | false | no | off) OFFSITE_ENABLED=false ;;
+  *)
+    echo "JOB_AGENT_BACKUP_OFFSITE_ENABLED must be true or false." >&2
+    exit 1
+    ;;
+esac
+if [[ "$OFFSITE_ENABLED" == "true" ]]; then
+  echo "==> Uploading and verifying the encrypted offsite backup"
+  temporary_upload_report="${UPLOAD_REPORT}.tmp"
+  docker run --rm --network host \
+    --user "$(id -u):$(id -g)" \
+    --env-file "$BACKUP_ENV" \
+    -v "${BACKUP_DIR}:/backup:ro" \
+    "$IMAGE_REF" \
+    python -m job_hunting_agent.backup_storage upload \
+      --directory /backup \
+      --backup-id "$BACKUP_ID" \
+    > "$temporary_upload_report"
+  chmod 600 "$temporary_upload_report"
+  mv "$temporary_upload_report" "$UPLOAD_REPORT"
+  OFFSITE_STATUS="VERIFIED"
+fi
 
-RECOVERY_POSTGRES_PASSWORD="$(openssl rand -hex 24)"
-RECOVERY_MINIO_USER="recoveryadmin"
-RECOVERY_MINIO_PASSWORD="$(openssl rand -hex 24)"
-
-docker run -d \
-  --name "$RECOVERY_POSTGRES" \
-  --network "$RECOVERY_NETWORK" \
-  -e "POSTGRES_USER=${POSTGRES_USER}" \
-  -e "POSTGRES_PASSWORD=${RECOVERY_POSTGRES_PASSWORD}" \
-  -e "POSTGRES_DB=${POSTGRES_DB}" \
-  -v "${RECOVERY_POSTGRES_VOLUME}:/var/lib/postgresql/data" \
-  "$POSTGRES_IMAGE" >/dev/null
-wait_for_container "$RECOVERY_POSTGRES" "pg_isready -U '${POSTGRES_USER}' -d '${POSTGRES_DB}'"
-
-docker cp "$POSTGRES_DUMP" "${RECOVERY_POSTGRES}:/tmp/production.dump"
-docker exec "$RECOVERY_POSTGRES" pg_restore \
-  --clean --if-exists --exit-on-error --no-owner --no-acl \
-  -U "$POSTGRES_USER" -d "$POSTGRES_DB" /tmp/production.dump
-docker exec "$RECOVERY_POSTGRES" rm -f /tmp/production.dump
-
-docker run --rm --entrypoint sh \
-  -v "${RECOVERY_MINIO_VOLUME}:/data" \
-  -v "${BACKUP_DIR}:/backup:ro" \
-  "$POSTGRES_IMAGE" \
-  -ec 'tar xzf /backup/minio-data.tar.gz -C /data'
-docker run -d \
-  --name "$RECOVERY_MINIO" \
-  --network "$RECOVERY_NETWORK" \
-  -e "MINIO_ROOT_USER=${RECOVERY_MINIO_USER}" \
-  -e "MINIO_ROOT_PASSWORD=${RECOVERY_MINIO_PASSWORD}" \
-  -v "${RECOVERY_MINIO_VOLUME}:/data" \
-  "$MINIO_IMAGE" server /data >/dev/null
-wait_for_container "$RECOVERY_MINIO" "curl --fail --silent http://127.0.0.1:9000/minio/health/live"
-
-RESTORED_ACCOUNT_COUNT="$(docker exec "$RECOVERY_POSTGRES" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc 'SELECT COUNT(*) FROM accounts')"
-RESTORED_LONG_TEXT_COUNT="$(docker exec "$RECOVERY_POSTGRES" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc 'SELECT COUNT(*) FROM long_texts')"
-RESTORED_RAG_CHUNK_COUNT="$(docker exec "$RECOVERY_POSTGRES" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc 'SELECT COUNT(*) FROM rag_chunks')"
-RESTORED_ALEMBIC_REVISION="$(docker exec "$RECOVERY_POSTGRES" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc 'SELECT version_num FROM alembic_version')"
-RESTORED_OBJECT_COUNT="$(docker exec "$RECOVERY_MINIO" sh -ec 'mc alias set recovery-target http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; mc stat "recovery-target/$1" >/dev/null; mc ls --recursive --json "recovery-target/$1" | wc -l' sh "$OBJECT_BUCKET")"
-
-[[ "$RESTORED_ACCOUNT_COUNT" == "$ACCOUNT_COUNT" ]]
-[[ "$RESTORED_LONG_TEXT_COUNT" == "$LONG_TEXT_COUNT" ]]
-[[ "$RESTORED_RAG_CHUNK_COUNT" == "$RAG_CHUNK_COUNT" ]]
-[[ "$RESTORED_ALEMBIC_REVISION" == "$ALEMBIC_REVISION" ]]
-[[ "$RESTORED_OBJECT_COUNT" == "$OBJECT_COUNT" ]]
-
-COMPLETED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-RTO_SECONDS=$(( $(date +%s) - STARTED_EPOCH ))
-python3 - "$REPORT_PATH" <<PY
-import json
-import sys
-
-report = {
-    "result": "PASSED",
-    "started_at": "${STARTED_AT}",
-    "completed_at": "${COMPLETED_AT}",
-    "recovery_time_objective_observed_seconds": int("${RTO_SECONDS}"),
-    "operational_rpo_measured": False,
-    "production_data_modified": False,
-    "backup_directory": "${BACKUP_DIR}",
-    "checks": {
-        "postgres_sha256_verified": True,
-        "minio_sha256_verified": True,
-        "account_count_matches": True,
-        "long_text_count_matches": True,
-        "rag_chunk_count_matches": True,
-        "object_count_matches": True,
-        "alembic_revision_matches": True,
-        "isolated_restore_used_unique_volumes": True,
-    },
-    "note": "The restore target used isolated containers and volumes. Production RPO still depends on backup frequency and off-host replication.",
+LOCAL_RETENTION="$(read_image_setting JOB_AGENT_BACKUP_LOCAL_RETENTION_COUNT 7)"
+[[ "$LOCAL_RETENTION" =~ ^[0-9]+$ ]] && (( LOCAL_RETENTION >= 2 && LOCAL_RETENTION <= 90 )) || {
+  echo "JOB_AGENT_BACKUP_LOCAL_RETENTION_COUNT must be between 2 and 90." >&2
+  exit 1
 }
-with open(sys.argv[1], "w", encoding="utf-8") as handle:
-    json.dump(report, handle, ensure_ascii=True, indent=2)
-    handle.write("\n")
-PY
-chmod 600 "$REPORT_PATH"
+prune_local_backups "$LOCAL_RETENTION"
 
-echo "Production backup and isolated restore validation: PASS"
+write_status "PASSED" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$OFFSITE_STATUS"
+post_backup_alert resolved
+echo "Production scheduled backup: PASS"
 echo "Backup directory: ${BACKUP_DIR}"
-echo "Observed recovery drill duration: ${RTO_SECONDS}s"
+echo "Offsite status: ${OFFSITE_STATUS}"

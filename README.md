@@ -101,7 +101,7 @@
 - Prometheus 请求指标和五类基础告警：Web 不可用、5xx 比例过高、响应过慢、安全拦截突增、高并发。
 - Alertmanager 聚合告警并通过 SMTP 发送邮件。
 - Loki + Alloy 集中收集 Docker 日志，Tempo + OpenTelemetry 保存 Trace，Grafana 统一查看。
-- PostgreSQL/MinIO 备份恢复、Worker 故障恢复、ClamAV 文件扫描和安全扫描验收脚本。
+- PostgreSQL/MinIO 定时一致快照、异地加密上传与下载校验、Worker 故障恢复、ClamAV 文件扫描和安全扫描验收脚本。
 
 ## 4. 技术栈
 
@@ -149,6 +149,7 @@
 6. **检索漏斗可调优**：Retriever 先取 Top-K 候选，再由 Reranker 取最终 Top-N；当前线上默认值为 `K=10`、`N=5`。
 7. **生产发布可回退**：CI 成功后才发布不可变 GHCR 镜像；生产部署要求完整提交 SHA、人工确认、迁移前备份和健康检查。
 8. **可观测且低敏**：日志和 Trace 共享 `trace_id`，但不采集请求正文、Cookie、API Key、模型提示词或用户文件原文。
+9. **备份不与服务器同命运**：每天生成数据库与对象存储一致快照，校验哈希后上传独立私有存储，并保留可审计状态与失败告警。
 
 ## 6. 目录结构说明
 
@@ -309,6 +310,8 @@ docker compose --env-file /opt/job-hunting-agent/shared/.env \
 
 服务器上的生产 `.env` 保留在 `shared/.env`，不由 GitHub Actions 上传。首次部署前必须准备对象存储 bucket、生产密钥、证书和 GitHub Actions 所需的 SSH/Environment 配置。详细步骤见 [生产发布与恢复基线](docs/learning/production-release.md)。
 
+部署后可安装 `job-agent-backup.timer`，默认每日 `03:30`（上海时区）生成生产快照。本机默认保留 7 份；配置独立 S3-compatible 私有 bucket 后，远端默认保留 30 份并执行完整下载校验。生产异地存储凭据只保存在服务器 `shared/backup.env`，不会注入 Web 或 Worker。
+
 ## 8. 接口文档
 
 启动 Web 后，以 `/docs` 和 `/redoc` 生成的接口为准。主要接口如下：
@@ -383,10 +386,10 @@ OCR、GitHub 分析、项目归档、RAG 索引和简历导出在队列开启时
 - [x] 建立 Retriever Top-K / Reranker Top-N 参数扫描、P95 统计和质量防回退门禁。
 - [ ] 持续扩充经过授权的真实行业语料，并按正式模型重新校准阈值。
 - [x] 接入 Prometheus、Alertmanager、OpenTelemetry、Loki、Tempo 和 Grafana。
-- [x] 建立备份恢复、Worker 恢复、ClamAV 和告警投递验收脚本。
+- [x] 建立定时备份、异地上传/取回校验、隔离恢复、Worker 恢复、ClamAV 和告警投递机制。
 - [ ] 在出现明确外部调用方后，为 MCP adapter 增加鉴权、授权和 Server 生命周期。
 - [ ] 建立更严格的类型检查基线并消化类型债务。
-- [ ] 完成生产服务器的渗透测试、灾难恢复演练、密钥轮换和容量基线。
+- [ ] 持续执行生产恢复演练、密钥轮换、渗透测试和容量基线复测。
 - [ ] 增加工业 PDF 表格/图注坐标、父子 Chunk、数值范围检索和 CAD 解析能力。
 - [ ] 建立公开线上演示环境和脱敏效果截图。
 

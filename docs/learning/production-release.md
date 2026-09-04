@@ -597,6 +597,91 @@ Redis 不进入备份。它只承载可重建的队列和缓存，任务权威�
 脚本默认操作 `job-hunting-agent-production` 项目；`-ProjectName` 与 `-ComposeFiles` 仅用于
 隔离验收或显式指定的部署拓扑，日常生产备份不需要传入。
 
+### Linux 生产定时备份与异地存储
+
+生产发布包包含 `run_production_backup.sh`。它与部署和恢复演练共用
+`state/production-operation.lock`，因此三类操作不会同时修改容器状态。每次执行会：
+
+1. 短暂停止公网入口、Web、Worker 和 Beat，阻止新的业务写入。
+2. 导出 PostgreSQL custom-format dump，读取业务计数和 Alembic revision。
+3. 停止 MinIO 后归档对象卷，随后立即恢复并等待全部生产服务可用。
+4. 计算并复查两个归档的 SHA-256，生成 `manifest.json` 和 `COMPLETE` 标记。
+5. 根据配置上传到独立 S3-compatible 私有 bucket，重新下载远端内容计算 SHA-256。
+6. 只清理符合命名规则且带 `COMPLETE` 标记的旧备份。
+
+本机备份位于 `/opt/job-hunting-agent/backups/scheduled/<backup-id>/`，最后一次结果位于
+`/opt/job-hunting-agent/state/last-scheduled-backup.json`。默认每日执行一次，因此当前目标
+RPO 是 24 小时；实际 RPO 应以该状态文件中最近一次成功时间到故障发生时间计算。
+
+先从发布目录复制独立模板，不要把异地备份密钥放进生产主 `.env`。主 `.env` 会注入
+Web/Worker，而 `backup.env` 只提供给一次性备份容器：
+
+```bash
+install -m 600 /opt/job-hunting-agent/current/deploy/backup.env.example \
+  /opt/job-hunting-agent/shared/backup.env
+```
+
+然后编辑 `/opt/job-hunting-agent/shared/backup.env`：
+
+```ini
+JOB_AGENT_BACKUP_LOCAL_RETENTION_COUNT=7
+JOB_AGENT_BACKUP_OFFSITE_ENABLED=true
+JOB_AGENT_BACKUP_OFFSITE_ENDPOINT=https://replace-with-offsite-s3-endpoint
+JOB_AGENT_BACKUP_OFFSITE_BUCKET=replace-with-private-backup-bucket
+JOB_AGENT_BACKUP_OFFSITE_PREFIX=job-hunting-agent/production
+JOB_AGENT_BACKUP_OFFSITE_REGION=replace-with-region
+JOB_AGENT_BACKUP_OFFSITE_ACCESS_KEY=replace-with-backup-only-access-key
+JOB_AGENT_BACKUP_OFFSITE_SECRET_KEY=replace-with-backup-only-secret-key
+JOB_AGENT_BACKUP_OFFSITE_FORCE_PATH_STYLE=false
+JOB_AGENT_BACKUP_OFFSITE_SERVER_SIDE_ENCRYPTION=AES256
+JOB_AGENT_BACKUP_OFFSITE_VERIFY_DOWNLOAD=true
+JOB_AGENT_BACKUP_OFFSITE_RETENTION_COUNT=30
+```
+
+异地 bucket 必须与 ECS 系统盘处于不同故障域，并保持私有。凭据只授予该 bucket/prefix 的
+List、Get、Put 和按保留策略 Delete 权限。建议开启 bucket 版本控制和供应商生命周期规则；
+不要复用业务 MinIO 的管理员密钥，也不要把生产凭据提交到 Git。
+
+新版本部署完成后，以 root 在服务器执行一次安装。默认计划为上海时区每天 `03:30`，另加
+最多 15 分钟随机延迟，错过计划时会在机器恢复后补跑：
+
+```bash
+sudo /opt/job-hunting-agent/current/scripts/install_production_backup_timer.sh \
+  /opt/job-hunting-agent jobagent-deploy INSTALL
+```
+
+安装后立即手动触发首份备份，并检查结果：
+
+```bash
+sudo systemctl start job-agent-backup.service
+sudo systemctl status job-agent-backup.service --no-pager
+sudo systemctl list-timers job-agent-backup.timer --no-pager
+sudo cat /opt/job-hunting-agent/state/last-scheduled-backup.json
+```
+
+当备份或异地校验失败时，脚本会向本机 Alertmanager 提交
+`JobAgentScheduledBackupFailed` 严重告警，沿用生产 SMTP 路由发送邮件；下一次成功会自动发送
+恢复状态。日志通过 `journalctl -u job-agent-backup.service` 查看，不记录存储密钥。
+
+服务器丢失后，可在装有同一发布镜像的新主机上按备份 ID 下载。该命令要求目标目录中不存在
+同名备份，并会校验远端完成标记、文件大小、SHA-256 和本地清单：
+
+```bash
+IMAGE_REF="$(cat /opt/job-hunting-agent/state/current-image)"
+mkdir -p /opt/job-hunting-agent/backups/offsite-downloads
+docker run --rm --network host \
+  --user "$(id -u):$(id -g)" \
+  --env-file /opt/job-hunting-agent/shared/backup.env \
+  -v /opt/job-hunting-agent/backups/offsite-downloads:/downloads \
+  "$IMAGE_REF" \
+  python -m job_hunting_agent.backup_storage download \
+    --directory /downloads \
+    --backup-id 20260904-033000-012345abcdef
+```
+
+不要把“能下载”视为恢复完成。仍应定期使用下一节的隔离恢复演练核对数据库、对象数量和迁移
+版本；真正覆盖生产卷属于破坏性恢复操作，必须在明确事故流程中单独确认。
+
 ## 恢复演练
 
 恢复会覆盖生产数据库和对象存储，必须显式确认：

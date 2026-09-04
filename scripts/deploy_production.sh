@@ -28,6 +28,7 @@ SHARED_ENV="${APP_ROOT}/shared/.env"
 CURRENT_LINK="${APP_ROOT}/current"
 STATE_DIR="${APP_ROOT}/state"
 BACKUP_DIR="${APP_ROOT}/backups"
+OPERATION_LOCK_DIR="${STATE_DIR}/production-operation.lock"
 
 for required_command in docker readlink sha256sum; do
   command -v "$required_command" >/dev/null 2>&1 || {
@@ -56,9 +57,19 @@ fi
 [[ -f "${RELEASE_DIR}/deploy/loki/loki.yml" ]]
 [[ -f "${RELEASE_DIR}/deploy/tempo/tempo.yml" ]]
 [[ -f "${RELEASE_DIR}/deploy/grafana/provisioning/datasources/datasources.yml" ]]
+[[ -x "${RELEASE_DIR}/scripts/run_production_backup.sh" ]]
+[[ -x "${RELEASE_DIR}/scripts/install_production_backup_timer.sh" ]]
 
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
 chmod 600 "$SHARED_ENV"
+if ! mkdir "$OPERATION_LOCK_DIR" 2>/dev/null; then
+  echo "Another production data operation is active: ${OPERATION_LOCK_DIR}" >&2
+  exit 1
+fi
+cleanup_operation_lock() {
+  rmdir "$OPERATION_LOCK_DIR" >/dev/null 2>&1 || true
+}
+trap cleanup_operation_lock EXIT
 
 ACTIVE_RELEASE_DIR="$RELEASE_DIR"
 ACTIVE_IMAGE="$IMAGE_REF"
