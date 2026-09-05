@@ -50,6 +50,53 @@ def test_intent_router_disables_gateway_retries(monkeypatch, tmp_path):
     assert captured == [0, 4]
 
 
+def test_project_visual_operations_disable_thinking_without_changing_agent_chat(
+    monkeypatch,
+    tmp_path,
+):
+    """结构化视觉提取关闭思考模式，但普通 Agent 对话保持原配置。"""
+
+    captured: list[LLMSettings] = []
+    sentinel = object()
+
+    def fake_build_chat_model(settings, temperature, max_retries, callbacks):
+        captured.append(settings)
+        return sentinel
+
+    monkeypatch.setattr(
+        "job_hunting_agent.model_gateway.build_chat_model",
+        fake_build_chat_model,
+    )
+    configured = LLMSettings(
+        provider="test",
+        model="multimodal-model",
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        enable_thinking=True,
+        thinking="enabled",
+        reasoning_effort="high",
+    )
+    gateway = ModelGateway(
+        tmp_path / ".env",
+        llm_settings=configured,
+        settings=ModelGatewaySettings(environment="test", chat_max_retries=0),
+    )
+
+    extraction_model = gateway.chat_model("project_visual_extraction")
+    reinspection_model = gateway.chat_model("project_visual_reinspection")
+    agent_model = gateway.chat_model("agent_chat")
+
+    assert extraction_model is sentinel
+    assert reinspection_model is sentinel
+    assert agent_model is sentinel
+    assert [item.enable_thinking for item in captured] == [False, False, True]
+    assert captured[0].thinking is None
+    assert captured[0].reasoning_effort is None
+    assert captured[1].thinking is None
+    assert captured[1].reasoning_effort is None
+    assert captured[2] == configured
+
+
 def test_gateway_settings_distinguish_runtime_environment_and_retry_policy(tmp_path):
     """Gateway 配置必须明确标记运行环境，并接受 0 次重试。"""
 

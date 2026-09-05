@@ -406,6 +406,20 @@ class ModelGateway:
         """
 
         normalized_operation = normalize_operation(operation)
+        resolved_llm_settings = llm_settings or self.llm_settings
+        if normalized_operation in {
+            "project_visual_extraction",
+            "project_visual_reinspection",
+        }:
+            # These calls request a small, schema-constrained JSON payload.
+            # Provider thinking mode makes a single image take roughly an
+            # order of magnitude longer and can trip the visual hard timeout.
+            resolved_llm_settings = replace(
+                resolved_llm_settings,
+                enable_thinking=False,
+                thinking=None,
+                reasoning_effort=None,
+            )
         if self._chat_circuit_breaker is None:
             gateway_settings = self.settings
             self._chat_circuit_breaker = CircuitBreaker(
@@ -421,7 +435,7 @@ class ModelGateway:
                 )
             )
         return build_chat_model(
-            llm_settings or self.llm_settings,
+            resolved_llm_settings,
             temperature=temperature,
             # 路由器已有总截止时间，不能让 SDK 的逐次重试把用户等待放大到数倍。
             max_retries=(
