@@ -142,6 +142,8 @@ jobs:
           BUNDLE_FILES=(compose.yaml compose.prod.yaml deploy scripts/deploy_production.sh)
           BUNDLE_FILES+=(
             scripts/validate_production_recovery.sh
+            scripts/validate_production_user_flow.py
+            scripts/validate_production_user_flow.sh
             scripts/run_production_backup.sh
             scripts/install_production_backup_timer.sh
           )
@@ -174,7 +176,7 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             "$TARGET" \
-            "set -eu; tar -xzf '${REMOTE_BUNDLE}' -C '${RELEASE_DIR}'; rm -f '${REMOTE_BUNDLE}'; chmod 700 '${RELEASE_DIR}/scripts/deploy_production.sh' '${RELEASE_DIR}/scripts/validate_production_recovery.sh' '${RELEASE_DIR}/scripts/run_production_backup.sh' '${RELEASE_DIR}/scripts/install_production_backup_timer.sh'"
+            "set -eu; tar -xzf '${REMOTE_BUNDLE}' -C '${RELEASE_DIR}'; rm -f '${REMOTE_BUNDLE}'; chmod 700 '${RELEASE_DIR}/scripts/deploy_production.sh' '${RELEASE_DIR}/scripts/validate_production_recovery.sh' '${RELEASE_DIR}/scripts/validate_production_user_flow.sh' '${RELEASE_DIR}/scripts/run_production_backup.sh' '${RELEASE_DIR}/scripts/install_production_backup_timer.sh'"
 
       - name: Transfer the verified release image
         env:

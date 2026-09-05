@@ -150,6 +150,8 @@ def test_production_deployment_exposes_an_explicit_coexist_topology():
         "- coexist",
         "DEPLOY_TOPOLOGY: ${{ inputs.topology }}",
         "BUNDLE_FILES=(compose.yaml compose.prod.yaml deploy scripts/deploy_production.sh)",
+        "scripts/validate_production_user_flow.py",
+        "scripts/validate_production_user_flow.sh",
         "BUNDLE_FILES+=(compose.coexist.yaml scripts/reload_coexist_https.sh)",
         "compose.coexist.yaml",
         'TOPOLOGY_ARGUMENT=""',
@@ -386,6 +388,8 @@ def test_production_deployment_requires_manual_confirmation_and_environment():
         '"https://${DEPLOY_HOST}:8443/api/health"',
         "BUNDLE_FILES=(compose.yaml compose.prod.yaml deploy scripts/deploy_production.sh)",
         "scripts/deploy_production.sh",
+        "scripts/validate_production_user_flow.py",
+        "scripts/validate_production_user_flow.sh",
     ):
         assert required in workflow
 
