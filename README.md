@@ -312,6 +312,15 @@ docker compose --env-file /opt/job-hunting-agent/shared/.env \
 
 部署后可安装 `job-agent-backup.timer`，默认每日 `03:30`（上海时区）生成生产快照。本机默认保留 7 份；配置独立 S3-compatible 私有 bucket 后，远端默认保留 30 份并执行完整下载校验。生产异地存储凭据只保存在服务器 `shared/backup.env`，不会注入 Web 或 Worker。
 
+版本部署和人工页面检查完成后，可在服务器执行一次可清理的真实用户流程回归：
+
+```bash
+/opt/job-hunting-agent/current/scripts/validate_production_user_flow.sh \
+  https://<公网IP>:8443 RUN
+```
+
+该脚本会通过公网 HTTPS 验证登录、CSRF、档案、职位、RAG、Agent SSE、聊天历史、计费和删除链路。它会产生少量真实模型费用，执行期间占用生产操作锁，并在成功或失败后硬删除临时账号及其级联数据；不要将其加入定时任务或并发执行。
+
 ## 8. 接口文档
 
 启动 Web 后，以 `/docs` 和 `/redoc` 生成的接口为准。主要接口如下：
