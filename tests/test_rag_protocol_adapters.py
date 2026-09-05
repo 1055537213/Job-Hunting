@@ -226,6 +226,38 @@ def test_native_multimodal_embeddings_send_base64_images_as_independent_items():
     assert contents[0]["image"].startswith("data:image/png;base64,")
     assert contents[1]["image"].startswith("data:image/jpeg;base64,")
 
+
+def test_native_multimodal_embeddings_cap_text_batches_at_provider_limit():
+    """原生多模态文本批次不得超过供应商单次 20 条的限制。"""
+
+    batch_sizes: list[int] = []
+
+    def fake_transport(url, headers, payload, timeout):
+        contents = payload["input"]["contents"]
+        batch_sizes.append(len(contents))
+        return {
+            "output": {
+                "embeddings": [
+                    {"index": index, "embedding": [float(index), 1.0]}
+                    for index in range(len(contents))
+                ]
+            }
+        }
+
+    embeddings = NativeMultimodalEmbeddings(
+        api_key="test-key",
+        base_url="https://embedding.example/v1/encode",
+        model="qwen3-vl-embedding",
+        batch_size=64,
+        transport=fake_transport,
+    )
+
+    vectors = embeddings.embed_documents([f"document-{index}" for index in range(45)])
+
+    assert batch_sizes == [20, 20, 5]
+    assert len(vectors) == 45
+
+
 def test_native_reranker_uses_query_documents_payload_and_preserves_indexes():
     """native 重排器仅返回候选索引，调用方可复用本地 chunk。"""
 

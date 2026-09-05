@@ -624,7 +624,10 @@ class NativeMultimodalEmbeddings(Embeddings):
         self.model = model
         self.dimensions = dimensions
         self.timeout_seconds = timeout_seconds
-        self.batch_size = batch_size
+        # DashScope qwen3-vl-embedding accepts at most 20 text items per
+        # request. Keep the protocol adapter safe even when a shared/default
+        # embedding batch size is configured for another provider.
+        self.batch_size = min(batch_size, 20)
         self.transport = transport or post_embeddings_json
         self.usage_callback = usage_callback
         self.usage_operation = usage_operation
