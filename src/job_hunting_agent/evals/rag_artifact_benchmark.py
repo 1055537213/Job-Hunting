@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -60,6 +60,8 @@ MAX_ARTIFACT_COUNT = 40
 MAX_ARTIFACT_DOWNLOAD_BYTES = 32 * 1024 * 1024
 MAX_ARTIFACT_TOTAL_BYTES = 128 * 1024 * 1024
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
+DEFAULT_DOWNLOAD_MAX_ATTEMPTS = 3
+DEFAULT_DOWNLOAD_RETRY_DELAY_SECONDS = 1.0
 _COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _GITHUB_PART_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -371,23 +373,51 @@ def download_pinned_github_artifact(
     artifact: PinnedGitHubArtifact,
     *,
     timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+    max_attempts: int = DEFAULT_DOWNLOAD_MAX_ATTEMPTS,
+    retry_delay_seconds: float = DEFAULT_DOWNLOAD_RETRY_DELAY_SECONDS,
 ) -> bytes:
     """只从 raw.githubusercontent.com 下载并再次校验最终地址、大小和哈希。"""
 
-    opener = build_opener(_RawGitHubRedirectHandler())
-    request = Request(
-        artifact.raw_url,
-        headers={"User-Agent": "job-hunting-agent-rag-artifact-benchmark/1.0"},
-    )
-    with opener.open(request, timeout=timeout_seconds) as response:
-        final = urlsplit(response.geturl())
-        if final.scheme != "https" or final.hostname != "raw.githubusercontent.com":
-            raise ValueError("GitHub artifact download left the approved host.")
-        declared_length = response.headers.get("Content-Length")
-        if declared_length and int(declared_length) != artifact.size_bytes:
-            raise ValueError(f"GitHub artifact {artifact.id!r} content length changed.")
-        content = response.read(artifact.size_bytes + 1)
-    return verify_pinned_github_artifact(artifact, content)
+    if max_attempts < 1:
+        raise ValueError("GitHub artifact download max_attempts must be positive.")
+    if retry_delay_seconds < 0:
+        raise ValueError("GitHub artifact download retry_delay_seconds cannot be negative.")
+
+    for attempt in range(max_attempts):
+        opener = build_opener(_RawGitHubRedirectHandler())
+        request = Request(
+            artifact.raw_url,
+            headers={"User-Agent": "job-hunting-agent-rag-artifact-benchmark/1.0"},
+        )
+        try:
+            with opener.open(request, timeout=timeout_seconds) as response:
+                final = urlsplit(response.geturl())
+                if (
+                    final.scheme != "https"
+                    or final.hostname != "raw.githubusercontent.com"
+                ):
+                    raise ValueError("GitHub artifact download left the approved host.")
+                declared_length = response.headers.get("Content-Length")
+                if declared_length and int(declared_length) != artifact.size_bytes:
+                    raise ValueError(
+                        f"GitHub artifact {artifact.id!r} content length changed."
+                    )
+                content = response.read(artifact.size_bytes + 1)
+            return verify_pinned_github_artifact(artifact, content)
+        except Exception as error:
+            if attempt + 1 >= max_attempts or not _retryable_download_error(error):
+                raise
+            time.sleep(retry_delay_seconds * (2**attempt))
+
+    raise RuntimeError("GitHub artifact download exhausted without a result.")
+
+
+def _retryable_download_error(error: Exception) -> bool:
+    """只重试超时、连接中断、限流和服务端错误。"""
+
+    if isinstance(error, HTTPError):
+        return error.code in {408, 425, 429} or error.code >= 500
+    return isinstance(error, (TimeoutError, ConnectionError, URLError, OSError))
 
 
 def verify_pinned_github_artifact(

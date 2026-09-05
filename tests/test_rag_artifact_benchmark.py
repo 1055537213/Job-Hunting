@@ -9,6 +9,7 @@ import sqlalchemy as sa
 from job_hunting_agent.evals.rag_artifact_benchmark import (
     GitHubArtifactBenchmarkSuite,
     PinnedGitHubArtifact,
+    download_pinned_github_artifact,
     load_github_artifact_benchmark_suite,
     run_github_artifact_benchmark,
     verify_pinned_github_artifact,
@@ -199,6 +200,95 @@ def test_artifact_content_verification_rejects_upstream_drift() -> None:
         assert "size does not match" in str(error)
     else:  # pragma: no cover
         raise AssertionError("changed upstream content must be rejected")
+
+
+def test_artifact_download_retries_transient_read_timeout(monkeypatch) -> None:
+    """固定材料下载遇到瞬时读取超时后应重新建立请求。"""
+
+    content = b"pinned artifact content"
+    artifact = _artifact("retry", "docs/retry.md", content, expected_term="pinned")
+    calls = 0
+
+    class FakeResponse:
+        headers = {"Content-Length": str(len(content))}
+
+        def __init__(self, fail: bool) -> None:
+            self.fail = fail
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def geturl(self) -> str:
+            return artifact.raw_url
+
+        def read(self, _limit: int) -> bytes:
+            if self.fail:
+                raise TimeoutError("temporary read timeout")
+            return content
+
+    class FakeOpener:
+        def open(self, _request, *, timeout):
+            nonlocal calls
+            calls += 1
+            return FakeResponse(fail=calls == 1)
+
+    monkeypatch.setattr(
+        "job_hunting_agent.evals.rag_artifact_benchmark.build_opener",
+        lambda *_handlers: FakeOpener(),
+    )
+
+    downloaded = download_pinned_github_artifact(
+        artifact,
+        timeout_seconds=0.01,
+        max_attempts=2,
+        retry_delay_seconds=0,
+    )
+
+    assert downloaded == content
+    assert calls == 2
+
+
+def test_artifact_download_does_not_retry_catalog_mismatch(monkeypatch) -> None:
+    """内容长度或哈希漂移属于确定性错误，不应通过重试掩盖。"""
+
+    content = b"pinned artifact content"
+    artifact = _artifact("drift", "docs/drift.md", content, expected_term="pinned")
+    calls = 0
+
+    class FakeResponse:
+        headers = {"Content-Length": str(len(content) + 1)}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def geturl(self) -> str:
+            return artifact.raw_url
+
+    class FakeOpener:
+        def open(self, _request, *, timeout):
+            nonlocal calls
+            calls += 1
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "job_hunting_agent.evals.rag_artifact_benchmark.build_opener",
+        lambda *_handlers: FakeOpener(),
+    )
+
+    with pytest.raises(ValueError, match="content length changed"):
+        download_pinned_github_artifact(
+            artifact,
+            max_attempts=3,
+            retry_delay_seconds=0,
+        )
+
+    assert calls == 1
 
 
 def test_artifact_benchmark_runs_project_ingestion_and_cleans_up(database_url) -> None:
