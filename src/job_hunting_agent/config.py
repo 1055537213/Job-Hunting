@@ -184,6 +184,21 @@ class TaskQueueSettings:
 
 
 @dataclass(frozen=True)
+class BusinessCacheSettings:
+    """可重建业务数据的 Redis Cache-Aside 配置。"""
+
+    enabled: bool = False
+    redis_url: str | None = None
+    redis_timeout_seconds: float = 0.5
+    key_prefix: str = "job_agent:cache:v1"
+    admin_summary_ttl_seconds: int = 15
+    profile_ttl_seconds: int = 60
+    public_config_ttl_seconds: int = 300
+    embedding_ttl_seconds: int = 86400
+    max_value_bytes: int = 1_048_576
+
+
+@dataclass(frozen=True)
 class WebSecuritySettings:
     """Web 边缘安全和基础观测配置。"""
 
@@ -1073,6 +1088,86 @@ def masked_task_queue_settings(settings: TaskQueueSettings) -> dict[str, object]
         "task_time_limit_seconds": settings.task_time_limit_seconds,
         "task_soft_time_limit_seconds": settings.task_soft_time_limit_seconds,
         "task_stale_after_seconds": settings.task_stale_after_seconds,
+    }
+
+
+def load_business_cache_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> BusinessCacheSettings:
+    """读取 Redis 业务缓存配置；本地直跑默认关闭。"""
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(key: str, default: str | None = None) -> str | None:
+        value = environment.get(key) or file_values.get(key)
+        return value if value not in {None, ""} else default
+
+    enabled = parse_bool(get("JOB_AGENT_BUSINESS_CACHE_ENABLED", "false"))
+    if not enabled:
+        return BusinessCacheSettings(enabled=False)
+    redis_url = get("JOB_AGENT_BUSINESS_CACHE_REDIS_URL")
+    if not redis_url:
+        raise ValueError(
+            "启用业务缓存时必须配置 JOB_AGENT_BUSINESS_CACHE_REDIS_URL。"
+        )
+    parsed_url = urlsplit(redis_url)
+    if parsed_url.scheme not in {"redis", "rediss"} or not parsed_url.netloc:
+        raise ValueError(
+            "JOB_AGENT_BUSINESS_CACHE_REDIS_URL 必须使用 redis:// 或 rediss:// 地址。"
+        )
+    key_prefix = (
+        get("JOB_AGENT_BUSINESS_CACHE_KEY_PREFIX", "job_agent:cache:v1")
+        or "job_agent:cache:v1"
+    ).strip(": ")
+    if not key_prefix or len(key_prefix) > 80:
+        raise ValueError("JOB_AGENT_BUSINESS_CACHE_KEY_PREFIX 必须为 1 到 80 个字符")
+    return BusinessCacheSettings(
+        enabled=True,
+        redis_url=redis_url,
+        redis_timeout_seconds=parse_positive_float(
+            get("JOB_AGENT_BUSINESS_CACHE_REDIS_TIMEOUT_SECONDS", "0.5"),
+            "JOB_AGENT_BUSINESS_CACHE_REDIS_TIMEOUT_SECONDS",
+        ),
+        key_prefix=key_prefix,
+        admin_summary_ttl_seconds=parse_positive_int(
+            get("JOB_AGENT_BUSINESS_CACHE_ADMIN_SUMMARY_TTL_SECONDS", "15"),
+            "JOB_AGENT_BUSINESS_CACHE_ADMIN_SUMMARY_TTL_SECONDS",
+        ),
+        profile_ttl_seconds=parse_positive_int(
+            get("JOB_AGENT_BUSINESS_CACHE_PROFILE_TTL_SECONDS", "60"),
+            "JOB_AGENT_BUSINESS_CACHE_PROFILE_TTL_SECONDS",
+        ),
+        public_config_ttl_seconds=parse_positive_int(
+            get("JOB_AGENT_BUSINESS_CACHE_PUBLIC_CONFIG_TTL_SECONDS", "300"),
+            "JOB_AGENT_BUSINESS_CACHE_PUBLIC_CONFIG_TTL_SECONDS",
+        ),
+        embedding_ttl_seconds=parse_positive_int(
+            get("JOB_AGENT_BUSINESS_CACHE_EMBEDDING_TTL_SECONDS", "86400"),
+            "JOB_AGENT_BUSINESS_CACHE_EMBEDDING_TTL_SECONDS",
+        ),
+        max_value_bytes=parse_positive_int(
+            get("JOB_AGENT_BUSINESS_CACHE_MAX_VALUE_BYTES", "1048576"),
+            "JOB_AGENT_BUSINESS_CACHE_MAX_VALUE_BYTES",
+        ),
+    )
+
+
+def masked_business_cache_settings(
+    settings: BusinessCacheSettings,
+) -> dict[str, object]:
+    """返回不包含 Redis 凭据的业务缓存配置摘要。"""
+
+    return {
+        "enabled": settings.enabled,
+        "backend": "redis" if settings.enabled else "disabled",
+        "redis_configured": bool(settings.redis_url),
+        "admin_summary_ttl_seconds": settings.admin_summary_ttl_seconds,
+        "profile_ttl_seconds": settings.profile_ttl_seconds,
+        "public_config_ttl_seconds": settings.public_config_ttl_seconds,
+        "embedding_ttl_seconds": settings.embedding_ttl_seconds,
+        "max_value_bytes": settings.max_value_bytes,
     }
 
 

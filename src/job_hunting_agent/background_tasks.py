@@ -206,6 +206,7 @@ def _record_background_task_trace(
             source=source,
         )
     )
+    backend.invalidate_admin_summary_cache()
 
 
 def purge_old_operational_audit_records(backend: JobHuntingApp) -> dict[str, int]:

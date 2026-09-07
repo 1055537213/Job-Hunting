@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import hashlib
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, replace
 from pathlib import Path
 
 from langchain_core.embeddings import Embeddings
 
 from .auth import AuthService
+from .business_cache import BusinessCache, build_business_cache
 from .concurrency_control import (
     ConcurrencyController,
     build_concurrency_controller,
@@ -24,6 +25,7 @@ from .config import (
     DEFAULT_ENV_PATH,
     DEFAULT_RAG_RERANK_TOP_N,
     load_billing_settings,
+    load_business_cache_settings,
     load_concurrency_settings,
     load_database_settings,
     load_file_scanning_settings,
@@ -140,6 +142,7 @@ class JobHuntingApp:
         task_queue: BackgroundTaskQueue | None = None,
         concurrency_controller: ConcurrencyController | None = None,
         file_scanner: FileScanner | None = None,
+        business_cache: BusinessCache | None = None,
     ):
         """绑定数据库、项目 `.env`、对象存储和可选后台任务队列。"""
 
@@ -149,6 +152,10 @@ class JobHuntingApp:
         )
         self.store = SQLAlchemyStore(resolved_database_url)
         self.store.configure_billing(load_billing_settings(self.env_path))
+        self.business_cache_settings = load_business_cache_settings(self.env_path)
+        self.business_cache = business_cache or build_business_cache(
+            self.business_cache_settings
+        )
         # 直接运行 Web 或单元测试默认关闭队列；Compose 会显式开启并注入 Redis URL。
         self.task_queue_settings = load_task_queue_settings(self.env_path)
         self.task_queue = task_queue
@@ -187,6 +194,15 @@ class JobHuntingApp:
             self.env_path,
             usage_store=self.store,
             concurrency_controller=self.concurrency_controller,
+            business_cache=(
+                self.business_cache
+                if business_cache is not None or self.business_cache_settings.enabled
+                else None
+            ),
+            embedding_cache_ttl_seconds=(
+                self.business_cache_settings.embedding_ttl_seconds
+            ),
+            usage_cache_invalidator=self.invalidate_admin_summary_cache,
         )
         self.job_screenshot_extractor = JobScreenshotExtractor(self.model_gateway)
         self.project_visual_analysis_settings = load_project_visual_analysis_settings(
@@ -604,7 +620,9 @@ class JobHuntingApp:
     def save_candidate_profile(self, profile: CandidateProfileInput, account_id: int | None = None) -> int:
         """保存候选人档案，返回候选人 ID。"""
 
-        return self.store.save_candidate_profile(profile, account_id=account_id)
+        candidate_id = self.store.save_candidate_profile(profile, account_id=account_id)
+        self.invalidate_profile_cache(account_id, candidate_id)
+        return candidate_id
 
     def get_candidate_profile(self, candidate_id: int, account_id: int | None = None) -> CandidateProfile:
         """读取候选人档案。
@@ -612,12 +630,38 @@ class JobHuntingApp:
         Web API 和测试通过应用服务读取档案，避免越过门面类直接访问持久化实现。
         """
 
-        return self.store.get_candidate_profile(candidate_id, account_id=account_id)
+        cache_key = self._profile_cache_key(account_id, candidate_id)
+        if cache_key is not None:
+            cached = _candidate_profile_from_cache(self.business_cache.get_json(cache_key))
+            if cached is not None:
+                return cached
+        profile = self.store.get_candidate_profile(candidate_id, account_id=account_id)
+        if cache_key is not None:
+            self.business_cache.set_json(
+                cache_key,
+                asdict(profile),
+                self.business_cache_settings.profile_ttl_seconds,
+            )
+        return profile
 
     def list_candidate_profiles(self, account_id: int | None = None) -> list[CandidateProfile]:
         """列出候选人档案，供 Web 页面侧边栏选择。"""
 
-        return self.store.list_candidate_profiles(account_id=account_id)
+        cache_key = self._profile_list_cache_key(account_id)
+        if cache_key is not None:
+            cached = self.business_cache.get_json(cache_key)
+            if isinstance(cached, list):
+                profiles = [_candidate_profile_from_cache(item) for item in cached]
+                if all(profile is not None for profile in profiles):
+                    return [profile for profile in profiles if profile is not None]
+        profiles = self.store.list_candidate_profiles(account_id=account_id)
+        if cache_key is not None:
+            self.business_cache.set_json(
+                cache_key,
+                [asdict(profile) for profile in profiles],
+                self.business_cache_settings.profile_ttl_seconds,
+            )
+        return profiles
 
     def delete_candidate_profile(
         self,
@@ -629,12 +673,84 @@ class JobHuntingApp:
         result = self.store.delete_candidate_profile(candidate_id, account_id=account_id)
         for storage_key in result.get("storage_keys", []):
             self.resume_files.delete(str(storage_key))
-        return self._finish_deletion_cleanup(result)
+        cleaned = self._finish_deletion_cleanup(result)
+        self.invalidate_profile_cache(account_id, candidate_id)
+        return cleaned
 
     def delete_chat_session(self, session_id: str, account_id: int) -> dict[str, object]:
         """永久删除一段网页对话及其消息。"""
 
         return self.store.delete_chat_session(session_id, account_id)
+
+    def cached_admin_usage_summary(
+        self,
+        loader: Callable[[], dict[str, object]],
+    ) -> dict[str, object]:
+        """读取短期管理汇总缓存，未命中时执行权威查询。"""
+
+        key = "admin:usage-summary"
+        cached = self.business_cache.get_json(key)
+        if isinstance(cached, dict):
+            return cached
+        payload = loader()
+        self.business_cache.set_json(
+            key,
+            payload,
+            self.business_cache_settings.admin_summary_ttl_seconds,
+        )
+        return payload
+
+    def cached_public_config(
+        self,
+        loader: Callable[[], dict[str, object]],
+    ) -> dict[str, object]:
+        """读取公开配置缓存；配置文件仍是未命中时的权威来源。"""
+
+        key = "public:auth-config"
+        cached = self.business_cache.get_json(key)
+        if isinstance(cached, dict):
+            return cached
+        payload = loader()
+        self.business_cache.set_json(
+            key,
+            payload,
+            self.business_cache_settings.public_config_ttl_seconds,
+        )
+        return payload
+
+    def invalidate_admin_summary_cache(self) -> None:
+        """业务写入成功后失效管理员聚合缓存。"""
+
+        self.business_cache.delete("admin:usage-summary")
+
+    def invalidate_profile_cache(
+        self,
+        account_id: int | None,
+        candidate_id: int,
+    ) -> None:
+        """在档案事务提交后失效单档案和账号档案列表缓存。"""
+
+        keys = [
+            key
+            for key in (
+                self._profile_cache_key(account_id, candidate_id),
+                self._profile_list_cache_key(account_id),
+            )
+            if key is not None
+        ]
+        self.business_cache.delete(*keys)
+
+    @staticmethod
+    def _profile_cache_key(account_id: int | None, candidate_id: int) -> str | None:
+        if account_id is None or account_id <= 0 or candidate_id <= 0:
+            return None
+        return f"profile:account:{account_id}:candidate:{candidate_id}"
+
+    @staticmethod
+    def _profile_list_cache_key(account_id: int | None) -> str | None:
+        if account_id is None or account_id <= 0:
+            return None
+        return f"profile:account:{account_id}:list"
 
     def ingest_conversation_message(
         self,
@@ -660,6 +776,8 @@ class JobHuntingApp:
             decision.profile_updates,
             account_id=account_id,
         )
+        if saved_structured_fields:
+            self.invalidate_profile_cache(account_id, candidate_id)
         # 长文本先进入 PostgreSQL long_texts；当前 RAG 后端只从这里构建可追溯的派生索引。
         saved_long_text_ids = [
             self.store.add_long_text(
@@ -2138,6 +2256,17 @@ class JobHuntingApp:
         """创建唯一的 PostgreSQL + pgvector 知识库实例。"""
 
         return PgVectorKnowledgeBase(self.store.engine, embeddings=embeddings, reranker=reranker)
+
+
+def _candidate_profile_from_cache(value: object) -> CandidateProfile | None:
+    """只接受能够完整还原领域对象的缓存数据。"""
+
+    if not isinstance(value, dict):
+        return None
+    try:
+        return CandidateProfile(**value)
+    except (TypeError, ValueError):
+        return None
 
 
 def format_rag_evidence(result: RAGSearchResult) -> str:

@@ -26,7 +26,7 @@
 - 使用 Agent 对话完成档案维护、职位匹配、材料整理和简历生成。
 - 记录 Token 用量、余额流水、工具轨迹、后台任务和管理员审计事件。
 
-数据边界如下：PostgreSQL 是结构化事实和任务状态的权威来源；pgvector 是可重建的派生索引；MinIO/S3 保存二进制对象；Redis 负责 Celery 消息、共享限流和并发租约。
+数据边界如下：PostgreSQL 是结构化事实和任务状态的权威来源；pgvector 是可重建的派生索引；MinIO/S3 保存二进制对象；Redis 负责 Celery 消息、共享限流、并发租约，以及可随时重建的 Cache-Aside 业务缓存。
 
 ## 2. 在线演示 / 效果截图
 
@@ -125,7 +125,7 @@
 
 - PostgreSQL：账号、档案、职位、项目、长文本、向量、任务、账务、审计和用量事实。
 - MinIO/S3-compatible：简历原件、导出文件、项目原件和视觉派生对象。
-- Redis：Celery Broker、共享限流、并发租约和短期运行状态。
+- Redis：Celery Broker、共享限流、并发租约和 Cache-Aside 业务缓存。逻辑库 `/0` 用于队列，`/1` 用于限流与并发控制，`/2` 用于业务缓存。
 - ClamAV：生产上传文件和项目归档的病毒扫描。
 - Prometheus：指标采集、查询和告警规则。
 - Alertmanager：告警聚合、去重、恢复通知和 SMTP 投递。
@@ -150,6 +150,7 @@
 7. **生产发布可回退**：CI 成功后才发布不可变 GHCR 镜像；生产部署要求完整提交 SHA、人工确认、迁移前备份和健康检查。
 8. **可观测且低敏**：日志和 Trace 共享 `trace_id`，但不采集请求正文、Cookie、API Key、模型提示词或用户文件原文。
 9. **备份不与服务器同命运**：每天生成数据库与对象存储一致快照，校验哈希后上传独立私有存储，并保留可审计状态与失败告警。
+10. **缓存可降级且不改变事实**：后台汇总、档案摘要、公共配置和 Embedding 结果采用 Cache-Aside；写入数据库后主动失效，Redis 故障时自动回源，不影响核心业务。
 
 ## 6. 目录结构说明
 
@@ -226,6 +227,7 @@ JOB_AGENT_LLM_BASE_URL=https://api.example.com/v1
 JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY=your-minio-access-key
 JOB_AGENT_OBJECT_STORAGE_SECRET_KEY=your-minio-secret
 JOB_AGENT_REDIS_PASSWORD=your-strong-redis-password
+JOB_AGENT_BUSINESS_CACHE_ENABLED=true
 ```
 
 本地开发默认使用回环地址、控制台邮件、本地文件扫描和开发数据库认证。生产配置请以 `deploy/env.production.example` 为模板，必须使用独立密钥、密码认证 PostgreSQL、Redis、ClamAV、SMTP 和 HTTPS。
@@ -251,9 +253,22 @@ docker compose -f compose.yaml -f compose.dev.yaml logs --tail 100 web worker be
 docker compose -f compose.yaml -f compose.dev.yaml down
 ```
 
+### 7.4 Redis 业务缓存
+
+Docker Compose 默认启用业务缓存并使用 Redis 逻辑库 `/2`。缓存范围与默认 TTL 如下：
+
+| 缓存内容 | 默认 TTL | 一致性策略 |
+| --- | ---: | --- |
+| 管理后台账号、用量和工具调用汇总 | 15 秒 | 相关 API 或后台任务写入后主动失效 |
+| 候选人档案详情与列表摘要 | 60 秒 | 档案保存、对话更新或删除后主动失效 |
+| 登录页公共注册配置 | 300 秒 | 配置是权威来源，过期后重新读取 |
+| 文本、查询和图片 Embedding 结果 | 86400 秒 | 按模型身份、类型和内容哈希隔离；命中时不调用模型供应商 |
+
+Redis 超时、连接失败、缓存值损坏或单项超过 1 MiB 时按“未命中”处理，应用继续读取 PostgreSQL、配置文件或模型供应商。缓存只保存可重建结果，不作为数据库备份，也不保存原始对话和上传文件正文。管理员可从 `/api/health` 的业务缓存运行摘要查看命中、未命中、写入、失效和错误计数。
+
 只有确认要删除本地 PostgreSQL、MinIO、Redis 和 Prometheus 数据时，才执行 `down -v`。
 
-### 7.4 本地质量检查
+### 7.5 本地质量检查
 
 ```powershell
 ruff check src tests alembic
@@ -287,7 +302,7 @@ docker compose --env-file .env.example -f compose.yaml -f compose.prod.yaml -f c
 
 RAG 正式发布集必须在上线前使用真实 Embedding、视觉模型和 Reranker 重新测量。`local_hash` 只用于验证评测管线，不代表语义召回质量。
 
-### 7.5 生产部署
+### 7.6 生产部署
 
 生产部署使用通过 CI 的不可变镜像，不在服务器上直接从源码临时构建。完整生产拓扑使用 `compose.prod.yaml`，同机已有其他项目占用 `80/443` 时使用共存拓扑：
 

@@ -31,6 +31,8 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 
 from .auth import utc_now
+from .business_cache import BusinessCache
+from .cached_embeddings import CachedEmbeddings
 from .concurrency_control import ConcurrencyController, ConcurrencyLease
 from .config import (
     DEFAULT_ENV_PATH,
@@ -207,6 +209,8 @@ class ConcurrencyLimitedEmbeddings(Embeddings):
         self.account_id = account_id
         # 暴露稳定的模型身份，确保文本查询向量与图片索引向量只在同一空间比较。
         self.model = getattr(delegate, "model", None)
+        self.provider = getattr(delegate, "provider", None)
+        self.api_style = getattr(delegate, "api_style", None)
         self.endpoint = getattr(delegate, "endpoint", None)
         self.embeddings_url = getattr(delegate, "embeddings_url", None)
         self.dimensions = getattr(delegate, "dimensions", None)
@@ -301,6 +305,9 @@ class ModelGateway:
         intent_router_settings: IntentRouterSettings | None = None,
         settings: ModelGatewaySettings | None = None,
         concurrency_controller: ConcurrencyController | None = None,
+        business_cache: BusinessCache | None = None,
+        embedding_cache_ttl_seconds: int = 86400,
+        usage_cache_invalidator: Callable[[], None] | None = None,
     ):
         """绑定配置位置和可选的用量流水存储。
 
@@ -316,6 +323,9 @@ class ModelGateway:
         self._intent_router_settings = intent_router_settings
         self._settings = settings
         self.concurrency_controller = concurrency_controller
+        self.business_cache = business_cache
+        self.embedding_cache_ttl_seconds = max(1, embedding_cache_ttl_seconds)
+        self.usage_cache_invalidator = usage_cache_invalidator
         self._chat_circuit_breaker: CircuitBreaker | None = None
         self._embedding_circuit_breaker: CircuitBreaker | None = None
         self._rerank_circuit_breaker: CircuitBreaker | None = None
@@ -545,15 +555,23 @@ class ModelGateway:
             max_retries=self.settings.embedding_max_retries,
             circuit_breaker=circuit_breaker,
         )
-        if self.concurrency_controller is None or embedding_settings is None:
-            return embeddings
-        if embedding_settings.api_style == "local_hash":
-            return embeddings
-        return ConcurrencyLimitedEmbeddings(
-            embeddings,
-            self.concurrency_controller,
-            context.account_id,
+        remote_embeddings = (
+            embedding_settings is not None
+            and embedding_settings.api_style != "local_hash"
         )
+        if self.concurrency_controller is not None and remote_embeddings:
+            embeddings = ConcurrencyLimitedEmbeddings(
+                embeddings,
+                self.concurrency_controller,
+                context.account_id,
+            )
+        if self.business_cache is not None and remote_embeddings:
+            embeddings = CachedEmbeddings(
+                embeddings,
+                self.business_cache,
+                ttl_seconds=self.embedding_cache_ttl_seconds,
+            )
+        return embeddings
 
     def reranker(self, context: ModelCallContext) -> Reranker | None:
         """返回带 Gateway 计量回调的可选 Rerank 实现。"""
@@ -744,6 +762,8 @@ class ModelGateway:
                     pricing_version=None,
                 )
             )
+            if self.usage_cache_invalidator is not None:
+                self.usage_cache_invalidator()
         return {**normalized, "usage_source": source}
 
     def _chat_identity(self, llm_settings: LLMSettings | None = None) -> tuple[str, str]:

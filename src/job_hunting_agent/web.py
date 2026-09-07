@@ -67,6 +67,7 @@ from .billing_projection import (
     balance_summary_to_dict,
     project_account_balances,
 )
+from .business_cache import BusinessCache
 from .concurrency_control import (
     ConcurrencyBackendUnavailable,
     ConcurrencyController,
@@ -80,6 +81,7 @@ from .config import (
     load_agent_memory_settings,
     load_billing_settings,
     load_bootstrap_admin_settings,
+    load_business_cache_settings,
     load_concurrency_settings,
     load_cookie_secure,
     load_database_settings,
@@ -95,6 +97,7 @@ from .config import (
     masked_account_lifecycle_settings,
     masked_agent_memory_settings,
     masked_billing_settings,
+    masked_business_cache_settings,
     masked_concurrency_settings,
     masked_embedding_settings,
     masked_file_scanning_settings,
@@ -403,6 +406,7 @@ def create_web_app(
     file_scanner: object | None = None,
     account_email_sender: AccountEmailSender | None = None,
     account_email_queue: AccountEmailQueue | None = None,
+    business_cache: BusinessCache | None = None,
 ) -> FastAPI:
     """创建本地 FastAPI 应用。
 
@@ -421,6 +425,7 @@ def create_web_app(
         task_queue=task_queue,
         concurrency_controller=concurrency_controller,
         file_scanner=file_scanner,  # type: ignore[arg-type]
+        business_cache=business_cache,
     )
     backend.initialize()
     env_path = Path(env_file)
@@ -521,6 +526,20 @@ def create_web_app(
         identity_resolver=rate_limit_identity,
         rate_limiter=rate_limiter,
     )
+
+    @web_app.middleware("http")
+    async def invalidate_business_cache_after_write(request: Request, call_next):
+        """成功写请求提交后失效聚合缓存；缓存删除失败不会覆盖业务响应。"""
+
+        response = await call_next(request)
+        if (
+            request.url.path.startswith("/api/")
+            and request.method.upper() not in {"GET", "HEAD", "OPTIONS", "TRACE"}
+            and response.status_code < 400
+        ):
+            backend.invalidate_admin_summary_cache()
+        return response
+
     web_app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")
     # 截图本体不持久化，无法安全地只向 Worker 投递 task_key；因此它是一个有界的
     # 前台导入例外。实际模型调用在线程池执行，共享并发控制器负责限制图片内存占用。
@@ -577,13 +596,17 @@ def create_web_app(
     def auth_config() -> dict[str, object]:
         """Expose only public registration requirements to the login page."""
 
-        return {
-            "registration_enabled": account_lifecycle_settings.registration_enabled,
-            "email_verification_required": account_lifecycle_settings.email_verification_required,
-            "consent_required": account_lifecycle_settings.consent_required,
-            "terms_version": account_lifecycle_settings.terms_version,
-            "privacy_version": account_lifecycle_settings.privacy_version,
-        }
+        return backend.cached_public_config(
+            lambda: {
+                "registration_enabled": account_lifecycle_settings.registration_enabled,
+                "email_verification_required": (
+                    account_lifecycle_settings.email_verification_required
+                ),
+                "consent_required": account_lifecycle_settings.consent_required,
+                "terms_version": account_lifecycle_settings.terms_version,
+                "privacy_version": account_lifecycle_settings.privacy_version,
+            }
+        )
 
     @web_app.post("/api/auth/register")
     def register(payload: RegisterPayload, request: Request) -> dict[str, object]:
@@ -989,6 +1012,15 @@ def create_web_app(
         except ValueError as error:
             billing_config = {"configured": False, "error": str(error)}
         try:
+            business_cache_config = masked_business_cache_settings(
+                load_business_cache_settings(env_path)
+            )
+            business_cache_config["runtime"] = (
+                backend.business_cache.health_snapshot()
+            )
+        except ValueError as error:
+            business_cache_config = {"enabled": False, "error": str(error)}
+        try:
             concurrency_config = masked_concurrency_settings(
                 load_concurrency_settings(env_path)
             )
@@ -1036,6 +1068,10 @@ def create_web_app(
                     ),
                 },
                 "billing": {"configured": bool(billing_config.get("configured"))},
+                "business_cache": {
+                    "configured": bool(business_cache_config.get("enabled")),
+                    "backend": business_cache_config.get("backend"),
+                },
                 "concurrency": {
                     "configured": not bool(concurrency_config.get("error")),
                     "enabled": bool(concurrency_config.get("enabled")),
@@ -1061,6 +1097,7 @@ def create_web_app(
             "web_security": web_security_config,
             "account_lifecycle": account_lifecycle_config,
             "billing": billing_config,
+            "business_cache": business_cache_config,
             "concurrency": concurrency_config,
             "file_scanning": file_scanning_config,
             "project_visual_analysis": project_visual_config,
@@ -2384,27 +2421,40 @@ def create_web_app(
         """管理员查看全局 Token 和工具调用汇总。"""
 
         require_admin(request)
-        prune_admin_retention_window()
-        billing_settings = load_billing_settings(env_path)
-        balance_projections, balance_summary = project_account_balances(
-            backend.store.list_accounts(),
-            backend.store.summarize_account_balances(),
-            price_per_million_tokens_yuan=billing_settings.price_per_million_tokens_yuan,
-            starting_balance_yuan=billing_settings.starting_balance_yuan,
-            low_balance_threshold_yuan=billing_settings.low_balance_threshold_yuan,
-        )
-        return {
-            "summary": backend.store.summarize_usage(),
-            "by_account": backend.store.summarize_usage_by_account(),
-            "tool_calls_by_account": backend.store.summarize_tool_call_traces_by_account(),
-            "billing": {
-                "settings": masked_billing_settings(billing_settings),
-                "summary": balance_summary_to_dict(balance_summary),
-                "by_account": [balance_projection_to_dict(projection) for projection in balance_projections],
-            },
-            "page_size": ADMIN_LEDGER_PAGE_SIZE,
-            "max_pages": ADMIN_LEDGER_MAX_PAGES,
-        }
+
+        def load_summary() -> dict[str, object]:
+            prune_admin_retention_window()
+            billing_settings = load_billing_settings(env_path)
+            balance_projections, balance_summary = project_account_balances(
+                backend.store.list_accounts(),
+                backend.store.summarize_account_balances(),
+                price_per_million_tokens_yuan=(
+                    billing_settings.price_per_million_tokens_yuan
+                ),
+                starting_balance_yuan=billing_settings.starting_balance_yuan,
+                low_balance_threshold_yuan=(
+                    billing_settings.low_balance_threshold_yuan
+                ),
+            )
+            return {
+                "summary": backend.store.summarize_usage(),
+                "by_account": backend.store.summarize_usage_by_account(),
+                "tool_calls_by_account": (
+                    backend.store.summarize_tool_call_traces_by_account()
+                ),
+                "billing": {
+                    "settings": masked_billing_settings(billing_settings),
+                    "summary": balance_summary_to_dict(balance_summary),
+                    "by_account": [
+                        balance_projection_to_dict(projection)
+                        for projection in balance_projections
+                    ],
+                },
+                "page_size": ADMIN_LEDGER_PAGE_SIZE,
+                "max_pages": ADMIN_LEDGER_MAX_PAGES,
+            }
+
+        return backend.cached_admin_usage_summary(load_summary)
 
     @web_app.get("/api/admin/balance/events")
     def admin_balance_events(
@@ -3398,6 +3448,7 @@ def persist_tool_trace(
             source=source,
         )
     )
+    backend.invalidate_admin_summary_cache()
 
 
 def load_or_new_tool_trace(

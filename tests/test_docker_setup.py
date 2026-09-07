@@ -58,6 +58,10 @@ def test_compose_mounts_env_read_only_and_starts_postgres_before_web():
     assert 'JOB_AGENT_CONCURRENCY_BACKEND: "redis"' in compose
     assert compose.count("JOB_AGENT_CONCURRENCY_REDIS_URL") == 2
     assert "@redis:6379/1" in compose
+    # 每个服务同时出现环境变量名和默认值插值，因此两个服务共出现四次。
+    assert compose.count("JOB_AGENT_BUSINESS_CACHE_ENABLED") == 4
+    assert compose.count("JOB_AGENT_BUSINESS_CACHE_REDIS_URL") == 2
+    assert "@redis:6379/2" in compose
     assert "worker:" in compose
     assert "job-agent-worker" in compose
     assert "beat:" in compose

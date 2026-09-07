@@ -122,6 +122,9 @@ def test_production_compose_does_not_expose_internal_services():
     assert "JOB_AGENT_RATE_LIMIT_REDIS_URL" in base_compose
     assert 'JOB_AGENT_CONCURRENCY_BACKEND: "redis"' in base_compose
     assert base_compose.count("JOB_AGENT_CONCURRENCY_REDIS_URL") == 2
+    assert base_compose.count("JOB_AGENT_BUSINESS_CACHE_ENABLED") == 4
+    assert base_compose.count("JOB_AGENT_BUSINESS_CACHE_REDIS_URL") == 2
+    assert "@redis:6379/2" in base_compose
     assert "JOB_AGENT_OBJECT_STORAGE_AUTO_CREATE_BUCKET: \"false\"" in compose
     assert "reverse-proxy:" in compose
     assert "caddy:2.9.1-alpine" in compose

@@ -49,7 +49,7 @@ services:
       start_period: 10s
 
   redis:
-    # Redis 数据库 0 作为 Celery broker，数据库 1 保存跨副本共享的短期限流窗口和并发租约；
+    # Redis DB 0 用于 Celery，DB 1 用于限流和并发租约，DB 2 用于可重建业务缓存；
     # 任务、账号和计费的权威业务状态仍保存在 PostgreSQL。
     image: "${JOB_AGENT_REDIS_IMAGE:-redis:7.4-alpine}"
     restart: unless-stopped
@@ -127,6 +127,13 @@ services:
       # 模型和截图占位与限流共用 Redis DB 1，但使用独立键前缀。
       JOB_AGENT_CONCURRENCY_BACKEND: "redis"
       JOB_AGENT_CONCURRENCY_REDIS_URL: "redis://:${JOB_AGENT_REDIS_PASSWORD:?set JOB_AGENT_REDIS_PASSWORD in .env}@redis:6379/1"
+      # 可重建业务缓存使用独立 DB 2；Redis 故障时自动回源 PostgreSQL/配置/模型。
+      JOB_AGENT_BUSINESS_CACHE_ENABLED: "${JOB_AGENT_BUSINESS_CACHE_ENABLED:-true}"
+      JOB_AGENT_BUSINESS_CACHE_REDIS_URL: "redis://:${JOB_AGENT_REDIS_PASSWORD:?set JOB_AGENT_REDIS_PASSWORD in .env}@redis:6379/2"
+      JOB_AGENT_BUSINESS_CACHE_ADMIN_SUMMARY_TTL_SECONDS: "${JOB_AGENT_BUSINESS_CACHE_ADMIN_SUMMARY_TTL_SECONDS:-15}"
+      JOB_AGENT_BUSINESS_CACHE_PROFILE_TTL_SECONDS: "${JOB_AGENT_BUSINESS_CACHE_PROFILE_TTL_SECONDS:-60}"
+      JOB_AGENT_BUSINESS_CACHE_PUBLIC_CONFIG_TTL_SECONDS: "${JOB_AGENT_BUSINESS_CACHE_PUBLIC_CONFIG_TTL_SECONDS:-300}"
+      JOB_AGENT_BUSINESS_CACHE_EMBEDDING_TTL_SECONDS: "${JOB_AGENT_BUSINESS_CACHE_EMBEDDING_TTL_SECONDS:-86400}"
       # Agent 短期上下文使用 PostgreSQL 聊天历史，避免 Web 副本各自持有 MemorySaver。
       JOB_AGENT_MEMORY_CHECKPOINT_BACKEND: "database"
     ports:
@@ -180,6 +187,9 @@ services:
       # Worker 的 Embedding、Rerank 和文本模型调用共享同一组全局/账号并发额度。
       JOB_AGENT_CONCURRENCY_BACKEND: "redis"
       JOB_AGENT_CONCURRENCY_REDIS_URL: "redis://:${JOB_AGENT_REDIS_PASSWORD:?set JOB_AGENT_REDIS_PASSWORD in .env}@redis:6379/1"
+      JOB_AGENT_BUSINESS_CACHE_ENABLED: "${JOB_AGENT_BUSINESS_CACHE_ENABLED:-true}"
+      JOB_AGENT_BUSINESS_CACHE_REDIS_URL: "redis://:${JOB_AGENT_REDIS_PASSWORD:?set JOB_AGENT_REDIS_PASSWORD in .env}@redis:6379/2"
+      JOB_AGENT_BUSINESS_CACHE_EMBEDDING_TTL_SECONDS: "${JOB_AGENT_BUSINESS_CACHE_EMBEDDING_TTL_SECONDS:-86400}"
     volumes:
       - ./.env:/app/.env:ro
     command: ["job-agent-worker", "--env-file", "/app/.env", "--log-level", "INFO", "--concurrency", "1"]
