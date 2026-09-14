@@ -216,7 +216,7 @@ jobs:
               -o ServerAliveCountMax=12 \
               -o ConnectTimeout=20 \
               "$TARGET" \
-              "set -eu; docker pull '${IMAGE_DIGEST_REF}'; docker tag '${IMAGE_DIGEST_REF}' '${IMAGE_REF}'; test \"\$(docker image inspect '${IMAGE_DIGEST_REF}' --format '{{.Id}}')\" = \"\$(docker image inspect '${IMAGE_REF}' --format '{{.Id}}')\""; then
+              "set -eu; timeout --signal=TERM --kill-after=15s 180s docker pull '${IMAGE_DIGEST_REF}'; docker tag '${IMAGE_DIGEST_REF}' '${IMAGE_REF}'; test \"\$(docker image inspect '${IMAGE_DIGEST_REF}' --format '{{.Id}}')\" = \"\$(docker image inspect '${IMAGE_REF}' --format '{{.Id}}')\""; then
               PULL_SUCCEEDED=true
               break
             fi

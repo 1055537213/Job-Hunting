@@ -392,6 +392,7 @@ def test_production_deployment_requires_manual_confirmation_and_environment():
         "for attempt in 1 2 3 4 5 6",
         '[[ "$PULL_SUCCEEDED" == "true" ]]',
         "docker pull '${IMAGE_DIGEST_REF}'",
+        "timeout --signal=TERM --kill-after=15s 180s docker pull '${IMAGE_DIGEST_REF}'",
         "docker tag '${IMAGE_DIGEST_REF}' '${IMAGE_REF}'",
         '"https://${DEPLOY_HOST}:8443/api/health"',
         "BUNDLE_FILES=(compose.yaml compose.prod.yaml deploy scripts/deploy_production.sh)",
