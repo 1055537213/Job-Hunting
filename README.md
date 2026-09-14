@@ -321,7 +321,7 @@ docker compose --env-file /opt/job-hunting-agent/shared/.env \
 1. 推送到 `master` 后，`CI` 执行 Python、前端、Compose、配置和安全检查。
 2. CI 成功后，`Publish release image` 重新构建并扫描精确提交，发布 `ghcr.io/<owner>/<repo>:sha-<提交前12位>`。
 3. 管理员手动启动 `Deploy production`，填写完整 40 位提交 SHA、确认词 `DEPLOY`，并选择 `coexist` 或 `standalone`。
-4. GitHub `production` Environment 审批通过后，工作流通过固定 SSH 指纹上传部署包和镜像，在服务器上执行迁移、备份、健康检查和失败回滚。
+4. GitHub `production` Environment 审批通过后，工作流通过固定 SSH 指纹上传部署包；服务器按不可变镜像 digest 从 GHCR 拉取缺失层，再执行迁移、备份、健康检查和失败回滚。
 
 服务器上的生产 `.env` 保留在 `shared/.env`，不由 GitHub Actions 上传。首次部署前必须准备对象存储 bucket、生产密钥、证书和 GitHub Actions 所需的 SSH/Environment 配置。详细步骤见 [生产发布与恢复基线](docs/learning/production-release.md)。
 

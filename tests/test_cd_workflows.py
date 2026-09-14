@@ -382,9 +382,12 @@ def test_production_deployment_requires_manual_confirmation_and_environment():
         '[[ "${CONFIRMATION}" == "DEPLOY" ]]',
         "git merge-base --is-ancestor",
         "org.opencontainers.image.revision",
+        "IMAGE_DIGEST_REF",
+        "steps.verified_image.outputs.digest_ref",
         "DEPLOY_KNOWN_HOSTS",
         "StrictHostKeyChecking=yes",
-        "docker save \"${IMAGE_REF}\"",
+        "docker pull '${IMAGE_DIGEST_REF}'",
+        "docker tag '${IMAGE_DIGEST_REF}' '${IMAGE_REF}'",
         '"https://${DEPLOY_HOST}:8443/api/health"',
         "BUNDLE_FILES=(compose.yaml compose.prod.yaml deploy scripts/deploy_production.sh)",
         "scripts/deploy_production.sh",
@@ -395,6 +398,7 @@ def test_production_deployment_requires_manual_confirmation_and_environment():
 
     assert "ssh-keyscan" not in workflow
     assert "StrictHostKeyChecking=no" not in workflow
+    assert "docker save" not in workflow
 
 
 def test_remote_deployment_validates_health_and_can_restore_previous_release():

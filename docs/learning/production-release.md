@@ -323,7 +323,7 @@ Trivy 高危/严重漏洞门禁并生成 CycloneDX SBOM；门禁失败时不会�
 ### 服务器首次准备
 
 服务器必须已安装 Docker Engine 和 Docker Compose plugin，部署账号必须拥有目标目录和
-Docker 权限。先创建共享配置目录：
+Docker 权限，并能够访问公开的 GHCR 发布包。先创建共享配置目录：
 
 ```bash
 sudo mkdir -p /opt/job-hunting-agent/shared
@@ -350,8 +350,9 @@ Redis 密码和对象存储密钥始终只保存在服务器共享目录。
 4. GitHub 创建待审批 deployment 后，由 `production Environment` 的 reviewer 审批。
 
 部署工作流会依次验证提交属于 `master`、拉取 `sha-<commit 前 12 位>` 镜像、核对完整 OCI
-revision、验证固定 SSH 主机指纹、上传 Compose/Caddy/Prometheus 配置，并通过加密 SSH 通道
-直接传输已验证镜像。服务器不需要长期保存 GHCR Token。
+revision、解析不可变镜像 digest、验证固定 SSH 主机指纹并上传 Compose/Caddy/Prometheus 配置。
+服务器随后按 digest 直接从公开 GHCR 拉取缺失镜像层，校验 digest 引用与版本标签指向同一镜像后
+才进入部署。这样既避免跨 SSH 重传全部镜像层，也不需要在服务器长期保存 GHCR Token。
 
 服务器端 `scripts/deploy_production.sh` 会在已有 PostgreSQL 运行时创建迁移前 custom-format
 数据库备份，然后执行 Compose 配置校验、Alembic 迁移和服务更新。两种拓扑都要求 Web 健康且

@@ -93,6 +93,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Log in and verify the immutable image
+        id: verified_image
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE_REF: ${{ steps.image.outputs.ref }}
@@ -103,6 +104,9 @@ jobs:
           docker pull "${IMAGE_REF}"
           IMAGE_REVISION="$(docker image inspect "${IMAGE_REF}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
           [[ "${IMAGE_REVISION}" == "${COMMIT_SHA}" ]]
+          IMAGE_DIGEST_REF="$(docker image inspect "${IMAGE_REF}" --format '{{ index .RepoDigests 0 }}')"
+          [[ "${IMAGE_DIGEST_REF}" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]
+          echo "digest_ref=${IMAGE_DIGEST_REF}" >> "$GITHUB_OUTPUT"
 
       - name: Configure pinned SSH host trust
         shell: bash
@@ -178,22 +182,23 @@ jobs:
             "$TARGET" \
             "set -eu; tar -xzf '${REMOTE_BUNDLE}' -C '${RELEASE_DIR}'; rm -f '${REMOTE_BUNDLE}'; chmod 700 '${RELEASE_DIR}/scripts/deploy_production.sh' '${RELEASE_DIR}/scripts/validate_production_recovery.sh' '${RELEASE_DIR}/scripts/validate_production_user_flow.sh' '${RELEASE_DIR}/scripts/run_production_backup.sh' '${RELEASE_DIR}/scripts/install_production_backup_timer.sh'"
 
-      - name: Transfer the verified release image
+      - name: Pull the verified release image on the production host
         env:
+          IMAGE_DIGEST_REF: ${{ steps.verified_image.outputs.digest_ref }}
           IMAGE_REF: ${{ steps.image.outputs.ref }}
         shell: bash
         run: |
           set -euo pipefail
           PORT="${DEPLOY_PORT:-22}"
           TARGET="${DEPLOY_USER}@${DEPLOY_HOST}"
-          docker save "${IMAGE_REF}" | gzip -1 | ssh \
+          ssh \
             -i "$HOME/.ssh/deploy_key" \
             -p "$PORT" \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             "$TARGET" \
-            'gzip -d | docker load >/dev/null'
+            "set -eu; docker pull '${IMAGE_DIGEST_REF}'; docker tag '${IMAGE_DIGEST_REF}' '${IMAGE_REF}'; test \"\$(docker image inspect '${IMAGE_DIGEST_REF}' --format '{{.Id}}')\" = \"\$(docker image inspect '${IMAGE_REF}' --format '{{.Id}}')\""
 
       - name: Deploy and verify production
         env:
