@@ -429,6 +429,7 @@ def create_web_app(
     )
     backend.initialize()
     env_path = Path(env_file)
+    billing_settings = load_billing_settings(env_path)
     bootstrap_initial_admin(backend, env_path)
     cookie_secure = load_cookie_secure(env_path)
     web_security_settings = load_web_security_settings(env_path)
@@ -2584,7 +2585,7 @@ def create_web_app(
             "offset": offset,
             "page_size": ADMIN_LEDGER_PAGE_SIZE,
             "max_pages": None,
-            "settings": masked_billing_settings(load_billing_settings(env_path)),
+            "settings": masked_billing_settings(billing_settings),
         }
 
     @web_app.get("/api/me/recharge/orders")
@@ -2606,17 +2607,19 @@ def create_web_app(
 
     @web_app.post("/api/me/balance/recharge")
     def recharge_my_balance(payload: BalanceRechargePayload, request: Request) -> dict[str, object]:
-        """当前账号发起一次本地模拟充值。"""
+        """当前账号发起一次受限演示充值。"""
 
         account = current_account(request)
-        if load_web_security_settings(env_path).environment == "production":
-            raise HTTPException(status_code=503, detail="真实支付尚未接入，生产环境暂不开放模拟充值。")
+        if not billing_settings.demo_recharge_enabled:
+            raise HTTPException(status_code=503, detail="演示充值当前未开放，请联系管理员。")
         try:
             order, entry = backend.store.create_simulated_recharge_order(
                 account.id,
                 payload.amount_yuan,
                 idempotency_key=payload.idempotency_key or uuid.uuid4().hex,
                 description=(payload.note or "个人中心模拟充值").strip(),
+                max_amount_yuan=billing_settings.demo_recharge_max_amount_yuan,
+                max_total_yuan=billing_settings.demo_recharge_max_total_yuan,
             )
         except IdempotencyConflictError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error

@@ -8,6 +8,10 @@ services:
       # The lightweight topology keeps Prometheus metrics but does not start the
       # Loki/Tempo/Alloy trace and log pipeline.
       JOB_AGENT_OTEL_ENABLED: "false"
+      # Portfolio/demo deployments may grant bounded test credit without a real payment provider.
+      JOB_AGENT_DEMO_RECHARGE_ENABLED: "${JOB_AGENT_DEMO_RECHARGE_ENABLED:-true}"
+      JOB_AGENT_DEMO_RECHARGE_MAX_AMOUNT_YUAN: "${JOB_AGENT_DEMO_RECHARGE_MAX_AMOUNT_YUAN:-20}"
+      JOB_AGENT_DEMO_RECHARGE_MAX_TOTAL_YUAN: "${JOB_AGENT_DEMO_RECHARGE_MAX_TOTAL_YUAN:-50}"
     ports: !override
       - "127.0.0.1:18081:8000"
 

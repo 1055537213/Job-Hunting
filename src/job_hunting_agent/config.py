@@ -278,6 +278,9 @@ class BillingSettings:
     price_per_million_tokens_yuan: float = 25.0
     starting_balance_yuan: float = 0.0
     low_balance_threshold_yuan: float = 10.0
+    demo_recharge_enabled: bool = False
+    demo_recharge_max_amount_yuan: float = 20.0
+    demo_recharge_max_total_yuan: float = 50.0
 
 
 @dataclass(frozen=True)
@@ -1537,6 +1540,10 @@ def load_billing_settings(
                 return file_values[key]
         return default
 
+    runtime_environment = (get("JOB_AGENT_ENVIRONMENT", default="development") or "development").strip().lower()
+    if runtime_environment not in {"development", "test", "production"}:
+        raise ValueError("JOB_AGENT_ENVIRONMENT 只能是 development、test 或 production")
+    demo_recharge_enabled_default = "false" if runtime_environment == "production" else "true"
     settings = BillingSettings(
         price_per_million_tokens_yuan=parse_positive_float(
             get("JOB_AGENT_BILLING_PRICE_PER_MILLION_TOKENS_YUAN", default="25"),
@@ -1550,7 +1557,23 @@ def load_billing_settings(
             get("JOB_AGENT_BILLING_LOW_BALANCE_THRESHOLD_YUAN", default="10"),
             "JOB_AGENT_BILLING_LOW_BALANCE_THRESHOLD_YUAN",
         ),
+        demo_recharge_enabled=parse_bool(
+            get("JOB_AGENT_DEMO_RECHARGE_ENABLED", default=demo_recharge_enabled_default)
+        ),
+        demo_recharge_max_amount_yuan=parse_positive_float(
+            get("JOB_AGENT_DEMO_RECHARGE_MAX_AMOUNT_YUAN", default="20"),
+            "JOB_AGENT_DEMO_RECHARGE_MAX_AMOUNT_YUAN",
+        ),
+        demo_recharge_max_total_yuan=parse_positive_float(
+            get("JOB_AGENT_DEMO_RECHARGE_MAX_TOTAL_YUAN", default="50"),
+            "JOB_AGENT_DEMO_RECHARGE_MAX_TOTAL_YUAN",
+        ),
     )
+    if settings.demo_recharge_max_total_yuan < settings.demo_recharge_max_amount_yuan:
+        raise ValueError(
+            "JOB_AGENT_DEMO_RECHARGE_MAX_TOTAL_YUAN 不能小于 "
+            "JOB_AGENT_DEMO_RECHARGE_MAX_AMOUNT_YUAN"
+        )
     return settings
 
 
@@ -1562,6 +1585,9 @@ def masked_billing_settings(settings: BillingSettings) -> dict[str, object]:
         "price_per_million_tokens_yuan": settings.price_per_million_tokens_yuan,
         "starting_balance_yuan": settings.starting_balance_yuan,
         "low_balance_threshold_yuan": settings.low_balance_threshold_yuan,
+        "demo_recharge_enabled": settings.demo_recharge_enabled,
+        "demo_recharge_max_amount_yuan": settings.demo_recharge_max_amount_yuan,
+        "demo_recharge_max_total_yuan": settings.demo_recharge_max_total_yuan,
     }
 
 

@@ -1885,9 +1885,18 @@ if (!window.Vue) {
 
       /** 个人中心里的模拟充值。 */
       async rechargeMyBalance() {
+        if (this.profileCenter.settings?.demo_recharge_enabled === false) {
+          this.profileBalanceError = "演示充值当前未开放，请联系管理员。";
+          return;
+        }
         const amountYuan = Number(this.profileRechargeForm.amountYuan);
         if (!Number.isFinite(amountYuan) || amountYuan <= 0) {
           this.profileBalanceError = "请输入大于 0 的充值金额。";
+          return;
+        }
+        const maxAmountYuan = Number(this.profileCenter.settings?.demo_recharge_max_amount_yuan || 20);
+        if (amountYuan > maxAmountYuan) {
+          this.profileBalanceError = `单笔演示充值不能超过 ${maxAmountYuan} 元。`;
           return;
         }
         const idempotencyKey = this.profileRechargeForm.idempotencyKey || this.newIdempotencyKey("recharge");

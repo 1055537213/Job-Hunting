@@ -1250,17 +1250,20 @@
                 </div>
                 <span class="profile-simulation-badge">模拟入口</span>
               </div>
-              <p class="profile-panel-lede">当前先提供本地模拟充值，提交后会立即写入余额流水。接入真实支付前不会产生实际扣款。</p>
+              <p v-if="profileCenter.settings?.demo_recharge_enabled !== false" class="profile-panel-lede">
+                演示充值不会产生实际扣款，单笔最多 {{ profileCenter.settings?.demo_recharge_max_amount_yuan || 20 }} 元，每个账号累计最多 {{ profileCenter.settings?.demo_recharge_max_total_yuan || 50 }} 元。
+              </p>
+              <p v-else class="profile-panel-lede">演示充值当前未开放，需要由管理员补充余额。</p>
               <form class="profile-recharge-form" @submit.prevent="rechargeMyBalance">
                 <label class="field-group" for="profileRechargeAmount">
                   <span>充值金额（元）</span>
-                  <input id="profileRechargeAmount" v-model.number="profileRechargeForm.amountYuan" class="field" type="number" min="0.01" max="1000000" step="0.01" required @input="profileRechargeForm.idempotencyKey = ''; profileRechargeSuccess = ''" />
+                  <input id="profileRechargeAmount" v-model.number="profileRechargeForm.amountYuan" class="field" type="number" min="0.01" :max="profileCenter.settings?.demo_recharge_max_amount_yuan || 20" step="0.01" required :disabled="profileCenter.settings?.demo_recharge_enabled === false" @input="profileRechargeForm.idempotencyKey = ''; profileRechargeSuccess = ''" />
                 </label>
                 <label class="field-group" for="profileRechargeNote">
                   <span>备注（可选）</span>
-                  <input id="profileRechargeNote" v-model.trim="profileRechargeForm.note" class="field" maxlength="120" placeholder="例如：测试充值" @input="profileRechargeForm.idempotencyKey = ''; profileRechargeSuccess = ''" />
+                  <input id="profileRechargeNote" v-model.trim="profileRechargeForm.note" class="field" maxlength="120" placeholder="例如：测试充值" :disabled="profileCenter.settings?.demo_recharge_enabled === false" @input="profileRechargeForm.idempotencyKey = ''; profileRechargeSuccess = ''" />
                 </label>
-                <button class="primary-button" type="submit" :disabled="profileRechargeLoading" :data-state="profileRechargeLoading ? 'loading' : 'idle'">
+                <button class="primary-button" type="submit" :disabled="profileRechargeLoading || profileCenter.settings?.demo_recharge_enabled === false" :data-state="profileRechargeLoading ? 'loading' : 'idle'">
                   {{ profileRechargeLoading ? "处理中" : "模拟充值" }}
                 </button>
               </form>

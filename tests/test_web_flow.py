@@ -1095,6 +1095,66 @@ def test_web_profile_balance_and_simulated_recharge_are_account_scoped(tmp_path)
     assert invalid.status_code == 422
 
 
+def test_demo_recharge_obeys_switch_and_account_caps(tmp_path):
+    """公开演示充值必须显式可控，并限制单笔和账号累计到账金额。"""
+
+    disabled_env = tmp_path / "disabled.env"
+    disabled_env.write_text("JOB_AGENT_DEMO_RECHARGE_ENABLED=false\n", encoding="utf-8")
+    disabled_client = login_test_account(
+        TestClient(create_web_app(env_file=disabled_env)),
+        email="demo-recharge-disabled@example.com",
+    )
+    disabled = disabled_client.post(
+        "/api/me/balance/recharge",
+        json={"amount_yuan": 1, "idempotency_key": "demo-disabled-key-1"},
+    )
+    assert disabled.status_code == 503
+    assert disabled_client.get("/api/me/balance").json()["settings"]["demo_recharge_enabled"] is False
+
+    enabled_env = tmp_path / "enabled.env"
+    enabled_env.write_text(
+        "\n".join(
+            (
+                "JOB_AGENT_DEMO_RECHARGE_ENABLED=true",
+                "JOB_AGENT_DEMO_RECHARGE_MAX_AMOUNT_YUAN=5",
+                "JOB_AGENT_DEMO_RECHARGE_MAX_TOTAL_YUAN=8",
+            )
+        ),
+        encoding="utf-8",
+    )
+    enabled_client = login_test_account(
+        TestClient(create_web_app(env_file=enabled_env)),
+        email="demo-recharge-enabled@example.com",
+    )
+    initial_balance = enabled_client.get("/api/me/balance").json()["summary"][
+        "balance_micro_yuan"
+    ]
+    too_large = enabled_client.post(
+        "/api/me/balance/recharge",
+        json={"amount_yuan": 6, "idempotency_key": "demo-too-large-key"},
+    )
+    assert too_large.status_code == 400
+
+    first_payload = {"amount_yuan": 5, "idempotency_key": "demo-first-credit-key"}
+    first = enabled_client.post("/api/me/balance/recharge", json=first_payload)
+    duplicate = enabled_client.post("/api/me/balance/recharge", json=first_payload)
+    assert first.status_code == 200
+    assert duplicate.status_code == 200
+    assert duplicate.json()["order"]["id"] == first.json()["order"]["id"]
+
+    over_total = enabled_client.post(
+        "/api/me/balance/recharge",
+        json={"amount_yuan": 4, "idempotency_key": "demo-over-total-key"},
+    )
+    assert over_total.status_code == 400
+    final = enabled_client.post(
+        "/api/me/balance/recharge",
+        json={"amount_yuan": 3, "idempotency_key": "demo-final-credit-key"},
+    )
+    assert final.status_code == 200
+    assert final.json()["summary"]["balance_micro_yuan"] == initial_balance + 8_000_000
+
+
 def test_admin_balance_summary_and_ledger_are_paginated(tmp_path):
     """管理员可以按账号读取余额流水，并和账号级余额投影保持一致。"""
 

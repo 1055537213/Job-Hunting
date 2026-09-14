@@ -1332,11 +1332,19 @@ class RepositoryStore:
         *,
         idempotency_key: str,
         description: str = "个人中心模拟充值",
+        max_amount_yuan: float | Decimal | None = None,
+        max_total_yuan: float | Decimal | None = None,
     ) -> tuple[RechargeOrderRecord, BalanceLedgerRecord]:
-        """开发环境创建并立即结算模拟订单，完整经过订单和支付事件链路。"""
+        """创建并立即结算受限模拟订单，完整经过订单和支付事件链路。"""
 
         account = self.get_account(account_id)
         amount_micro_yuan = self._positive_money_amount(amount_yuan)
+        max_amount_micro_yuan = (
+            self._positive_money_amount(max_amount_yuan) if max_amount_yuan is not None else None
+        )
+        max_total_micro_yuan = (
+            self._positive_money_amount(max_total_yuan) if max_total_yuan is not None else None
+        )
         key = self._validated_idempotency_key(idempotency_key)
         clean_description = description.strip()[:500] or "个人中心模拟充值"
         with self.connect() as conn:
@@ -1368,6 +1376,25 @@ class RepositoryStore:
                     self._balance_ledger_from_row(ledger_row),
                 )
 
+            if max_amount_micro_yuan is not None and amount_micro_yuan > max_amount_micro_yuan:
+                raise ValueError("单笔模拟充值金额超过演示额度上限。")
+            if max_total_micro_yuan is not None:
+                simulated_total_row = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(amount_micro_yuan), 0) AS total_micro_yuan
+                    FROM recharge_orders
+                    WHERE account_id = ? AND payment_provider = 'simulated' AND status = 'paid'
+                    """,
+                    (account_id,),
+                ).fetchone()
+                simulated_total = (
+                    int(simulated_total_row["total_micro_yuan"])
+                    if simulated_total_row is not None
+                    else 0
+                )
+                if simulated_total + amount_micro_yuan > max_total_micro_yuan:
+                    raise ValueError("该账号已达到模拟充值累计演示额度上限。")
+
             now = now_iso()
             order_number = f"recharge-{uuid4().hex}"
             order_cursor = conn.execute(
@@ -1390,7 +1417,7 @@ class RepositoryStore:
                     key,
                     clean_description,
                     None,
-                    json.dumps({"environment": "development"}, ensure_ascii=False),
+                    json.dumps({"mode": "demo"}, ensure_ascii=False),
                     now,
                     now,
                     None,
