@@ -129,6 +129,9 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=12 \
+            -o ConnectTimeout=20 \
             "$TARGET" \
             'set -eu; docker version >/dev/null; docker compose version >/dev/null'
 
@@ -163,6 +166,9 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=12 \
+            -o ConnectTimeout=20 \
             "$TARGET" \
             "set -eu; mkdir -p '${RELEASE_DIR}' '${DEPLOY_PATH}/shared' '${DEPLOY_PATH}/state' '${DEPLOY_PATH}/backups'; rm -f '${REMOTE_BUNDLE}'"
           scp \
@@ -171,6 +177,9 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=12 \
+            -o ConnectTimeout=20 \
             "$BUNDLE" \
             "${TARGET}:${REMOTE_BUNDLE}"
           ssh \
@@ -179,6 +188,9 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=12 \
+            -o ConnectTimeout=20 \
             "$TARGET" \
             "set -eu; tar -xzf '${REMOTE_BUNDLE}' -C '${RELEASE_DIR}'; rm -f '${REMOTE_BUNDLE}'; chmod 700 '${RELEASE_DIR}/scripts/deploy_production.sh' '${RELEASE_DIR}/scripts/validate_production_recovery.sh' '${RELEASE_DIR}/scripts/validate_production_user_flow.sh' '${RELEASE_DIR}/scripts/run_production_backup.sh' '${RELEASE_DIR}/scripts/install_production_backup_timer.sh'"
 
@@ -191,14 +203,29 @@ jobs:
           set -euo pipefail
           PORT="${DEPLOY_PORT:-22}"
           TARGET="${DEPLOY_USER}@${DEPLOY_HOST}"
-          ssh \
-            -i "$HOME/.ssh/deploy_key" \
-            -p "$PORT" \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            "$TARGET" \
-            "set -eu; docker pull '${IMAGE_DIGEST_REF}'; docker tag '${IMAGE_DIGEST_REF}' '${IMAGE_REF}'; test \"\$(docker image inspect '${IMAGE_DIGEST_REF}' --format '{{.Id}}')\" = \"\$(docker image inspect '${IMAGE_REF}' --format '{{.Id}}')\""
+          PULL_SUCCEEDED=false
+          for attempt in 1 2 3 4 5 6; do
+            echo "Remote image pull attempt ${attempt}/6"
+            if ssh \
+              -i "$HOME/.ssh/deploy_key" \
+              -p "$PORT" \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=12 \
+              -o ConnectTimeout=20 \
+              "$TARGET" \
+              "set -eu; docker pull '${IMAGE_DIGEST_REF}'; docker tag '${IMAGE_DIGEST_REF}' '${IMAGE_REF}'; test \"\$(docker image inspect '${IMAGE_DIGEST_REF}' --format '{{.Id}}')\" = \"\$(docker image inspect '${IMAGE_REF}' --format '{{.Id}}')\""; then
+              PULL_SUCCEEDED=true
+              break
+            fi
+            if (( attempt < 6 )); then
+              echo "Remote image pull was interrupted; reconnecting in 10 seconds."
+              sleep 10
+            fi
+          done
+          [[ "$PULL_SUCCEEDED" == "true" ]]
 
       - name: Deploy and verify production
         env:
@@ -219,6 +246,9 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=12 \
+            -o ConnectTimeout=20 \
             "$TARGET" \
             "bash '${DEPLOY_PATH}/releases/${RELEASE_ID}/scripts/deploy_production.sh' '${DEPLOY_PATH}' '${RELEASE_ID}' '${IMAGE_REF}'${TOPOLOGY_ARGUMENT}"
 
