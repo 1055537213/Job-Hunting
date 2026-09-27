@@ -27,8 +27,9 @@
 - `platform-service/`：可构建的 Spring Boot 运行骨架。
 - `/internal/v1/health` 和 `/internal/v1/version`：服务探针。
 - `billing-internal.openapi.yaml`：余额、消费、充值、退款内部契约。
+- Java 账务垂直链路：余额查询和模型调用扣费，默认关闭且未接入生产流量。
 - 当前 Python 账务实现保持唯一写入权，避免双写和重复扣费。
 
 ## 下一阶段
 
-实现 Java 账务模块并接入 PostgreSQL。完成双服务集成测试后，再让 Python `model_gateway` 通过内部接口调用 Java 的扣费接口，最后迁移充值、退款和管理员补款。
+完成 PostgreSQL Testcontainers 集成测试后，再让 Python `model_gateway` 通过内部接口调用 Java 的扣费接口，最后迁移充值、退款和管理员补款。

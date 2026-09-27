@@ -21,7 +21,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/BalanceResponse'
+                $ref: '#/components/schemas/BalanceProjection'
         '404':
           $ref: '#/components/responses/AccountNotFound'
   /internal/v1/billing/consume:
@@ -47,6 +47,8 @@ paths:
           $ref: '#/components/responses/InsufficientBalance'
         '422':
           $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/InternalUnauthorized'
   /internal/v1/billing/recharge:
     post:
       operationId: rechargeBalance
@@ -65,7 +67,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/BalanceResponse'
+                $ref: '#/components/schemas/BalanceProjection'
         '409':
           $ref: '#/components/responses/IdempotencyConflict'
         '422':
@@ -88,7 +90,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/BalanceResponse'
+                $ref: '#/components/schemas/BalanceProjection'
         '409':
           $ref: '#/components/responses/IdempotencyConflict'
         '422':
@@ -123,6 +125,10 @@ components:
     ConsumeRequest:
       type: object
       required: [account_id, amount_micro_yuan, source_reference]
+      description: >-
+        For consumption, source_reference is the billable model call identifier
+        and must equal the Idempotency-Key header. This keeps retries aligned
+        with the existing Python usage_events call_id.
       properties:
         account_id:
           type: integer
@@ -139,7 +145,7 @@ components:
         source_reference:
           type: string
           minLength: 1
-          maxLength: 256
+          maxLength: 160
         description:
           type: string
           maxLength: 512
@@ -158,7 +164,7 @@ components:
         source_reference:
           type: string
           minLength: 1
-          maxLength: 256
+          maxLength: 160
         actor_account_id:
           type: integer
           format: int64
@@ -181,13 +187,32 @@ components:
         source_reference:
           type: string
           minLength: 1
-          maxLength: 256
+          maxLength: 160
         description:
           type: string
           maxLength: 512
-    BalanceResponse:
+    BalanceProjection:
       type: object
-      required: [account_id, balance_micro_yuan, ledger_entry_id, replayed]
+      required: [account_id, balance_micro_yuan, total_recharge_micro_yuan, total_consumed_micro_yuan, ledger_entry_count]
+      properties:
+        account_id:
+          type: integer
+          format: int64
+        balance_micro_yuan:
+          type: integer
+          format: int64
+        total_recharge_micro_yuan:
+          type: integer
+          format: int64
+        total_consumed_micro_yuan:
+          type: integer
+          format: int64
+        ledger_entry_count:
+          type: integer
+          format: int64
+    ChargeResponse:
+      type: object
+      required: [account_id, balance_micro_yuan, ledger_entry_id, replayed, charged_micro_yuan]
       properties:
         account_id:
           type: integer
@@ -200,22 +225,16 @@ components:
           format: int64
         replayed:
           type: boolean
-    ChargeResponse:
-      allOf:
-        - $ref: '#/components/schemas/BalanceResponse'
-        - type: object
-          required: [charged_micro_yuan]
-          properties:
-            charged_micro_yuan:
-              type: integer
-              format: int64
+        charged_micro_yuan:
+          type: integer
+          format: int64
     BusinessError:
       type: object
       required: [code, message, trace_id]
       properties:
         code:
           type: string
-          enum: [ACCOUNT_NOT_FOUND, INSUFFICIENT_BALANCE, IDEMPOTENCY_CONFLICT, INVALID_REQUEST]
+          enum: [ACCOUNT_NOT_FOUND, INSUFFICIENT_BALANCE, IDEMPOTENCY_CONFLICT, INVALID_REQUEST, INTERNAL_UNAUTHORIZED]
         message:
           type: string
         trace_id:
@@ -223,6 +242,10 @@ components:
   responses:
     AccountNotFound:
       description: Account does not exist
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/BusinessError'
     InsufficientBalance:
       description: Account balance is insufficient
       content:
@@ -237,6 +260,12 @@ components:
             $ref: '#/components/schemas/BusinessError'
     InvalidRequest:
       description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/BusinessError'
+    InternalUnauthorized:
+      description: Internal service authentication failed
       content:
         application/json:
           schema:
