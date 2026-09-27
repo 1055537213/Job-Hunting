@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -90,6 +91,21 @@ public class BillingService implements BillingOperations {
         }
 
         BalanceRow balance = lockBalance(accountId);
+        // A concurrent request with the same key may have committed while this one waited for the balance lock.
+        existing = findExistingLedger(sourceReference);
+        if (existing != null) {
+            if (existing.accountId() != accountId
+                    || !"consumption".equals(existing.entryKind())
+                    || existing.amountMicroYuan() != -amount) {
+                throw idempotencyConflict();
+            }
+            return new BillingDtos.ChargeResponse(
+                    accountId,
+                    existing.balanceAfterMicroYuan(),
+                    existing.id(),
+                    true,
+                    amount);
+        }
         if (balance.balanceMicroYuan() < amount) {
             throw new BillingException(
                     "INSUFFICIENT_BALANCE",
@@ -111,8 +127,10 @@ public class BillingService implements BillingOperations {
                 accountId);
 
         String details = serializeDetails(request, amount);
-        long ledgerId = jdbcTemplate.queryForObject(
-                """
+        long ledgerId;
+        try {
+            ledgerId = jdbcTemplate.queryForObject(
+                    """
                 INSERT INTO account_balance_ledger (
                     account_id, entry_kind, amount_micro_yuan,
                     balance_before_micro_yuan, balance_after_micro_yuan,
@@ -120,19 +138,22 @@ public class BillingService implements BillingOperations {
                     source_reference, summary, details_json, created_at
                 ) VALUES (?, 'consumption', ?, ?, ?, ?, ?, ?, ?, CAST(? AS jsonb), CURRENT_TIMESTAMP)
                 RETURNING id
-                """,
-                Long.class,
-                accountId,
-                -amount,
-                balance.balanceMicroYuan(),
-                after,
-                tokenCount,
-                pricePerMillionTokensYuan,
-                sourceReference,
-                request.description() == null || request.description().isBlank()
-                        ? "模型调用扣费"
-                        : request.description().trim(),
-                details);
+                    """,
+                    Long.class,
+                    accountId,
+                    -amount,
+                    balance.balanceMicroYuan(),
+                    after,
+                    tokenCount,
+                    pricePerMillionTokensYuan,
+                    sourceReference,
+                    request.description() == null || request.description().isBlank()
+                            ? "模型调用扣费"
+                            : request.description().trim(),
+                    details);
+        } catch (DuplicateKeyException exception) {
+            throw idempotencyConflict();
+        }
 
         return new BillingDtos.ChargeResponse(accountId, after, ledgerId, false, amount);
     }

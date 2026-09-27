@@ -13,6 +13,16 @@ mvn -B test
 mvn -B spring-boot:run
 ```
 
+真实 PostgreSQL 集成测试需要本机或 CI 提供可被 Testcontainers 访问的 Docker 环境：
+
+```bash
+mvn -B -Dtest=BillingServiceIntegrationTest -Drun.integration.tests=true test
+```
+
+集成测试会验证幂等重试、并发扣费、余额不足和防止余额透支。Windows Docker Desktop
+若 Testcontainers 无法连接 named pipe，普通单元测试仍可运行，应改在 Linux CI runner
+中执行上述命令。
+
 启动后检查：
 
 ```text

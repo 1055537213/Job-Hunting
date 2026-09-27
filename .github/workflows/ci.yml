@@ -84,6 +84,12 @@ jobs:
         working-directory: platform-service
         run: mvn -B -ntp test
 
+      - name: Run Java PostgreSQL integration tests
+        working-directory: platform-service
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+        run: mvn -B -ntp -Dtest=BillingServiceIntegrationTest -Drun.integration.tests=true test
+
       - name: Audit locked Python dependencies
         id: python_audit
         continue-on-error: true
