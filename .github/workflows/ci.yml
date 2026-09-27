@@ -90,6 +90,45 @@ jobs:
           TESTCONTAINERS_RYUK_DISABLED: "true"
         run: mvn -B -ntp -Dtest=BillingServiceIntegrationTest -Drun.integration.tests=true test
 
+      - name: Run Python-Java billing contract
+        shell: bash
+        env:
+          JOB_AGENT_DATABASE_URL: postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent
+          JOB_AGENT_JAVA_BILLING_INTERNAL_TOKEN: ci-platform-token
+          JOB_AGENT_PLATFORM_CONTRACT_URL: http://127.0.0.1:8081
+          PLATFORM_BILLING_ENABLED: "true"
+          PLATFORM_INTERNAL_TOKEN: ci-platform-token
+          PLATFORM_PRICE_PER_MILLION_TOKENS_YUAN: "25"
+          SPRING_DATASOURCE_URL: jdbc:postgresql://127.0.0.1:5432/job_agent
+          SPRING_DATASOURCE_USERNAME: job_agent
+          SPRING_DATASOURCE_PASSWORD: ""
+          SERVER_PORT: "8081"
+        run: |
+          set -euo pipefail
+          alembic upgrade head
+          log_file="$RUNNER_TEMP/platform-service-contract.log"
+          (cd platform-service && mvn -B -ntp spring-boot:run >"$log_file" 2>&1) &
+          java_pid=$!
+          cleanup() {
+            kill "$java_pid" 2>/dev/null || true
+            wait "$java_pid" 2>/dev/null || true
+            cat "$log_file" || true
+          }
+          trap cleanup EXIT
+          ready=false
+          for _ in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:8081/internal/v1/health >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$ready" != "true" ]]; then
+            echo "Java platform service did not become ready."
+            exit 1
+          fi
+          python tests/python_java_billing_contract.py
+
       - name: Audit locked Python dependencies
         id: python_audit
         continue-on-error: true
