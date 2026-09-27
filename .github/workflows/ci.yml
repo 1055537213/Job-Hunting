@@ -50,6 +50,13 @@ jobs:
         with:
           node-version: "22.x"
 
+      - name: Set up Java
+        uses: actions/setup-java@v7
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
       - name: Install locked dependencies and quality tools
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.lock -r requirements-dev.lock
 
@@ -72,6 +79,10 @@ jobs:
           for test_file in tests/frontend_*.mjs; do
             node "$test_file"
           done
+
+      - name: Run Java platform service tests
+        working-directory: platform-service
+        run: mvn -B -ntp test
 
       - name: Audit locked Python dependencies
         id: python_audit

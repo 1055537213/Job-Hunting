@@ -114,6 +114,12 @@
 - SQLAlchemy + Alembic
 - PostgreSQL 16 + pgvector
 
+### Java 平台服务（迁移阶段）
+
+- Spring Boot 3.4 + Java 21
+- 当前提供独立运行骨架、健康检查、版本探针和账务内部 OpenAPI 契约
+- 后续按模块迁移账号、余额、消费账本、退款和管理后台；迁移前由 Python 独占现有账务表写入
+
 ### 前端
 
 - Vue 3 Global Build，运行时文件随仓库提供
@@ -182,6 +188,10 @@
 │  ├─ observability*.py        # 日志、Trace、指标和告警配置
 │  ├─ file_scanning.py         # 本地扫描和 ClamAV 边界
 │  └─ web_static/              # 前端页面、脚本、样式和 Vue 运行时
+├─ platform-service/           # Spring Boot 平台服务，分阶段接管企业业务模块
+│  ├─ src/main/java/           # Java 服务入口和系统探针
+│  ├─ src/main/resources/      # 应用配置和账务内部 OpenAPI 契约
+│  └─ Dockerfile               # 独立 Java 服务镜像
 ├─ alembic/                    # Alembic 数据库迁移
 ├─ tests/                      # Python 测试和前端回归测试
 ├─ evals/rag/                  # RAG 黄金集、困难负样本和真实文件评测清单
@@ -190,6 +200,7 @@
 ├─ docs/                       # ADR、架构决策、运行和发布文档
 ├─ compose.yaml                # 基础开发拓扑
 ├─ compose.dev.yaml            # 源码挂载和热更新覆盖
+├─ compose.platform.yaml       # Java 平台服务本地开发覆盖
 ├─ compose.prod.yaml           # 单机生产覆盖
 ├─ compose.coexist.yaml        # 同机轻量共存覆盖
 ├─ compose.*-test.yaml         # 恢复、扫描、观测、扩容和验收覆盖

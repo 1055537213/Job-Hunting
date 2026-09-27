@@ -1,0 +1,15 @@
+# Java 平台服务的本地开发覆盖文件。
+# 使用 `docker compose -f compose.yaml -f compose.platform.yaml up -d platform-service`
+# 启动时，现有 Python Web、Worker 和数据库拓扑保持不变。
+services:
+  platform-service:
+    build:
+      context: ./platform-service
+      dockerfile: Dockerfile
+    image: job-hunting-agent:platform-dev
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${JOB_AGENT_PLATFORM_PORT:-8081}:8081"
+    environment:
+      SERVER_PORT: "8081"
+      APP_VERSION: "0.1.0"

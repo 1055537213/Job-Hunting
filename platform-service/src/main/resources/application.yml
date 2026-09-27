@@ -1,0 +1,23 @@
+spring:
+  application:
+    name: job-hunting-platform
+
+server:
+  port: ${SERVER_PORT:8081}
+  shutdown: graceful
+
+app:
+  version: ${APP_VERSION:0.1.0}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  info:
+    env:
+      enabled: false

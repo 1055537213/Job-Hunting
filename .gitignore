@@ -12,6 +12,7 @@ venv/
 data/
 build/
 dist/
+**/target/
 htmlcov/
 .coverage
 *.db
