@@ -100,6 +100,43 @@ def test_platform_client_sends_idempotent_charge_headers(monkeypatch):
     assert calls[0]["json"]["source_reference"] == "call-20260927-0001"
 
 
+def test_platform_client_sends_recharge_limits_and_returns_projection(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    def fake_request(method, url, *, headers, json=None, timeout):
+        calls.append({"method": method, "url": url, "headers": headers, "json": json, "timeout": timeout})
+        return httpx.Response(
+            200,
+            json={
+                "account_id": 42,
+                "balance_micro_yuan": 10_000_000,
+                "total_recharge_micro_yuan": 10_000_000,
+                "total_consumed_micro_yuan": 0,
+                "ledger_entry_count": 1,
+            },
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    client = PlatformBillingClient(
+        PlatformBillingSettings(True, "http://platform-service:8081", "secret", 5)
+    )
+
+    result = client.recharge(
+        account_id=42,
+        amount_micro_yuan=10_000_000,
+        source_reference="recharge-20260927-0001",
+        actor_account_id=42,
+        description="个人中心模拟充值",
+        max_amount_micro_yuan=20_000_000,
+        max_total_micro_yuan=100_000_000,
+    )
+
+    assert result.balance_micro_yuan == 10_000_000
+    assert calls[0]["url"] == "http://platform-service:8081/internal/v1/billing/recharge"
+    assert calls[0]["headers"]["Idempotency-Key"] == "recharge-20260927-0001"
+    assert calls[0]["json"]["max_amount_micro_yuan"] == 20_000_000
+
+
 def test_platform_client_preserves_business_error_and_maps_network_failure(monkeypatch):
     monkeypatch.setattr(
         httpx,

@@ -61,6 +61,40 @@ class PlatformBillingClient:
             f"/internal/v1/billing/accounts/{int(account_id)}/balance",
             trace_id=trace_id,
         )
+        return self._balance_projection(payload)
+
+    def recharge(
+        self,
+        *,
+        account_id: int,
+        amount_micro_yuan: int,
+        source_reference: str,
+        actor_account_id: int,
+        description: str,
+        max_amount_micro_yuan: int | None = None,
+        max_total_micro_yuan: int | None = None,
+        trace_id: str | None = None,
+    ) -> PlatformBalanceProjection:
+        if amount_micro_yuan <= 0:
+            raise ValueError("充值金额必须大于 0。")
+        payload = self._request(
+            "POST",
+            "/internal/v1/billing/recharge",
+            trace_id=trace_id,
+            idempotency_key=source_reference,
+            json={
+                "account_id": int(account_id),
+                "amount_micro_yuan": int(amount_micro_yuan),
+                "source_reference": source_reference,
+                "actor_account_id": int(actor_account_id),
+                "max_amount_micro_yuan": max_amount_micro_yuan,
+                "max_total_micro_yuan": max_total_micro_yuan,
+                "description": description,
+            },
+        )
+        return self._balance_projection(payload)
+
+    def _balance_projection(self, payload: dict[str, Any]) -> PlatformBalanceProjection:
         try:
             return PlatformBalanceProjection(
                 account_id=int(payload["account_id"]),

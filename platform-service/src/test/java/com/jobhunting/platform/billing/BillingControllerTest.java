@@ -85,6 +85,28 @@ class BillingControllerTest {
                 .andExpect(jsonPath("$.trace_id").value("trace-44"));
     }
 
+    @Test
+    void rechargeReturnsTheUpdatedBalanceAndAcceptsTheInternalToken() throws Exception {
+        mockMvc.perform(post("/internal/v1/billing/recharge")
+                        .header("Idempotency-Key", "recharge-20260927-0001")
+                        .header("X-Internal-Service-Token", "platform-secret")
+                        .header("X-Trace-Id", "trace-recharge-42")
+                        .contentType(APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "account_id": 42,
+                                  "amount_micro_yuan": 10000000,
+                                  "source_reference": "recharge-20260927-0001",
+                                  "actor_account_id": 42,
+                                  "description": "个人中心模拟充值"
+                                }
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.account_id").value(42))
+                .andExpect(jsonPath("$.balance_micro_yuan").value(18_000_000))
+                .andExpect(jsonPath("$.total_recharge_micro_yuan").value(20_000_000));
+    }
+
     @TestConfiguration
     static class StubBillingConfiguration {
 
@@ -117,6 +139,13 @@ class BillingControllerTest {
                         HttpStatus.CONFLICT);
             }
             return new BillingDtos.ChargeResponse(request.account_id(), 8_000_000, 7, false, 2_000_000);
+        }
+
+        @Override
+        public BillingDtos.BalanceProjection recharge(
+                BillingDtos.RechargeRequest request,
+                String idempotencyKey) {
+            return new BillingDtos.BalanceProjection(request.account_id(), 18_000_000, 20_000_000, 2_000_000, 3);
         }
     }
 }

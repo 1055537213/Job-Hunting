@@ -27,10 +27,11 @@
 - `platform-service/`：可构建的 Spring Boot 运行骨架。
 - `/internal/v1/health` 和 `/internal/v1/version`：服务探针。
 - `billing-internal.openapi.yaml`：余额、消费、充值、退款内部契约。
-- Java 账务垂直链路：余额查询和模型调用扣费，默认关闭且未接入生产流量。
-- Python `RepositoryStore` 已支持通过 `JOB_AGENT_JAVA_BILLING_ENABLED` 切换到 Java 扣费；同一 `call_id` 作为 Java 的幂等键，失败后可安全重试。
-- 当前 Python 账务实现保持唯一写入权，避免双写和重复扣费。
+- Java 账务垂直链路：余额查询、模拟充值和模型调用扣费，默认关闭且未接入生产流量。
+- Python `RepositoryStore` 已支持通过 `JOB_AGENT_JAVA_BILLING_ENABLED` 切换到 Java 充值和扣费；充值幂等键沿用充值请求的 `idempotency_key`，模型调用使用 `call_id`。
+- 开关关闭时 Python 保持原有账务写入路径；开关打开后 Java 独占余额、充值订单、余额流水和支付事件的写入权，Python 只调用接口并读取已提交结果。
+- CI 的 Python-Java contract check 会验证模拟充值、模型扣费、数据库流水和幂等重试。
 
 ## 下一阶段
 
-下一阶段先在 CI 和预发布环境验证 Python 到 Java 的扣费联调，再迁移充值、退款和管理员补款；生产环境暂不打开 `JOB_AGENT_JAVA_BILLING_ENABLED`。
+下一阶段在预发布环境打开开关并验证充值、扣费、故障重试，再迁移退款和管理员补款；生产环境暂不打开 `JOB_AGENT_JAVA_BILLING_ENABLED`。

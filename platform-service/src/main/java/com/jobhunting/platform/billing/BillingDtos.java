@@ -18,6 +18,16 @@ public final class BillingDtos {
             @Size(max = 512) String description) {
     }
 
+    public record RechargeRequest(
+            @NotNull @Min(1) Long account_id,
+            @NotNull @Min(1) Long amount_micro_yuan,
+            @NotBlank @Size(min = 16, max = 128) String source_reference,
+            @Min(1) Long actor_account_id,
+            @Min(1) Long max_amount_micro_yuan,
+            @Min(1) Long max_total_micro_yuan,
+            @Size(max = 512) String description) {
+    }
+
     public record BalanceProjection(
             long account_id,
             long balance_micro_yuan,

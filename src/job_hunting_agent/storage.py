@@ -1361,6 +1361,16 @@ class RepositoryStore:
         )
         key = self._validated_idempotency_key(idempotency_key)
         clean_description = description.strip()[:500] or "个人中心模拟充值"
+        if self._platform_billing_client is not None:
+            return self._create_simulated_recharge_order_via_platform(
+                account_id=account_id,
+                account=account,
+                amount_micro_yuan=amount_micro_yuan,
+                idempotency_key=key,
+                description=clean_description,
+                max_amount_micro_yuan=max_amount_micro_yuan,
+                max_total_micro_yuan=max_total_micro_yuan,
+            )
         with self.connect() as conn:
             self._ensure_account_billing_row(conn, account_id)
             balance_row = self._lock_account_billing_row(conn, account_id)
@@ -1515,6 +1525,93 @@ class RepositoryStore:
         if order_row is None or ledger_row is None:
             raise RuntimeError("模拟充值结算结果读取失败。")
         return self._recharge_order_from_row(order_row), self._balance_ledger_from_row(ledger_row)
+
+    def _create_simulated_recharge_order_via_platform(
+        self,
+        *,
+        account_id: int,
+        account: AccountRecord,
+        amount_micro_yuan: int,
+        idempotency_key: str,
+        description: str,
+        max_amount_micro_yuan: int | None,
+        max_total_micro_yuan: int | None,
+    ) -> tuple[RechargeOrderRecord, BalanceLedgerRecord]:
+        """Ask Java to settle a simulated recharge, then read its committed facts."""
+
+        existing = self._find_recharge_order_by_account_key(account_id, idempotency_key)
+        if existing is not None:
+            if (
+                existing.amount_micro_yuan != amount_micro_yuan
+                or existing.payment_provider != "simulated"
+            ):
+                raise IdempotencyConflictError("该幂等键已用于另一笔充值请求。")
+            ledger = self._find_recharge_ledger(existing.id)
+            if ledger is None or existing.status != "paid":
+                raise RuntimeError("模拟充值订单尚未完成，请稍后重试。")
+            return existing, ledger
+
+        if self._platform_billing_client is None:
+            raise RuntimeError("Java 平台账务客户端未配置。")
+        try:
+            projection = self._platform_billing_client.recharge(
+                account_id=account_id,
+                amount_micro_yuan=amount_micro_yuan,
+                source_reference=idempotency_key,
+                actor_account_id=account.id,
+                description=description,
+                max_amount_micro_yuan=max_amount_micro_yuan,
+                max_total_micro_yuan=max_total_micro_yuan,
+            )
+        except PlatformBillingError as error:
+            if error.code == "IDEMPOTENCY_CONFLICT":
+                raise IdempotencyConflictError(str(error)) from error
+            if error.code == "ACCOUNT_NOT_FOUND":
+                raise KeyError(f"Account balance not found: {account_id}") from error
+            if error.code == "INVALID_REQUEST":
+                raise ValueError(str(error)) from error
+            raise
+        if projection.account_id != account_id:
+            raise PlatformBillingError(
+                "INVALID_PLATFORM_RESPONSE",
+                "平台账务服务返回了错误的账号。",
+            )
+
+        order = self._find_recharge_order_by_account_key(account_id, idempotency_key)
+        if order is None:
+            raise RuntimeError("平台充值已成功，但本地无法读取充值订单。")
+        ledger = self._find_recharge_ledger(order.id)
+        if ledger is None:
+            raise RuntimeError("平台充值已成功，但本地无法读取充值流水。")
+        return order, ledger
+
+    def _find_recharge_order_by_account_key(
+        self,
+        account_id: int,
+        idempotency_key: str,
+    ) -> RechargeOrderRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM recharge_orders
+                WHERE account_id = ? AND idempotency_key = ?
+                """,
+                (account_id, idempotency_key),
+            ).fetchone()
+        return self._recharge_order_from_row(row) if row is not None else None
+
+    def _find_recharge_ledger(self, recharge_order_id: int) -> BalanceLedgerRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM account_balance_ledger
+                WHERE recharge_order_id = ? AND entry_kind = 'recharge'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (recharge_order_id,),
+            ).fetchone()
+        return self._balance_ledger_from_row(row) if row is not None else None
 
     def credit_account_balance_with_audit(
         self,

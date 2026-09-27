@@ -7,4 +7,8 @@ public interface BillingOperations {
     BillingDtos.ChargeResponse consume(
             BillingDtos.ConsumeRequest request,
             String idempotencyKey);
+
+    BillingDtos.BalanceProjection recharge(
+            BillingDtos.RechargeRequest request,
+            String idempotencyKey);
 }

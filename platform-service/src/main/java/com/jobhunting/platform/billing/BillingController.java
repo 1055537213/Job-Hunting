@@ -42,4 +42,14 @@ public class BillingController {
         tokenVerifier.verify(internalToken);
         return ResponseEntity.ok(billingService.consume(request, idempotencyKey));
     }
+
+    @PostMapping("/recharge")
+    public ResponseEntity<BillingDtos.BalanceProjection> recharge(
+            @Valid @RequestBody BillingDtos.RechargeRequest request,
+            @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @RequestHeader("X-Trace-Id") String traceId,
+            @RequestHeader(name = "X-Internal-Service-Token", required = false) String internalToken) {
+        tokenVerifier.verify(internalToken);
+        return ResponseEntity.ok(billingService.recharge(request, idempotencyKey));
+    }
 }

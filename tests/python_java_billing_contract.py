@@ -44,6 +44,7 @@ def main() -> None:
 
     try:
         store.initialize()
+        store.configure_platform_billing(client)
         account = store.create_account(
             email=f"python-java-contract-{suffix}@example.com",
             password_hash="contract-test-only-password-hash",
