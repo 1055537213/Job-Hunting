@@ -35,6 +35,7 @@ from .llm import LLMRequestError
 from .model_resilience import ModelCircuitOpenError, is_transient_model_error
 from .models import BackgroundTaskRecord
 from .project_archive import ProjectArchiveError
+from .platform_billing import PlatformBillingUnavailableError
 from .rag import RAGProviderRequestError
 from .resume_document import ResumeDocumentError
 from .sqlalchemy_store import SQLAlchemyStore
@@ -353,6 +354,8 @@ def background_task_error_policy(error: Exception, task_type: str) -> tuple[str,
 
     if isinstance(error, InsufficientBalanceError):
         return INSUFFICIENT_BALANCE_MESSAGE, False
+    if isinstance(error, PlatformBillingUnavailableError):
+        return "平台账务服务暂时不可用，任务将在稍后自动重试。", True
     if isinstance(error, FileInfectedError):
         return "文件未通过安全扫描，任务已停止。", False
     if isinstance(error, FileScannerUnavailableError):

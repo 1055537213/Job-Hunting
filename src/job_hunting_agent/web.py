@@ -91,6 +91,7 @@ from .config import (
     load_object_storage_settings,
     load_observability_settings,
     load_project_visual_analysis_settings,
+    load_platform_billing_settings,
     load_rerank_settings,
     load_task_queue_settings,
     load_web_security_settings,
@@ -104,6 +105,7 @@ from .config import (
     masked_llm_settings,
     masked_object_storage_settings,
     masked_project_visual_analysis_settings,
+    masked_platform_billing_settings,
     masked_rerank_settings,
     masked_task_queue_settings,
     masked_web_security_settings,
@@ -137,6 +139,7 @@ from .project_evidence import (
     ProjectEvidenceError,
     ProjectManifestItem,
 )
+from .platform_billing import PlatformBillingUnavailableError
 from .rag import RAGProviderRequestError
 from .rate_limiting import RateLimiter
 from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
@@ -478,6 +481,17 @@ def create_web_app(
             status_code=503,
             content={"detail": "并发保护服务暂时不可用，请稍后重试。"},
             headers={"Retry-After": "1"},
+        )
+
+    @web_app.exception_handler(PlatformBillingUnavailableError)
+    async def platform_billing_handler(
+        request: Request,
+        error: PlatformBillingUnavailableError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": str(error)},
+            headers={"Retry-After": "2"},
         )
 
     @web_app.exception_handler(ModelCircuitOpenError)
@@ -1013,6 +1027,12 @@ def create_web_app(
         except ValueError as error:
             billing_config = {"configured": False, "error": str(error)}
         try:
+            platform_billing_config = masked_platform_billing_settings(
+                load_platform_billing_settings(env_path)
+            )
+        except ValueError as error:
+            platform_billing_config = {"configured": False, "error": str(error)}
+        try:
             business_cache_config = masked_business_cache_settings(
                 load_business_cache_settings(env_path)
             )
@@ -1069,6 +1089,9 @@ def create_web_app(
                     ),
                 },
                 "billing": {"configured": bool(billing_config.get("configured"))},
+                "platform_billing": {
+                    "configured": bool(platform_billing_config.get("enabled")),
+                },
                 "business_cache": {
                     "configured": bool(business_cache_config.get("enabled")),
                     "backend": business_cache_config.get("backend"),
@@ -1098,6 +1121,7 @@ def create_web_app(
             "web_security": web_security_config,
             "account_lifecycle": account_lifecycle_config,
             "billing": billing_config,
+            "platform_billing": platform_billing_config,
             "business_cache": business_cache_config,
             "concurrency": concurrency_config,
             "file_scanning": file_scanning_config,

@@ -31,6 +31,7 @@ from .config import (
     load_file_scanning_settings,
     load_object_storage_settings,
     load_project_visual_analysis_settings,
+    load_platform_billing_settings,
     load_semantic_matching_enabled,
     load_task_queue_settings,
     require_postgresql_database_url,
@@ -81,6 +82,7 @@ from .models import (
     TailoredResumeResult,
 )
 from .object_storage import ObjectNotFoundError, ObjectStorage, S3ObjectStorage
+from .platform_billing import PlatformBillingClient
 from .pgvector_rag import PgVectorKnowledgeBase
 from .pgvector_visual import PgVectorVisualKnowledgeBase
 from .project_analyzer import analyze_project, build_project_experience_card
@@ -152,6 +154,12 @@ class JobHuntingApp:
         )
         self.store = SQLAlchemyStore(resolved_database_url)
         self.store.configure_billing(load_billing_settings(self.env_path))
+        platform_billing_settings = load_platform_billing_settings(self.env_path)
+        self.store.configure_platform_billing(
+            PlatformBillingClient(platform_billing_settings)
+            if platform_billing_settings.enabled
+            else None
+        )
         self.business_cache_settings = load_business_cache_settings(self.env_path)
         self.business_cache = business_cache or build_business_cache(
             self.business_cache_settings

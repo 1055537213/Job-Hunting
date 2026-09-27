@@ -13,3 +13,23 @@ services:
     environment:
       SERVER_PORT: "8081"
       APP_VERSION: "0.1.0"
+      PLATFORM_BILLING_ENABLED: "${JOB_AGENT_JAVA_BILLING_ENABLED:-false}"
+      PLATFORM_INTERNAL_TOKEN: "${JOB_AGENT_JAVA_BILLING_INTERNAL_TOKEN:-}"
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
+      SPRING_DATASOURCE_USERNAME: "${JOB_AGENT_POSTGRES_USER:-job_agent}"
+      SPRING_DATASOURCE_PASSWORD: "${JOB_AGENT_POSTGRES_PASSWORD:-}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+  web:
+    environment:
+      JOB_AGENT_JAVA_BILLING_BASE_URL: "http://platform-service:8081"
+    depends_on:
+      platform-service:
+        condition: service_started
+  worker:
+    environment:
+      JOB_AGENT_JAVA_BILLING_BASE_URL: "http://platform-service:8081"
+    depends_on:
+      platform-service:
+        condition: service_started

@@ -284,6 +284,16 @@ class BillingSettings:
 
 
 @dataclass(frozen=True)
+class PlatformBillingSettings:
+    """Java 平台账务服务的渐进式迁移开关。"""
+
+    enabled: bool = False
+    base_url: str = ""
+    internal_token: str = ""
+    timeout_seconds: int = 5
+
+
+@dataclass(frozen=True)
 class BootstrapAdminSettings:
     """首次启动时创建管理员账号的一次性配置。
 
@@ -1588,6 +1598,52 @@ def masked_billing_settings(settings: BillingSettings) -> dict[str, object]:
         "demo_recharge_enabled": settings.demo_recharge_enabled,
         "demo_recharge_max_amount_yuan": settings.demo_recharge_max_amount_yuan,
         "demo_recharge_max_total_yuan": settings.demo_recharge_max_total_yuan,
+    }
+
+
+def load_platform_billing_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> PlatformBillingSettings:
+    """读取 Java 账务迁移配置；默认关闭，避免误切生产写入路径。"""
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(key: str, default: str = "") -> str:
+        return str(environment.get(key) or file_values.get(key) or default).strip()
+
+    enabled = parse_bool(get("JOB_AGENT_JAVA_BILLING_ENABLED", "false"))
+    settings = PlatformBillingSettings(
+        enabled=enabled,
+        base_url=get("JOB_AGENT_JAVA_BILLING_BASE_URL"),
+        internal_token=get("JOB_AGENT_JAVA_BILLING_INTERNAL_TOKEN"),
+        timeout_seconds=parse_positive_int(
+            get("JOB_AGENT_JAVA_BILLING_TIMEOUT_SECONDS", "5"),
+            "JOB_AGENT_JAVA_BILLING_TIMEOUT_SECONDS",
+        ),
+    )
+    if settings.enabled and not settings.base_url:
+        raise ValueError(
+            "启用 Java 账务迁移前必须配置 JOB_AGENT_JAVA_BILLING_BASE_URL。"
+        )
+    if settings.enabled and not settings.internal_token:
+        raise ValueError(
+            "启用 Java 账务迁移前必须配置 JOB_AGENT_JAVA_BILLING_INTERNAL_TOKEN。"
+        )
+    return settings
+
+
+def masked_platform_billing_settings(
+    settings: PlatformBillingSettings,
+) -> dict[str, object]:
+    """返回不泄露内部 Token 的 Java 账务迁移状态。"""
+
+    return {
+        "enabled": settings.enabled,
+        "base_url": settings.base_url,
+        "timeout_seconds": settings.timeout_seconds,
+        "internal_token_configured": bool(settings.internal_token),
     }
 
 

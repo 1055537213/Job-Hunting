@@ -62,6 +62,7 @@ from .models import (
     sanitize_preference_weights,
 )
 from .profile_mutation import apply_candidate_profile_patch
+from .platform_billing import PlatformBillingClient, PlatformBillingError
 from .skill_normalization import normalize_skill_mapping
 
 RESUME_ARTIFACT_STATUSES = {"ready", "processing", "failed", "scanning", "quarantined"}
@@ -134,6 +135,7 @@ class RepositoryStore:
         """初始化默认计费参数。"""
 
         self._billing_settings = BillingSettings()
+        self._platform_billing_client: PlatformBillingClient | None = None
 
     def connect(self) -> RepositoryConnection:
         """返回一次短生命周期事务连接。"""
@@ -154,6 +156,14 @@ class RepositoryStore:
         """返回当前计费参数。"""
 
         return self._billing_settings
+
+    def configure_platform_billing(
+        self,
+        client: PlatformBillingClient | None,
+    ) -> None:
+        """配置 Java 账务客户端；None 表示继续使用 Python 本地扣费。"""
+
+        self._platform_billing_client = client
     # 账号、Session、会话和用量流水
     # ------------------------------------------------------------------
 
@@ -1200,12 +1210,16 @@ class RepositoryStore:
     def assert_account_can_spend(self, account_id: int) -> None:
         """确认账号仍可进行模型调用；余额停用或手动禁用时抛出错误。"""
 
-        self.get_account(account_id)
+        account = self.get_account(account_id)
+        if account.status != "active":
+            raise ValueError("账号已停用，请联系管理员。")
+        if self._platform_billing_client is not None:
+            projection = self._platform_billing_client.get_balance(account_id)
+            if projection.balance_micro_yuan <= 0:
+                raise InsufficientBalanceError()
+            return
         summary = self.get_account_balance_summary(account_id)
         if summary.state == "suspended":
-            account = self.get_account(account_id)
-            if account.status != "active":
-                raise ValueError("账号已停用，请联系管理员。")
             raise InsufficientBalanceError()
 
     def get_account_balance_summary(self, account_id: int) -> AccountBalanceSummary:
@@ -2325,6 +2339,7 @@ class RepositoryStore:
         self.get_account(event.account_id)
         if event.candidate_id is not None:
             self.get_candidate_profile(event.candidate_id, account_id=event.account_id)
+        remote_charge: tuple[int, str, str, int, str] | None = None
         with self.connect() as conn:
             cursor = conn.execute(
                 """
@@ -2405,19 +2420,49 @@ class RepositoryStore:
                 and row["usage_source"] == "provider"
                 and row["status"] == "succeeded"
             ):
-                self._record_balance_consumption(
-                    conn,
-                    account_id=int(row["account_id"]),
-                    call_id=str(row["call_id"]),
-                    operation=str(row["operation"]),
-                    total_tokens=int(row["total_tokens"]),
-                    created_at=str(row["created_at"]),
-                )
+                if self._platform_billing_client is None:
+                    self._record_balance_consumption(
+                        conn,
+                        account_id=int(row["account_id"]),
+                        call_id=str(row["call_id"]),
+                        operation=str(row["operation"]),
+                        total_tokens=int(row["total_tokens"]),
+                        created_at=str(row["created_at"]),
+                    )
+                else:
+                    remote_charge = (
+                        int(row["account_id"]),
+                        str(row["call_id"]),
+                        str(row["operation"]),
+                        int(row["total_tokens"]),
+                        str(row["root_request_id"]),
+                    )
             self._prune_usage_events_for_account(
                 conn,
                 event.account_id,
                 max_records=ADMIN_LEDGER_MAX_RECORDS,
             )
+        if remote_charge is not None:
+            account_id, call_id, operation, total_tokens, root_request_id = remote_charge
+            cost_micro_yuan = round(
+                total_tokens * self.billing_settings().price_per_million_tokens_yuan
+            )
+            if cost_micro_yuan > 0:
+                try:
+                    self._platform_billing_client.consume(
+                        account_id=account_id,
+                        amount_micro_yuan=cost_micro_yuan,
+                        token_count=total_tokens,
+                        source_reference=call_id,
+                        description=f"{operation} 扣费",
+                        trace_id=root_request_id,
+                    )
+                except PlatformBillingError as error:
+                    if error.code == "INSUFFICIENT_BALANCE":
+                        raise InsufficientBalanceError() from error
+                    if error.code == "IDEMPOTENCY_CONFLICT":
+                        raise IdempotencyConflictError(str(error)) from error
+                    raise
         if row is None:  # pragma: no cover - 仅在数据库异常时触发
             raise RuntimeError(f"Usage event was not persisted: {event.call_id}")
         return usage_event_from_row(row)

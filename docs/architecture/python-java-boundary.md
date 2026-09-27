@@ -28,8 +28,9 @@
 - `/internal/v1/health` 和 `/internal/v1/version`：服务探针。
 - `billing-internal.openapi.yaml`：余额、消费、充值、退款内部契约。
 - Java 账务垂直链路：余额查询和模型调用扣费，默认关闭且未接入生产流量。
+- Python `RepositoryStore` 已支持通过 `JOB_AGENT_JAVA_BILLING_ENABLED` 切换到 Java 扣费；同一 `call_id` 作为 Java 的幂等键，失败后可安全重试。
 - 当前 Python 账务实现保持唯一写入权，避免双写和重复扣费。
 
 ## 下一阶段
 
-完成 PostgreSQL Testcontainers 集成测试后，再让 Python `model_gateway` 通过内部接口调用 Java 的扣费接口，最后迁移充值、退款和管理员补款。
+下一阶段先在 CI 和预发布环境验证 Python 到 Java 的扣费联调，再迁移充值、退款和管理员补款；生产环境暂不打开 `JOB_AGENT_JAVA_BILLING_ENABLED`。
