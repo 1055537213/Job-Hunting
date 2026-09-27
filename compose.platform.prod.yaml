@@ -1,0 +1,33 @@
+# Independent, internal-only Java standby service. This Compose project does not
+# manage the Python application or the pre-existing application on the host.
+name: job-hunting-platform-production
+
+services:
+  platform-service:
+    image: "${JOB_AGENT_PLATFORM_IMAGE:?set JOB_AGENT_PLATFORM_IMAGE to a verified immutable image}"
+    restart: unless-stopped
+    environment:
+      SERVER_PORT: "8081"
+      PLATFORM_BILLING_ENABLED: "${JOB_AGENT_JAVA_BILLING_ENABLED:-false}"
+      PLATFORM_INTERNAL_TOKEN: "${JOB_AGENT_JAVA_BILLING_INTERNAL_TOKEN:-}"
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://postgres:5432/${JOB_AGENT_POSTGRES_DB:-job_agent}"
+      SPRING_DATASOURCE_USERNAME: "${JOB_AGENT_POSTGRES_USER:-job_agent}"
+      SPRING_DATASOURCE_PASSWORD: "${JOB_AGENT_POSTGRES_PASSWORD:-}"
+    expose:
+      - "8081"
+    networks:
+      job-agent:
+        aliases:
+          - platform-service
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+networks:
+  job-agent:
+    external: true
+    name: job-hunting-agent-production_default

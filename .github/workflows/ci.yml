@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, java-platform-migration]
   pull_request:
 
 permissions:
@@ -285,3 +285,122 @@ jobs:
             echo "Container vulnerability gate failed. Review the security-reports artifact."
             exit 1
           fi
+
+  publish-platform:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/java-platform-migration'
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TRIVY_IMAGE: aquasec/trivy@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
+    steps:
+      - name: Check out the verified Java branch commit
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve immutable Java image reference
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$GITHUB_SHA"
+          [[ "$(git rev-parse HEAD)" == "$HEAD_SHA" ]]
+          IMAGE_REF="ghcr.io/${GITHUB_REPOSITORY,,}-platform:sha-${HEAD_SHA:0:12}"
+          echo "ref=$IMAGE_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Refuse to overwrite an existing version tag
+        id: existing
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker manifest inspect "$IMAGE_REF" >/dev/null 2>&1; then
+            docker pull "$IMAGE_REF"
+            [[ "$(docker image inspect "$IMAGE_REF" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" == "$GITHUB_SHA" ]]
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Java platform image
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull --no-cache \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --tag "$IMAGE_REF" platform-service
+
+      - name: Scan Java image and generate SBOM
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/trivy-cache" platform-release-reports
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
+            -v "$PWD/platform-release-reports:/reports" \
+            "$TRIVY_IMAGE" image --quiet --scanners vuln --severity HIGH,CRITICAL \
+            --format json --output /reports/vulnerabilities.json "$IMAGE_REF"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
+            -v "$PWD/platform-release-reports:/reports" \
+            "$TRIVY_IMAGE" image --quiet --format cyclonedx \
+            --output /reports/sbom.cdx.json "$IMAGE_REF"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
+            "$TRIVY_IMAGE" image --quiet --scanners vuln --ignore-unfixed \
+            --severity HIGH,CRITICAL --exit-code 1 "$IMAGE_REF"
+
+      - name: Push immutable Java platform image
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        shell: bash
+        run: docker push "$IMAGE_REF"
+
+      - name: Record published digest
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIGEST="$(docker buildx imagetools inspect "$IMAGE_REF" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo "image=$IMAGE_REF"
+            echo "digest=$DIGEST"
+            echo "commit=$GITHUB_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Java security reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: platform-image-security-${{ github.sha }}
+          path: platform-release-reports/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Log out of GitHub Container Registry
+        if: always()
+        shell: bash
+        run: docker logout ghcr.io >/dev/null 2>&1 || true

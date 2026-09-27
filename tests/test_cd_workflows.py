@@ -452,3 +452,48 @@ def test_production_guide_documents_cd_setup_and_secret_boundaries():
         "不会上传生产 `.env`",
     ):
         assert required in guide
+
+
+def test_java_platform_release_is_internal_only_and_has_rollback_guardrails():
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "JOB_AGENT_JAVA_BILLING_ENABLED": "false",
+            "JOB_AGENT_JAVA_BILLING_INTERNAL_TOKEN": "ci-platform-token",
+            "JOB_AGENT_PLATFORM_IMAGE": "ghcr.io/example/job-hunting-platform:sha-0123456789ab",
+            "JOB_AGENT_POSTGRES_PASSWORD": "test-postgres-password",
+        }
+    )
+    completed = subprocess.run(
+        ["docker", "compose", "-f", "compose.platform.prod.yaml", "config", "--format", "json"],
+        cwd=ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    config = json.loads(completed.stdout)
+    platform = config["services"]["platform-service"]
+    assert "ports" not in platform
+    assert platform["environment"]["PLATFORM_BILLING_ENABLED"] == "false"
+    assert platform["networks"]["job-agent"]["aliases"] == ["platform-service"]
+
+    script = (ROOT / "scripts" / "deploy_platform_service.sh").read_text(encoding="utf-8")
+    for required in (
+        "platform-releases",
+        "platform-state",
+        "job-hunting-agent-production_default",
+        "wait_healthy",
+        "Previous Java platform release restored.",
+        "--no-deps --pull never platform-service",
+    ):
+        assert required in script
+    assert "down -v" not in script
+
+    dockerfile = (ROOT / "platform-service" / "Dockerfile").read_text(encoding="utf-8")
+    assert "HEALTHCHECK" in dockerfile
+
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "publish-platform:" in ci
+    assert "refs/heads/java-platform-migration" in ci
+    assert "-platform:sha-" in ci
