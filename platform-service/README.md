@@ -21,6 +21,18 @@ mvn -B test
 mvn -B spring-boot:run
 ```
 
+Python+Java 分支当前只做本地联调，不会部署到现有生产服务器。仓库根目录执行：
+
+```powershell
+.\scripts\validate_python_java_local.ps1
+```
+
+该命令会创建临时的 `job_agent_java_local_*` PostgreSQL schema，执行 Alembic
+迁移，使用 Maven 启动 Java 服务，运行 Python 账务契约测试，最后停止 Java
+进程并删除临时 schema，不会写入网页运行时使用的 `public` schema。默认 Java
+端口为 `18081`；端口被占用时使用 `-Port 18082`。如需连接其他本地测试库，
+设置 `JOB_AGENT_TEST_DATABASE_URL` 环境变量即可。
+
 真实 PostgreSQL 集成测试需要本机或 CI 提供可被 Testcontainers 访问的 Docker 环境：
 
 ```bash

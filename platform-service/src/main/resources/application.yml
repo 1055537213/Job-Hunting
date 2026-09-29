@@ -15,6 +15,8 @@ spring:
 server:
   port: ${SERVER_PORT:8081}
   shutdown: graceful
+  tomcat:
+    protocol: ${SERVER_TOMCAT_PROTOCOL:org.apache.coyote.http11.Http11NioProtocol}
 
 app:
   version: ${APP_VERSION:0.1.0}
