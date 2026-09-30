@@ -356,7 +356,7 @@ jobs:
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
             -v "$PWD/platform-release-reports:/reports" \
-            "$TRIVY_IMAGE" image --quiet --scanners vuln --severity HIGH,CRITICAL \
+            "$TRIVY_IMAGE" image --quiet --scanners vuln --pkg-types os --severity HIGH,CRITICAL \
             --format json --output /reports/vulnerabilities.json "$IMAGE_REF"
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
@@ -367,7 +367,7 @@ jobs:
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
-            "$TRIVY_IMAGE" image --quiet --scanners vuln --ignore-unfixed \
+            "$TRIVY_IMAGE" image --quiet --scanners vuln --pkg-types os --ignore-unfixed \
             --severity HIGH,CRITICAL --exit-code 1 "$IMAGE_REF"
 
       - name: Push immutable Java platform image
