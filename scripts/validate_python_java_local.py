@@ -312,6 +312,7 @@ def main() -> int:
             {
                 "SERVER_PORT": str(args.port),
                 "PLATFORM_BILLING_ENABLED": "true",
+                "PLATFORM_AUTH_ENABLED": "true",
                 "PLATFORM_INTERNAL_TOKEN": internal_token,
                 "SPRING_DATASOURCE_URL": jdbc_url,
                 "SPRING_DATASOURCE_USERNAME": jdbc_username,
@@ -366,6 +367,9 @@ def main() -> int:
                 "JOB_AGENT_JAVA_BILLING_ENABLED": "true",
                 "JOB_AGENT_JAVA_BILLING_BASE_URL": service_url,
                 "JOB_AGENT_JAVA_BILLING_INTERNAL_TOKEN": internal_token,
+                "JOB_AGENT_JAVA_AUTH_ENABLED": "true",
+                "JOB_AGENT_JAVA_AUTH_BASE_URL": service_url,
+                "JOB_AGENT_JAVA_AUTH_INTERNAL_TOKEN": internal_token,
                 "JOB_AGENT_ENVIRONMENT": "test",
                 "JOB_AGENT_OBJECT_STORAGE_BACKEND": "local",
                 "JOB_AGENT_CSRF_ENABLED": "false",

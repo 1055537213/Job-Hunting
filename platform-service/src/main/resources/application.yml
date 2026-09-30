@@ -23,6 +23,8 @@ app:
 
 platform:
   internal-token: ${PLATFORM_INTERNAL_TOKEN:}
+  auth:
+    enabled: ${PLATFORM_AUTH_ENABLED:false}
   billing:
     enabled: ${PLATFORM_BILLING_ENABLED:false}
     price-per-million-tokens-yuan: ${PLATFORM_PRICE_PER_MILLION_TOKENS_YUAN:25.0}

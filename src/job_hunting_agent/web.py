@@ -139,6 +139,7 @@ from .project_evidence import (
     ProjectEvidenceError,
     ProjectManifestItem,
 )
+from .platform_auth import PlatformAuthError, PlatformAuthUnavailableError
 from .platform_billing import PlatformBillingUnavailableError
 from .rag import RAGProviderRequestError
 from .rate_limiting import RateLimiter
@@ -755,10 +756,33 @@ def create_web_app(
     def login(payload: LoginPayload, response: Response, request: Request) -> dict[str, object]:
         """验证密码并签发服务端 Session Cookie。"""
 
-        record = backend.store.get_account_by_email(payload.email.strip().lower())
-        if record is None or not verify_password(record[1], payload.password):
-            raise HTTPException(status_code=401, detail="邮箱或密码错误。")
-        account, _ = record
+        normalized_email = payload.email.strip().lower()
+        if backend.platform_auth_client is not None:
+            try:
+                verified = backend.platform_auth_client.verify_credentials(
+                    email=normalized_email,
+                    password=payload.password,
+                    email_verification_required=account_lifecycle_settings.email_verification_required,
+                    trace_id=request.headers.get("x-trace-id"),
+                )
+            except PlatformAuthUnavailableError as error:
+                raise HTTPException(status_code=503, detail=str(error)) from error
+            except PlatformAuthError as error:
+                raise HTTPException(
+                    status_code=error.status_code or 401,
+                    detail=str(error),
+                ) from error
+            try:
+                account = backend.store.get_account(verified.account_id)
+            except KeyError as error:
+                raise HTTPException(status_code=401, detail="邮箱或密码错误。") from error
+            if account.email != normalized_email:
+                raise HTTPException(status_code=401, detail="邮箱或密码错误。")
+        else:
+            record = backend.store.get_account_by_email(normalized_email)
+            if record is None or not verify_password(record[1], payload.password):
+                raise HTTPException(status_code=401, detail="邮箱或密码错误。")
+            account, _ = record
         if account.status != "active":
             raise HTTPException(status_code=403, detail="账号已被禁用。")
         if (

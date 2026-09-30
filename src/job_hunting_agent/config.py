@@ -294,6 +294,16 @@ class PlatformBillingSettings:
 
 
 @dataclass(frozen=True)
+class PlatformAuthSettings:
+    """Java 平台认证服务的渐进式迁移开关。"""
+
+    enabled: bool = False
+    base_url: str = ""
+    internal_token: str = ""
+    timeout_seconds: int = 5
+
+
+@dataclass(frozen=True)
 class BootstrapAdminSettings:
     """首次启动时创建管理员账号的一次性配置。
 
@@ -1631,6 +1641,35 @@ def load_platform_billing_settings(
         raise ValueError(
             "启用 Java 账务迁移前必须配置 JOB_AGENT_JAVA_BILLING_INTERNAL_TOKEN。"
         )
+    return settings
+
+
+def load_platform_auth_settings(
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> PlatformAuthSettings:
+    """读取 Java 认证迁移配置；默认关闭，避免误切现有登录路径。"""
+
+    file_values = load_dotenv_values(env_path)
+    environment = os.environ if environ is None else environ
+
+    def get(key: str, default: str = "") -> str:
+        return str(environment.get(key) or file_values.get(key) or default).strip()
+
+    enabled = parse_bool(get("JOB_AGENT_JAVA_AUTH_ENABLED", "false"))
+    settings = PlatformAuthSettings(
+        enabled=enabled,
+        base_url=get("JOB_AGENT_JAVA_AUTH_BASE_URL"),
+        internal_token=get("JOB_AGENT_JAVA_AUTH_INTERNAL_TOKEN"),
+        timeout_seconds=parse_positive_int(
+            get("JOB_AGENT_JAVA_AUTH_TIMEOUT_SECONDS", "5"),
+            "JOB_AGENT_JAVA_AUTH_TIMEOUT_SECONDS",
+        ),
+    )
+    if settings.enabled and not settings.base_url:
+        raise ValueError("启用 Java 认证迁移前必须配置 JOB_AGENT_JAVA_AUTH_BASE_URL。")
+    if settings.enabled and not settings.internal_token:
+        raise ValueError("启用 Java 认证迁移前必须配置 JOB_AGENT_JAVA_AUTH_INTERNAL_TOKEN。")
     return settings
 
 

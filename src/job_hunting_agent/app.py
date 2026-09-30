@@ -32,6 +32,7 @@ from .config import (
     load_object_storage_settings,
     load_project_visual_analysis_settings,
     load_platform_billing_settings,
+    load_platform_auth_settings,
     load_semantic_matching_enabled,
     load_task_queue_settings,
     require_postgresql_database_url,
@@ -83,6 +84,7 @@ from .models import (
 )
 from .object_storage import ObjectNotFoundError, ObjectStorage, S3ObjectStorage
 from .platform_billing import PlatformBillingClient
+from .platform_auth import PlatformAuthClient
 from .pgvector_rag import PgVectorKnowledgeBase
 from .pgvector_visual import PgVectorVisualKnowledgeBase
 from .project_analyzer import analyze_project, build_project_experience_card
@@ -158,6 +160,12 @@ class JobHuntingApp:
         self.store.configure_platform_billing(
             PlatformBillingClient(platform_billing_settings)
             if platform_billing_settings.enabled
+            else None
+        )
+        platform_auth_settings = load_platform_auth_settings(self.env_path)
+        self.platform_auth_client = (
+            PlatformAuthClient(platform_auth_settings)
+            if platform_auth_settings.enabled
             else None
         )
         self.business_cache_settings = load_business_cache_settings(self.env_path)

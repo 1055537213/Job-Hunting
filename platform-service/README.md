@@ -1,8 +1,8 @@
 # Job Hunting Platform Service
 
-这是求职助手的 Java 平台服务，当前实现账务垂直链路：余额查询、模拟充值和模型调用扣费。
+这是求职助手的 Java 平台服务，当前实现账务垂直链路，以及可选的账号凭据校验接口。
 
-默认配置不会连接数据库，账务模块必须显式设置 `PLATFORM_BILLING_ENABLED=true` 后才会启用 PostgreSQL。当前版本不会接管生产流量，账务迁移完成前，现有 Python 服务仍是生产事实源。
+默认配置不会连接数据库，账务或认证模块必须显式设置 `PLATFORM_BILLING_ENABLED=true` 或 `PLATFORM_AUTH_ENABLED=true` 后才会启用 PostgreSQL。当前版本不会接管生产流量，迁移完成前，现有 Python 服务仍是账号和账务事实源。
 
 Python 侧通过 `JOB_AGENT_JAVA_BILLING_ENABLED=true` 开启调用 Java 的扣费路径；这两个开关必须同时打开，并且两边使用同一个 PostgreSQL、内部 Token 和价格配置。开发环境可使用：
 
@@ -60,6 +60,29 @@ SPRING_DATASOURCE_URL=jdbc:postgresql://127.0.0.1:5432/job_agent
 SPRING_DATASOURCE_USERNAME=job_agent
 SPRING_DATASOURCE_PASSWORD=your-password
 ```
+
+启用本地凭据校验时还需要配置：
+
+```dotenv
+PLATFORM_AUTH_ENABLED=true
+PLATFORM_INTERNAL_TOKEN=local-platform-secret
+SPRING_DATASOURCE_URL=jdbc:postgresql://127.0.0.1:5432/job_agent
+SPRING_DATASOURCE_USERNAME=job_agent
+SPRING_DATASOURCE_PASSWORD=your-password
+```
+
+认证接口只供 Python 内部服务调用：
+
+```text
+POST /internal/v1/auth/verify-credentials
+X-Internal-Service-Token: local-platform-secret
+X-Trace-Id: local-trace-id
+```
+
+它返回已验证的 `account_id`；错误码包括 `INVALID_CREDENTIALS`、
+`ACCOUNT_DISABLED` 和 `EMAIL_UNVERIFIED`。请求体中的密码不会写入 Java 日志，
+Java 兼容 Python 当前使用的 Argon2id 和 scrypt 哈希格式。Python 的登录迁移由
+`JOB_AGENT_JAVA_AUTH_ENABLED=true` 控制，认证服务不可用时返回 503，不会静默回退。
 
 充值和扣费接口都要求 `Idempotency-Key` 与请求中的 `source_reference` 相同。Java 在充值时同一事务写入 `recharge_orders`、`account_balance_ledger` 和 `payment_events`，重复充值只返回原账务结果，不会重复到账。余额不足时返回 `INSUFFICIENT_BALANCE` 和 `余额不足，请先充值后重试`。余额行使用 PostgreSQL 行锁，账务流水使用唯一约束保证重试不会重复写入。Python 在远端扣费失败时保留 `usage_events`，后续使用同一个 `call_id` 重试，不会重复扣费。
 

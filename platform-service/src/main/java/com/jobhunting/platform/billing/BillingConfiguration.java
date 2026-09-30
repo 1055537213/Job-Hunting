@@ -3,13 +3,13 @@ package com.jobhunting.platform.billing;
 import javax.sql.DataSource;
 
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.jdbc.DataSourceBuilder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 @Configuration
-@ConditionalOnProperty(prefix = "platform.billing", name = "enabled", havingValue = "true")
+@ConditionalOnExpression("${platform.billing.enabled:false} or ${platform.auth.enabled:false}")
 public class BillingConfiguration {
 
     @Bean
