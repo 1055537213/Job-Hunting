@@ -1,0 +1,149 @@
+openapi: 3.1.0
+info:
+  title: Job Hunting Authentication Internal Contract
+  version: 0.1.0
+  description: >-
+    Internal contract used by the Python Web service during the gradual
+    migration of account registration and credential verification to Java.
+    Passwords are accepted only in memory and are never returned or logged.
+servers:
+  - url: http://platform-service:8081
+paths:
+  /internal/v1/auth/register:
+    post:
+      operationId: registerAccount
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistrationRequest'
+      responses:
+        '200':
+          description: Account and its zero-balance summary were created atomically
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResult'
+        '409':
+          $ref: '#/components/responses/AccountAlreadyExists'
+        '401':
+          $ref: '#/components/responses/InternalUnauthorized'
+  /internal/v1/auth/verify-credentials:
+    post:
+      operationId: verifyCredentials
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CredentialRequest'
+      responses:
+        '200':
+          description: Existing credentials and account state were verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResult'
+        '401':
+          $ref: '#/components/responses/InternalUnauthorized'
+        '403':
+          description: Account is disabled or email verification is required
+        '401':
+          description: Internal token or credentials are invalid
+components:
+  parameters:
+    TraceId:
+      name: X-Trace-Id
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+  schemas:
+    CredentialRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 8
+          maxLength: 1024
+        email_verification_required:
+          type: boolean
+          default: false
+    RegistrationRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 8
+          maxLength: 1024
+        display_name:
+          type: string
+          maxLength: 128
+        email_verified:
+          type: boolean
+          default: true
+        consents:
+          type: array
+          items:
+            $ref: '#/components/schemas/Consent'
+    Consent:
+      type: object
+      required: [document_type, version]
+      properties:
+        document_type:
+          type: string
+          enum: [terms, privacy]
+        version:
+          type: string
+          maxLength: 64
+        ip_address:
+          type: string
+          maxLength: 64
+        user_agent:
+          type: string
+          maxLength: 512
+    AccountResult:
+      type: object
+      required: [account_id]
+      properties:
+        account_id:
+          type: integer
+          format: int64
+          minimum: 1
+    Error:
+      type: object
+      required: [code, message, trace_id]
+      properties:
+        code: {type: string}
+        message: {type: string}
+        trace_id: {type: string}
+  responses:
+    AccountAlreadyExists:
+      description: Email is already registered
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalUnauthorized:
+      description: Internal service token is missing or invalid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'

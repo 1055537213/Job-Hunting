@@ -154,6 +154,7 @@ def run_web_billing_flow(
     """Exercise the real Web routes and the production Python usage path."""
 
     sys.path.insert(0, str(ROOT / "src"))
+    from job_hunting_agent.auth import verify_password  # noqa: PLC0415
     from job_hunting_agent.config import BillingSettings, PlatformBillingSettings  # noqa: PLC0415
     from job_hunting_agent.models import UsageEventRecord  # noqa: PLC0415
     from job_hunting_agent.platform_billing import PlatformBillingClient  # noqa: PLC0415
@@ -178,6 +179,16 @@ def run_web_billing_flow(
         if registered.status_code != 200:
             raise RuntimeError(f"Web registration failed: {registered.status_code} {registered.text[:300]}")
         account_id = int(registered.json()["account"]["id"])
+
+        registration_store = SQLAlchemyStore(database_url)
+        try:
+            _, stored_password_hash = registration_store.get_account_with_password(account_id)
+            if not verify_password(stored_password_hash, password):
+                raise AssertionError("Java registration produced a password hash Python cannot verify.")
+            if registration_store.get_account_balance_summary(account_id).balance_micro_yuan != 0:
+                raise AssertionError("New Java-registered accounts must start with zero balance.")
+        finally:
+            registration_store.close()
 
         logged_in = client.post("/api/auth/login", json={"email": email, "password": password})
         if logged_in.status_code != 200:

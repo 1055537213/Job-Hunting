@@ -28,6 +28,7 @@ platform:
   billing:
     enabled: ${PLATFORM_BILLING_ENABLED:false}
     price-per-million-tokens-yuan: ${PLATFORM_PRICE_PER_MILLION_TOKENS_YUAN:25.0}
+    low-balance-threshold-micro-yuan: ${PLATFORM_LOW_BALANCE_THRESHOLD_MICRO_YUAN:10000000}
 
 management:
   endpoints:

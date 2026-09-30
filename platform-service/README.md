@@ -71,7 +71,8 @@ SPRING_DATASOURCE_USERNAME=job_agent
 SPRING_DATASOURCE_PASSWORD=your-password
 ```
 
-认证接口只供 Python 内部服务调用：
+认证接口只供 Python 内部服务调用；完整请求/响应约束见
+`src/main/resources/auth-internal.openapi.yaml`：
 
 ```text
 POST /internal/v1/auth/verify-credentials
@@ -83,6 +84,10 @@ X-Trace-Id: local-trace-id
 `ACCOUNT_DISABLED` 和 `EMAIL_UNVERIFIED`。请求体中的密码不会写入 Java 日志，
 Java 兼容 Python 当前使用的 Argon2id 和 scrypt 哈希格式。Python 的登录迁移由
 `JOB_AGENT_JAVA_AUTH_ENABLED=true` 控制，认证服务不可用时返回 503，不会静默回退。
+
+注册迁移接口为 `POST /internal/v1/auth/register`。Java 在同一事务中写入账号、
+零余额摘要行和协议同意记录；Python 收到 `account_id` 后继续登记邮箱验证邮件
+Outbox。重复邮箱返回 `ACCOUNT_ALREADY_EXISTS`，事务失败不会留下半个账号。
 
 充值和扣费接口都要求 `Idempotency-Key` 与请求中的 `source_reference` 相同。Java 在充值时同一事务写入 `recharge_orders`、`account_balance_ledger` 和 `payment_events`，重复充值只返回原账务结果，不会重复到账。余额不足时返回 `INSUFFICIENT_BALANCE` 和 `余额不足，请先充值后重试`。余额行使用 PostgreSQL 行锁，账务流水使用唯一约束保证重试不会重复写入。Python 在远端扣费失败时保留 `usage_events`，后续使用同一个 `call_id` 重试，不会重复扣费。
 

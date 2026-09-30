@@ -85,6 +85,44 @@ def test_platform_auth_client_sends_internal_request_without_logging_password(mo
     ]
 
 
+def test_platform_auth_client_registers_account_and_passes_consents(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url, *, headers, json=None, timeout):
+        calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        return httpx.Response(200, json={"account_id": 43})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    client = PlatformAuthClient(
+        PlatformAuthSettings(True, "http://platform-service:8081", "secret", 5)
+    )
+
+    result = client.register_account(
+        email="user@example.com",
+        password="password-123",
+        display_name="Test User",
+        email_verified=False,
+        consents=[
+            {
+                "document_type": "terms",
+                "version": "2026-01",
+                "ip_address": "127.0.0.1",
+                "user_agent": "pytest",
+            }
+        ],
+        trace_id="trace-register-43",
+    )
+
+    assert result.account_id == 43
+    assert calls[0]["url"] == "http://platform-service:8081/internal/v1/auth/register"
+    assert calls[0]["headers"] == {
+        "X-Internal-Service-Token": "secret",
+        "X-Trace-Id": "trace-register-43",
+    }
+    assert calls[0]["json"]["consents"][0]["document_type"] == "terms"
+    assert calls[0]["json"]["password"] == "password-123"
+
+
 def test_platform_auth_client_maps_business_and_network_errors(monkeypatch):
     client = PlatformAuthClient(
         PlatformAuthSettings(True, "http://platform-service:8081", "secret", 5)
@@ -117,3 +155,18 @@ def test_platform_auth_client_maps_business_and_network_errors(monkeypatch):
             password="password-123",
             email_verification_required=False,
         )
+
+
+def test_platform_auth_client_maps_malformed_success_response_to_bad_gateway(monkeypatch):
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: httpx.Response(200, json={}))
+    client = PlatformAuthClient(
+        PlatformAuthSettings(True, "http://platform-service:8081", "secret", 5)
+    )
+
+    with pytest.raises(PlatformAuthError) as error:
+        client.verify_credentials(
+            email="user@example.com",
+            password="password-123",
+            email_verification_required=False,
+        )
+    assert error.value.status_code == 502

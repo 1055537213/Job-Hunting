@@ -644,23 +644,50 @@ def create_web_app(
                 ("terms", account_lifecycle_settings.terms_version),
                 ("privacy", account_lifecycle_settings.privacy_version),
             ]
-        try:
-            password_hash = hash_password(payload.password)
-            account = backend.store.create_account(
-                email=email,
-                password_hash=password_hash,
-                display_name=normalize_display_name(payload.display_name, payload.password),
-                role="user",
-                email_verified=not account_lifecycle_settings.email_verification_required,
-                consents=consent_rows,
-                consent_ip_address=request.client.host if request.client else None,
-                consent_user_agent=request.headers.get("user-agent"),
-            )
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-        # PostgreSQL 唯一约束异常统一映射为同一 409 响应。
-        except SQLAlchemyIntegrityError as error:
-            raise HTTPException(status_code=409, detail="该邮箱已经注册。") from error
+        if backend.platform_auth_client is not None:
+            try:
+                registration = backend.platform_auth_client.register_account(
+                    email=email,
+                    password=payload.password,
+                    display_name=normalize_display_name(payload.display_name, payload.password),
+                    email_verified=not account_lifecycle_settings.email_verification_required,
+                    consents=[
+                        {
+                            "document_type": document_type,
+                            "version": version,
+                            "ip_address": request.client.host if request.client else None,
+                            "user_agent": request.headers.get("user-agent"),
+                        }
+                        for document_type, version in consent_rows
+                    ],
+                    trace_id=request.headers.get("x-trace-id"),
+                )
+                account = backend.store.get_account(registration.account_id)
+            except PlatformAuthUnavailableError as error:
+                raise HTTPException(status_code=503, detail=str(error)) from error
+            except PlatformAuthError as error:
+                raise HTTPException(
+                    status_code=error.status_code or 400,
+                    detail=str(error),
+                ) from error
+        else:
+            try:
+                password_hash = hash_password(payload.password)
+                account = backend.store.create_account(
+                    email=email,
+                    password_hash=password_hash,
+                    display_name=normalize_display_name(payload.display_name, payload.password),
+                    role="user",
+                    email_verified=not account_lifecycle_settings.email_verification_required,
+                    consents=consent_rows,
+                    consent_ip_address=request.client.host if request.client else None,
+                    consent_user_agent=request.headers.get("user-agent"),
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+            # PostgreSQL 唯一约束异常统一映射为同一 409 响应。
+            except SQLAlchemyIntegrityError as error:
+                raise HTTPException(status_code=409, detail="该邮箱已经注册。") from error
         if account_lifecycle_settings.email_verification_required:
             enqueue_account_action_email(account, "verify_email", request)
         return {

@@ -42,6 +42,7 @@
   `PLATFORM_AUTH_ENABLED=true` 和相同的 `PLATFORM_INTERNAL_TOKEN`。
 - Java 认证服务不可用时，Python 返回 503，不会静默回退到 Python 密码校验，避免双写/双事实源造成行为不一致。
 - 本地验收脚本会在隔离 PostgreSQL schema 中验证注册账号、Java 凭据校验、Python Session 创建和后续账务请求。
+- 注册请求通过 Java 内部接口完成；账号、零余额摘要和协议同意记录在一个事务中写入，Python 只负责邮箱 Outbox 和外部 API 兼容。
 
 ## 下一阶段
 

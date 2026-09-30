@@ -11,6 +11,12 @@ import httpx
 from .config import PlatformAuthSettings
 
 
+def _platform_response_error_status(response: httpx.Response) -> int:
+    """Never expose a malformed successful upstream response as HTTP 200."""
+
+    return response.status_code if response.is_error else 502
+
+
 class PlatformAuthError(RuntimeError):
     """Java 认证服务返回的业务错误。"""
 
@@ -29,6 +35,11 @@ class PlatformAuthUnavailableError(PlatformAuthError):
 
 @dataclass(frozen=True)
 class PlatformCredentialResult:
+    account_id: int
+
+
+@dataclass(frozen=True)
+class PlatformRegistrationResult:
     account_id: int
 
 
@@ -73,13 +84,13 @@ class PlatformAuthClient:
             raise PlatformAuthError(
                 "INVALID_PLATFORM_RESPONSE",
                 "平台认证服务返回了无法解析的响应。",
-                response.status_code,
+                _platform_response_error_status(response),
             ) from error
         if not isinstance(payload, dict):
             raise PlatformAuthError(
                 "INVALID_PLATFORM_RESPONSE",
                 "平台认证服务返回了无效响应。",
-                response.status_code,
+                _platform_response_error_status(response),
             )
         if response.is_error:
             raise PlatformAuthError(
@@ -93,5 +104,65 @@ class PlatformAuthClient:
             raise PlatformAuthError(
                 "INVALID_PLATFORM_RESPONSE",
                 "平台认证服务返回了无效账号数据。",
+                _platform_response_error_status(response),
+            ) from error
+
+    def register_account(
+        self,
+        *,
+        email: str,
+        password: str,
+        display_name: str | None,
+        email_verified: bool,
+        consents: list[dict[str, str | None]],
+        trace_id: str | None = None,
+    ) -> PlatformRegistrationResult:
+        """Create an account through Java without logging the password."""
+
+        headers = {
+            "X-Internal-Service-Token": self.internal_token,
+            "X-Trace-Id": trace_id or f"platform-auth-{uuid4().hex}",
+        }
+        try:
+            response = httpx.post(
+                f"{self.base_url}/internal/v1/auth/register",
+                headers=headers,
+                json={
+                    "email": email,
+                    "password": password,
+                    "display_name": display_name,
+                    "email_verified": email_verified,
+                    "consents": consents,
+                },
+                timeout=self.timeout_seconds,
+            )
+        except httpx.HTTPError as error:
+            raise PlatformAuthUnavailableError() from error
+        try:
+            payload: Any = response.json()
+        except ValueError as error:
+            raise PlatformAuthError(
+                "INVALID_PLATFORM_RESPONSE",
+                "平台认证服务返回了无法解析的响应。",
+                _platform_response_error_status(response),
+            ) from error
+        if not isinstance(payload, dict):
+            raise PlatformAuthError(
+                "INVALID_PLATFORM_RESPONSE",
+                "平台认证服务返回了无效响应。",
+                _platform_response_error_status(response),
+            )
+        if response.is_error:
+            raise PlatformAuthError(
+                str(payload.get("code") or "PLATFORM_AUTH_ERROR"),
+                str(payload.get("message") or "平台认证服务请求失败。"),
                 response.status_code,
+            )
+        try:
+            return PlatformRegistrationResult(account_id=int(payload["account_id"]))
+        except (KeyError, TypeError, ValueError) as error:
+            raise PlatformAuthError(
+                "INVALID_PLATFORM_RESPONSE",
+                "平台认证服务返回了无效账号数据。",
+                _platform_response_error_status(response),
             ) from error
