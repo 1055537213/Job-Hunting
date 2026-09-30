@@ -351,7 +351,7 @@ tzdata==2026.3
     #   tzlocal
 tzlocal==5.4.4
     # via celery
-urllib3==2.7.0
+urllib3==2.8.0
     # via
     #   botocore
     #   requests
