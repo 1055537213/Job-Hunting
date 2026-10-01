@@ -268,7 +268,7 @@ GitHub 托管运行器访问 `https://<PUBLIC_IP>:8443/api/health`，用于验�
 .\scripts\security_scan.ps1
 ```
 
-确认 `python_gate_passed` 和 `container_gate_passed` 均为 `true`，并将本次 CycloneDX SBOM 与
+确认 `python_gate_passed`、`java_gate_passed` 和 `container_gate_passed` 均为 `true`，并将本次 CycloneDX SBOM 与
 发布记录关联。详细策略见 [依赖与容器镜像安全扫描](security-scanning.md)。
 
 ```powershell

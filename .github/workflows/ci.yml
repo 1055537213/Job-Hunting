@@ -30,6 +30,7 @@ jobs:
       JOB_AGENT_TEST_DATABASE_URL: postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent
       ACTIONLINT_IMAGE: rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
       PIP_AUDIT_VERSION: "2.10.1"
+      OSV_SCANNER_IMAGE: ghcr.io/google/osv-scanner@sha256:afd838850ac1a0fcc15ff4a041dc9ba11123c3f0d2666217a5f0fcf9222b55fa
       TRIVY_IMAGE: aquasec/trivy@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
 
     steps:
@@ -89,6 +90,21 @@ jobs:
         env:
           TESTCONTAINERS_RYUK_DISABLED: "true"
         run: mvn -B -ntp -Dtest=BillingServiceIntegrationTest -Drun.integration.tests=true test
+
+      - name: Audit Java dependencies
+        id: java_audit
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p security-reports
+          docker run --rm \
+            -v "$PWD:/workspace:ro" \
+            -v "$PWD/security-reports:/reports" \
+            -w /workspace \
+            "$OSV_SCANNER_IMAGE" scan source -r platform-service \
+            --format json \
+            --output-file /reports/java-dependencies.json
 
       - name: Run Python-Java billing contract
         shell: bash
@@ -279,6 +295,10 @@ jobs:
           set -euo pipefail
           if [[ "${{ steps.python_audit.outcome }}" != "success" ]]; then
             echo "Python dependency audit failed. Review the security-reports artifact."
+            exit 1
+          fi
+          if [[ "${{ steps.java_audit.outcome }}" != "success" ]]; then
+            echo "Java dependency audit failed. Review the security-reports artifact."
             exit 1
           fi
           if [[ "${{ steps.container_audit.outcome }}" != "success" ]]; then

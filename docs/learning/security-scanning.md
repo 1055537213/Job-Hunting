@@ -5,6 +5,7 @@
 项目把供应链检查拆成两个事实源：
 
 - `pip-audit 2.10.1` 检查 `requirements.lock` 和 `requirements-dev.lock` 中的 Python 包。
+- OSV-Scanner 检查 `platform-service/pom.xml` 解析出的 Java/Maven 依赖及其传递依赖。
 - Trivy `0.74.0` 检查最终运行镜像中的 Debian 系统包，并生成完整镜像 SBOM。
 
 前端目前是随 Python 包发布的仓库内静态资源，没有 `package.json` 或 npm 锁文件，因此没有
@@ -33,6 +34,8 @@ Python 审计容器只读挂载两个锁文件，不读取 `.env`。Docker 构�
 ## 发布门禁
 
 - Python：发现任何已知漏洞即失败，不设置永久忽略列表。
+- Java：发现 Maven 依赖中的任何已知漏洞即失败，不设置永久忽略列表；依赖升级必须先通过本地
+  Maven 测试和 OSV 扫描。
 - 容器：存在已有修复版本的 `HIGH` 或 `CRITICAL` Debian 漏洞即失败。
 - 尚无发行版修复的系统漏洞保留在完整报告中，但不让所有发布永久处于失败状态；每次上线前
   仍要人工检查可达性、运行架构和 Debian 安全状态。
@@ -42,14 +45,15 @@ Python 审计容器只读挂载两个锁文件，不读取 `.env`。Docker 构�
 本地报告保存在被 Git 忽略的 `data/security-reports/<timestamp>/`：
 
 - `python-dependencies.json`：Python 漏洞清单。
+- `java-dependencies.json`：Java/Maven 依赖漏洞清单。
 - `container-vulnerabilities.json`：所有 HIGH/CRITICAL 系统漏洞，包括尚无修复版本的记录。
 - `image-sbom.cdx.json`：CycloneDX 软件物料清单。
 - `security-summary.json`：门禁结果、计数、工具版本和固定镜像摘要。
 
 ## GitHub CI
 
-CI 会在测试、Ruff 和前端回归通过后执行同一策略：审计锁文件、使用固定基础镜像构建最终
-镜像、生成 Trivy 报告与 SBOM，最后统一判定两个门禁。报告通过固定版本的
+CI 会在测试、Ruff 和前端回归通过后执行同一策略：审计 Python 锁文件、审计 Java/Maven 依赖、使用固定基础镜像构建最终
+镜像、生成 Trivy 报告与 SBOM，最后统一判定三个门禁。报告通过固定版本的
 `actions/upload-artifact` 上传为 `security-reports`，保留 14 天；即使门禁失败也会尝试上传，
 便于定位具体包、CVE、已安装版本和修复版本。
 

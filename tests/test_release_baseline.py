@@ -61,6 +61,7 @@ def test_supply_chain_security_gate_is_pinned_and_reproducible():
     assert "apt-get upgrade -y" in dockerfile
     assert compose.count(python_image) == 4
     assert '$pipAuditVersion = "2.10.1"' in script
+    assert '$osvScannerImage = "ghcr.io/google/osv-scanner@sha256:' in script
     assert f'$trivyImage = "{trivy_image}"' in script
     assert "/workspace/requirements.lock:ro" in script
     assert "/workspace/requirements-dev.lock:ro" in script
@@ -70,6 +71,8 @@ def test_supply_chain_security_gate_is_pinned_and_reproducible():
     assert '"--pkg-types", "os"' in script
     assert '"--ignore-unfixed"' in script
     assert '"image-sbom.cdx.json"' in script
+    assert '"java-dependencies.json"' in script
+    assert "java_gate_passed" in script
     assert '"security-summary.json"' in script
     assert not (ROOT / ".trivyignore").exists()
     assert "没有 `package.json`" in guide

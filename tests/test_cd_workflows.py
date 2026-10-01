@@ -497,3 +497,11 @@ def test_java_platform_release_is_internal_only_and_has_rollback_guardrails():
     assert "publish-platform:" in ci
     assert "refs/heads/java-platform-migration" in ci
     assert "-platform:sha-" in ci
+    for required in (
+        "OSV_SCANNER_IMAGE: ghcr.io/google/osv-scanner@sha256:",
+        "name: Audit Java dependencies",
+        "id: java_audit",
+        "java-dependencies.json",
+        "steps.java_audit.outcome",
+    ):
+        assert required in ci

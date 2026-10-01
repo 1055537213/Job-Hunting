@@ -16,6 +16,7 @@ if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction Sile
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $pythonAuditImage = "python:3.12.13-slim@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36"
 $pipAuditVersion = "2.10.1"
+$osvScannerImage = "ghcr.io/google/osv-scanner@sha256:afd838850ac1a0fcc15ff4a041dc9ba11123c3f0d2666217a5f0fcf9222b55fa"
 $trivyImage = "aquasec/trivy@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $reportBase = if ([IO.Path]::IsPathRooted($ReportRoot)) {
@@ -26,6 +27,7 @@ else {
 }
 $reportPath = Join-Path $reportBase $timestamp
 $pythonReport = Join-Path $reportPath "python-dependencies.json"
+$javaReport = Join-Path $reportPath "java-dependencies.json"
 $containerReport = Join-Path $reportPath "container-vulnerabilities.json"
 $sbomReport = Join-Path $reportPath "image-sbom.cdx.json"
 $summaryReport = Join-Path $reportPath "security-summary.json"
@@ -64,6 +66,15 @@ function Get-ContainerVulnerabilityCounts {
             -not [string]::IsNullOrWhiteSpace([string]$_.FixedVersion)
         }).Count
     }
+}
+
+function Get-JavaVulnerabilityCount {
+    if (-not (Test-Path -LiteralPath $javaReport -PathType Leaf)) {
+        return $null
+    }
+    $report = Get-Content -Raw -LiteralPath $javaReport | ConvertFrom-Json
+    $packages = @($report.results | ForEach-Object { @($_.packages) })
+    return @($packages | ForEach-Object { @($_.vulnerabilities) }).Count
 }
 
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
@@ -108,6 +119,20 @@ else {
     }
 }
 
+Write-Host "==> Auditing Java/Maven dependencies with OSV-Scanner"
+$repositoryDockerPath = $repositoryRoot.Replace("\", "/")
+$javaAuditArguments = @(
+    "run", "--rm",
+    "-v", "${repositoryDockerPath}:/workspace:ro",
+    "-v", "${reportDockerPath}:/reports",
+    "-w", "/workspace",
+    $osvScannerImage,
+    "scan", "source", "-r", "platform-service",
+    "--format", "json", "--output-file", "/reports/java-dependencies.json"
+)
+& docker @javaAuditArguments
+$javaAuditExitCode = $LASTEXITCODE
+
 Write-Host "==> Recording all HIGH/CRITICAL container findings"
 Invoke-Docker -Arguments @(
     "run", "--rm",
@@ -147,6 +172,7 @@ $summary = [ordered]@{
     image = $Image
     policy = [ordered]@{
         python_known_vulnerabilities_allowed = $false
+        java_known_vulnerabilities_allowed = $false
         container_gate_severity = @("HIGH", "CRITICAL")
         container_package_types = @("os")
         container_unfixed_findings_block_release = $false
@@ -154,19 +180,23 @@ $summary = [ordered]@{
     tools = [ordered]@{
         pip_audit = $pipAuditVersion
         python_audit_image = $pythonAuditImage
+        osv_scanner_image = $osvScannerImage
         trivy_image = $trivyImage
     }
     python_vulnerabilities = Get-PythonVulnerabilityCount
+    java_vulnerabilities = Get-JavaVulnerabilityCount
     container_vulnerabilities = Get-ContainerVulnerabilityCounts
     python_gate_passed = $pythonAuditExitCode -eq 0
+    java_gate_passed = $javaAuditExitCode -eq 0
     container_gate_passed = $containerAuditExitCode -eq 0
 }
 $summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $summaryReport -Encoding UTF8
 Write-Host "Security reports: $reportPath"
 
-if ($pythonAuditExitCode -ne 0 -or $containerAuditExitCode -ne 0) {
-    throw "Security gate failed (pip-audit=$pythonAuditExitCode, trivy=$containerAuditExitCode). Review $summaryReport"
+if ($pythonAuditExitCode -ne 0 -or $javaAuditExitCode -ne 0 -or $containerAuditExitCode -ne 0) {
+    throw "Security gate failed (pip-audit=$pythonAuditExitCode, osv-scanner=$javaAuditExitCode, trivy=$containerAuditExitCode). Review $summaryReport"
 }
 
 Write-Host "Python dependency audit: PASS"
+Write-Host "Java/Maven dependency audit: PASS"
 Write-Host "Fixable HIGH/CRITICAL container vulnerability gate: PASS"
