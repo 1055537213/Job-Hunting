@@ -239,15 +239,14 @@ def dispatch_due_account_emails(
 
     lifecycle_settings = load_account_lifecycle_settings(env_path)
     task_queue_settings = load_task_queue_settings(env_path)
+    auth_settings = load_platform_auth_settings(env_path)
     records = store.list_due_account_email_outbox(
         lifecycle_settings.email_claim_timeout_seconds,
+        exclude_purpose="verify_email" if auth_settings.enabled else "",
     )
     dispatched = 0
     failed = 0
-    auth_settings = load_platform_auth_settings(env_path)
     for record in records:
-        if auth_settings.enabled and record.purpose == "verify_email":
-            continue
         try:
             celery_app.send_task(
                 ACCOUNT_EMAIL_DELIVERY_TASK_NAME,

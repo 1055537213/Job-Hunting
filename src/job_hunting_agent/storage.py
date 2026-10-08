@@ -564,6 +564,7 @@ class RepositoryStore:
         self,
         claim_timeout_seconds: int,
         limit: int = 100,
+        exclude_purpose: str = "",
     ) -> list[AccountEmailOutboxRecord]:
         """列出待发送、到期重试和失联认领记录。"""
 
@@ -605,7 +606,7 @@ class RepositoryStore:
             rows = conn.execute(
                 """
                 SELECT * FROM account_email_outbox
-                WHERE attempt_count < max_attempts AND (
+                WHERE purpose <> ? AND attempt_count < max_attempts AND (
                     (status IN ('pending', 'retrying') AND next_attempt_at <= ?)
                     OR (status = 'sending' AND claimed_at < ?)
                 )
@@ -616,7 +617,7 @@ class RepositoryStore:
                 )
                 ORDER BY next_attempt_at, id LIMIT ?
                 """,
-                (current, stale_before, current, max(1, min(limit, 500))),
+                (exclude_purpose, current, stale_before, current, max(1, min(limit, 500))),
             ).fetchall()
         return [account_email_outbox_from_row(row) for row in rows]
 
