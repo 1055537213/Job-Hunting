@@ -77,10 +77,20 @@ COMPOSE_FILES=(
 if [[ "$TOPOLOGY" == "coexist" ]]; then
   COMPOSE_FILES+=( -f "${RELEASE_DIR}/compose.coexist.yaml" )
 fi
+PLATFORM_IMAGE=""
+if [[ -f "${STATE_DIR}/current-platform-image" ]]; then
+  PLATFORM_IMAGE="$(<"${STATE_DIR}/current-platform-image")"
+fi
+if [[ -n "$PLATFORM_IMAGE" ]]; then
+  [[ "$PLATFORM_IMAGE" =~ ^ghcr\.io/[a-z0-9._/-]+-platform:sha-[0-9a-f]{12}$ ]]
+  [[ "${PLATFORM_IMAGE##*:}" == "${IMAGE_REF##*:}" ]]
+  COMPOSE_FILES+=( -f "${RELEASE_DIR}/compose.hybrid.prod.yaml" )
+fi
 
 compose_production() {
   COMPOSE_PROFILES="" \
     JOB_AGENT_IMAGE="$IMAGE_REF" \
+    JOB_AGENT_PLATFORM_IMAGE="$PLATFORM_IMAGE" \
     JOB_AGENT_RUNTIME_ENV_FILE="$SHARED_ENV" \
     docker compose \
     --project-name "$PROJECT_NAME" \
@@ -329,6 +339,9 @@ else
   compose_production stop reverse-proxy
 fi
 compose_production stop web worker beat
+if [[ -n "$PLATFORM_IMAGE" ]]; then
+  compose_production stop platform-service
+fi
 
 REMOTE_DUMP="/tmp/job-agent-${BACKUP_ID}.dump"
 docker exec "$POSTGRES_ID" pg_dump \

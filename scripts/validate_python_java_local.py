@@ -178,6 +178,42 @@ def run_web_billing_flow(
         )
         if registered.status_code != 200:
             raise RuntimeError(f"Web registration failed: {registered.status_code} {registered.text[:300]}")
+
+        from job_hunting_agent.config import PlatformAuthSettings  # noqa: PLC0415
+        from job_hunting_agent.platform_auth import PlatformAuthClient  # noqa: PLC0415
+        from job_hunting_agent.platform_email import deliver_platform_verification  # noqa: PLC0415
+        from urllib.parse import parse_qs, urlsplit  # noqa: PLC0415
+
+        auth_client = PlatformAuthClient(PlatformAuthSettings(True, base_url, internal_token, 10))
+        account_id = registered.json()["account"]["id"]
+        denied = client.post("/api/auth/login", json={"email": email, "password": password})
+        if denied.status_code != 403:
+            raise RuntimeError("Unverified account was allowed to log in")
+        jobs = auth_client.email_verification("due")["records"]
+        if len(jobs) != 1:
+            raise RuntimeError("Registration must create one durable verification job")
+
+        class RecordingSender:
+            url = ""
+
+            def send_verification(self, recipient, url):
+                if recipient != email:
+                    raise RuntimeError("Verification email recipient mismatch")
+                self.url = url
+
+        sender = RecordingSender()
+        delivered = deliver_platform_verification(auth_client, sender, jobs[0]["id"])
+        if not delivered["accepted"]:
+            raise RuntimeError("Verification delivery was not accepted")
+        token = parse_qs(urlsplit(sender.url).query)["verify_email_token"][0]
+        confirmed = client.post("/api/auth/verify-email", json={"token": token})
+        if confirmed.status_code != 200 or confirmed.json()["account"]["id"] != account_id:
+            raise RuntimeError("Email verification confirmation failed")
+        if client.post("/api/auth/verify-email", json={"token": token}).status_code != 400:
+            raise RuntimeError("Verification token was reusable")
+        if client.post("/api/auth/verify-email", json={"token": "invalid-verification-token-000000000"}).status_code != 400:
+            raise RuntimeError("Invalid verification token was accepted")
+        print("==> Java verification -> Python SMTP worker -> Web confirm: PASS")
         account_id = int(registered.json()["account"]["id"])
 
         registration_store = SQLAlchemyStore(database_url)
@@ -335,8 +371,18 @@ def main() -> int:
             }
         )
         log_file = log_path.open("w", encoding="utf-8")
+        build = subprocess.run(
+            [choose_maven(), "-B", "-ntp", "package", "-DskipTests"],
+            cwd=ROOT / "platform-service", env=java_environment,
+            stdout=log_file, stderr=subprocess.STDOUT, timeout=600,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if build.returncode != 0:
+            raise RuntimeError("Java platform packaging failed")
+        java_home = java_environment.get("JAVA_HOME")
+        java = str(Path(java_home) / "bin" / ("java.exe" if os.name == "nt" else "java")) if java_home else "java"
         process = subprocess.Popen(
-            [choose_maven(), "-B", "-ntp", "-DskipTests", "spring-boot:run"],
+            [java, "-jar", "target/platform-service-0.1.0-SNAPSHOT.jar"],
             cwd=ROOT / "platform-service",
             env=java_environment,
             stdout=log_file,
@@ -358,7 +404,7 @@ def main() -> int:
                     "JOB_AGENT_ENVIRONMENT=test",
                     "JOB_AGENT_OBJECT_STORAGE_BACKEND=local",
                     "JOB_AGENT_CSRF_ENABLED=false",
-                    "JOB_AGENT_EMAIL_VERIFICATION_REQUIRED=false",
+                    "JOB_AGENT_EMAIL_VERIFICATION_REQUIRED=true",
                     "JOB_AGENT_CONSENT_REQUIRED=false",
                     "JOB_AGENT_DEMO_RECHARGE_ENABLED=true",
                     "JOB_AGENT_DEMO_RECHARGE_MAX_AMOUNT_YUAN=20",
@@ -384,7 +430,7 @@ def main() -> int:
                 "JOB_AGENT_ENVIRONMENT": "test",
                 "JOB_AGENT_OBJECT_STORAGE_BACKEND": "local",
                 "JOB_AGENT_CSRF_ENABLED": "false",
-                "JOB_AGENT_EMAIL_VERIFICATION_REQUIRED": "false",
+                "JOB_AGENT_EMAIL_VERIFICATION_REQUIRED": "true",
                 "JOB_AGENT_CONSENT_REQUIRED": "false",
                 "JOB_AGENT_DEMO_RECHARGE_ENABLED": "true",
                 "JOB_AGENT_TASK_QUEUE_ENABLED": "false",

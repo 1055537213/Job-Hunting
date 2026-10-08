@@ -21,6 +21,7 @@ from .config import (
     DEFAULT_ENV_PATH,
     load_account_lifecycle_settings,
     load_database_settings,
+    load_platform_auth_settings,
     load_task_queue_settings,
     require_postgresql_database_url,
 )
@@ -36,6 +37,8 @@ from .model_resilience import ModelCircuitOpenError, is_transient_model_error
 from .models import BackgroundTaskRecord
 from .project_archive import ProjectArchiveError
 from .platform_billing import PlatformBillingUnavailableError
+from .platform_auth import PlatformAuthClient
+from .platform_email import deliver_platform_verification
 from .rag import RAGProviderRequestError
 from .resume_document import ResumeDocumentError
 from .sqlalchemy_store import SQLAlchemyStore
@@ -43,6 +46,7 @@ from .storage import INSUFFICIENT_BALANCE_MESSAGE, InsufficientBalanceError
 from .task_queue import (
     ACCOUNT_EMAIL_DELIVERY_TASK_NAME,
     ACCOUNT_EMAIL_DISPATCH_TASK_NAME,
+    PLATFORM_EMAIL_DELIVERY_TASK_NAME,
     BACKGROUND_TASK_NAME,
     GITHUB_PROJECT_ANALYSIS_TASK_TYPE,
     OPERATIONAL_LEDGER_RETENTION_TASK_NAME,
@@ -240,7 +244,10 @@ def dispatch_due_account_emails(
     )
     dispatched = 0
     failed = 0
+    auth_settings = load_platform_auth_settings(env_path)
     for record in records:
+        if auth_settings.enabled and record.purpose == "verify_email":
+            continue
         try:
             celery_app.send_task(
                 ACCOUNT_EMAIL_DELIVERY_TASK_NAME,
@@ -252,6 +259,19 @@ def dispatch_due_account_emails(
             dispatched += 1
         except Exception:  # noqa: BLE001 - 下一轮 Beat 会再次扫描同一数据库记录。
             failed += 1
+    if auth_settings.enabled:
+        jobs = PlatformAuthClient(auth_settings).email_verification("due")["records"]
+        for job in jobs:
+            try:
+                celery_app.send_task(
+                    PLATFORM_EMAIL_DELIVERY_TASK_NAME,
+                    args=[job["id"]], kwargs={},
+                    task_id=f"platform-email-{job['id']}-{job['attempt_count'] + 1}",
+                    queue=task_queue_settings.queue_name,
+                )
+                dispatched += 1
+            except Exception:  # noqa: BLE001 - Beat rediscovers the persistent job.
+                failed += 1
     return {"dispatched": dispatched, "dispatch_failed": failed}
 
 
@@ -1178,6 +1198,15 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
         finally:
             store.close()
 
+    @celery_app.task(name=PLATFORM_EMAIL_DELIVERY_TASK_NAME, acks_late=True,
+                     reject_on_worker_lost=True, ignore_result=True)
+    def deliver_platform_email(outbox_id: int) -> dict[str, object]:
+        settings = load_account_lifecycle_settings(env_path)
+        return deliver_platform_verification(
+            PlatformAuthClient(load_platform_auth_settings(env_path)),
+            build_account_email_sender(settings), outbox_id,
+        )
+
     @celery_app.task(
         bind=True,
         name=ACCOUNT_EMAIL_DELIVERY_TASK_NAME,
@@ -1190,6 +1219,13 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
 
         store = _account_email_store(env_path)
         try:
+            if load_platform_auth_settings(env_path).enabled:
+                try:
+                    record = store.get_account_email_outbox(outbox_id)
+                except KeyError:
+                    return {"outbox_id": outbox_id, "status": "not_claimed"}
+                if record.purpose == "verify_email":
+                    return {"outbox_id": outbox_id, "status": "superseded_by_java"}
             lifecycle_settings = load_account_lifecycle_settings(env_path)
             service = AccountEmailOutboxService(
                 store,

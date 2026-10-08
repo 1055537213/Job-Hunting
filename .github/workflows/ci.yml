@@ -89,7 +89,10 @@ jobs:
         working-directory: platform-service
         env:
           TESTCONTAINERS_RYUK_DISABLED: "true"
-        run: mvn -B -ntp -Dtest=BillingServiceIntegrationTest -Drun.integration.tests=true test
+        run: mvn -B -ntp -Dtest=BillingServiceIntegrationTest,EmailVerificationIntegrationTest -Drun.integration.tests=true test
+
+      - name: Run Python-Java account and billing acceptance
+        run: python scripts/validate_python_java_local.py --port 18081 --startup-timeout 120
 
       - name: Audit Java dependencies
         id: java_audit
@@ -175,11 +178,20 @@ jobs:
           JOB_AGENT_PUBLIC_IP: 203.0.113.10
           JOB_AGENT_TLS_EMAIL: ops@example.com
           JOB_AGENT_GRAFANA_ADMIN_PASSWORD: ci-grafana-password
+          JOB_AGENT_PLATFORM_INTERNAL_TOKEN: ci-platform-shared-internal-token
+          JOB_AGENT_PLATFORM_IMAGE: ghcr.io/example/job-hunting-platform:sha-0123456789ab
+          JOB_AGENT_ACCOUNT_ACTION_SECRET: ci-account-action-secret-at-least-32-characters
         run: |
           docker compose --env-file .env.example \
             -f compose.yaml -f compose.prod.yaml config --quiet
           docker compose --env-file .env.example \
             -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml config --quiet
+          docker compose --env-file .env.example \
+            -f compose.yaml -f compose.platform.yaml config --quiet
+          docker compose --env-file .env.example \
+            -f compose.yaml -f compose.prod.yaml -f compose.hybrid.prod.yaml config --quiet
+          docker compose --env-file .env.example \
+            -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml -f compose.hybrid.prod.yaml config --quiet
 
       - name: Validate coexist Nginx HTTPS configuration
         env:
@@ -233,6 +245,12 @@ jobs:
 
       - name: Build release image
         run: docker build --pull --no-cache --tag job-hunting-agent:ci .
+
+      - name: Validate Python Java Docker connectivity
+        run: |
+          docker build --tag job-hunting-platform:ci platform-service
+          python scripts/validate_python_java_docker.py \
+            --ai-image job-hunting-agent:ci --java-image job-hunting-platform:ci
 
       - name: Record container findings and CycloneDX SBOM
         shell: bash
@@ -396,6 +414,32 @@ jobs:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
         shell: bash
         run: docker push "$IMAGE_REF"
+
+      - name: Publish matching Python AI image
+        shell: bash
+        run: |
+          set -euo pipefail
+          AI_IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}-ai:sha-${GITHUB_SHA:0:12}"
+          ai_exists=false
+          if docker manifest inspect "$AI_IMAGE" >/dev/null 2>&1; then
+            docker pull "$AI_IMAGE"
+            [[ "$(docker image inspect "$AI_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" == "$GITHUB_SHA" ]]
+            ai_exists=true
+          else
+            docker build --pull --no-cache \
+              --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              --label "org.opencontainers.image.revision=${GITHUB_SHA}" --tag "$AI_IMAGE" .
+          fi
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache" "$TRIVY_IMAGE" image \
+            --quiet --scanners vuln --pkg-types os --ignore-unfixed \
+            --severity HIGH,CRITICAL --exit-code 1 "$AI_IMAGE"
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
+            -v "$PWD/platform-release-reports:/reports" "$TRIVY_IMAGE" image \
+            --quiet --format cyclonedx --output /reports/ai-sbom.cdx.json "$AI_IMAGE"
+          if [[ "$ai_exists" == false ]]; then docker push "$AI_IMAGE"; fi
+          echo "ai_image=$AI_IMAGE" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Record published digest
         env:

@@ -71,7 +71,7 @@ class RegistrationControllerTest {
 
         @Bean
         RegistrationService registrationService() {
-            return new RegistrationService(null, null, 10_000_000) {
+            return new RegistrationService(null, null, null, 10_000_000) {
                 @Override
                 public long register(
                         String email,

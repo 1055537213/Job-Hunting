@@ -25,6 +25,8 @@ def _production_compose_config(*extra_files: str) -> dict:
             "JOB_AGENT_COEXIST_WEB_PORT": "28081",
             "JOB_AGENT_GRAFANA_ADMIN_PASSWORD": "test-grafana-password",
             "JOB_AGENT_IMAGE": "ghcr.io/example/job-agent:sha-0123456789ab",
+            "JOB_AGENT_PLATFORM_IMAGE": "ghcr.io/example/job-platform:sha-0123456789ab",
+            "JOB_AGENT_PLATFORM_INTERNAL_TOKEN": "test-platform-secret",
             "JOB_AGENT_DOMAIN": "agent.example.invalid",
             "JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY": "test-access-key",
             "JOB_AGENT_OBJECT_STORAGE_SECRET_KEY": "test-secret-key",
@@ -505,3 +507,35 @@ def test_java_platform_release_is_internal_only_and_has_rollback_guardrails():
         "steps.java_audit.outcome",
     ):
         assert required in ci
+
+
+def test_hybrid_release_pair_and_production_compose_are_connected():
+    for extra in (("compose.hybrid.prod.yaml",), ("compose.coexist.yaml", "compose.hybrid.prod.yaml")):
+        config = _production_compose_config(*extra)
+        java = config["services"]["platform-service"]
+        assert not java.get("ports")
+        assert "build" not in java
+        assert java["environment"]["PLATFORM_AUTH_ENABLED"] == "true"
+        assert java["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
+        for name in ("web", "worker", "beat"):
+            service = config["services"][name]
+            assert service["depends_on"]["platform-service"]["condition"] == "service_healthy"
+            assert service["environment"]["JOB_AGENT_JAVA_AUTH_ENABLED"] == "true"
+            assert service["environment"]["JOB_AGENT_JAVA_AUTH_INTERNAL_TOKEN"] == java["environment"]["PLATFORM_INTERNAL_TOKEN"]
+    workflow = (ROOT / ".github/workflows/deploy-hybrid.yml").read_text(encoding="utf-8")
+    for required in ("environment: production", "DEPLOY", "origin/java-platform-migration", ".conclusion == \"success\"",
+                     "-ai:$release", "-platform:$release", "org.opencontainers.image.revision", "chmod +x"):
+        assert required in workflow
+    script = (ROOT / "scripts/deploy_production.sh").read_text(encoding="utf-8")
+    for required in ("compose.hybrid.prod.yaml", "ACTIVE_PLATFORM_IMAGE", "PREVIOUS_PLATFORM_IMAGE",
+                     '"$PLATFORM_REVISION" == "$IMAGE_REVISION"', "current-platform-image"):
+        assert required in script
+
+
+def test_production_operations_preserve_hybrid_configuration():
+    for name in ("run_production_backup.sh", "validate_production_recovery.sh", "reload_coexist_https.sh"):
+        script = (ROOT / "scripts" / name).read_text(encoding="utf-8")
+        for required in ("current-platform-image", "compose.hybrid.prod.yaml", 'JOB_AGENT_PLATFORM_IMAGE="$PLATFORM_IMAGE"'):
+            assert required in script
+        if name != "reload_coexist_https.sh":
+            assert "compose_production stop platform-service" in script

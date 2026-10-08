@@ -1,0 +1,146 @@
+openapi: 3.1.0
+info:
+  title: Internal Email Verification and Delivery
+  version: 0.1.0
+  description: Java owns verification state; the Python SMTP worker receives only claimed deliveries. Never log request tokens or claim responses.
+security:
+  - InternalToken: []
+paths:
+  /internal/v1/auth/email-verification/request:
+    post:
+      operationId: requestEmailVerification
+      description: Returns the same result for missing, verified, disabled or rate-limited accounts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: {type: string, format: email, maxLength: 254}
+                source: {type: [string, 'null'], maxLength: 64}
+      responses:
+        '200': {$ref: '#/components/responses/Ok'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /internal/v1/auth/email-verification/confirm:
+    post:
+      operationId: confirmEmailVerification
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200':
+          description: Token consumed and account verified in one transaction
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [account_id]
+                properties:
+                  account_id: {type: integer, minimum: 1}
+        '400': {description: Invalid, expired, consumed token or inactive account}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /internal/v1/auth/email-verification/due:
+    post:
+      operationId: listDueVerificationDeliveries
+      description: Cancels invalid jobs, recovers final lost attempts and prunes expired terminal records. Returns at most 100 jobs.
+      responses:
+        '200':
+          description: Due jobs
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [records]
+                properties:
+                  records:
+                    type: array
+                    maxItems: 100
+                    items:
+                      type: object
+                      required: [id, attempt_count]
+                      properties:
+                        id: {type: integer, minimum: 1}
+                        attempt_count: {type: integer, minimum: 0}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /internal/v1/auth/email-verification/claim:
+    post:
+      operationId: claimVerificationDelivery
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: {type: integer, minimum: 1}
+      responses:
+        '200':
+          description: claim is null when no eligible job is available
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [claim]
+                properties:
+                  claim:
+                    type: [object, 'null']
+                    properties:
+                      id: {type: integer}
+                      claim_key: {type: string, maxLength: 64}
+                      recipient_email: {type: string, format: email}
+                      action_url: {type: string, format: uri}
+                      attempt_count: {type: integer}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /internal/v1/auth/email-verification/finish:
+    post:
+      operationId: finishVerificationDelivery
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, claim_key, sent]
+              properties:
+                id: {type: integer, minimum: 1}
+                claim_key: {type: string, minLength: 1, maxLength: 64}
+                sent: {type: boolean}
+                error_type: {type: [string, 'null'], pattern: '^[A-Za-z0-9_]{1,128}$'}
+      responses:
+        '200': {$ref: '#/components/responses/Ok'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /internal/v1/auth/email-verification/observations:
+    post:
+      operationId: observeVerificationDeliveries
+      description: Low-sensitivity state only; no token hashes, delivery keys, claim keys or action URLs. Python must redact recipient email before exposing to administrators.
+      responses:
+        '200':
+          description: State counts and latest 20 delivery records
+        '401': {$ref: '#/components/responses/Unauthorized'}
+components:
+  securitySchemes:
+    InternalToken:
+      type: apiKey
+      in: header
+      name: X-Internal-Service-Token
+  responses:
+    Ok:
+      description: Accepted operation; finish returns ok=false for a stale claim
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [ok]
+            properties:
+              ok: {type: boolean}
+    Unauthorized:
+      description: Missing or invalid internal service token

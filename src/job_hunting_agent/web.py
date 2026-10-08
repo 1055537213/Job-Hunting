@@ -20,6 +20,7 @@ import re
 import time
 import uuid
 from dataclasses import asdict
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import quote
@@ -688,7 +689,7 @@ def create_web_app(
             # PostgreSQL 唯一约束异常统一映射为同一 409 响应。
             except SQLAlchemyIntegrityError as error:
                 raise HTTPException(status_code=409, detail="该邮箱已经注册。") from error
-        if account_lifecycle_settings.email_verification_required:
+        if account_lifecycle_settings.email_verification_required and backend.platform_auth_client is None:
             enqueue_account_action_email(account, "verify_email", request)
         return {
             "account": asdict(account),
@@ -699,9 +700,16 @@ def create_web_app(
     def verify_email(payload: AccountActionTokenPayload) -> dict[str, object]:
         """Consume a one-time verification token."""
 
-        account = backend.store.consume_email_verification_token(
-            action_token_hash(payload.token)
-        )
+        if backend.platform_auth_client is not None:
+            try:
+                result = backend.platform_auth_client.email_verification("confirm", token=payload.token)
+                account = backend.store.get_account(int(result["account_id"]))
+            except PlatformAuthUnavailableError as error:
+                raise HTTPException(status_code=503, detail=str(error)) from error
+            except PlatformAuthError as error:
+                raise HTTPException(status_code=error.status_code or 502, detail=str(error)) from error
+        else:
+            account = backend.store.consume_email_verification_token(action_token_hash(payload.token))
         if account is None:
             raise HTTPException(status_code=400, detail="验证链接无效或已过期。")
         return {"account": asdict(account)}
@@ -749,6 +757,17 @@ def create_web_app(
     def request_verification(payload: AccountEmailPayload, request: Request) -> dict[str, str]:
         """Resend verification without revealing whether the email is registered."""
 
+        if backend.platform_auth_client is not None:
+            try:
+                backend.platform_auth_client.email_verification(
+                    "request", email=payload.email.strip().lower(),
+                    source=request.client.host if request.client else None,
+                )
+            except PlatformAuthUnavailableError as error:
+                raise HTTPException(status_code=503, detail=str(error)) from error
+            except PlatformAuthError as error:
+                raise HTTPException(status_code=error.status_code or 502, detail=str(error)) from error
+            return {"message": "如果账号需要验证，验证邮件已发送。"}
         record = backend.store.get_account_by_email(payload.email.strip().lower())
         if record is not None and record[0].status == "active" and record[0].email_verified_at is None:
             send_account_action_email(record[0], "verify_email", request)
@@ -2712,7 +2731,13 @@ def create_web_app(
 
         require_admin(request)
         email_records = backend.store.list_account_email_outbox(limit=20)
-        return {
+        platform_email = None
+        if backend.platform_auth_client is not None:
+            try:
+                platform_email = backend.platform_auth_client.email_verification("observations")
+            except PlatformAuthError as error:
+                raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
+        result = {
             "requests": web_app.state.request_metrics.snapshot(),
             "account_email": {
                 "summary": backend.store.summarize_account_email_outbox(),
@@ -2734,6 +2759,16 @@ def create_web_app(
                 ],
             },
         }
+        if platform_email is not None:
+            for status, count in platform_email["summary"].items():
+                result["account_email"]["summary"][status] += int(count)
+            for record in platform_email["records"]:
+                record["recipient_email"] = redact_email(record["recipient_email"])
+            result["account_email"]["records"] = sorted(
+                result["account_email"]["records"] + platform_email["records"],
+                key=lambda record: datetime.fromisoformat(record["created_at"]), reverse=True,
+            )[:20]
+        return result
 
     @web_app.get("/api/admin/audit/events")
     def admin_audit_events(

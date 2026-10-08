@@ -18,6 +18,7 @@ ACCOUNT_EMAIL_DELIVERY_TASK_NAME = (
 ACCOUNT_EMAIL_DISPATCH_TASK_NAME = (
     "job_hunting_agent.background_tasks.dispatch_due_account_emails"
 )
+PLATFORM_EMAIL_DELIVERY_TASK_NAME = "job_hunting_agent.background_tasks.deliver_platform_email"
 MAINTENANCE_QUEUE_SUFFIX = "_maintenance"
 # Token 和工具调用记录均按账号保留固定分页窗口，Beat 每天触发一次兜底裁剪。
 OPERATIONAL_LEDGER_RETENTION_TASK_NAME = (

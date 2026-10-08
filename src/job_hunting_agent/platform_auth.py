@@ -30,7 +30,9 @@ class PlatformAuthUnavailableError(PlatformAuthError):
     """Java 认证服务暂时无法访问。"""
 
     def __init__(self) -> None:
-        super().__init__("PLATFORM_AUTH_UNAVAILABLE", "平台认证服务暂时不可用，请稍后重试。")
+        super().__init__(
+            "PLATFORM_AUTH_UNAVAILABLE", "平台认证服务暂时不可用，请稍后重试。"
+        )
 
 
 @dataclass(frozen=True)
@@ -146,6 +148,7 @@ class PlatformAuthClient:
                 "平台认证服务返回了无法解析的响应。",
                 _platform_response_error_status(response),
             ) from error
+
         if not isinstance(payload, dict):
             raise PlatformAuthError(
                 "INVALID_PLATFORM_RESPONSE",
@@ -166,3 +169,85 @@ class PlatformAuthClient:
                 "平台认证服务返回了无效账号数据。",
                 _platform_response_error_status(response),
             ) from error
+
+    def email_verification(self, operation: str, **data: Any) -> dict[str, Any]:
+        """Internal verification and delivery state API; never falls back to local writes."""
+
+        if operation not in {
+            "request",
+            "confirm",
+            "due",
+            "claim",
+            "finish",
+            "observations",
+        }:
+            raise ValueError("Unknown verification operation")
+        try:
+            response = httpx.post(
+                f"{self.base_url}/internal/v1/auth/email-verification/{operation}",
+                headers={
+                    "X-Internal-Service-Token": self.internal_token,
+                    "X-Trace-Id": f"platform-email-{uuid4().hex}",
+                },
+                json=data,
+                timeout=self.timeout_seconds,
+            )
+        except httpx.HTTPError as error:
+            raise PlatformAuthUnavailableError() from error
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise PlatformAuthError(
+                "INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502
+            ) from error
+        if not isinstance(payload, dict):
+            raise PlatformAuthError(
+                "INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502
+            )
+        if response.is_error:
+            raise PlatformAuthError(
+                str(payload.get("code") or "PLATFORM_AUTH_ERROR"),
+                str(payload.get("message") or "平台认证服务请求失败。"),
+                response.status_code,
+            )
+        field = {
+            "request": "ok",
+            "confirm": "account_id",
+            "due": "records",
+            "claim": "claim",
+            "finish": "ok",
+            "observations": "summary",
+        }[operation]
+        value = payload.get(field)
+        valid = field in payload
+        if field == "ok":
+            valid = isinstance(value, bool)
+        elif field == "account_id":
+            valid = isinstance(value, int) and not isinstance(value, bool) and value > 0
+        elif field == "records":
+            valid = isinstance(value, list) and all(
+                isinstance(job, dict)
+                and isinstance(job.get("id"), int)
+                and job["id"] > 0
+                and isinstance(job.get("attempt_count"), int)
+                and job["attempt_count"] >= 0
+                for job in value
+            )
+        elif field == "claim":
+            valid = valid and (
+                value is None
+                or (
+                    isinstance(value, dict)
+                    and all(
+                        isinstance(value.get(key), str) and value[key]
+                        for key in ("claim_key", "recipient_email", "action_url")
+                    )
+                )
+            )
+        elif field == "summary":
+            valid = isinstance(value, dict) and isinstance(payload.get("records"), list)
+        if not valid:
+            raise PlatformAuthError(
+                "INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502
+            )
+        return payload

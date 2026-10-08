@@ -36,14 +36,30 @@
 
 - Java `POST /internal/v1/auth/verify-credentials` 负责查询账号、校验密码哈希、账号状态和邮箱验证状态。
 - Java 同时兼容现有 Python 写入的 Argon2id 和旧版 scrypt 哈希，不要求批量重置用户密码。
-- Python 继续负责注册、邮箱验证、Session Cookie 和登录后的账号读取；Java 只返回已验证的 `account_id`。
+- 当时 Python 保留注册、邮箱验证、Session Cookie 和登录后的账号读取；注册和邮箱验证已在后续阶段迁移，当前边界见下文。
 - Python 通过 `JOB_AGENT_JAVA_AUTH_ENABLED`、`JOB_AGENT_JAVA_AUTH_BASE_URL` 和
   `JOB_AGENT_JAVA_AUTH_INTERNAL_TOKEN` 开关此迁移，默认关闭。Java 服务对应使用
   `PLATFORM_AUTH_ENABLED=true` 和相同的 `PLATFORM_INTERNAL_TOKEN`。
 - Java 认证服务不可用时，Python 返回 503，不会静默回退到 Python 密码校验，避免双写/双事实源造成行为不一致。
 - 本地验收脚本会在隔离 PostgreSQL schema 中验证注册账号、Java 凭据校验、Python Session 创建和后续账务请求。
-- 注册请求通过 Java 内部接口完成；账号、零余额摘要和协议同意记录在一个事务中写入，Python 只负责邮箱 Outbox 和外部 API 兼容。
+- 注册请求通过 Java 内部接口完成；账号、零余额摘要和协议同意记录在一个事务中写入，Python 保留外部 API 兼容。
 
 ## 下一阶段
 
-下一阶段在本地继续迁移注册、邮箱验证、密码重置和 Session 撤销，并补充跨服务集成测试；完成预发布验收前，生产环境暂不打开 `JOB_AGENT_JAVA_AUTH_ENABLED` 或 `JOB_AGENT_JAVA_BILLING_ENABLED`。
+邮箱验证已迁移到 Java；注册账号与初始验证邮件任务在同一事务中创建。
+`platform_email_verifications` 是 Java 独占写入的验证/投递账本，Python SMTP Worker 通过内部
+接口领取任务、投递并回报，不直接写此表。密码重置仍使用原 Python 表，后续单独迁移。
+切换 Java 认证后旧 Python 验证链接失效，用户应重新请求验证；不会静默回退到 Python 消费令牌。
+
+## 目标入口与发布规则
+
+最终由 Java 接管对外业务 API，Python 提供内部 AI/长任务能力，保持现有前端 URL/API 兼容。
+当前仍由 Python 提供外部 HTTP 接口，Java 内部提供注册、验证、凭据和账务服务。
+
+本地使用 `compose.yaml + compose.platform.yaml`；生产加载 `compose.yaml`、`compose.prod.yaml`
+和 `compose.hybrid.prod.yaml`，共享 Java 服务配置；共存部署另加 `compose.coexist.yaml`。
+CI 通过后发布相同提交的 `-ai` 和 `-platform` 两个版本镜像，审批部署通过 `Deploy Python Java`
+工作流执行；生产只填环境配置，不需要修改代码/Compose。此分支不自动部署服务器。
+
+后续迁移密码重置、Session 撤销/管理和管理员业务接口。所有 GitHub 推送必须确认对应提交
+CI 最终通过，镜像发布失败也不视为完成。

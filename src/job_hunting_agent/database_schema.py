@@ -144,6 +144,35 @@ sa.Index(
 )
 
 
+# Java owns this verification ledger; Python only reads through internal APIs.
+platform_email_verifications = sa.Table(
+    "platform_email_verifications", metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column("account_id", sa.Integer, sa.ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("recipient_email", sa.String(254), nullable=False),
+    sa.Column("delivery_key", sa.String(64), nullable=False, unique=True),
+    sa.Column("token_hash", sa.String(64), nullable=False, unique=True),
+    sa.Column("request_source_hash", sa.String(64)),
+    sa.Column("expires_at", timestamp_type, nullable=False),
+    sa.Column("consumed_at", timestamp_type),
+    sa.Column("status", sa.String(32), nullable=False),
+    sa.Column("attempt_count", sa.Integer, nullable=False),
+    sa.Column("max_attempts", sa.Integer, nullable=False),
+    sa.Column("next_attempt_at", timestamp_type, nullable=False),
+    sa.Column("claimed_at", timestamp_type),
+    sa.Column("claim_key", sa.String(64)),
+    sa.Column("sent_at", timestamp_type),
+    sa.Column("last_error_type", sa.String(128)),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.Column("updated_at", timestamp_type, nullable=False),
+    sa.CheckConstraint("status IN ('pending', 'sending', 'retrying', 'sent', 'failed', 'cancelled')", name="platform_verification_status"),
+    sa.CheckConstraint("attempt_count >= 0 AND max_attempts > 0 AND attempt_count <= max_attempts", name="platform_verification_attempts"),
+)
+sa.Index("idx_platform_verification_due", platform_email_verifications.c.status, platform_email_verifications.c.next_attempt_at)
+sa.Index("idx_platform_verification_account", platform_email_verifications.c.account_id, platform_email_verifications.c.created_at)
+sa.Index("idx_platform_verification_source", platform_email_verifications.c.request_source_hash, platform_email_verifications.c.created_at)
+
+
 # 保存用户同意的协议版本，避免只保留一个随版本更新而失真的布尔值。
 account_consents = sa.Table(
     "account_consents",

@@ -86,8 +86,13 @@ Java 兼容 Python 当前使用的 Argon2id 和 scrypt 哈希格式。Python 的
 `JOB_AGENT_JAVA_AUTH_ENABLED=true` 控制，认证服务不可用时返回 503，不会静默回退。
 
 注册迁移接口为 `POST /internal/v1/auth/register`。Java 在同一事务中写入账号、
-零余额摘要行和协议同意记录；Python 收到 `account_id` 后继续登记邮箱验证邮件
-Outbox。重复邮箱返回 `ACCOUNT_ALREADY_EXISTS`，事务失败不会留下半个账号。
+零余额摘要行、协议同意记录及待验证账号的邮件任务。重复邮箱返回
+`ACCOUNT_ALREADY_EXISTS`，事务失败不会留下半个账号。
+
+邮箱验证使用 Java 独占的 `platform_email_verifications` 账本；Python SMTP Worker
+通过内部 API 认领并回报投递，不直接更新验证状态。一次性令牌只保存摘要，认领键
+阻止失联 Worker 的迟到结果覆盖新任务状态。密码重置暂保留 Python 实现。
+本地与联合生产部署步骤见 [Python + Java 部署指南](../docs/learning/python-java-deployment.md)。
 
 充值和扣费接口都要求 `Idempotency-Key` 与请求中的 `source_reference` 相同。Java 在充值时同一事务写入 `recharge_orders`、`account_balance_ledger` 和 `payment_events`，重复充值只返回原账务结果，不会重复到账。余额不足时返回 `INSUFFICIENT_BALANCE` 和 `余额不足，请先充值后重试`。余额行使用 PostgreSQL 行锁，账务流水使用唯一约束保证重试不会重复写入。Python 在远端扣费失败时保留 `usage_events`，后续使用同一个 `call_id` 重试，不会重复扣费。
 

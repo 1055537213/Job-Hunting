@@ -25,6 +25,17 @@ platform:
   internal-token: ${PLATFORM_INTERNAL_TOKEN:}
   auth:
     enabled: ${PLATFORM_AUTH_ENABLED:false}
+  email:
+    action-secret: ${JOB_AGENT_ACCOUNT_ACTION_SECRET:development-only-account-action-secret}
+    public-base-url: ${JOB_AGENT_PUBLIC_BASE_URL:http://localhost:8000}
+    ttl-minutes: ${JOB_AGENT_VERIFICATION_TOKEN_TTL_MINUTES:1440}
+    cooldown-seconds: ${JOB_AGENT_ACCOUNT_EMAIL_COOLDOWN_SECONDS:60}
+    account-hourly-limit: ${JOB_AGENT_ACCOUNT_EMAIL_HOURLY_LIMIT:5}
+    source-hourly-limit: ${JOB_AGENT_ACCOUNT_EMAIL_SOURCE_HOURLY_LIMIT:20}
+    max-attempts: ${JOB_AGENT_ACCOUNT_EMAIL_MAX_ATTEMPTS:5}
+    claim-timeout-seconds: ${JOB_AGENT_ACCOUNT_EMAIL_CLAIM_TIMEOUT_SECONDS:300}
+    retry-base-seconds: ${JOB_AGENT_ACCOUNT_EMAIL_RETRY_BASE_SECONDS:30}
+    retention-days: ${JOB_AGENT_ACCOUNT_EMAIL_RETENTION_DAYS:14}
   billing:
     enabled: ${PLATFORM_BILLING_ENABLED:false}
     price-per-million-tokens-yuan: ${PLATFORM_PRICE_PER_MILLION_TOKENS_YUAN:25.0}

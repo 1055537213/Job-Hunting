@@ -2,8 +2,8 @@
 
 set -Eeuo pipefail
 
-if [[ $# -lt 3 || $# -gt 4 ]]; then
-  echo "Usage: deploy_production.sh <app-root> <release-id> <image-ref> [standalone|coexist]" >&2
+if [[ $# -lt 3 || $# -gt 5 ]]; then
+  echo "Usage: deploy_production.sh <app-root> <release-id> <image-ref> [standalone|coexist] [platform-image-ref]" >&2
   exit 2
 fi
 
@@ -11,6 +11,12 @@ APP_ROOT="$1"
 RELEASE_ID="$2"
 IMAGE_REF="$3"
 DEPLOY_TOPOLOGY="${4:-standalone}"
+PLATFORM_IMAGE="${5:-}"
+if [[ -n "$PLATFORM_IMAGE" ]]; then
+  [[ "$PLATFORM_IMAGE" =~ ^ghcr\.io/[a-z0-9._/-]+-platform:sha-[0-9a-f]{12}$ ]]
+  [[ "$IMAGE_REF" =~ ^ghcr\.io/[a-z0-9._/-]+-ai:sha-[0-9a-f]{12}$ ]]
+  [[ "${PLATFORM_IMAGE##*:}" == "$RELEASE_ID" ]]
+fi
 
 [[ "$APP_ROOT" =~ ^/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)+$ ]]
 [[ "$RELEASE_ID" =~ ^sha-[0-9a-f]{12}$ ]]
@@ -73,9 +79,11 @@ trap cleanup_operation_lock EXIT
 
 ACTIVE_RELEASE_DIR="$RELEASE_DIR"
 ACTIVE_IMAGE="$IMAGE_REF"
+ACTIVE_PLATFORM_IMAGE="$PLATFORM_IMAGE"
 ACTIVE_TOPOLOGY="$DEPLOY_TOPOLOGY"
 PREVIOUS_RELEASE=""
 PREVIOUS_IMAGE=""
+PREVIOUS_PLATFORM_IMAGE=""
 PREVIOUS_TOPOLOGY="standalone"
 DEPLOYMENT_STARTED=0
 
@@ -90,8 +98,12 @@ compose_active() {
       -f "${ACTIVE_RELEASE_DIR}/compose.coexist.yaml"
     )
   fi
+  if [[ -n "$ACTIVE_PLATFORM_IMAGE" ]]; then
+    compose_arguments+=(-f "${ACTIVE_RELEASE_DIR}/compose.hybrid.prod.yaml")
+  fi
   COMPOSE_PROFILES="" \
     JOB_AGENT_IMAGE="$ACTIVE_IMAGE" \
+    JOB_AGENT_PLATFORM_IMAGE="$ACTIVE_PLATFORM_IMAGE" \
     JOB_AGENT_RUNTIME_ENV_FILE="$SHARED_ENV" \
     docker compose \
     "${compose_arguments[@]}" \
@@ -118,6 +130,9 @@ if [[ -L "$CURRENT_LINK" ]]; then
 fi
 if [[ -f "${STATE_DIR}/current-image" ]]; then
   PREVIOUS_IMAGE="$(<"${STATE_DIR}/current-image")"
+fi
+if [[ -f "${STATE_DIR}/current-platform-image" ]]; then
+  PREVIOUS_PLATFORM_IMAGE="$(<"${STATE_DIR}/current-platform-image")"
 fi
 if [[ -f "${STATE_DIR}/current-topology" ]]; then
   PREVIOUS_TOPOLOGY="$(<"${STATE_DIR}/current-topology")"
@@ -290,6 +305,10 @@ remove_inactive_coexist_services() {
 wait_for_active_topology_services() {
   local service
 
+  if [[ -n "$ACTIVE_PLATFORM_IMAGE" ]]; then
+    wait_for_healthy_service platform-service 300 || return 1
+  fi
+
   if ! wait_for_completed_service alertmanager-config 120; then
     return 1
   fi
@@ -345,10 +364,12 @@ backup_database_if_running() {
 
 rollback_previous_release() {
   if [[ -n "$PREVIOUS_RELEASE" && -n "$PREVIOUS_IMAGE" \
-      ]] && topology_files_exist "$PREVIOUS_RELEASE" "$PREVIOUS_TOPOLOGY"; then
+      ]] && topology_files_exist "$PREVIOUS_RELEASE" "$PREVIOUS_TOPOLOGY" \
+      && { [[ -z "$PREVIOUS_PLATFORM_IMAGE" ]] || [[ -f "${PREVIOUS_RELEASE}/compose.hybrid.prod.yaml" ]]; }; then
     echo "Restoring previous release ${PREVIOUS_RELEASE} with image ${PREVIOUS_IMAGE}" >&2
     ACTIVE_RELEASE_DIR="$PREVIOUS_RELEASE"
     ACTIVE_IMAGE="$PREVIOUS_IMAGE"
+    ACTIVE_PLATFORM_IMAGE="$PREVIOUS_PLATFORM_IMAGE"
     ACTIVE_TOPOLOGY="$PREVIOUS_TOPOLOGY"
     if ! compose_active config --quiet; then
       echo "Rollback Compose configuration validation failed." >&2
@@ -379,6 +400,9 @@ rollback_previous_release() {
   compose_active stop \
     web worker beat reverse-proxy prometheus alertmanager loki tempo alloy grafana \
     >/dev/null 2>&1 || true
+  if [[ -n "$ACTIVE_PLATFORM_IMAGE" ]]; then
+    compose_active stop platform-service >/dev/null 2>&1 || true
+  fi
   return 1
 }
 
@@ -404,6 +428,12 @@ docker image inspect "$IMAGE_REF" >/dev/null
 IMAGE_REVISION="$(docker image inspect "$IMAGE_REF" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
 [[ "$IMAGE_REVISION" =~ ^[0-9a-f]{40}$ ]]
 [[ "sha-${IMAGE_REVISION:0:12}" == "$RELEASE_ID" ]]
+if [[ -n "$PLATFORM_IMAGE" ]]; then
+  [[ -f "${RELEASE_DIR}/compose.hybrid.prod.yaml" && -f "${RELEASE_DIR}/compose.platform.yaml" ]]
+  docker image inspect "$PLATFORM_IMAGE" >/dev/null
+  PLATFORM_REVISION="$(docker image inspect "$PLATFORM_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+  [[ "$PLATFORM_REVISION" == "$IMAGE_REVISION" ]]
+fi
 compose_active config --quiet
 backup_database_if_running
 
@@ -417,6 +447,9 @@ wait_for_active_topology_services
 ln -sfnT "$RELEASE_DIR" "$CURRENT_LINK"
 printf '%s\n' "$IMAGE_REF" > "${STATE_DIR}/current-image.tmp"
 mv "${STATE_DIR}/current-image.tmp" "${STATE_DIR}/current-image"
+printf '%s\n' "$PLATFORM_IMAGE" > "${STATE_DIR}/current-platform-image.tmp"
+mv "${STATE_DIR}/current-platform-image.tmp" "${STATE_DIR}/current-platform-image"
+chmod 600 "${STATE_DIR}/current-platform-image"
 printf '%s\n' "$RELEASE_ID" > "${STATE_DIR}/current-release.tmp"
 mv "${STATE_DIR}/current-release.tmp" "${STATE_DIR}/current-release"
 printf '%s\n' "$DEPLOY_TOPOLOGY" > "${STATE_DIR}/current-topology.tmp"

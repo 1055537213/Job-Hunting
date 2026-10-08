@@ -1,0 +1,122 @@
+name: Deploy Python Java
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full SHA with successful CI and both published images
+        required: true
+        type: string
+      confirmation:
+        description: Type DEPLOY to confirm deployment
+        required: true
+        type: string
+      topology:
+        description: Dedicated host or lightweight shared host
+        required: true
+        default: coexist
+        type: choice
+        options: [standalone, coexist]
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: production
+    env:
+      SHA: ${{ inputs.commit_sha }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+      TOPOLOGY: ${{ inputs.topology }}
+      HOST: ${{ secrets.DEPLOY_HOST }}
+      PORT: ${{ secrets.DEPLOY_PORT }}
+      USER: ${{ secrets.DEPLOY_USER }}
+      KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+      KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+      APP_ROOT: ${{ vars.DEPLOY_PATH }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Validate request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CONFIRMATION" == DEPLOY && "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TOPOLOGY" == coexist || "$TOPOLOGY" == standalone ]]
+          [[ "$HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]
+          [[ "$USER" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]]
+          [[ "${PORT:-22}" =~ ^[0-9]+$ ]]
+          (( ${PORT:-22} >= 1 && ${PORT:-22} <= 65535 ))
+          [[ "$APP_ROOT" =~ ^/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)+$ ]]
+          [[ -n "$KEY" && -n "$KNOWN_HOSTS" ]]
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require exact successful migration CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SHA" ]]
+          git merge-base --is-ancestor "$SHA" origin/java-platform-migration
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&per_page=100" \
+            --jq '.workflow_runs | sort_by(.id) | last | select(.head_branch == "java-platform-migration" and .conclusion == "success") | .id' > "$RUNNER_TEMP/ci-id"
+          [[ -s "$RUNNER_TEMP/ci-id" ]]
+      - name: Configure SSH trust
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$KEY" | tr -d '\r' > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$KNOWN_HOSTS" | tr -d '\r' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
+      - name: Verify release pair and deploy approved bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          release="sha-${SHA:0:12}"
+          ai="ghcr.io/${GITHUB_REPOSITORY,,}-ai:$release"
+          java="ghcr.io/${GITHUB_REPOSITORY,,}-platform:$release"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          for image in "$ai" "$java"; do
+            docker pull "$image"
+            [[ "$(docker image inspect "$image" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" == "$SHA" ]]
+          done
+          remote="/tmp/job-agent-hybrid-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
+          tar -czf "$RUNNER_TEMP/hybrid.tar.gz" compose.yaml compose.prod.yaml compose.coexist.yaml \
+            compose.platform.yaml compose.hybrid.prod.yaml deploy scripts
+          SSH=(-i "$HOME/.ssh/deploy_key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=12)
+          scp "${SSH[@]}" -P "${PORT:-22}" "$RUNNER_TEMP/hybrid.tar.gz" "$USER@$HOST:$remote"
+          ssh "${SSH[@]}" -p "${PORT:-22}" "$USER@$HOST" \
+            "bash -s -- '$APP_ROOT' '$release' '$ai' '$java' '$TOPOLOGY' '$remote'" <<'REMOTE'
+          set -euo pipefail
+          root="$1"; release="$2"; ai="$3"; java="$4"; topology="$5"; bundle="$6"
+          test -f "$root/shared/.env"
+          trap 'rm -f "$bundle"' EXIT
+          mkdir -p "$root/releases/$release"
+          tar -xzf "$bundle" -C "$root/releases/$release"
+          chmod +x "$root/releases/$release/scripts/"*.sh
+          for image in "$ai" "$java"; do
+            pulled=false
+            for attempt in {1..6}; do
+              if timeout 180 docker pull "$image"; then pulled=true; break; fi
+              sleep 10
+            done
+            [[ "$pulled" == true ]]
+          done
+          bash "$root/releases/$release/scripts/deploy_production.sh" "$root" "$release" "$ai" "$topology" "$java"
+          REMOTE
+          echo "commit=$SHA topology=$TOPOLOGY ai=$ai java=$java" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove local credentials
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$HOME/.ssh/deploy_key"
+          docker logout ghcr.io >/dev/null 2>&1 || true

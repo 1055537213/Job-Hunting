@@ -9,6 +9,18 @@ info:
 servers:
   - url: http://platform-service:8081
 paths:
+  /internal/v1/auth/email-verification/request:
+    $ref: './email-verification.openapi.yaml#/paths/~1internal~1v1~1auth~1email-verification~1request'
+  /internal/v1/auth/email-verification/confirm:
+    $ref: './email-verification.openapi.yaml#/paths/~1internal~1v1~1auth~1email-verification~1confirm'
+  /internal/v1/auth/email-verification/due:
+    $ref: './email-verification.openapi.yaml#/paths/~1internal~1v1~1auth~1email-verification~1due'
+  /internal/v1/auth/email-verification/claim:
+    $ref: './email-verification.openapi.yaml#/paths/~1internal~1v1~1auth~1email-verification~1claim'
+  /internal/v1/auth/email-verification/finish:
+    $ref: './email-verification.openapi.yaml#/paths/~1internal~1v1~1auth~1email-verification~1finish'
+  /internal/v1/auth/email-verification/observations:
+    $ref: './email-verification.openapi.yaml#/paths/~1internal~1v1~1auth~1email-verification~1observations'
   /internal/v1/auth/register:
     post:
       operationId: registerAccount
@@ -49,13 +61,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AccountResult'
-        '401':
-          $ref: '#/components/responses/InternalUnauthorized'
         '403':
           description: Account is disabled or email verification is required
         '401':
           description: Internal token or credentials are invalid
 components:
+  securitySchemes:
+    InternalToken:
+      type: apiKey
+      in: header
+      name: X-Internal-Service-Token
   parameters:
     TraceId:
       name: X-Trace-Id
