@@ -181,7 +181,7 @@ def run_web_billing_flow(
 
         from job_hunting_agent.config import PlatformAuthSettings  # noqa: PLC0415
         from job_hunting_agent.platform_auth import PlatformAuthClient  # noqa: PLC0415
-        from job_hunting_agent.platform_email import deliver_platform_verification  # noqa: PLC0415
+        from job_hunting_agent.platform_email import deliver_platform_account_email, deliver_platform_verification  # noqa: PLC0415
         from urllib.parse import parse_qs, urlsplit  # noqa: PLC0415
 
         auth_client = PlatformAuthClient(PlatformAuthSettings(True, base_url, internal_token, 10))
@@ -199,6 +199,11 @@ def run_web_billing_flow(
             def send_verification(self, recipient, url):
                 if recipient != email:
                     raise RuntimeError("Verification email recipient mismatch")
+                self.url = url
+
+            def send_password_reset(self, recipient, url):
+                if recipient != email:
+                    raise RuntimeError("Reset email recipient mismatch")
                 self.url = url
 
         sender = RecordingSender()
@@ -229,6 +234,33 @@ def run_web_billing_flow(
         logged_in = client.post("/api/auth/login", json={"email": email, "password": password})
         if logged_in.status_code != 200:
             raise RuntimeError(f"Web login failed: {logged_in.status_code} {logged_in.text[:300]}")
+
+        old_cookies = dict(client.cookies)
+        requested = client.post("/api/auth/password-reset/request", json={"email": email})
+        unknown = client.post("/api/auth/password-reset/request", json={"email": f"missing-{suffix}@example.com"})
+        if requested.status_code != 200 or requested.json() != unknown.json():
+            raise RuntimeError("Password reset request exposed account existence")
+        reset_jobs = auth_client.password_reset("due")["records"]
+        if len(reset_jobs) != 1:
+            raise RuntimeError("Reset must create one durable Java job")
+        reset_delivery = deliver_platform_account_email(auth_client, sender, reset_jobs[0]["id"], "reset_password")
+        if not reset_delivery["accepted"]:
+            raise RuntimeError("Reset delivery was not accepted")
+        reset_token = parse_qs(urlsplit(sender.url).query)["reset_password_token"][0]
+        new_password = "reset-contract-password-456"
+        reset_body = {"token": reset_token, "new_password": new_password}
+        if client.post("/api/auth/password-reset/confirm", json=reset_body).status_code != 200:
+            raise RuntimeError("Java password reset confirmation failed")
+        if client.post("/api/auth/password-reset/confirm", json=reset_body).status_code != 400:
+            raise RuntimeError("Password reset token was reusable")
+        with httpx.Client(base_url=web_url, cookies=old_cookies) as old_client:
+            if old_client.get("/api/auth/me").json()["authenticated"]:
+                raise RuntimeError("Pre-reset session remained valid")
+        if client.post("/api/auth/login", json={"email": email, "password": password}).status_code != 401:
+            raise RuntimeError("Old password remained valid after reset")
+        if client.post("/api/auth/login", json={"email": email, "password": new_password}).status_code != 200:
+            raise RuntimeError("New password could not log in after reset")
+        print("==> Java reset -> Python SMTP worker -> Web confirm -> old session revoked: PASS")
 
         recharge_payload = {
             "amount_yuan": 10,

@@ -90,20 +90,3 @@ def test_web_verification_never_falls_back_on_platform_outage(tmp_path):
         == 503
     )
     assert app.state.backend.store.list_account_email_outbox(limit=20) == []
-
-
-def test_legacy_verification_does_not_starve_password_reset(tmp_path):
-    app = create_web_app(env_file=tmp_path / "missing.env")
-    store = app.state.backend.store
-    account = store.create_account(
-        email="legacy@example.com", password_hash="test-hash"
-    )
-    verification = app.state.account_email_outbox.enqueue(account, "verify_email", None)
-    reset = app.state.account_email_outbox.enqueue(account, "reset_password", None)
-    assert store.list_due_account_email_outbox(60, limit=1)[0].id == verification.id
-    assert (
-        store.list_due_account_email_outbox(
-            60, limit=1, exclude_purpose="verify_email"
-        )[0].id
-        == reset.id
-    )

@@ -2,14 +2,19 @@
 
 ## 当前边界
 
-网页入口仍是 Python；Java 负责账号注册、密码校验、邮箱验证和可选账务。
+网页入口仍是 Python；Java 负责账号注册、密码校验、邮箱验证、密码重置和可选账务。
 Java 使用 Spring Boot 4.0 / Java 21，JSON 序列化使用 Jackson 3；
 本地与 CI 使用同一 `pom.xml` 和 Python 3.12 锁文件，不需要服务器专用代码。
-Python 的 SMTP/Celery Worker 仅通过 Java 内部接口投递验证邮件；密码重置暂留 Python。
+Python 的 SMTP/Celery Worker 通过 Java 内部接口投递验证/重置邮件，不写 Java 邮件状态。
 Java 验证令牌只保存 SHA-256 摘要，由服务端密钥重建邮件 URL；投递回报必须带本次认领键。
-SMTP 不支持 exactly-once：发送成功后 Worker 失联仍可能重复发送，但重复邮件不会允许重复验证。
+SMTP 不支持 exactly-once：发送成功后 Worker 失联仍可能重复发送，但令牌只能消费一次。
 新注册的待验证账号与邮件任务原子创建，Beat 默认每 30 秒发现到期任务。
-开关切换后旧 Python 验证链接不再有效，应重新发送，不自动回退。
+开关切换后旧 Python 验证/重置链接不再有效，应重新发送，不自动回退。
+已有 Java 验证链接在账本升级后保持有效。重置默认 30 分钟过期，可用
+`JOB_AGENT_PASSWORD_RESET_TOKEN_TTL_MINUTES` 配置；账号和来源限额按用途分别统计。
+重置成功原子撤销旧 Session，并作废所有旧操作链接；签发后密码变化也会让该重置链接失效。
+Python 在创建 Session 的事务里锁定账号并验证认证前的密码快照，防止旧密码并发登录绕过撤销。
+修改密码、注销、管理员初始化及 Session 的其余操作暂留 Python，后续继续迁移。
 
 ## 环境配置
 
@@ -36,7 +41,7 @@ docker compose -f compose.yaml -f compose.platform.yaml up -d --build
 ```
 
 验收脚本使用随机 PostgreSQL schema，结束后删除自己的测试 schema，不清空现有用户数据。
-脚本使用真实 Python Web/Java 进程和 Docker PostgreSQL验证注册、邮箱验证、重复确认、登录、
+脚本使用真实 Python Web/Java 进程和 Docker PostgreSQL验证注册、邮箱验证、密码重置、旧会话撤销、重复确认、登录、
 模拟充值及扣费；测试发送器捕获邮件，不向真实收件人发送。
 CI 还构建两份镜像，运行 `scripts/validate_python_java_docker.py` 验证容器间相同链路。
 该验收使用测试发送器，不等同于真实 SMTP/完整 Worker 队列验收。
@@ -44,7 +49,7 @@ Java 默认测试不启动 PostgreSQL 容器，完整集成测试：
 
 ```powershell
 cd platform-service
-mvn -B -ntp "-Dtest=BillingServiceIntegrationTest,EmailVerificationIntegrationTest" "-Drun.integration.tests=true" test
+mvn -B -ntp "-Dtest=BillingServiceIntegrationTest,AccountActionEmailIntegrationTest" "-Drun.integration.tests=true" test
 ```
 
 ## 生产指令

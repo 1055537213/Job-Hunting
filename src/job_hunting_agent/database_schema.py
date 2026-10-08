@@ -144,9 +144,12 @@ sa.Index(
 )
 
 
-# Java owns this verification ledger; Python only reads through internal APIs.
-platform_email_verifications = sa.Table(
-    "platform_email_verifications", metadata,
+# Java owns this account-action email ledger; Python only reads through internal APIs.
+platform_account_action_emails = sa.Table(
+    "platform_account_action_emails", metadata,
+    sa.Column("purpose", sa.String(32), nullable=False, server_default="verify_email"),
+    sa.Column("credential_hash", sa.String(64)),
+    sa.CheckConstraint("purpose IN ('verify_email', 'reset_password')", name="platform_action_email_purpose"),
     sa.Column("id", sa.Integer, primary_key=True),
     sa.Column("account_id", sa.Integer, sa.ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False),
     sa.Column("recipient_email", sa.String(254), nullable=False),
@@ -168,9 +171,9 @@ platform_email_verifications = sa.Table(
     sa.CheckConstraint("status IN ('pending', 'sending', 'retrying', 'sent', 'failed', 'cancelled')", name="platform_verification_status"),
     sa.CheckConstraint("attempt_count >= 0 AND max_attempts > 0 AND attempt_count <= max_attempts", name="platform_verification_attempts"),
 )
-sa.Index("idx_platform_verification_due", platform_email_verifications.c.status, platform_email_verifications.c.next_attempt_at)
-sa.Index("idx_platform_verification_account", platform_email_verifications.c.account_id, platform_email_verifications.c.created_at)
-sa.Index("idx_platform_verification_source", platform_email_verifications.c.request_source_hash, platform_email_verifications.c.created_at)
+sa.Index("idx_platform_action_email_due", platform_account_action_emails.c.purpose, platform_account_action_emails.c.status, platform_account_action_emails.c.next_attempt_at)
+sa.Index("idx_platform_action_email_account", platform_account_action_emails.c.account_id, platform_account_action_emails.c.purpose, platform_account_action_emails.c.created_at)
+sa.Index("idx_platform_action_email_source", platform_account_action_emails.c.request_source_hash, platform_account_action_emails.c.purpose, platform_account_action_emails.c.created_at)
 
 
 # 保存用户同意的协议版本，避免只保留一个随版本更新而失真的布尔值。

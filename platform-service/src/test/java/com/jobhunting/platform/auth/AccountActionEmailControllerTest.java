@@ -19,47 +19,49 @@ import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
-@WebMvcTest(EmailVerificationController.class)
-@Import({AuthErrorHandler.class, EmailVerificationControllerTest.Configuration.class})
+@WebMvcTest(AccountActionEmailController.class)
+@Import({AuthErrorHandler.class, AccountActionEmailControllerTest.Configuration.class})
 @TestPropertySource(properties = "platform.auth.enabled=true")
-class EmailVerificationControllerTest {
+class AccountActionEmailControllerTest {
     @Autowired private MockMvc mvc;
-    @MockitoBean private EmailVerificationService service;
+    @MockitoBean private AccountActionEmailService service;
 
     @Test
     void allOperationsRequireInternalAuthentication() throws Exception {
         String[][] requests = {
             {"request", "{\"email\":\"user@example.com\"}"},
-            {"confirm", "{\"token\":\"test-token\"}"},
+            {"confirm", "{\"token\":\"test-token\",\"new_password\":\"new-password-123\"}"},
             {"due", "{}"}, {"claim", "{\"id\":1}"},
             {"finish", "{\"id\":1,\"claim_key\":\"key\",\"sent\":true}"},
             {"observations", "{}"}
         };
         for (var request : requests) {
+          for (String action : new String[] {"email-verification", "password-reset"}) {
             for (String token : new String[] {"", "wrong-token"}) {
-                mvc.perform(post("/internal/v1/auth/email-verification/" + request[0])
+                mvc.perform(post("/internal/v1/auth/" + action + "/" + request[0])
                         .contentType(APPLICATION_JSON).content(request[1])
                         .header("X-Internal-Service-Token", token))
                     .andExpect(status().isUnauthorized());
             }
+          }
         }
         verifyNoInteractions(service);
     }
 
     @Test
     void claimAndFinishUseFencingKey() throws Exception {
-        when(service.claim(1)).thenReturn(null);
+        when(service.claim(AccountActionEmailService.Purpose.VERIFY_EMAIL, 1)).thenReturn(null);
         mvc.perform(post("/internal/v1/auth/email-verification/claim")
                 .header("X-Internal-Service-Token", "test-internal-token")
                 .contentType(APPLICATION_JSON).content("{\"id\":1}"))
             .andExpect(status().isOk()).andExpect(jsonPath("$.claim").isEmpty());
-        when(service.finish(1, "claim-key", true, null)).thenReturn(true);
+        when(service.finish(AccountActionEmailService.Purpose.VERIFY_EMAIL, 1, "claim-key", true, null)).thenReturn(true);
         mvc.perform(post("/internal/v1/auth/email-verification/finish")
                 .header("X-Internal-Service-Token", "test-internal-token")
                 .contentType(APPLICATION_JSON)
                 .content("{\"id\":1,\"claim_key\":\"claim-key\",\"sent\":true}"))
             .andExpect(status().isOk()).andExpect(jsonPath("$.ok").value(true));
-        verify(service).finish(1, "claim-key", true, null);
+        verify(service).finish(AccountActionEmailService.Purpose.VERIFY_EMAIL, 1, "claim-key", true, null);
     }
 
     @Test
@@ -73,6 +75,34 @@ class EmailVerificationControllerTest {
                 .header("X-Internal-Service-Token", "test-internal-token")
                 .contentType(APPLICATION_JSON)
                 .content("{\"id\":1,\"claim_key\":\"key\"}"))
+            .andExpect(status().isUnprocessableEntity());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    void resetUsesValidatedRedactedCredentialsAndPurposeScopedClaim() throws Exception {
+        when(service.resetPassword("opaque-token", "new-password-123")).thenReturn(1L);
+        mvc.perform(post("/internal/v1/auth/password-reset/confirm")
+                .header("X-Internal-Service-Token", "test-internal-token")
+                .contentType(APPLICATION_JSON)
+                .content("{\"token\":\"opaque-token\",\"new_password\":\"new-password-123\"}"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.account_id").value(1));
+        verify(service).resetPassword("opaque-token", "new-password-123");
+        when(service.claim(AccountActionEmailService.Purpose.RESET_PASSWORD, 1)).thenReturn(null);
+        mvc.perform(post("/internal/v1/auth/password-reset/claim")
+                .header("X-Internal-Service-Token", "test-internal-token")
+                .contentType(APPLICATION_JSON).content("{\"id\":1}"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.claim").isEmpty());
+        verify(service).claim(AccountActionEmailService.Purpose.RESET_PASSWORD, 1);
+        org.assertj.core.api.Assertions.assertThat(new AccountActionEmailController.TokenRequest("opaque-token", "new-password-123").toString())
+            .doesNotContain("opaque-token", "new-password-123");
+    }
+
+    @Test
+    void rejectsShortResetPasswordBeforeServiceCall() throws Exception {
+        mvc.perform(post("/internal/v1/auth/password-reset/confirm")
+                .header("X-Internal-Service-Token", "test-internal-token")
+                .contentType(APPLICATION_JSON).content("{\"token\":\"opaque\",\"new_password\":\"short\"}"))
             .andExpect(status().isUnprocessableEntity());
         verifyNoInteractions(service);
     }

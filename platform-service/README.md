@@ -6,7 +6,7 @@
 依赖版本由 Maven 锁定，Tomcat/Jackson 的安全修复版本在 `pom.xml` 中显式覆盖；
 CI 会扫描传递依赖，不通过忽略漏洞绕过门禁。
 
-默认配置不会连接数据库，账务或认证模块必须显式设置 `PLATFORM_BILLING_ENABLED=true` 或 `PLATFORM_AUTH_ENABLED=true` 后才会启用 PostgreSQL。启用迁移模块后，Java 接管对应写入，Python 仍是网页入口并负责 SMTP/后台任务；密码重置暂留 Python。本分支不接管现有生产流量。
+默认配置不会连接数据库，账务或认证模块必须显式设置 `PLATFORM_BILLING_ENABLED=true` 或 `PLATFORM_AUTH_ENABLED=true` 后才会启用 PostgreSQL。启用迁移模块后，Java 接管对应写入，Python 仍是网页入口并负责 SMTP/后台任务。本分支不接管现有生产流量。
 
 Python 侧通过 `JOB_AGENT_JAVA_BILLING_ENABLED=true` 开启调用 Java 的扣费路径；这两个开关必须同时打开，并且两边使用同一个 PostgreSQL、内部 Token 和价格配置。开发环境可使用：
 
@@ -93,9 +93,14 @@ Java 兼容 Python 当前使用的 Argon2id 和 scrypt 哈希格式。Python 的
 零余额摘要行、协议同意记录及待验证账号的邮件任务。重复邮箱返回
 `ACCOUNT_ALREADY_EXISTS`，事务失败不会留下半个账号。
 
-邮箱验证使用 Java 独占的 `platform_email_verifications` 账本；Python SMTP Worker
+邮箱验证和密码重置共用 Java 独占的 `platform_account_action_emails` 账本；Python SMTP Worker
 通过内部 API 认领并回报投递，不直接更新验证状态。一次性令牌只保存摘要，认领键
-阻止失联 Worker 的迟到结果覆盖新任务状态。密码重置暂保留 Python 实现。
+阻止失联 Worker 的迟到结果覆盖新任务状态。`POST /internal/v1/auth/password-reset/confirm`
+在一个事务里消费令牌、更新 Argon2id 密码、撤销所有旧会话并使旧操作链接失效。
+重置链接默认有效 30 分钟，绑定签发时的密码摘要，不能覆盖签发后发生的密码修改。
+Python 签发 Session 前锁定账号并检查认证前的密码快照，关闭重置与登录并发窗口。
+已签发的 Java 验证链接原样保留；旧 Python 操作链接在 Java 模式下不再支持，应重新请求。
+Java 模式下不派发旧 Python 邮件任务；关闭迁移开关时仍保留兼容实现，不能称为全部清理。
 本地与联合生产部署步骤见 [Python + Java 部署指南](../docs/learning/python-java-deployment.md)。
 
 充值和扣费接口都要求 `Idempotency-Key` 与请求中的 `source_reference` 相同。Java 在充值时同一事务写入 `recharge_orders`、`account_balance_ledger` 和 `payment_events`，重复充值只返回原账务结果，不会重复到账。余额不足时返回 `INSUFFICIENT_BALANCE` 和 `余额不足，请先充值后重试`。余额行使用 PostgreSQL 行锁，账务流水使用唯一约束保证重试不会重复写入。Python 在远端扣费失败时保留 `usage_events`，后续使用同一个 `call_id` 重试，不会重复扣费。

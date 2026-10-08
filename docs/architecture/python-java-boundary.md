@@ -16,7 +16,7 @@
 
 ## 迁移规则
 
-1. 一个事实表只能有一个服务负责写入。
+1. 同一业务写入操作只能有一个服务负责执行；迁移完成后收束为一张事实表一个写入所有者。
 2. 迁移前必须先冻结 OpenAPI 契约、错误码、幂等键和 trace id 规则。
 3. Python 和 Java 不通过直接改对方表来通信。
 4. 长耗时 AI 操作使用任务 ID，平台服务不等待模型执行完成。
@@ -44,22 +44,28 @@
 - 本地验收脚本会在隔离 PostgreSQL schema 中验证注册账号、Java 凭据校验、Python Session 创建和后续账务请求。
 - 注册请求通过 Java 内部接口完成；账号、零余额摘要和协议同意记录在一个事务中写入，Python 保留外部 API 兼容。
 
-## 下一阶段
+## 第三阶段：验证与密码重置
 
 邮箱验证已迁移到 Java；注册账号与初始验证邮件任务在同一事务中创建。
-`platform_email_verifications` 是 Java 独占写入的验证/投递账本，Python SMTP Worker 通过内部
-接口领取任务、投递并回报，不直接写此表。密码重置仍使用原 Python 表，后续单独迁移。
-切换 Java 认证后旧 Python 验证链接失效，用户应重新请求验证；不会静默回退到 Python 消费令牌。
+`platform_account_action_emails` 是 Java 独占写入的验证/重置投递账本，Python SMTP Worker
+通过内部接口领取任务、投递并回报，不直接写此表。密码重置、令牌消费和旧会话撤销在一个
+Java 事务中完成；重置令牌绑定签发时的密码摘要，防止旧链接覆盖后来的密码修改。
+Python 登录签发 Session 前锁定账号并核对认证前的密码快照，防止重置后出现旧密码的新会话。
+迁移期 `accounts` 和 `auth_sessions` 是共享表例外：Java 执行注册/重置及其会话撤销，
+Python 暂执行登录 Session 签发、修改密码和注销。二者使用同一账号行锁，并由并发/回滚测试
+验证约束；不是最终的单写者架构。后续 Session/账号生命周期整体转移后删除此例外。
+升级保留已有 Java 验证链接；切换 Java 后旧 Python 操作链接失效，应重新请求，不静默回退。
+Java 模式不再派发任何旧 Python 账号邮件，旧队列消息也被跳过；关闭迁移开关时仍保留兼容路径。
 
 ## 目标入口与发布规则
 
 最终由 Java 接管对外业务 API，Python 提供内部 AI/长任务能力，保持现有前端 URL/API 兼容。
-当前仍由 Python 提供外部 HTTP 接口，Java 内部提供注册、验证、凭据和账务服务。
+当前仍由 Python 提供外部 HTTP 接口，Java 内部提供注册、验证、密码重置、凭据和账务服务。
 
 本地使用 `compose.yaml + compose.platform.yaml`；生产加载 `compose.yaml`、`compose.prod.yaml`
 和 `compose.hybrid.prod.yaml`，共享 Java 服务配置；共存部署另加 `compose.coexist.yaml`。
 CI 通过后发布相同提交的 `-ai` 和 `-platform` 两个版本镜像，审批部署通过 `Deploy Python Java`
 工作流执行；生产只填环境配置，不需要修改代码/Compose。此分支不自动部署服务器。
 
-后续迁移密码重置、Session 撤销/管理和管理员业务接口。所有 GitHub 推送必须确认对应提交
+后续迁移修改密码、Session 签发/管理和管理员业务接口。所有 GitHub 推送必须确认对应提交
 CI 最终通过，镜像发布失败也不视为完成。

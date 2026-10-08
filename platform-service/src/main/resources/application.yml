@@ -29,6 +29,7 @@ platform:
     action-secret: ${JOB_AGENT_ACCOUNT_ACTION_SECRET:development-only-account-action-secret}
     public-base-url: ${JOB_AGENT_PUBLIC_BASE_URL:http://localhost:8000}
     ttl-minutes: ${JOB_AGENT_VERIFICATION_TOKEN_TTL_MINUTES:1440}
+    reset-ttl-minutes: ${JOB_AGENT_PASSWORD_RESET_TOKEN_TTL_MINUTES:30}
     cooldown-seconds: ${JOB_AGENT_ACCOUNT_EMAIL_COOLDOWN_SECONDS:60}
     account-hourly-limit: ${JOB_AGENT_ACCOUNT_EMAIL_HOURLY_LIMIT:5}
     source-hourly-limit: ${JOB_AGENT_ACCOUNT_EMAIL_SOURCE_HOURLY_LIMIT:20}

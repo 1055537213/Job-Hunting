@@ -38,7 +38,7 @@ from .models import BackgroundTaskRecord
 from .project_archive import ProjectArchiveError
 from .platform_billing import PlatformBillingUnavailableError
 from .platform_auth import PlatformAuthClient
-from .platform_email import deliver_platform_verification
+from .platform_email import deliver_platform_account_email
 from .rag import RAGProviderRequestError
 from .resume_document import ResumeDocumentError
 from .sqlalchemy_store import SQLAlchemyStore
@@ -240,9 +240,8 @@ def dispatch_due_account_emails(
     lifecycle_settings = load_account_lifecycle_settings(env_path)
     task_queue_settings = load_task_queue_settings(env_path)
     auth_settings = load_platform_auth_settings(env_path)
-    records = store.list_due_account_email_outbox(
+    records = [] if auth_settings.enabled else store.list_due_account_email_outbox(
         lifecycle_settings.email_claim_timeout_seconds,
-        exclude_purpose="verify_email" if auth_settings.enabled else "",
     )
     dispatched = 0
     failed = 0
@@ -259,18 +258,22 @@ def dispatch_due_account_emails(
         except Exception:  # noqa: BLE001 - 下一轮 Beat 会再次扫描同一数据库记录。
             failed += 1
     if auth_settings.enabled:
-        jobs = PlatformAuthClient(auth_settings).email_verification("due")["records"]
-        for job in jobs:
-            try:
-                celery_app.send_task(
-                    PLATFORM_EMAIL_DELIVERY_TASK_NAME,
-                    args=[job["id"]], kwargs={},
-                    task_id=f"platform-email-{job['id']}-{job['attempt_count'] + 1}",
-                    queue=task_queue_settings.queue_name,
-                )
-                dispatched += 1
-            except Exception:  # noqa: BLE001 - Beat rediscovers the persistent job.
-                failed += 1
+        client = PlatformAuthClient(auth_settings)
+        for purpose, action in (
+            ("verify_email", client.email_verification), ("reset_password", client.password_reset),
+        ):
+            jobs = action("due")["records"]
+            for job in jobs:
+                try:
+                    celery_app.send_task(
+                        PLATFORM_EMAIL_DELIVERY_TASK_NAME,
+                        args=[job["id"]], kwargs={"purpose": purpose},
+                        task_id=f"platform-email-{job['id']}-{job['attempt_count'] + 1}",
+                        queue=task_queue_settings.queue_name,
+                    )
+                    dispatched += 1
+                except Exception:  # noqa: BLE001 - Beat rediscovers the persistent job.
+                    failed += 1
     return {"dispatched": dispatched, "dispatch_failed": failed}
 
 
@@ -1199,11 +1202,11 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
 
     @celery_app.task(name=PLATFORM_EMAIL_DELIVERY_TASK_NAME, acks_late=True,
                      reject_on_worker_lost=True, ignore_result=True)
-    def deliver_platform_email(outbox_id: int) -> dict[str, object]:
+    def deliver_platform_email(outbox_id: int, purpose: str = "verify_email") -> dict[str, object]:
         settings = load_account_lifecycle_settings(env_path)
-        return deliver_platform_verification(
+        return deliver_platform_account_email(
             PlatformAuthClient(load_platform_auth_settings(env_path)),
-            build_account_email_sender(settings), outbox_id,
+            build_account_email_sender(settings), outbox_id, purpose,
         )
 
     @celery_app.task(
@@ -1223,7 +1226,7 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
                     record = store.get_account_email_outbox(outbox_id)
                 except KeyError:
                     return {"outbox_id": outbox_id, "status": "not_claimed"}
-                if record.purpose == "verify_email":
+                if record.purpose in {"verify_email", "reset_password"}:
                     return {"outbox_id": outbox_id, "status": "superseded_by_java"}
             lifecycle_settings = load_account_lifecycle_settings(env_path)
             service = AccountEmailOutboxService(

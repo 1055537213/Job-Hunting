@@ -777,6 +777,15 @@ def create_web_app(
     def request_password_reset(payload: AccountEmailPayload, request: Request) -> dict[str, str]:
         """Issue a reset token while keeping account existence private."""
 
+        if backend.platform_auth_client is not None:
+            try:
+                backend.platform_auth_client.password_reset(
+                    "request", email=payload.email,
+                    source=request.client.host if request.client else None,
+                )
+            except PlatformAuthError as error:
+                raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
+            return {"message": "如果该邮箱已注册，密码重置邮件已发送。"}
         record = backend.store.get_account_by_email(payload.email.strip().lower())
         if record is not None and record[0].status == "active":
             send_account_action_email(record[0], "reset_password", request)
@@ -786,6 +795,14 @@ def create_web_app(
     def confirm_password_reset(payload: PasswordResetConfirmPayload) -> dict[str, bool]:
         """Consume a reset token and revoke every existing device session."""
 
+        if backend.platform_auth_client is not None:
+            try:
+                backend.platform_auth_client.password_reset(
+                    "confirm", token=payload.token, new_password=payload.new_password,
+                )
+            except PlatformAuthError as error:
+                raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
+            return {"ok": True}
         try:
             password_hash = hash_password(payload.new_password)
         except ValueError as error:
@@ -803,6 +820,7 @@ def create_web_app(
         """验证密码并签发服务端 Session Cookie。"""
 
         normalized_email = payload.email.strip().lower()
+        credential_snapshot = backend.store.get_account_by_email(normalized_email)
         if backend.platform_auth_client is not None:
             try:
                 verified = backend.platform_auth_client.verify_credentials(
@@ -824,8 +842,10 @@ def create_web_app(
                 raise HTTPException(status_code=401, detail="邮箱或密码错误。") from error
             if account.email != normalized_email:
                 raise HTTPException(status_code=401, detail="邮箱或密码错误。")
+            if credential_snapshot is None or credential_snapshot[0].id != account.id:
+                raise HTTPException(status_code=401, detail="账号凭据已变化，请重新登录。")
         else:
-            record = backend.store.get_account_by_email(normalized_email)
+            record = credential_snapshot
             if record is None or not verify_password(record[1], payload.password):
                 raise HTTPException(status_code=401, detail="邮箱或密码错误。")
             account, _ = record
@@ -839,16 +859,20 @@ def create_web_app(
         raw_token = new_session_token()
         now = utc_now().isoformat(timespec="seconds")
         expires_at, absolute_expires_at = session_expiry()
-        backend.store.save_auth_session(
-            account_id=account.id,
-            token_hash=session_token_hash(raw_token),
-            created_at=now,
-            last_seen_at=now,
-            expires_at=expires_at,
-            absolute_expires_at=absolute_expires_at,
-            user_agent=request.headers.get("user-agent"),
-            ip_address=request.client.host if request.client else None,
-        )
+        try:
+            backend.store.save_auth_session(
+                account_id=account.id,
+                token_hash=session_token_hash(raw_token),
+                created_at=now,
+                last_seen_at=now,
+                expires_at=expires_at,
+                absolute_expires_at=absolute_expires_at,
+                user_agent=request.headers.get("user-agent"),
+                ip_address=request.client.host if request.client else None,
+                expected_password_hash=credential_snapshot[1],
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=401, detail="账号凭据已变化，请重新登录。") from error
         response.set_cookie(
             SESSION_COOKIE_NAME,
             raw_token,
@@ -2731,10 +2755,13 @@ def create_web_app(
 
         require_admin(request)
         email_records = backend.store.list_account_email_outbox(limit=20)
-        platform_email = None
+        platform_emails = []
         if backend.platform_auth_client is not None:
             try:
-                platform_email = backend.platform_auth_client.email_verification("observations")
+                platform_emails = [
+                    backend.platform_auth_client.email_verification("observations"),
+                    backend.platform_auth_client.password_reset("observations"),
+                ]
             except PlatformAuthError as error:
                 raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
         result = {
@@ -2759,7 +2786,7 @@ def create_web_app(
                 ],
             },
         }
-        if platform_email is not None:
+        for platform_email in platform_emails:
             for status, count in platform_email["summary"].items():
                 result["account_email"]["summary"][status] += int(count)
             for record in platform_email["records"]:

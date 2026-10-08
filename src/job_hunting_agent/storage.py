@@ -564,7 +564,6 @@ class RepositoryStore:
         self,
         claim_timeout_seconds: int,
         limit: int = 100,
-        exclude_purpose: str = "",
     ) -> list[AccountEmailOutboxRecord]:
         """列出待发送、到期重试和失联认领记录。"""
 
@@ -606,7 +605,7 @@ class RepositoryStore:
             rows = conn.execute(
                 """
                 SELECT * FROM account_email_outbox
-                WHERE purpose <> ? AND attempt_count < max_attempts AND (
+                WHERE attempt_count < max_attempts AND (
                     (status IN ('pending', 'retrying') AND next_attempt_at <= ?)
                     OR (status = 'sending' AND claimed_at < ?)
                 )
@@ -617,7 +616,7 @@ class RepositoryStore:
                 )
                 ORDER BY next_attempt_at, id LIMIT ?
                 """,
-                (exclude_purpose, current, stale_before, current, max(1, min(limit, 500))),
+                (current, stale_before, current, max(1, min(limit, 500))),
             ).fetchall()
         return [account_email_outbox_from_row(row) for row in rows]
 
@@ -2187,10 +2186,23 @@ class RepositoryStore:
         absolute_expires_at: str,
         user_agent: str | None = None,
         ip_address: str | None = None,
+        expected_password_hash: str | None = None,
     ) -> AuthSessionRecord:
         """保存服务端 Session；Cookie 原文不会进入数据库。"""
 
         with self.connect() as conn:
+            if expected_password_hash is not None:
+                credential = conn.execute(
+                    "SELECT password_hash, status, deleted_at FROM accounts WHERE id = ? FOR UPDATE",
+                    (account_id,),
+                ).fetchone()
+                if (
+                    credential is None
+                    or credential["password_hash"] != expected_password_hash
+                    or credential["status"] != "active"
+                    or credential["deleted_at"] is not None
+                ):
+                    raise ValueError("Account credentials changed during login")
             cursor = conn.execute(
                 """
                 INSERT INTO auth_sessions (

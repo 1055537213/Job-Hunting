@@ -171,7 +171,13 @@ class PlatformAuthClient:
             ) from error
 
     def email_verification(self, operation: str, **data: Any) -> dict[str, Any]:
-        """Internal verification and delivery state API; never falls back to local writes."""
+        return self._account_email("email-verification", operation, data)
+
+    def password_reset(self, operation: str, **data: Any) -> dict[str, Any]:
+        return self._account_email("password-reset", operation, data)
+
+    def _account_email(self, action: str, operation: str, data: dict[str, Any]) -> dict[str, Any]:
+        """Java owns tokens and delivery state; never fall back to local writes."""
 
         if operation not in {
             "request",
@@ -181,10 +187,10 @@ class PlatformAuthClient:
             "finish",
             "observations",
         }:
-            raise ValueError("Unknown verification operation")
+            raise ValueError("Unknown account email operation")
         try:
             response = httpx.post(
-                f"{self.base_url}/internal/v1/auth/email-verification/{operation}",
+                f"{self.base_url}/internal/v1/auth/{action}/{operation}",
                 headers={
                     "X-Internal-Service-Token": self.internal_token,
                     "X-Trace-Id": f"platform-email-{uuid4().hex}",

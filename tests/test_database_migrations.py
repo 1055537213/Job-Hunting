@@ -429,3 +429,37 @@ def test_downgrade_database_returns_an_empty_revision_chain(temporary_database_u
         engine.dispose()
     assert "accounts" not in tables
     assert "rag_chunks" not in tables
+
+
+def test_action_email_upgrade_preserves_existing_verification_and_round_trips(temporary_database_url):
+    upgrade_database(temporary_database_url, "20261008_0021")
+    engine = sa.create_engine(temporary_database_url)
+    try:
+        with engine.begin() as conn:
+            account_id = conn.execute(sa.text("""
+                INSERT INTO accounts (email,password_hash,role,status,must_change_password,created_at,updated_at)
+                VALUES ('link@example.com','test-hash','user','active',FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) RETURNING id
+            """)).scalar_one()
+            conn.execute(sa.text("""
+                INSERT INTO platform_email_verifications (account_id,recipient_email,delivery_key,token_hash,
+                    expires_at,status,attempt_count,max_attempts,next_attempt_at,created_at,updated_at)
+                VALUES (:id,'link@example.com','existing-key',:hash,CURRENT_TIMESTAMP+INTERVAL '1 day',
+                    'sent',1,5,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            """), {"id": account_id, "hash": "a" * 64})
+        upgrade_database(temporary_database_url)
+        with engine.begin() as conn:
+            original = conn.execute(sa.text("SELECT delivery_key,token_hash,purpose FROM platform_account_action_emails")).one()
+            assert tuple(original) == ("existing-key", "a" * 64, "verify_email")
+            conn.execute(sa.text("""
+                INSERT INTO platform_account_action_emails (account_id,recipient_email,delivery_key,token_hash,purpose,
+                    expires_at,status,attempt_count,max_attempts,next_attempt_at,created_at,updated_at)
+                VALUES (:id,'link@example.com','reset-key',:hash,'reset_password',CURRENT_TIMESTAMP+INTERVAL '1 day',
+                    'pending',0,5,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            """), {"id": account_id, "hash": "b" * 64})
+        downgrade_database(temporary_database_url, "20261008_0021")
+        with engine.connect() as conn:
+            assert conn.execute(sa.text("SELECT delivery_key,token_hash FROM platform_email_verifications")).one() == ("existing-key", "a" * 64)
+        upgrade_database(temporary_database_url)
+        assert "platform_account_action_emails" in sa.inspect(engine).get_table_names()
+    finally:
+        engine.dispose()

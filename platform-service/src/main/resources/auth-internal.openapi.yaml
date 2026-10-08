@@ -8,7 +8,21 @@ info:
     Passwords are accepted only in memory and are never returned or logged.
 servers:
   - url: http://platform-service:8081
+security:
+  - InternalToken: []
 paths:
+  /internal/v1/auth/password-reset/request:
+    $ref: './password-reset.openapi.yaml#/paths/~1internal~1v1~1auth~1password-reset~1request'
+  /internal/v1/auth/password-reset/confirm:
+    $ref: './password-reset.openapi.yaml#/paths/~1internal~1v1~1auth~1password-reset~1confirm'
+  /internal/v1/auth/password-reset/due:
+    $ref: './password-reset.openapi.yaml#/paths/~1internal~1v1~1auth~1password-reset~1due'
+  /internal/v1/auth/password-reset/claim:
+    $ref: './password-reset.openapi.yaml#/paths/~1internal~1v1~1auth~1password-reset~1claim'
+  /internal/v1/auth/password-reset/finish:
+    $ref: './password-reset.openapi.yaml#/paths/~1internal~1v1~1auth~1password-reset~1finish'
+  /internal/v1/auth/password-reset/observations:
+    $ref: './password-reset.openapi.yaml#/paths/~1internal~1v1~1auth~1password-reset~1observations'
   /internal/v1/auth/email-verification/request:
     $ref: './email-verification.openapi.yaml#/paths/~1internal~1v1~1auth~1email-verification~1request'
   /internal/v1/auth/email-verification/confirm:

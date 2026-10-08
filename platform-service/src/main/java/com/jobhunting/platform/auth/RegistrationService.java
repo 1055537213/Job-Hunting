@@ -15,13 +15,13 @@ import org.springframework.transaction.annotation.Transactional;
 public class RegistrationService {
     private final JdbcTemplate jdbc;
     private final PasswordHasher passwords;
-    private final EmailVerificationService verification;
+    private final AccountActionEmailService verification;
     private final long lowBalanceThresholdMicroYuan;
 
     public RegistrationService(
             JdbcTemplate jdbc,
             PasswordHasher passwords,
-            EmailVerificationService verification,
+            AccountActionEmailService verification,
             @Value("${platform.billing.low-balance-threshold-micro-yuan:10000000}")
             long lowBalanceThresholdMicroYuan) {
         this.jdbc = jdbc;
@@ -81,7 +81,7 @@ public class RegistrationService {
                         consent.ip_address(),
                         consent.user_agent());
             }
-            if (!emailVerified) verification.enqueue(accountId, null);
+            if (!emailVerified) verification.enqueue(AccountActionEmailService.Purpose.VERIFY_EMAIL, accountId, null);
             return accountId;
         } catch (DuplicateKeyException exception) {
             throw new AuthException(
