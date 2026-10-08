@@ -1,5 +1,6 @@
 package com.jobhunting.platform.auth;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.http.MediaType.APPLICATION_JSON;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -10,7 +11,7 @@ import java.util.List;
 import com.jobhunting.platform.billing.InternalTokenVerifier;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
@@ -62,6 +63,19 @@ class RegistrationControllerTest {
                 .andExpect(jsonPath("$.message").value("该邮箱已经注册。"));
     }
 
+    @Test
+    void omittedOrNullVerificationFlagDefaultsToUnverified() throws Exception {
+        for (String optionalFlag : new String[] {"", ",\"email_verified\":null"}) {
+            mockMvc.perform(post("/internal/v1/auth/register")
+                            .header("X-Internal-Service-Token", "platform-secret")
+                            .contentType(APPLICATION_JSON)
+                            .content("{\"email\":\"optional@example.com\",\"password\":\"password-123\""
+                                    + optionalFlag + "}"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.account_id").value(43));
+        }
+    }
+
     @TestConfiguration
     static class StubConfiguration {
         @Bean
@@ -79,6 +93,10 @@ class RegistrationControllerTest {
                         String displayName,
                         boolean emailVerified,
                         List<RegistrationController.Consent> consents) {
+                    if ("optional@example.com".equals(email)) {
+                        assertThat(emailVerified).isFalse();
+                        assertThat(consents).isEmpty();
+                    }
                     if ("duplicate@example.com".equals(email)) {
                         throw new AuthException(
                                 "ACCOUNT_ALREADY_EXISTS", "该邮箱已经注册。", HttpStatus.CONFLICT);

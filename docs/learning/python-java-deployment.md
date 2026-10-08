@@ -3,6 +3,8 @@
 ## 当前边界
 
 网页入口仍是 Python；Java 负责账号注册、密码校验、邮箱验证和可选账务。
+Java 使用 Spring Boot 4.0 / Java 21，JSON 序列化使用 Jackson 3；
+本地与 CI 使用同一 `pom.xml` 和 Python 3.12 锁文件，不需要服务器专用代码。
 Python 的 SMTP/Celery Worker 仅通过 Java 内部接口投递验证邮件；密码重置暂留 Python。
 Java 验证令牌只保存 SHA-256 摘要，由服务端密钥重建邮件 URL；投递回报必须带本次认领键。
 SMTP 不支持 exactly-once：发送成功后 Worker 失联仍可能重复发送，但重复邮件不会允许重复验证。

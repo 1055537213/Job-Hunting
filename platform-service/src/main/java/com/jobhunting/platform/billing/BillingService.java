@@ -7,8 +7,8 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Map;
 import java.util.UUID;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -355,7 +355,7 @@ public class BillingService implements BillingOperations {
                     "source_reference", request.source_reference(),
                     "token_count", request.token_count() == null ? 0 : request.token_count(),
                     "consumption_micro_yuan", amount));
-        } catch (JsonProcessingException exception) {
+        } catch (JacksonException exception) {
             throw new IllegalStateException("账务明细序列化失败。", exception);
         }
     }
@@ -367,7 +367,7 @@ public class BillingService implements BillingOperations {
                     "order_number", orderNumber,
                     "source_reference", sourceReference,
                     "amount_micro_yuan", amount));
-        } catch (JsonProcessingException exception) {
+        } catch (JacksonException exception) {
             throw new IllegalStateException("充值明细序列化失败。", exception);
         }
     }

@@ -11,7 +11,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.jobhunting.platform.billing.InternalTokenVerifier;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
@@ -68,6 +68,11 @@ class EmailVerificationControllerTest {
                 .header("X-Internal-Service-Token", "test-internal-token")
                 .contentType(APPLICATION_JSON)
                 .content("{\"id\":1,\"claim_key\":\"key\",\"sent\":false,\"error_type\":\"secret=https://token\"}"))
+            .andExpect(status().isUnprocessableEntity());
+        mvc.perform(post("/internal/v1/auth/email-verification/finish")
+                .header("X-Internal-Service-Token", "test-internal-token")
+                .contentType(APPLICATION_JSON)
+                .content("{\"id\":1,\"claim_key\":\"key\"}"))
             .andExpect(status().isUnprocessableEntity());
         verifyNoInteractions(service);
     }

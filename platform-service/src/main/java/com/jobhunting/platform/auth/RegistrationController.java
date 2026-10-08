@@ -33,7 +33,7 @@ public class RegistrationController {
                 request.email(),
                 request.password(),
                 request.display_name(),
-                request.email_verified(),
+                Boolean.TRUE.equals(request.email_verified()),
                 request.consents() == null ? List.of() : request.consents()));
     }
 
@@ -41,7 +41,7 @@ public class RegistrationController {
             @NotBlank @Email @Size(max = 254) String email,
             @NotBlank @Size(min = 8, max = 1024) String password,
             @Size(max = 128) String display_name,
-            boolean email_verified,
+            Boolean email_verified,
             List<Consent> consents) {
         @Override
         public String toString() { return "RegistrationRequest[redacted]"; }

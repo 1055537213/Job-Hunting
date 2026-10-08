@@ -5,7 +5,7 @@ spring:
     # 平台服务骨架默认不连接数据库；启用 PLATFORM_BILLING_ENABLED 后，
     # BillingConfiguration 会创建 PostgreSQL DataSource。
     exclude:
-      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration
   datasource:
     url: ${SPRING_DATASOURCE_URL:}
     username: ${SPRING_DATASOURCE_USERNAME:}

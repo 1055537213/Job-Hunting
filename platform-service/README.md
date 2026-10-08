@@ -1,8 +1,12 @@
 # Job Hunting Platform Service
 
-这是求职助手的 Java 平台服务，当前实现账务垂直链路，以及可选的账号凭据校验接口。
+这是求职助手的 Java 平台服务，当前实现账务垂直链路，以及账号注册、凭据校验和邮箱验证内部接口。
 
-默认配置不会连接数据库，账务或认证模块必须显式设置 `PLATFORM_BILLING_ENABLED=true` 或 `PLATFORM_AUTH_ENABLED=true` 后才会启用 PostgreSQL。当前版本不会接管生产流量，迁移完成前，现有 Python 服务仍是账号和账务事实源。
+运行基线为 Spring Boot 4.0、Spring Framework 7、Jackson 3、Tomcat 11 和 Java 21。
+依赖版本由 Maven 锁定，Tomcat/Jackson 的安全修复版本在 `pom.xml` 中显式覆盖；
+CI 会扫描传递依赖，不通过忽略漏洞绕过门禁。
+
+默认配置不会连接数据库，账务或认证模块必须显式设置 `PLATFORM_BILLING_ENABLED=true` 或 `PLATFORM_AUTH_ENABLED=true` 后才会启用 PostgreSQL。启用迁移模块后，Java 接管对应写入，Python 仍是网页入口并负责 SMTP/后台任务；密码重置暂留 Python。本分支不接管现有生产流量。
 
 Python 侧通过 `JOB_AGENT_JAVA_BILLING_ENABLED=true` 开启调用 Java 的扣费路径；这两个开关必须同时打开，并且两边使用同一个 PostgreSQL、内部 Token 和价格配置。开发环境可使用：
 
