@@ -94,20 +94,20 @@ def test_java_dispatch_does_not_process_legacy_mail_and_carries_only_ids(monkeyp
     assert [(call["args"], call["kwargs"]) for call in calls] == [([1], {"purpose": "verify_email"}), ([2], {"purpose": "reset_password"})]
 
 
-def test_password_changed_during_java_verification_cannot_create_live_session(tmp_path):
+def test_java_login_failure_cannot_create_python_session(tmp_path):
     app = create_web_app(env_file=tmp_path / "missing.env")
     store = app.state.backend.store
     account = store.create_account(email="race@example.com", password_hash=hash_password("old-password-123"))
 
-    class ResetDuringVerification:
-        def verify_credentials(self, **kwargs):
-            store.update_account_password_and_revoke_sessions(account.id, hash_password("new-password-123"))
-            return SimpleNamespace(account_id=account.id)
+    class Unavailable:
+        def session(self, operation, **kwargs):
+            assert operation == "login"
+            raise PlatformAuthUnavailableError()
 
-    app.state.backend.platform_auth_client = ResetDuringVerification()
+    app.state.backend.platform_auth_client = Unavailable()
     with TestClient(app) as client:
         result = client.post("/api/auth/login", json={"email": account.email, "password": "old-password-123"})
-        assert result.status_code == 401
+        assert result.status_code == 503
         assert not result.cookies
     with store.connect() as conn:
         assert conn.execute("SELECT count(*) AS n FROM auth_sessions WHERE account_id = ?", (account.id,)).fetchone()["n"] == 0

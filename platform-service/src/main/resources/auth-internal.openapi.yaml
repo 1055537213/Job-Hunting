@@ -11,6 +11,16 @@ servers:
 security:
   - InternalToken: []
 paths:
+  /internal/v1/auth/sessions/login:
+    $ref: './sessions.openapi.yaml#/paths/~1internal~1v1~1auth~1sessions~1login'
+  /internal/v1/auth/sessions/resolve:
+    $ref: './sessions.openapi.yaml#/paths/~1internal~1v1~1auth~1sessions~1resolve'
+  /internal/v1/auth/sessions/logout:
+    $ref: './sessions.openapi.yaml#/paths/~1internal~1v1~1auth~1sessions~1logout'
+  /internal/v1/auth/sessions/logout-all:
+    $ref: './sessions.openapi.yaml#/paths/~1internal~1v1~1auth~1sessions~1logout-all'
+  /internal/v1/auth/sessions/change-password:
+    $ref: './sessions.openapi.yaml#/paths/~1internal~1v1~1auth~1sessions~1change-password'
   /internal/v1/auth/password-reset/request:
     $ref: './password-reset.openapi.yaml#/paths/~1internal~1v1~1auth~1password-reset~1request'
   /internal/v1/auth/password-reset/confirm:
@@ -57,28 +67,6 @@ paths:
           $ref: '#/components/responses/AccountAlreadyExists'
         '401':
           $ref: '#/components/responses/InternalUnauthorized'
-  /internal/v1/auth/verify-credentials:
-    post:
-      operationId: verifyCredentials
-      parameters:
-        - $ref: '#/components/parameters/TraceId'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CredentialRequest'
-      responses:
-        '200':
-          description: Existing credentials and account state were verified
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AccountResult'
-        '403':
-          description: Account is disabled or email verification is required
-        '401':
-          description: Internal token or credentials are invalid
 components:
   securitySchemes:
     InternalToken:
@@ -95,21 +83,6 @@ components:
         minLength: 8
         maxLength: 128
   schemas:
-    CredentialRequest:
-      type: object
-      required: [email, password]
-      properties:
-        email:
-          type: string
-          format: email
-          maxLength: 254
-        password:
-          type: string
-          minLength: 8
-          maxLength: 1024
-        email_verification_required:
-          type: boolean
-          default: false
     RegistrationRequest:
       type: object
       required: [email, password]
@@ -127,7 +100,7 @@ components:
           maxLength: 128
         email_verified:
           type: boolean
-          default: true
+          default: false
         consents:
           type: array
           items:

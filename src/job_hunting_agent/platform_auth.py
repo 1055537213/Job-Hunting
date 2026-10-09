@@ -36,11 +36,6 @@ class PlatformAuthUnavailableError(PlatformAuthError):
 
 
 @dataclass(frozen=True)
-class PlatformCredentialResult:
-    account_id: int
-
-
-@dataclass(frozen=True)
 class PlatformRegistrationResult:
     account_id: int
 
@@ -54,60 +49,6 @@ class PlatformAuthClient:
         self.base_url = settings.base_url.rstrip("/")
         self.internal_token = settings.internal_token
         self.timeout_seconds = settings.timeout_seconds
-
-    def verify_credentials(
-        self,
-        *,
-        email: str,
-        password: str,
-        email_verification_required: bool,
-        trace_id: str | None = None,
-    ) -> PlatformCredentialResult:
-        headers = {
-            "X-Internal-Service-Token": self.internal_token,
-            "X-Trace-Id": trace_id or f"platform-auth-{uuid4().hex}",
-        }
-        try:
-            response = httpx.post(
-                f"{self.base_url}/internal/v1/auth/verify-credentials",
-                headers=headers,
-                json={
-                    "email": email,
-                    "password": password,
-                    "email_verification_required": email_verification_required,
-                },
-                timeout=self.timeout_seconds,
-            )
-        except httpx.HTTPError as error:
-            raise PlatformAuthUnavailableError() from error
-        try:
-            payload: Any = response.json()
-        except ValueError as error:
-            raise PlatformAuthError(
-                "INVALID_PLATFORM_RESPONSE",
-                "平台认证服务返回了无法解析的响应。",
-                _platform_response_error_status(response),
-            ) from error
-        if not isinstance(payload, dict):
-            raise PlatformAuthError(
-                "INVALID_PLATFORM_RESPONSE",
-                "平台认证服务返回了无效响应。",
-                _platform_response_error_status(response),
-            )
-        if response.is_error:
-            raise PlatformAuthError(
-                str(payload.get("code") or "PLATFORM_AUTH_ERROR"),
-                str(payload.get("message") or "平台认证服务请求失败。"),
-                response.status_code,
-            )
-        try:
-            return PlatformCredentialResult(account_id=int(payload["account_id"]))
-        except (KeyError, TypeError, ValueError) as error:
-            raise PlatformAuthError(
-                "INVALID_PLATFORM_RESPONSE",
-                "平台认证服务返回了无效账号数据。",
-                _platform_response_error_status(response),
-            ) from error
 
     def register_account(
         self,
@@ -175,6 +116,52 @@ class PlatformAuthClient:
 
     def password_reset(self, operation: str, **data: Any) -> dict[str, Any]:
         return self._account_email("password-reset", operation, data)
+
+    def session(self, operation: str, *, trace_id: str | None = None, **data: Any) -> dict[str, Any]:
+        """Java is the sole session writer in hybrid mode; outages never authorize locally."""
+
+        if operation not in {"login", "resolve", "logout", "logout-all", "change-password"}:
+            raise ValueError("Unknown session operation")
+        try:
+            response = httpx.post(
+                f"{self.base_url}/internal/v1/auth/sessions/{operation}",
+                headers={
+                    "X-Internal-Service-Token": self.internal_token,
+                    "X-Trace-Id": trace_id or f"platform-session-{uuid4().hex}",
+                },
+                json=data,
+                timeout=self.timeout_seconds,
+            )
+        except httpx.HTTPError as error:
+            raise PlatformAuthUnavailableError() from error
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502) from error
+        if not isinstance(payload, dict):
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502)
+        if response.is_error:
+            raise PlatformAuthError(
+                str(payload.get("code") or "PLATFORM_AUTH_ERROR"),
+                str(payload.get("message") or "平台认证服务请求失败。"), response.status_code,
+            )
+        value = payload.get("account_id")
+        valid_id = isinstance(value, int) and not isinstance(value, bool) and value > 0
+        if operation == "login":
+            raw = payload.get("session_token")
+            valid = valid_id and isinstance(raw, str) and 32 <= len(raw) <= 128 and raw.isascii() and all(
+                c.isalnum() or c in "_-" for c in raw
+            )
+        elif operation == "resolve":
+            valid = "account_id" in payload and (value is None or valid_id)
+        else:
+            valid = payload.get("ok") is True
+            if operation == "logout-all":
+                count = payload.get("revoked_sessions")
+                valid = valid and isinstance(count, int) and not isinstance(count, bool) and count >= 0
+        if not valid:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502)
+        return payload
 
     def _account_email(self, action: str, operation: str, data: dict[str, Any]) -> dict[str, Any]:
         """Java owns tokens and delivery state; never fall back to local writes."""

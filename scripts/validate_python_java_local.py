@@ -262,6 +262,36 @@ def run_web_billing_flow(
             raise RuntimeError("New password could not log in after reset")
         print("==> Java reset -> Python SMTP worker -> Web confirm -> old session revoked: PASS")
 
+        with httpx.Client(base_url=web_url) as device:
+            if device.post("/api/auth/login", json={"email": email, "password": new_password}).status_code != 200:
+                raise RuntimeError("Second device login failed")
+            if device.post("/api/auth/logout").status_code != 200:
+                raise RuntimeError("Device logout failed")
+            if device.get("/api/auth/me").json()["authenticated"]:
+                raise RuntimeError("Logged-out device remained authenticated")
+            if not client.get("/api/auth/me").json()["authenticated"]:
+                raise RuntimeError("Device logout revoked another device")
+            device.post("/api/auth/login", json={"email": email, "password": new_password}).raise_for_status()
+            all_out = client.post("/api/auth/logout-all")
+            if all_out.status_code != 200 or all_out.json()["revoked_sessions"] != 2:
+                raise RuntimeError("Logout-all did not revoke both devices")
+            if device.get("/api/auth/me").json()["authenticated"]:
+                raise RuntimeError("Logout-all left another device authenticated")
+        client.post("/api/auth/login", json={"email": email, "password": new_password}).raise_for_status()
+        changed_password = "changed-contract-password-789"
+        wrong = client.post("/api/account/password", json={"current_password": "wrong", "new_password": changed_password})
+        if wrong.status_code != 400:
+            raise RuntimeError("Wrong current password was accepted")
+        change_cookies = dict(client.cookies)
+        client.post("/api/account/password", json={"current_password": new_password, "new_password": changed_password}).raise_for_status()
+        with httpx.Client(base_url=web_url, cookies=change_cookies) as invalidated:
+            if invalidated.get("/api/auth/me").json()["authenticated"]:
+                raise RuntimeError("Password change left old session authenticated")
+        if client.post("/api/auth/login", json={"email": email, "password": new_password}).status_code != 401:
+            raise RuntimeError("Old password worked after password change")
+        client.post("/api/auth/login", json={"email": email, "password": changed_password}).raise_for_status()
+        print("==> Java sessions -> device/logout-all -> change password -> old sessions revoked: PASS")
+
         recharge_payload = {
             "amount_yuan": 10,
             "note": "Python-Java Web 联调充值",

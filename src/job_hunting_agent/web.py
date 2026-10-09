@@ -507,6 +507,29 @@ def create_web_app(
             headers={"Retry-After": str(error.retry_after_seconds)},
         )
 
+    def platform_session(request: Request, operation: str, **data) -> dict[str, object]:
+        try:
+            return backend.platform_auth_client.session(
+                operation, trace_id=request.headers.get("x-trace-id") or getattr(request.state, "request_id", None), **data,
+            )
+        except PlatformAuthError as error:
+            raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
+
+    def resolve_platform_session(request: Request) -> int | None:
+        if not hasattr(request.state, "platform_session_result"):
+            token = request.cookies.get(SESSION_COOKIE_NAME)
+            try:
+                request.state.platform_session_result = (
+                    platform_session(request, "resolve", session_token=token)["account_id"]
+                    if token and len(token) <= 128 else None
+                )
+            except HTTPException as error:
+                request.state.platform_session_error = error
+                request.state.platform_session_result = None
+        if hasattr(request.state, "platform_session_error"):
+            raise request.state.platform_session_error
+        return request.state.platform_session_result
+
     def rate_limit_identity(request: Request) -> str:
         """把有效登录态映射为账号级限流键，并缓存已读取的 Session。"""
 
@@ -517,6 +540,13 @@ def create_web_app(
         token = request.cookies.get(SESSION_COOKIE_NAME)
         if not token:
             return network_identity
+        if backend.platform_auth_client is not None:
+            try:
+                account_id = resolve_platform_session(request)
+            except HTTPException:
+                # Keep IP protection, but protected routes still fail closed using the cached error.
+                return network_identity
+            return f"account:{account_id}" if account_id is not None else network_identity
         try:
             session = backend.store.get_auth_session_by_token_hash(
                 session_token_hash(token)
@@ -569,6 +599,20 @@ def create_web_app(
             if required:
                 raise HTTPException(status_code=401, detail="请先登录。")
             return None
+        if backend.platform_auth_client is not None:
+            account_id = resolve_platform_session(request)
+            if account_id is None:
+                if required:
+                    raise HTTPException(status_code=401, detail="登录状态已过期，请重新登录。")
+                return None
+            try:
+                account = backend.store.get_account(account_id)
+            except KeyError as error:
+                raise HTTPException(status_code=401, detail="登录账号不存在。") from error
+            if account.status != "active":
+                raise HTTPException(status_code=403, detail="账号已被禁用。")
+            request.state.account = account
+            return account
         session = getattr(request.state, "auth_session", None)
         if session is None:
             session = backend.store.get_auth_session_by_token_hash(
@@ -820,59 +864,43 @@ def create_web_app(
         """验证密码并签发服务端 Session Cookie。"""
 
         normalized_email = payload.email.strip().lower()
-        credential_snapshot = backend.store.get_account_by_email(normalized_email)
         if backend.platform_auth_client is not None:
+            admitted = platform_session(
+                request, "login", email=normalized_email, password=payload.password,
+                email_verification_required=account_lifecycle_settings.email_verification_required,
+                user_agent=(request.headers.get("user-agent") or "")[:1024],
+                ip_address=request.client.host if request.client else None,
+            )
             try:
-                verified = backend.platform_auth_client.verify_credentials(
-                    email=normalized_email,
-                    password=payload.password,
-                    email_verification_required=account_lifecycle_settings.email_verification_required,
-                    trace_id=request.headers.get("x-trace-id"),
-                )
-            except PlatformAuthUnavailableError as error:
-                raise HTTPException(status_code=503, detail=str(error)) from error
-            except PlatformAuthError as error:
-                raise HTTPException(
-                    status_code=error.status_code or 401,
-                    detail=str(error),
-                ) from error
-            try:
-                account = backend.store.get_account(verified.account_id)
+                account = backend.store.get_account(admitted["account_id"])
             except KeyError as error:
                 raise HTTPException(status_code=401, detail="邮箱或密码错误。") from error
-            if account.email != normalized_email:
-                raise HTTPException(status_code=401, detail="邮箱或密码错误。")
-            if credential_snapshot is None or credential_snapshot[0].id != account.id:
-                raise HTTPException(status_code=401, detail="账号凭据已变化，请重新登录。")
+            raw_token = admitted["session_token"]
         else:
+            credential_snapshot = backend.store.get_account_by_email(normalized_email)
             record = credential_snapshot
             if record is None or not verify_password(record[1], payload.password):
                 raise HTTPException(status_code=401, detail="邮箱或密码错误。")
             account, _ = record
-        if account.status != "active":
-            raise HTTPException(status_code=403, detail="账号已被禁用。")
-        if (
-            account_lifecycle_settings.email_verification_required
-            and account.email_verified_at is None
-        ):
-            raise HTTPException(status_code=403, detail="请先完成邮箱验证。")
-        raw_token = new_session_token()
-        now = utc_now().isoformat(timespec="seconds")
-        expires_at, absolute_expires_at = session_expiry()
-        try:
-            backend.store.save_auth_session(
-                account_id=account.id,
-                token_hash=session_token_hash(raw_token),
-                created_at=now,
-                last_seen_at=now,
-                expires_at=expires_at,
-                absolute_expires_at=absolute_expires_at,
-                user_agent=request.headers.get("user-agent"),
-                ip_address=request.client.host if request.client else None,
-                expected_password_hash=credential_snapshot[1],
-            )
-        except ValueError as error:
-            raise HTTPException(status_code=401, detail="账号凭据已变化，请重新登录。") from error
+            if account.status != "active":
+                raise HTTPException(status_code=403, detail="账号已被禁用。")
+            if account_lifecycle_settings.email_verification_required and account.email_verified_at is None:
+                raise HTTPException(status_code=403, detail="请先完成邮箱验证。")
+            raw_token = new_session_token()
+            now = utc_now().isoformat(timespec="seconds")
+            expires_at, absolute_expires_at = session_expiry()
+            try:
+                backend.store.save_auth_session(
+                    account_id=account.id, token_hash=session_token_hash(raw_token),
+                    created_at=now, last_seen_at=now, expires_at=expires_at,
+                    absolute_expires_at=absolute_expires_at,
+                    user_agent=request.headers.get("user-agent"),
+                    ip_address=request.client.host if request.client else None,
+                    expected_password_hash=credential_snapshot[1],
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=401, detail="账号凭据已变化，请重新登录。") from error
+            backend.store.touch_account_login(account.id)
         response.set_cookie(
             SESSION_COOKIE_NAME,
             raw_token,
@@ -884,7 +912,6 @@ def create_web_app(
         )
         csrf_token = new_csrf_token()
         set_csrf_cookie(response, csrf_token, secure=cookie_secure)
-        backend.store.touch_account_login(account.id)
         return {"account": asdict(account), "csrf_token": csrf_token}
 
     @web_app.get("/api/auth/me")
@@ -910,7 +937,10 @@ def create_web_app(
         """撤销当前设备 Session 并清理 Cookie。"""
 
         token = request.cookies.get(SESSION_COOKIE_NAME)
-        if token:
+        if backend.platform_auth_client is not None:
+            if token and len(token) <= 128:
+                platform_session(request, "logout", session_token=token)
+        elif token:
             session = backend.store.get_auth_session_by_token_hash(session_token_hash(token))
             if session is not None:
                 backend.store.revoke_auth_session(session.id)
@@ -924,7 +954,9 @@ def create_web_app(
 
         account = current_account(request)
         assert account is not None
-        if account.role == "admin":
+        if backend.platform_auth_client is not None:
+            count = platform_session(request, "logout-all", session_token=request.cookies[SESSION_COOKIE_NAME])["revoked_sessions"]
+        elif account.role == "admin":
             audit_event = AdminAuditEventRecord(
                 id=0,
                 actor_account_id=account.id,
@@ -954,6 +986,12 @@ def create_web_app(
 
         account = current_account(request)
         assert account is not None
+        if backend.platform_auth_client is not None:
+            platform_session(request, "change-password", session_token=request.cookies[SESSION_COOKIE_NAME],
+                             current_password=payload.current_password, new_password=payload.new_password)
+            response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+            delete_csrf_cookie(response)
+            return {"ok": True}
         _, current_hash = backend.store.get_account_with_password(account.id)
         if not verify_password(current_hash, payload.current_password):
             raise HTTPException(status_code=400, detail="当前密码错误。")

@@ -31,11 +31,14 @@ class AccountActionEmailIntegrationTest {
     @Autowired AccountActionEmailService service;
     @Autowired JdbcTemplate jdbc;
     @Autowired PasswordVerifier passwords;
+    @Autowired PasswordHasher hasher;
+    @Autowired SessionService sessions;
 
     @BeforeEach void reset() {
         jdbc.execute("""
             CREATE TABLE IF NOT EXISTS accounts (id integer PRIMARY KEY, email varchar(254) UNIQUE,
               password_hash text, must_change_password boolean DEFAULT TRUE,
+              role varchar(32) DEFAULT 'user',
               status varchar(32), deleted_at timestamptz, email_verified_at timestamptz, updated_at timestamptz)
             """);
         jdbc.execute("""
@@ -48,7 +51,17 @@ class AccountActionEmailIntegrationTest {
               created_at timestamptz, updated_at timestamptz)
             """);
         jdbc.execute("TRUNCATE platform_account_action_emails, accounts RESTART IDENTITY CASCADE");
-        jdbc.execute("CREATE TABLE IF NOT EXISTS auth_sessions (id serial PRIMARY KEY, account_id integer REFERENCES accounts(id), revoked_at timestamptz)");
+        jdbc.execute("""
+                CREATE TABLE IF NOT EXISTS auth_sessions (id serial PRIMARY KEY, account_id integer REFERENCES accounts(id),
+                  token_hash varchar(64) UNIQUE, created_at timestamptz, last_seen_at timestamptz,
+                  expires_at timestamptz, absolute_expires_at timestamptz, revoked_at timestamptz, user_agent text, ip_address varchar(64))
+                """);
+        jdbc.execute("""
+                CREATE TABLE IF NOT EXISTS admin_audit_events (id serial PRIMARY KEY, actor_account_id integer,
+                  target_account_id integer, action varchar(96), target_type varchar(64), target_id varchar(160),
+                  outcome varchar(32), summary text, details_json jsonb, request_id varchar(128), created_at timestamptz)
+                """);
+        jdbc.execute("TRUNCATE admin_audit_events");
         jdbc.execute("CREATE TABLE IF NOT EXISTS account_action_tokens (id serial PRIMARY KEY, account_id integer REFERENCES accounts(id), consumed_at timestamptz)");
         jdbc.execute("CREATE TABLE IF NOT EXISTS account_email_outbox (id serial PRIMARY KEY, account_id integer REFERENCES accounts(id), status varchar(32), claimed_at timestamptz, updated_at timestamptz)");
         jdbc.update("INSERT INTO accounts (id,email,status) VALUES (1,'a@example.com','active'),(2,'b@example.com','active')");
@@ -56,6 +69,119 @@ class AccountActionEmailIntegrationTest {
     }
     private String token(AccountActionEmailService.Claim claim) {
         return claim.action_url().split("verify_email_token=")[1];
+    }
+
+    private SessionService.Login login() {
+        jdbc.update("UPDATE accounts SET password_hash=?, email_verified_at=CURRENT_TIMESTAMP WHERE id=1", hasher.encode("password-123"));
+        return sessions.login("A@example.com", "password-123", true, "test-agent", "127.0.0.1");
+    }
+
+    @Test void sessionsAreHashedAndLogoutIsDeviceScopedAndIdempotent() {
+        var first = login();
+        var second = sessions.login("a@example.com", "password-123", true, null, null);
+        assertThat(first.toString()).doesNotContain(first.session_token());
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM auth_sessions WHERE token_hash=?", Integer.class,
+                SessionService.digest(first.session_token()))).isEqualTo(1);
+        assertThat(sessions.resolve(first.session_token())).isEqualTo(1L);
+        sessions.logout(first.session_token());
+        sessions.logout(first.session_token());
+        sessions.logout("missing");
+        assertThat(sessions.resolve(first.session_token())).isNull();
+        assertThat(sessions.resolve(second.session_token())).isEqualTo(1L);
+        assertThat(sessions.resolve("missing")).isNull();
+    }
+
+    @Test void invalidCredentialsAndRequiredVerificationNeverIssueSessions() {
+        jdbc.update("UPDATE accounts SET password_hash=? WHERE id=1", hasher.encode("password-123"));
+        assertThatThrownBy(() -> sessions.login("missing@example.com", "password-123", false, null, null)).isInstanceOf(AuthException.class);
+        assertThatThrownBy(() -> sessions.login("a@example.com", "wrong", false, null, null)).isInstanceOf(AuthException.class);
+        assertThatThrownBy(() -> sessions.login("a@example.com", "password-123", true, null, null)).isInstanceOf(AuthException.class);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM auth_sessions", Integer.class)).isZero();
+    }
+
+    @Test void auditFailureRollsBackLogoutAll() {
+        var loggedIn = login();
+        jdbc.update("UPDATE accounts SET role='admin' WHERE id=1");
+        jdbc.execute("ALTER TABLE admin_audit_events ADD CONSTRAINT reject_audit CHECK (action <> 'auth.logout_all_devices')");
+        try {
+            assertThatThrownBy(() -> sessions.logoutAll(loggedIn.session_token(), "trace"))
+                .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+            assertThat(sessions.resolve(loggedIn.session_token())).isEqualTo(1L);
+        } finally { jdbc.execute("ALTER TABLE admin_audit_events DROP CONSTRAINT reject_audit"); }
+    }
+
+    @Test void sessionsHonorBothExpiryLimitsAndAccountStatus() {
+        var first = login();
+        jdbc.update("UPDATE auth_sessions SET absolute_expires_at=CURRENT_TIMESTAMP+INTERVAL '1 hour'");
+        assertThat(sessions.resolve(first.session_token())).isEqualTo(1L);
+        assertThat(jdbc.queryForObject("SELECT expires_at=absolute_expires_at FROM auth_sessions", Boolean.class)).isTrue();
+        jdbc.update("UPDATE auth_sessions SET expires_at=CURRENT_TIMESTAMP-INTERVAL '1 second'");
+        assertThat(sessions.resolve(first.session_token())).isNull();
+        var second = sessions.login("a@example.com", "password-123", true, null, null);
+        jdbc.update("UPDATE accounts SET status='disabled' WHERE id=1");
+        assertThatThrownBy(() -> sessions.resolve(second.session_token())).isInstanceOf(AuthException.class);
+        sessions.logout(second.session_token());
+        assertThat(sessions.resolve(second.session_token())).isNull();
+        jdbc.update("UPDATE accounts SET status='active',deleted_at=CURRENT_TIMESTAMP WHERE id=1");
+        assertThatThrownBy(() -> sessions.login("a@example.com", "password-123", false, null, null)).isInstanceOf(AuthException.class);
+    }
+
+    @Test void logoutAllIncludesCurrentDeviceAndPreservesOtherAccountsAndAuditsAdmins() {
+        var first = login();
+        sessions.login("a@example.com", "password-123", true, null, null);
+        jdbc.update("UPDATE accounts SET role='admin' WHERE id=1");
+        jdbc.update("INSERT INTO auth_sessions (account_id) VALUES (2)");
+        assertThat(sessions.logoutAll(first.session_token(), "trace-logout")).isEqualTo(2);
+        assertThat(sessions.resolve(first.session_token())).isNull();
+        assertThatThrownBy(() -> sessions.logoutAll(first.session_token(), "trace")).isInstanceOf(AuthException.class);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM auth_sessions WHERE account_id=2 AND revoked_at IS NULL", Integer.class)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("SELECT details_json->>'revoked_sessions' FROM admin_audit_events", String.class)).isEqualTo("2");
+    }
+
+    @Test void changingPasswordInvalidatesAllDevicesAndAllCredentialLinks() {
+        var first = login();
+        var second = sessions.login("a@example.com", "password-123", true, null, null);
+        var reset = resetClaim("a@example.com");
+        assertThatThrownBy(() -> sessions.changePassword(first.session_token(), "wrong", "new-password-456")).isInstanceOf(AuthException.class);
+        assertThatThrownBy(() -> sessions.changePassword(first.session_token(), "password-123", "password-123")).isInstanceOf(AuthException.class);
+        assertThat(sessions.resolve(first.session_token())).isEqualTo(1L);
+        sessions.changePassword(first.session_token(), "password-123", "new-password-456");
+        assertThat(sessions.resolve(first.session_token())).isNull();
+        assertThat(sessions.resolve(second.session_token())).isNull();
+        assertThatThrownBy(() -> service.resetPassword(resetToken(reset), "another-password")).isInstanceOf(AuthException.class);
+        assertThatThrownBy(() -> sessions.login("a@example.com", "password-123", false, null, null)).isInstanceOf(AuthException.class);
+        assertThat(sessions.login("a@example.com", "new-password-456", true, null, null).account_id()).isEqualTo(1);
+    }
+
+    @Test void loginRacingResetNeverLeavesALiveOldCredentialSession() throws Exception {
+        var old = login();
+        var claim = resetClaim("a@example.com");
+        try (ExecutorService pool = Executors.newFixedThreadPool(2)) {
+            CountDownLatch start = new CountDownLatch(1);
+            Future<SessionService.Login> loggingIn = pool.submit(() -> { start.await();
+                try { return sessions.login("a@example.com", "password-123", false, null, null); }
+                catch (AuthException expected) { return null; } });
+            Future<Long> resetting = pool.submit(() -> { start.await(); return service.resetPassword(resetToken(claim), "new-password-456"); });
+            start.countDown();
+            resetting.get(10, TimeUnit.SECONDS);
+            var raced = loggingIn.get(10, TimeUnit.SECONDS);
+            assertThat(sessions.resolve(old.session_token())).isNull();
+            if (raced != null) assertThat(sessions.resolve(raced.session_token())).isNull();
+        }
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM auth_sessions WHERE revoked_at IS NULL", Integer.class)).isZero();
+    }
+
+    @Test void passwordChangeRollbackRetainsCredentialSessionAndResetToken() {
+        var loggedIn = login();
+        var claim = resetClaim("a@example.com");
+        jdbc.execute("ALTER TABLE auth_sessions ADD CONSTRAINT reject_revoke CHECK (revoked_at IS NULL)");
+        try {
+            assertThatThrownBy(() -> sessions.changePassword(loggedIn.session_token(), "password-123", "new-password-456"))
+                .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+            assertThat(sessions.resolve(loggedIn.session_token())).isEqualTo(1L);
+            assertThat(passwords.matches("password-123", jdbc.queryForObject("SELECT password_hash FROM accounts WHERE id=1", String.class))).isTrue();
+            assertThat(jdbc.queryForObject("SELECT consumed_at IS NULL FROM platform_account_action_emails WHERE id=?", Boolean.class, claim.id())).isTrue();
+        } finally { jdbc.execute("ALTER TABLE auth_sessions DROP CONSTRAINT reject_revoke"); }
     }
     @Test void verifiesExactlyOnceAndStoresOnlyDigest() throws Exception {
         service.request(AccountActionEmailService.Purpose.VERIFY_EMAIL, "A@example.com", null);

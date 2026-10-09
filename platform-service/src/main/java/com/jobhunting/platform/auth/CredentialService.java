@@ -9,7 +9,7 @@ import org.springframework.stereotype.Service;
 
 @Service
 @ConditionalOnProperty(prefix = "platform.auth", name = "enabled", havingValue = "true")
-public class CredentialService implements CredentialVerifier {
+public class CredentialService {
     private final JdbcTemplate jdbc;
     private final PasswordVerifier passwords;
     private final String dummyHash;
@@ -22,7 +22,6 @@ public class CredentialService implements CredentialVerifier {
                 .defaultsForSpringSecurity_v5_8().encode(java.util.UUID.randomUUID().toString());
     }
 
-    @Override
     public long verify(String email, String password, boolean verificationRequired) {
         var rows = jdbc.query(
                 "SELECT id, password_hash, status, email_verified_at, deleted_at FROM accounts WHERE email = ?",

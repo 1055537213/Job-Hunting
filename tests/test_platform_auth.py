@@ -56,24 +56,25 @@ def test_platform_auth_client_sends_internal_request_without_logging_password(mo
 
     def fake_post(url, *, headers, json=None, timeout):
         calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
-        return httpx.Response(200, json={"account_id": 42})
+        return httpx.Response(200, json={"account_id": 42, "session_token": "a" * 64})
 
     monkeypatch.setattr(httpx, "post", fake_post)
     client = PlatformAuthClient(
         PlatformAuthSettings(True, "http://platform-service:8081/", "secret", 7)
     )
 
-    result = client.verify_credentials(
+    result = client.session(
+        "login",
         email="user@example.com",
         password="password-123",
         email_verification_required=True,
         trace_id="trace-42",
     )
 
-    assert result.account_id == 42
+    assert result["account_id"] == 42
     assert calls == [
         {
-            "url": "http://platform-service:8081/internal/v1/auth/verify-credentials",
+            "url": "http://platform-service:8081/internal/v1/auth/sessions/login",
             "headers": {"X-Internal-Service-Token": "secret", "X-Trace-Id": "trace-42"},
             "json": {
                 "email": "user@example.com",
@@ -137,7 +138,8 @@ def test_platform_auth_client_maps_business_and_network_errors(monkeypatch):
         ),
     )
     with pytest.raises(PlatformAuthError) as error:
-        client.verify_credentials(
+        client.session(
+            "login",
             email="missing@example.com",
             password="wrong-password",
             email_verification_required=False,
@@ -150,7 +152,8 @@ def test_platform_auth_client_maps_business_and_network_errors(monkeypatch):
 
     monkeypatch.setattr(httpx, "post", unavailable)
     with pytest.raises(PlatformAuthUnavailableError):
-        client.verify_credentials(
+        client.session(
+            "login",
             email="user@example.com",
             password="password-123",
             email_verification_required=False,
@@ -164,7 +167,8 @@ def test_platform_auth_client_maps_malformed_success_response_to_bad_gateway(mon
     )
 
     with pytest.raises(PlatformAuthError) as error:
-        client.verify_credentials(
+        client.session(
+            "login",
             email="user@example.com",
             password="password-123",
             email_verification_required=False,

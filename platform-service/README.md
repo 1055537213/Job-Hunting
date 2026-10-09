@@ -1,6 +1,6 @@
 # Job Hunting Platform Service
 
-这是求职助手的 Java 平台服务，当前实现账务垂直链路，以及账号注册、凭据校验和邮箱验证内部接口。
+这是求职助手的 Java 平台服务，当前实现账务垂直链路，以及账号注册、凭据校验、邮箱验证、密码重置和会话管理内部接口。
 
 运行基线为 Spring Boot 4.0、Spring Framework 7、Jackson 3、Tomcat 11 和 Java 21。
 依赖版本由 Maven 锁定，Tomcat/Jackson 的安全修复版本在 `pom.xml` 中显式覆盖；
@@ -79,12 +79,12 @@ SPRING_DATASOURCE_PASSWORD=your-password
 `src/main/resources/auth-internal.openapi.yaml`：
 
 ```text
-POST /internal/v1/auth/verify-credentials
+POST /internal/v1/auth/sessions/login
 X-Internal-Service-Token: local-platform-secret
 X-Trace-Id: local-trace-id
 ```
 
-它返回已验证的 `account_id`；错误码包括 `INVALID_CREDENTIALS`、
+它原子创建会话并返回 `account_id` 和仅用于设置 Cookie 的 `session_token`；错误码包括 `INVALID_CREDENTIALS`、
 `ACCOUNT_DISABLED` 和 `EMAIL_UNVERIFIED`。请求体中的密码不会写入 Java 日志，
 Java 兼容 Python 当前使用的 Argon2id 和 scrypt 哈希格式。Python 的登录迁移由
 `JOB_AGENT_JAVA_AUTH_ENABLED=true` 控制，认证服务不可用时返回 503，不会静默回退。
@@ -98,7 +98,18 @@ Java 兼容 Python 当前使用的 Argon2id 和 scrypt 哈希格式。Python 的
 阻止失联 Worker 的迟到结果覆盖新任务状态。`POST /internal/v1/auth/password-reset/confirm`
 在一个事务里消费令牌、更新 Argon2id 密码、撤销所有旧会话并使旧操作链接失效。
 重置链接默认有效 30 分钟，绑定签发时的密码摘要，不能覆盖签发后发生的密码修改。
-Python 签发 Session 前锁定账号并检查认证前的密码快照，关闭重置与登录并发窗口。
+Java 在同一事务中锁定账号、验证密码并签发 Session，关闭重置与登录并发窗口。
+
+## 登录会话与修改密码
+
+`/internal/v1/auth/sessions/` 提供 `login`、`resolve`、`logout`、`logout-all`、
+`change-password` 五个内部 POST 接口，共用认证开关和内部 Token。
+Session 原文只返回给 Python 设置 HttpOnly Cookie，数据库只存 SHA-256 摘要；闲置有效期
+7 天，绝对有效期 30 天。解析时顺延闲置期限，但不超过绝对期限。
+单设备退出不影响其他设备；全部退出包含当前设备，管理员操作与审计同事务提交。
+修改密码校验当前密码，同时撤销所有设备并作废验证/重置链接，失败则整体回滚。
+Python 网页 API 保持不变；Java 模式不再通过 Python 创建、解析、续期或撤销用户登录会话。
+管理员禁用/账号注销尚待迁移，仍是共享账号与会话表的过渡写入例外。
 已签发的 Java 验证链接原样保留；旧 Python 操作链接在 Java 模式下不再支持，应重新请求。
 Java 模式下不派发旧 Python 邮件任务；关闭迁移开关时仍保留兼容实现，不能称为全部清理。
 本地与联合生产部署步骤见 [Python + Java 部署指南](../docs/learning/python-java-deployment.md)。

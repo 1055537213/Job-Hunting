@@ -1,0 +1,131 @@
+openapi: 3.1.0
+info:
+  title: Internal Session Contract
+  version: 0.1.0
+  description: Java-owned sessions. Raw tokens are transient secrets and must never be logged.
+security:
+  - InternalToken: []
+paths:
+  /internal/v1/auth/sessions/login:
+    post:
+      operationId: createSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: {type: string, minLength: 1, maxLength: 254}
+                password: {type: string, minLength: 1, maxLength: 1024, writeOnly: true}
+                email_verification_required: {type: boolean, default: false}
+                user_agent: {type: [string, 'null'], maxLength: 1024}
+                ip_address: {type: [string, 'null'], maxLength: 64}
+      responses:
+        '200':
+          description: Credentials verified and session created in one transaction
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [account_id, session_token]
+                properties:
+                  account_id: {type: integer, minimum: 1}
+                  session_token: {type: string, minLength: 64, maxLength: 64, pattern: '^[A-Za-z0-9_-]+$'}
+        '401': {description: Invalid credentials or internal token}
+        '403': {description: Disabled account or required email verification}
+        '422': {description: Invalid request fields}
+  /internal/v1/auth/sessions/resolve:
+    post:
+      operationId: resolveSession
+      requestBody: {$ref: '#/components/requestBodies/Token'}
+      responses:
+        '200':
+          description: Account ID or null for missing, expired, revoked or deleted sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [account_id]
+                properties:
+                  account_id: {type: [integer, 'null'], minimum: 1}
+        '401': {description: Invalid internal token}
+        '403': {description: Account disabled}
+        '422': {description: Invalid token format}
+  /internal/v1/auth/sessions/logout:
+    post:
+      operationId: revokeSession
+      requestBody: {$ref: '#/components/requestBodies/Token'}
+      responses:
+        '200': {$ref: '#/components/responses/Ok'}
+        '401': {description: Invalid internal token}
+        '422': {description: Invalid token format}
+  /internal/v1/auth/sessions/logout-all:
+    post:
+      operationId: revokeAllSessions
+      parameters:
+        - name: X-Trace-Id
+          in: header
+          schema: {type: string, maxLength: 128}
+      requestBody: {$ref: '#/components/requestBodies/Token'}
+      responses:
+        '200':
+          description: All devices revoked including the current one; admin audit committed atomically
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, revoked_sessions]
+                properties:
+                  ok: {type: boolean, const: true}
+                  revoked_sessions: {type: integer, minimum: 0}
+        '401': {description: Invalid internal token or expired session}
+        '403': {description: Account disabled}
+        '422': {description: Invalid token format}
+  /internal/v1/auth/sessions/change-password:
+    post:
+      operationId: changePassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/Token'
+                - type: object
+                  required: [current_password, new_password]
+                  properties:
+                    current_password: {type: string, minLength: 1, maxLength: 1024, writeOnly: true}
+                    new_password: {type: string, minLength: 8, maxLength: 1024, writeOnly: true}
+      responses:
+        '200': {$ref: '#/components/responses/Ok'}
+        '400': {description: Current password incorrect or new password unchanged}
+        '401': {description: Invalid internal token or expired session}
+        '403': {description: Account disabled}
+        '422': {description: Invalid password or token fields}
+components:
+  securitySchemes:
+    InternalToken: {type: apiKey, in: header, name: X-Internal-Service-Token}
+  schemas:
+    Token:
+      type: object
+      required: [session_token]
+      properties:
+        session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+  requestBodies:
+    Token:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Token'}
+  responses:
+    Ok:
+      description: Operation committed; logout of an absent token is idempotent
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [ok]
+            properties:
+              ok: {type: boolean, const: true}

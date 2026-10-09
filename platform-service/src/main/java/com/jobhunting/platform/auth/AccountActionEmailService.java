@@ -143,6 +143,12 @@ public class AccountActionEmailService {
                 WHERE id = ?
                 """, passwords.encode(newPassword), id);
         jdbc.update("UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE account_id = ? AND revoked_at IS NULL", id);
+        invalidateCredentialLinks(id);
+        return id;
+    }
+
+    // Caller holds the account lock in the password-change/reset transaction.
+    public void invalidateCredentialLinks(long id) {
         jdbc.update("""
                 UPDATE platform_account_action_emails SET consumed_at = COALESCE(consumed_at, CURRENT_TIMESTAMP),
                   status = CASE WHEN status IN ('pending','sending','retrying') THEN 'cancelled' ELSE status END,
@@ -154,7 +160,6 @@ public class AccountActionEmailService {
                 UPDATE account_email_outbox SET status = 'cancelled', claimed_at = NULL,
                   updated_at = CURRENT_TIMESTAMP WHERE account_id = ? AND status IN ('pending','sending','retrying')
                 """, id);
-        return id;
     }
 
     private long consume(Purpose purpose, String token) {
@@ -162,7 +167,7 @@ public class AccountActionEmailService {
                 (row, i) -> row.getLong(1), hash(token), purpose.value);
         if (ids.isEmpty()) throw invalidToken(purpose);
         long id = ids.getFirst();
-        // Use the same account-first lock as Python's checked session admission.
+        // Use the same account-first lock as Java session admission and password changes.
         var active = jdbc.query("SELECT password_hash FROM accounts WHERE id = ? AND status = 'active' AND deleted_at IS NULL FOR UPDATE",
                 (row, i) -> row.getString(1), id);
         if (active.isEmpty()) throw invalidToken(purpose);

@@ -117,7 +117,7 @@
 ### Java 平台服务（迁移阶段）
 
 - Spring Boot 4.0 + Java 21
-- 已迁移注册、密码校验、邮箱验证、密码重置及可选余额/模拟充值/扣费；Python 暂保留网页入口、Session 和 SMTP Worker
+- 已迁移注册、密码校验、邮箱验证、密码重置、登录会话、退出及修改密码和可选余额/模拟充值/扣费；Python 保留网页入口、Cookie/CSRF 和 SMTP Worker
 - 验证/重置共用 Java 邮件账本，支持一次性令牌、重试、旧会话撤销及登录并发保护
 - `java-platform-migration` 独立发布 Python AI 与 Java 平台镜像，纯 Python `master` 不被覆盖；当前仅本地验收，不部署服务器
 - 本地运行与未来服务器部署指令见 [Python + Java 部署指南](docs/learning/python-java-deployment.md)

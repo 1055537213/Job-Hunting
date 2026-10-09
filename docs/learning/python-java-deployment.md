@@ -2,7 +2,7 @@
 
 ## 当前边界
 
-网页入口仍是 Python；Java 负责账号注册、密码校验、邮箱验证、密码重置和可选账务。
+网页入口仍是 Python；Java 负责账号注册、密码校验、邮箱验证、密码重置、登录会话、退出、修改密码和可选账务。
 Java 使用 Spring Boot 4.0 / Java 21，JSON 序列化使用 Jackson 3；
 本地与 CI 使用同一 `pom.xml` 和 Python 3.12 锁文件，不需要服务器专用代码。
 Python 的 SMTP/Celery Worker 通过 Java 内部接口投递验证/重置邮件，不写 Java 邮件状态。
@@ -13,8 +13,10 @@ SMTP 不支持 exactly-once：发送成功后 Worker 失联仍可能重复发送
 已有 Java 验证链接在账本升级后保持有效。重置默认 30 分钟过期，可用
 `JOB_AGENT_PASSWORD_RESET_TOKEN_TTL_MINUTES` 配置；账号和来源限额按用途分别统计。
 重置成功原子撤销旧 Session，并作废所有旧操作链接；签发后密码变化也会让该重置链接失效。
-Python 在创建 Session 的事务里锁定账号并验证认证前的密码快照，防止旧密码并发登录绕过撤销。
-修改密码、注销、管理员初始化及 Session 的其余操作暂留 Python，后续继续迁移。
+Java 在同一事务里锁定账号、校验密码和创建 Session，防止旧密码并发登录绕过撤销。
+Java 解析会话、处理单设备/全部退出及修改密码；Python 仅设置/删除 Cookie 并保持 CSRF 防护。
+Java 中断时受保护接口返回 503，不将故障伪装成未登录，也不回退本地认证。
+账号注销、管理员禁用及管理员初始化暂留 Python，后续继续迁移；仍存在共享表过渡例外。
 
 ## 环境配置
 
