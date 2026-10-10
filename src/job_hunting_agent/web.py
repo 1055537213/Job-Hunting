@@ -190,6 +190,19 @@ def bootstrap_initial_admin(backend: JobHuntingApp, env_path: Path) -> None:
     settings = load_bootstrap_admin_settings(env_path)
     if settings is None:
         return
+    if backend.platform_auth_client is not None:
+        try:
+            # Java serializes the first-admin policy and never trusts a Python
+            # account list or promotes an existing ordinary account.
+            backend.platform_auth_client.account(
+                "bootstrap",
+                email=settings.email,
+                password=settings.password,
+                display_name=settings.display_name,
+            )
+        except PlatformAuthError as error:
+            raise RuntimeError("Java 平台认证服务未能完成首次管理员引导。") from error
+        return
     if any(account.role == "admin" for account in backend.store.list_accounts()):
         return
     try:
@@ -199,6 +212,23 @@ def bootstrap_initial_admin(backend: JobHuntingApp, env_path: Path) -> None:
         existing = backend.store.get_account_by_email(settings.email)
         if existing is None or existing[0].role != "admin":
             raise RuntimeError("首次管理员邮箱已被普通账号占用，请更换邮箱。") from error
+
+
+def platform_account_view(value: dict[str, object]) -> dict[str, object]:
+    """Translate the Java internal account id back to the public Python shape."""
+
+    return {
+        "id": value["account_id"],
+        "email": value["email"],
+        "display_name": value["display_name"],
+        "role": value["role"],
+        "status": value["status"],
+        "must_change_password": value["must_change_password"],
+        "email_verified_at": value["email_verified_at"],
+        "deleted_at": value["deleted_at"],
+        "created_at": value["created_at"],
+        "updated_at": value["updated_at"],
+    }
 
 
 class NoCacheStaticFiles(StaticFiles):
@@ -2523,6 +2553,19 @@ def create_web_app(
     def admin_accounts(request: Request) -> dict[str, object]:
         """管理员查看账号状态，不返回密码、档案或对话正文。"""
 
+        if backend.platform_auth_client is not None:
+            token = request.cookies.get(SESSION_COOKIE_NAME)
+            if not token:
+                raise HTTPException(status_code=401, detail="请先登录。")
+            try:
+                result = backend.platform_auth_client.account(
+                    "list",
+                    session_token=token,
+                    trace_id=request.headers.get("x-trace-id"),
+                )
+                return {"accounts": [platform_account_view(account) for account in result["accounts"]]}
+            except PlatformAuthError as error:
+                raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
         require_admin(request)
         return {"accounts": [asdict(account) for account in backend.store.list_accounts()]}
 
@@ -2533,6 +2576,22 @@ def create_web_app(
         request: Request,
     ) -> dict[str, object]:
         """管理员启用或禁用账号；禁用会立即撤销其全部 Session。"""
+
+        if backend.platform_auth_client is not None:
+            token = request.cookies.get(SESSION_COOKIE_NAME)
+            if not token:
+                raise HTTPException(status_code=401, detail="请先登录。")
+            try:
+                result = backend.platform_auth_client.account(
+                    "status",
+                    session_token=token,
+                    account_id=account_id,
+                    status=payload.status,
+                    trace_id=request.headers.get("x-trace-id"),
+                )
+                return {"account": platform_account_view(result["account"])}
+            except PlatformAuthError as error:
+                raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
 
         actor = require_admin(request)
         if payload.status not in {"active", "disabled"}:

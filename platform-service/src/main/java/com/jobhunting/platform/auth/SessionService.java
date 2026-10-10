@@ -112,7 +112,9 @@ public class SessionService {
         return jdbc.update("UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE account_id = ? AND revoked_at IS NULL", id);
     }
 
-    private long requireSession(String token) {
+    // Package-private so other Java-owned account operations can reuse the exact
+    // session lock and expiry checks instead of trusting an account id from Python.
+    long requireSession(String token) {
         Long id = lockAccount(token);
         if (id == null) {
             throw new AuthException("SESSION_EXPIRED", "登录状态已过期，请重新登录。", HttpStatus.UNAUTHORIZED);

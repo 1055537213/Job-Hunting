@@ -89,7 +89,7 @@ jobs:
         working-directory: platform-service
         env:
           TESTCONTAINERS_RYUK_DISABLED: "true"
-        run: mvn -B -ntp -Dtest=BillingServiceIntegrationTest,AccountActionEmailIntegrationTest -Drun.integration.tests=true test
+        run: mvn -B -ntp -Dtest=BillingServiceIntegrationTest,AccountActionEmailIntegrationTest,AccountAdministrationIntegrationTest -Drun.integration.tests=true test
 
       - name: Run Python-Java account and billing acceptance
         run: python scripts/validate_python_java_local.py --port 18081 --startup-timeout 120

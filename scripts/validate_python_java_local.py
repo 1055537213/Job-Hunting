@@ -164,6 +164,8 @@ def run_web_billing_flow(
     suffix = os.urandom(12).hex()
     email = f"web-java-contract-{suffix}@example.com"
     password = "contract-test-password-123"
+    admin_email = f"web-java-admin-{suffix}@example.com"
+    admin_password = "contract-admin-password-123"
     recharge_key = f"web-recharge-{suffix}"
     account_id: int
 
@@ -185,6 +187,14 @@ def run_web_billing_flow(
         from urllib.parse import parse_qs, urlsplit  # noqa: PLC0415
 
         auth_client = PlatformAuthClient(PlatformAuthSettings(True, base_url, internal_token, 10))
+        bootstrapped = auth_client.account(
+            "bootstrap",
+            email=admin_email,
+            password=admin_password,
+            display_name="Python Java Web 管理员",
+        )
+        if bootstrapped.get("created") is not True or not isinstance(bootstrapped.get("account_id"), int):
+            raise RuntimeError("Java administrator bootstrap did not create the first admin")
         account_id = registered.json()["account"]["id"]
         denied = client.post("/api/auth/login", json={"email": email, "password": password})
         if denied.status_code != 403:
@@ -234,6 +244,34 @@ def run_web_billing_flow(
         logged_in = client.post("/api/auth/login", json={"email": email, "password": password})
         if logged_in.status_code != 200:
             raise RuntimeError(f"Web login failed: {logged_in.status_code} {logged_in.text[:300]}")
+
+        with httpx.Client(base_url=web_url, timeout=10, follow_redirects=True) as admin_client:
+            admin_login = admin_client.post(
+                "/api/auth/login", json={"email": admin_email, "password": admin_password}
+            )
+            if admin_login.status_code != 200:
+                raise RuntimeError(f"Java administrator login failed: {admin_login.status_code} {admin_login.text[:300]}")
+            account_list = admin_client.get("/api/admin/accounts")
+            if account_list.status_code != 200 or not any(
+                item.get("id") == account_id for item in account_list.json().get("accounts", [])
+            ):
+                raise RuntimeError("Java administrator account list did not expose the registered account safely")
+            disabled = admin_client.patch(
+                f"/api/admin/accounts/{account_id}/status", json={"status": "disabled"}
+            )
+            if disabled.status_code != 200 or disabled.json().get("account", {}).get("status") != "disabled":
+                raise RuntimeError(f"Java administrator disable failed: {disabled.status_code} {disabled.text[:300]}")
+            disabled_me = client.get("/api/auth/me")
+            if disabled_me.status_code != 200 or disabled_me.json().get("authenticated") is not False:
+                raise RuntimeError("Disabling an account did not reject its existing session")
+            reenabled = admin_client.patch(
+                f"/api/admin/accounts/{account_id}/status", json={"status": "active"}
+            )
+            if reenabled.status_code != 200 or reenabled.json().get("account", {}).get("status") != "active":
+                raise RuntimeError(f"Java administrator re-enable failed: {reenabled.status_code} {reenabled.text[:300]}")
+        if client.post("/api/auth/login", json={"email": email, "password": password}).status_code != 200:
+            raise RuntimeError("Re-enabled account could not create a fresh session")
+        print("==> Java administrator bootstrap -> Web list/status -> session revocation: PASS")
 
         old_cookies = dict(client.cookies)
         requested = client.post("/api/auth/password-reset/request", json={"email": email})
@@ -473,6 +511,7 @@ def main() -> int:
                     "JOB_AGENT_DEMO_RECHARGE_MAX_TOTAL_YUAN=50",
                     "JOB_AGENT_TASK_QUEUE_ENABLED=false",
                     "JOB_AGENT_COOKIE_SECURE=false",
+                    "JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS=100",
                 ]
             )
             + "\n",
@@ -497,6 +536,7 @@ def main() -> int:
                 "JOB_AGENT_DEMO_RECHARGE_ENABLED": "true",
                 "JOB_AGENT_TASK_QUEUE_ENABLED": "false",
                 "JOB_AGENT_COOKIE_SECURE": "false",
+                "JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS": "100",
             }
         )
         web_log_file = web_log_path.open("w", encoding="utf-8")

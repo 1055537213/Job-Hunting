@@ -4,7 +4,8 @@ info:
   version: 0.1.0
   description: >-
     Internal contract used by the Python Web service during the gradual
-    migration of account registration and credential verification to Java.
+    migration of account registration, sessions and administrator account
+    operations to Java.
     Passwords are accepted only in memory and are never returned or logged.
 servers:
   - url: http://platform-service:8081
@@ -67,6 +68,66 @@ paths:
           $ref: '#/components/responses/AccountAlreadyExists'
         '401':
           $ref: '#/components/responses/InternalUnauthorized'
+  /internal/v1/auth/accounts/list:
+    post:
+      operationId: listAccounts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionRequest'
+      responses:
+        '200':
+          description: Safe account projections for an authenticated administrator
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountList'
+  /internal/v1/auth/accounts/status:
+    post:
+      operationId: updateAccountStatus
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountStatusRequest'
+      responses:
+        '200':
+          description: Account status and audit event were updated atomically
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResponse'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/InternalUnauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/AccountNotFound'
+  /internal/v1/auth/accounts/bootstrap:
+    post:
+      operationId: bootstrapInitialAdmin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BootstrapRequest'
+      responses:
+        '200':
+          description: Bootstrap is idempotent once any undeleted administrator exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BootstrapResult'
+        '409':
+          $ref: '#/components/responses/AccountAlreadyExists'
 components:
   securitySchemes:
     InternalToken:
@@ -129,6 +190,77 @@ components:
           type: integer
           format: int64
           minimum: 1
+    SessionRequest:
+      type: object
+      required: [session_token]
+      properties:
+        session_token:
+          type: string
+          minLength: 1
+          maxLength: 128
+    AccountStatusRequest:
+      type: object
+      required: [session_token, account_id, status]
+      properties:
+        session_token:
+          type: string
+          minLength: 1
+          maxLength: 128
+        account_id:
+          type: integer
+          format: int64
+          minimum: 1
+        status:
+          type: string
+          enum: [active, disabled]
+    BootstrapRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 8
+          maxLength: 1024
+        display_name:
+          type: string
+          maxLength: 128
+    AccountProjection:
+      type: object
+      required: [account_id, email, role, status, must_change_password, created_at, updated_at]
+      properties:
+        account_id: {type: integer, format: int64, minimum: 1}
+        email: {type: string, format: email}
+        display_name: {type: string, nullable: true}
+        role: {type: string, enum: [user, admin]}
+        status: {type: string, enum: [active, disabled]}
+        must_change_password: {type: boolean}
+        email_verified_at: {type: string, nullable: true}
+        deleted_at: {type: string, nullable: true}
+        created_at: {type: string}
+        updated_at: {type: string}
+    AccountList:
+      type: object
+      required: [accounts]
+      properties:
+        accounts:
+          type: array
+          items: {$ref: '#/components/schemas/AccountProjection'}
+    AccountResponse:
+      type: object
+      required: [account]
+      properties:
+        account:
+          $ref: '#/components/schemas/AccountProjection'
+    BootstrapResult:
+      type: object
+      required: [created]
+      properties:
+        created: {type: boolean}
+        account_id: {type: integer, format: int64, minimum: 1, nullable: true}
     Error:
       type: object
       required: [code, message, trace_id]
@@ -145,6 +277,24 @@ components:
             $ref: '#/components/schemas/Error'
     InternalUnauthorized:
       description: Internal service token is missing or invalid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InvalidRequest:
+      description: Request validation or account policy rejected the operation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: The session is not an administrator or the target operation is forbidden
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    AccountNotFound:
+      description: Account does not exist or has been deleted
       content:
         application/json:
           schema:

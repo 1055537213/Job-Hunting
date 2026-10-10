@@ -174,3 +174,63 @@ def test_platform_auth_client_maps_malformed_success_response_to_bad_gateway(mon
             email_verification_required=False,
         )
     assert error.value.status_code == 502
+
+
+def test_platform_auth_client_validates_java_admin_account_projection(monkeypatch):
+    safe_account = {
+        "account_id": 42,
+        "email": "admin@example.com",
+        "display_name": "Admin",
+        "role": "admin",
+        "status": "active",
+        "must_change_password": False,
+        "email_verified_at": "2026-10-10T00:00:00Z",
+        "deleted_at": None,
+        "created_at": "2026-10-10T00:00:00Z",
+        "updated_at": "2026-10-10T00:00:00Z",
+    }
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url, *, headers, json=None, timeout):
+        calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        return httpx.Response(200, json={"accounts": [safe_account]})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    client = PlatformAuthClient(
+        PlatformAuthSettings(True, "http://platform-service:8081", "secret", 5)
+    )
+
+    result = client.account("list", session_token="opaque", trace_id="trace-admin")
+
+    assert result["accounts"][0] == safe_account
+    assert calls[0]["url"].endswith("/internal/v1/auth/accounts/list")
+    assert calls[0]["json"] == {"session_token": "opaque"}
+    assert "password" not in str(calls[0])
+
+
+def test_platform_auth_client_rejects_account_projection_with_password(monkeypatch):
+    account = {
+        "account_id": 42,
+        "email": "admin@example.com",
+        "display_name": None,
+        "role": "admin",
+        "status": "active",
+        "must_change_password": False,
+        "email_verified_at": None,
+        "deleted_at": None,
+        "created_at": "2026-10-10T00:00:00Z",
+        "updated_at": "2026-10-10T00:00:00Z",
+        "password_hash": "must-not-cross-boundary",
+    }
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda *args, **kwargs: httpx.Response(200, json={"accounts": [account]}),
+    )
+    client = PlatformAuthClient(
+        PlatformAuthSettings(True, "http://platform-service:8081", "secret", 5)
+    )
+
+    with pytest.raises(PlatformAuthError) as error:
+        client.account("list", session_token="opaque")
+    assert error.value.status_code == 502

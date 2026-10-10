@@ -163,6 +163,56 @@ class PlatformAuthClient:
             raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502)
         return payload
 
+    def account(self, operation: str, *, trace_id: str | None = None, **data: Any) -> dict[str, Any]:
+        """Call Java-owned administrator account operations.
+
+        Account listing/status changes authenticate with the real session token
+        inside Java. Python must not turn a locally read account id into an
+        authorization decision.
+        """
+
+        if operation not in {"list", "status", "bootstrap"}:
+            raise ValueError("Unknown account operation")
+        try:
+            response = httpx.post(
+                f"{self.base_url}/internal/v1/auth/accounts/{operation}",
+                headers={
+                    "X-Internal-Service-Token": self.internal_token,
+                    "X-Trace-Id": trace_id or f"platform-account-{uuid4().hex}",
+                },
+                json=data,
+                timeout=self.timeout_seconds,
+            )
+        except httpx.HTTPError as error:
+            raise PlatformAuthUnavailableError() from error
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502) from error
+        if not isinstance(payload, dict):
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502)
+        if response.is_error:
+            raise PlatformAuthError(
+                str(payload.get("code") or "PLATFORM_AUTH_ERROR"),
+                str(payload.get("message") or "平台认证服务请求失败。"),
+                response.status_code,
+            )
+
+        if operation == "list":
+            accounts = payload.get("accounts")
+            valid = isinstance(accounts, list) and all(_is_safe_account_view(account) for account in accounts)
+        elif operation == "status":
+            valid = _is_safe_account_view(payload.get("account"))
+        else:
+            account_id = payload.get("account_id")
+            valid = isinstance(payload.get("created"), bool) and (
+                account_id is None
+                or (isinstance(account_id, int) and not isinstance(account_id, bool) and account_id > 0)
+            )
+        if not valid:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502)
+        return payload
+
     def _account_email(self, action: str, operation: str, data: dict[str, Any]) -> dict[str, Any]:
         """Java owns tokens and delivery state; never fall back to local writes."""
 
@@ -244,3 +294,30 @@ class PlatformAuthClient:
                 "INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502
             )
         return payload
+
+
+def _is_safe_account_view(value: Any) -> bool:
+    """Validate the Java projection before handing it to the frontend."""
+
+    if not isinstance(value, dict):
+        return False
+    required = {
+        "account_id", "email", "display_name", "role", "status",
+        "must_change_password", "email_verified_at", "deleted_at",
+        "created_at", "updated_at",
+    }
+    if set(value) != required:
+        return False
+    return (
+        isinstance(value["account_id"], int)
+        and not isinstance(value["account_id"], bool)
+        and value["account_id"] > 0
+        and isinstance(value["email"], str)
+        and (value["display_name"] is None or isinstance(value["display_name"], str))
+        and isinstance(value["role"], str)
+        and isinstance(value["status"], str)
+        and isinstance(value["must_change_password"], bool)
+        and all(value[field] is None or isinstance(value[field], str) for field in (
+            "email_verified_at", "deleted_at", "created_at", "updated_at"
+        ))
+    )
