@@ -130,6 +130,7 @@ def main() -> None:
             "JOB_AGENT_EMAIL_VERIFICATION_REQUIRED": "true",
             "JOB_AGENT_DEMO_RECHARGE_ENABLED": "true",
             "JOB_AGENT_TASK_QUEUE_ENABLED": "false",
+            "JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS": "100",
             "JOB_AGENT_JAVA_AUTH_ENABLED": "true",
             "JOB_AGENT_JAVA_BILLING_ENABLED": "true",
             "JOB_AGENT_JAVA_AUTH_BASE_URL": "http://platform-service:8081",
