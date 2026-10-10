@@ -51,6 +51,15 @@ public class AccountAdministrationController {
         return accounts.bootstrap(body.email(), body.password(), body.display_name());
     }
 
+    @PostMapping("/delete-admission")
+    public AccountAdministrationService.AccountResponse deleteAdmission(
+            @Valid @RequestBody DeleteAdmissionRequest body,
+            @RequestHeader(name = "X-Internal-Service-Token", required = false) String token,
+            @RequestHeader(name = "X-Trace-Id", defaultValue = "") String traceId) {
+        tokens.verify(token);
+        return accounts.prepareDeletion(body.session_token(), body.current_password(), traceId);
+    }
+
     public record SessionRequest(@NotBlank @Size(max = 128) String session_token) {
         @Override public String toString() { return "SessionRequest[redacted]"; }
     }
@@ -67,5 +76,11 @@ public class AccountAdministrationController {
             @NotBlank @Size(min = 8, max = 1024) String password,
             @Size(max = 128) String display_name) {
         @Override public String toString() { return "BootstrapRequest[redacted]"; }
+    }
+
+    public record DeleteAdmissionRequest(
+            @NotBlank @Size(max = 128) String session_token,
+            @NotBlank @Size(max = 1024) String current_password) {
+        @Override public String toString() { return "DeleteAdmissionRequest[redacted]"; }
     }
 }

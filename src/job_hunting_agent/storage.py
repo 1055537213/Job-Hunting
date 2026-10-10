@@ -64,6 +64,7 @@ from .models import (
 from .profile_mutation import apply_candidate_profile_patch
 from .platform_billing import PlatformBillingClient, PlatformBillingError
 from .skill_normalization import normalize_skill_mapping
+from .task_queue import ACCOUNT_DELETION_TASK_TYPE
 
 RESUME_ARTIFACT_STATUSES = {"ready", "processing", "failed", "scanning", "quarantined"}
 KNOWLEDGE_ASSET_LIFECYCLE_STATUSES = {"active", "archived"}
@@ -1052,7 +1053,12 @@ class RepositoryStore:
         return exported
 
     def prepare_account_deletion(self, account_id: int) -> list[str]:
-        """Disable an account, reject active work, and return owned object keys."""
+        """Disable an account and return owned object keys for durable cleanup.
+
+        Running tasks are intentionally not rejected here. They finish under the
+        account's disabled state; the deletion Worker waits until they are gone
+        before removing the rows they may still need.
+        """
 
         account = self.get_account(account_id)
         if account.role == "admin":
@@ -1061,15 +1067,6 @@ class RepositoryStore:
             raise ValueError("账号已经注销。")
         changed_at = now_iso()
         with self.connect() as conn:
-            running = conn.execute(
-                """
-                SELECT COUNT(*) AS count FROM background_tasks
-                WHERE account_id = ? AND status = 'running'
-                """,
-                (account_id,),
-            ).fetchone()
-            if running is not None and int(running["count"]) > 0:
-                raise ValueError("仍有后台任务正在执行，请等待任务结束后再注销。")
             key_rows = conn.execute(
                 """
                 SELECT versions.storage_key FROM knowledge_asset_versions AS versions
@@ -1122,37 +1119,31 @@ class RepositoryStore:
             )
         return sorted({str(row["storage_key"]) for row in key_rows if row["storage_key"]})
 
-    def restore_account_after_failed_deletion(self, account_id: int) -> None:
-        """Re-enable an account when object cleanup fails before database deletion."""
-
-        with self.connect() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE accounts SET status = 'active', updated_at = ?
-                WHERE id = ? AND deleted_at IS NULL AND status = 'disabled'
-                """,
-                (now_iso(), account_id),
-            )
-            if cursor.rowcount != 1:
-                raise KeyError(f"Account not found or already deleted: {account_id}")
-
     def finalize_account_deletion(
         self,
         account_id: int,
         anonymized_email: str,
         unusable_password_hash: str,
+        *,
+        exclude_task_key: str | None = None,
     ) -> AccountRecord:
-        """Delete personal workload data and retain anonymized financial facts."""
+        """Delete personal workload data and retain anonymized financial facts.
+
+        A running account-deletion task is excluded from the task-row cleanup so
+        it can write its terminal ``succeeded`` state after this transaction.
+        """
 
         deleted_at = now_iso()
         with self.connect() as conn:
-            running = conn.execute(
-                """
+            running_sql = """
                 SELECT COUNT(*) AS count FROM background_tasks
                 WHERE account_id = ? AND status = 'running'
-                """,
-                (account_id,),
-            ).fetchone()
+            """
+            running_parameters: tuple[object, ...] = (account_id,)
+            if exclude_task_key:
+                running_sql += " AND task_key <> ?"
+                running_parameters = (account_id, exclude_task_key)
+            running = conn.execute(running_sql, running_parameters).fetchone()
             if running is not None and int(running["count"]) > 0:
                 raise ValueError("注销过程中出现新的后台任务，请稍后重试。")
             # Child tables not directly removed by the candidate/profile cascades.
@@ -1177,10 +1168,16 @@ class RepositoryStore:
                 "account_email_outbox",
                 "account_action_tokens",
             ):
-                conn.execute(
-                    f"DELETE FROM {table_name} WHERE account_id = ?",
-                    (account_id,),
-                )
+                if table_name == "background_tasks" and exclude_task_key:
+                    conn.execute(
+                        "DELETE FROM background_tasks WHERE account_id = ? AND task_key <> ?",
+                        (account_id, exclude_task_key),
+                    )
+                else:
+                    conn.execute(
+                        f"DELETE FROM {table_name} WHERE account_id = ?",
+                        (account_id,),
+                    )
             conn.execute(
                 """
                 UPDATE account_consents
@@ -1206,6 +1203,26 @@ class RepositoryStore:
                 ),
             )
         return self.get_account(account_id)
+
+    def has_running_background_tasks(
+        self,
+        account_id: int,
+        *,
+        exclude_task_key: str | None = None,
+    ) -> bool:
+        """检查账号是否仍有会读取其资源的运行中任务。"""
+
+        sql = """
+            SELECT COUNT(*) AS count FROM background_tasks
+            WHERE account_id = ? AND status = 'running'
+        """
+        parameters: tuple[object, ...] = (account_id,)
+        if exclude_task_key:
+            sql += " AND task_key <> ?"
+            parameters = (account_id, exclude_task_key)
+        with self.connect() as conn:
+            row = conn.execute(sql, parameters).fetchone()
+        return row is not None and int(row["count"]) > 0
 
     def assert_account_can_spend(self, account_id: int) -> None:
         """确认账号仍可进行模型调用；余额停用或手动禁用时抛出错误。"""
@@ -3072,7 +3089,9 @@ class RepositoryStore:
             raise ValueError("后台任务类型不能为空。")
         if max_attempts <= 0:
             raise ValueError("后台任务最大尝试次数必须大于 0。")
-        self.get_account(account_id)
+        account = self.get_account(account_id)
+        if account.status != "active" and normalized_type != ACCOUNT_DELETION_TASK_TYPE:
+            raise ValueError("已停用账号不能创建新的后台任务。")
         if candidate_id is not None:
             self.get_candidate_profile(candidate_id, account_id=account_id)
         if audit_event is not None:

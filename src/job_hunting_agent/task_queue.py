@@ -48,6 +48,8 @@ PROJECT_ARCHIVE_ANALYSIS_TASK_TYPE = "project_archive_analysis"
 RESUME_EXPORT_TASK_TYPE = "resume_export"
 # Worker 探针只验证任务消费和数据库状态更新，不读取候选人材料。
 SYSTEM_PROBE_TASK_TYPE = "system_probe"
+# 账号注销是可恢复的后台清理任务；数据库任务状态是唯一事实源。
+ACCOUNT_DELETION_TASK_TYPE = "account_deletion"
 
 
 class TaskQueueError(RuntimeError):

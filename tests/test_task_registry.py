@@ -46,6 +46,6 @@ def test_background_task_catalog_contains_all_worker_task_types() -> None:
         "visual_index",
         "rag_index",
         "system_probe",
+        "account_deletion",
     ]
     assert all(item.audit_label for item in catalog)
-

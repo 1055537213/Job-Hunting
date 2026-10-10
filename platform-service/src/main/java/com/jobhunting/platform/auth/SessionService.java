@@ -108,6 +108,24 @@ public class SessionService {
         emails.invalidateCredentialLinks(id);
     }
 
+    @Transactional
+    long prepareDeletion(String token, String currentPassword) {
+        // Validate the Java-owned session and password before changing status.
+        long id = requireSession(token);
+        String hash = jdbc.queryForObject("SELECT password_hash FROM accounts WHERE id = ?", String.class, id);
+        if (!verifier.matches(currentPassword, hash)) {
+            throw new AuthException("INVALID_CURRENT_PASSWORD", "当前密码错误。", HttpStatus.BAD_REQUEST);
+        }
+        String role = jdbc.queryForObject("SELECT role FROM accounts WHERE id = ?", String.class, id);
+        if ("admin".equals(role)) {
+            throw new AuthException("ADMIN_DELETE_FORBIDDEN", "管理员账号不能通过个人中心自助注销。", HttpStatus.FORBIDDEN);
+        }
+        jdbc.update("UPDATE accounts SET status = 'disabled', updated_at = CURRENT_TIMESTAMP WHERE id = ?", id);
+        revokeAll(id);
+        emails.invalidateCredentialLinks(id);
+        return id;
+    }
+
     private int revokeAll(long id) {
         return jdbc.update("UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE account_id = ? AND revoked_at IS NULL", id);
     }

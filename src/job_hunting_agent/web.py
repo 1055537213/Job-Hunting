@@ -46,7 +46,6 @@ from .account_lifecycle import (
     AccountEmailSender,
     action_token_hash,
     build_account_email_sender,
-    new_action_token,
 )
 from .admin_ledger import ADMIN_LEDGER_MAX_PAGES, ADMIN_LEDGER_PAGE_SIZE
 from .agent import JobHuntingAgent
@@ -148,6 +147,7 @@ from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
 from .skill_normalization import normalize_skill_mapping
 from .storage import AccountEmailRequestSuppressed, IdempotencyConflictError
 from .task_queue import (
+    ACCOUNT_DELETION_TASK_TYPE,
     AccountEmailQueue,
     BackgroundTaskQueue,
     CeleryAccountEmailQueue,
@@ -169,6 +169,7 @@ from .web_hardening import (
     new_csrf_token,
     set_csrf_cookie,
 )
+from .background_tasks import run_registered_task
 
 STATIC_DIR = Path(__file__).with_name("web_static")
 SESSION_COOKIE_NAME = "job_agent_session"
@@ -1053,8 +1054,8 @@ def create_web_app(
         payload: AccountDeletePayload,
         request: Request,
         response: Response,
-    ) -> dict[str, bool]:
-        """Delete job-search data and anonymize the retained financial account."""
+    ) -> dict[str, object]:
+        """登记可恢复的账号注销清理任务，并立即撤销账号访问。"""
 
         account = current_account(request)
         assert account is not None
@@ -1063,31 +1064,55 @@ def create_web_app(
         _, current_hash = backend.store.get_account_with_password(account.id)
         if not verify_password(current_hash, payload.current_password):
             raise HTTPException(status_code=400, detail="当前密码错误。")
+        if backend.platform_auth_client is not None:
+            token = request.cookies.get(SESSION_COOKIE_NAME)
+            if not token:
+                raise HTTPException(status_code=401, detail="登录状态已过期，请重新登录。")
+            try:
+                backend.platform_auth_client.account(
+                    "delete-admission",
+                    trace_id=getattr(request.state, "request_id", None),
+                    session_token=token,
+                    current_password=payload.current_password,
+                )
+            except PlatformAuthError as error:
+                raise HTTPException(
+                    status_code=error.status_code or 503,
+                    detail=str(error),
+                ) from error
         try:
             storage_keys = backend.store.prepare_account_deletion(account.id)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        try:
-            for storage_key in storage_keys:
-                backend.resume_files.delete(storage_key)
-        except Exception as error:
-            web_logger.exception("account object cleanup failed", extra={"account_id": account.id})
-            try:
-                backend.store.restore_account_after_failed_deletion(account.id)
-            except Exception:
-                web_logger.exception(
-                    "account status restore failed after object cleanup error",
-                    extra={"account_id": account.id},
-                )
-            raise HTTPException(status_code=503, detail="账号文件清理失败，请稍后重试。") from error
-        backend.store.finalize_account_deletion(
-            account.id,
-            f"deleted-{account.id}-{uuid.uuid4().hex}@invalid.local",
-            hash_password(new_action_token()),
+        task = backend.store.create_background_task(
+            account_id=account.id,
+            task_type=ACCOUNT_DELETION_TASK_TYPE,
+            payload={"storage_keys": storage_keys},
+            max_attempts=8,
+            idempotency_key=f"account-deletion:{account.id}",
         )
+        if backend.task_queue is not None:
+            try:
+                backend.task_queue.enqueue(task.task_key)
+            except TaskQueueError as error:
+                backend.store.fail_queued_background_task(task.task_key, "注销清理任务投递失败。")
+                raise HTTPException(
+                    status_code=503,
+                    detail="注销清理任务暂时无法启动，请稍后重试。",
+                ) from error
+            result = {"ok": True, "status": "accepted", "task_key": task.task_key}
+        else:
+            # 本地无 Worker 的开发/测试环境仍执行同一注册任务，保证路径可验证；
+            # 失败时任务回到 queued，账号保持 disabled，后续可由 Worker 重试。
+            try:
+                result = run_registered_task(backend, task.task_key)
+            except Exception as error:  # noqa: BLE001 - 转为稳定的 API 摘要
+                web_logger.exception("account deletion task failed", extra={"account_id": account.id})
+                backend.store.requeue_background_task(task.task_key, "注销文件清理暂时失败。")
+                raise HTTPException(status_code=503, detail="账号注销正在等待重试，请稍后联系管理员。") from error
         response.delete_cookie(SESSION_COOKIE_NAME, path="/")
         delete_csrf_cookie(response)
-        return {"ok": True}
+        return result
 
     def frontend_shell() -> FileResponse:
         response = FileResponse(STATIC_DIR / "index.html")

@@ -524,8 +524,8 @@ def test_account_export_change_password_and_anonymized_deletion() -> None:
         ).fetchone()["count"] == 1
 
 
-def test_account_deletion_restores_login_when_object_cleanup_fails(monkeypatch) -> None:
-    """对象清理失败时不能把尚未注销的用户永久锁死。"""
+def test_account_deletion_keeps_disabled_state_when_object_cleanup_fails(monkeypatch) -> None:
+    """对象清理失败时保留禁用状态，并留下可重试的持久化任务。"""
 
     web_app = create_web_app()
     client = TestClient(web_app)
@@ -560,12 +560,20 @@ def test_account_deletion_restores_login_when_object_cleanup_fails(monkeypatch) 
 
     assert response.status_code == 503
     account = store.get_account(account_id)
-    assert account.status == "active"
+    assert account.status == "disabled"
     assert account.deleted_at is None
     assert client.post(
         "/api/auth/login",
         json={"email": email, "password": password},
-    ).status_code == 200
+    ).status_code != 200
+    with store.connect() as conn:
+        task = conn.execute(
+            "SELECT status, error_summary FROM background_tasks WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+    assert task is not None
+    assert task["status"] == "queued"
+    assert task["error_summary"] is not None
 
 
 def test_web_chat_payload_defaults_to_langchain_agent() -> None:

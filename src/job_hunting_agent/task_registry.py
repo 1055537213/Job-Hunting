@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .task_queue import (
+    ACCOUNT_DELETION_TASK_TYPE,
     GITHUB_PROJECT_ANALYSIS_TASK_TYPE,
     PROJECT_ARCHIVE_ANALYSIS_TASK_TYPE,
     RAG_INDEX_TASK_TYPE,
@@ -121,6 +122,11 @@ _BACKGROUND_TASK_CATALOG = (
         task_type=SYSTEM_PROBE_TASK_TYPE,
         audit_label="检查 Worker 连通性",
         trace_priority=10,
+    ),
+    TaskMetadata(
+        task_type=ACCOUNT_DELETION_TASK_TYPE,
+        audit_label="清理注销账号",
+        trace_priority=5,
     ),
 )
 

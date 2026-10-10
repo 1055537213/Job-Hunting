@@ -8,15 +8,16 @@ Web 只登记受控资源 ID，Worker 在独立进程中读取 PostgreSQL 事实
 from __future__ import annotations
 
 import time
+from uuid import uuid4
 from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from .account_email_outbox import AccountEmailOutboxService
-from .account_lifecycle import build_account_email_sender
+from .account_lifecycle import build_account_email_sender, new_action_token
 from .app import JobHuntingApp
-from .auth import iso_utc
+from .auth import hash_password, iso_utc
 from .config import (
     DEFAULT_ENV_PATH,
     load_account_lifecycle_settings,
@@ -44,6 +45,7 @@ from .resume_document import ResumeDocumentError
 from .sqlalchemy_store import SQLAlchemyStore
 from .storage import INSUFFICIENT_BALANCE_MESSAGE, InsufficientBalanceError
 from .task_queue import (
+    ACCOUNT_DELETION_TASK_TYPE,
     ACCOUNT_EMAIL_DELIVERY_TASK_NAME,
     ACCOUNT_EMAIL_DISPATCH_TASK_NAME,
     PLATFORM_EMAIL_DELIVERY_TASK_NAME,
@@ -564,6 +566,73 @@ def _mark_resume_ocr_artifact_failed(backend: JobHuntingApp, task_key: str) -> N
     except (KeyError, NonRetryableTaskError, RuntimeError, ValueError):
         # 文件可能已由用户删除；这里不应盖过原始任务错误或导致 Worker 再次失败。
         return
+
+
+def _account_deletion_task_payload(record: BackgroundTaskRecord) -> list[str]:
+    """校验注销任务中持久化的对象键；不接受任意路径或正文。"""
+
+    raw_keys = record.payload.get("storage_keys")
+    if not isinstance(raw_keys, list):
+        raise NonRetryableTaskError("账号注销任务缺少对象键列表。")
+    if len(raw_keys) > 100_000:
+        raise NonRetryableTaskError("账号注销任务对象数量超出限制。")
+    keys: list[str] = []
+    from .object_storage import validate_storage_key
+
+    for raw_key in raw_keys:
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise NonRetryableTaskError("账号注销任务包含无效对象键。")
+        try:
+            keys.append(validate_storage_key(raw_key.strip()))
+        except Exception as error:  # noqa: BLE001 - 转换为安全的不可重试摘要
+            raise NonRetryableTaskError("账号注销任务包含无效对象键。") from error
+    return list(dict.fromkeys(keys))
+
+
+def _run_account_deletion_task(
+    backend: JobHuntingApp,
+    record: BackgroundTaskRecord,
+) -> dict[str, object]:
+    """幂等清理对象并最终删除账号业务数据。
+
+    对象删除失败时直接抛出异常，由现有 Worker 重试策略重新投递。同一对象重复
+    DeleteObject 是幂等的，因此 Worker 在部分成功后重启不会造成数据库与对象存储
+    更不一致。数据库最终删除排除当前任务行，待任务成功状态写回后再保留一条完成事实。
+    """
+
+    storage_keys = _account_deletion_task_payload(record)
+    if backend.store.has_running_background_tasks(
+        record.account_id,
+        exclude_task_key=record.task_key,
+    ):
+        raise RuntimeError("账号仍有后台任务运行，注销清理将在稍后重试。")
+    total = len(storage_keys)
+    for index, storage_key in enumerate(storage_keys, start=1):
+        backend.resume_files.delete(storage_key)
+        if total:
+            backend.store.update_background_task_progress(
+                record.task_key,
+                min(90, max(1, int(index * 90 / total))),
+            )
+
+    completed = backend.store.finalize_account_deletion(
+        record.account_id,
+        f"deleted-{record.account_id}-{uuid4().hex}@invalid.local",
+        hash_password(new_action_token()),
+        exclude_task_key=record.task_key,
+    )
+    finished = backend.store.complete_background_task(
+        record.task_key,
+        {
+            "deleted_account_id": completed.id,
+            "deleted_object_count": total,
+        },
+    )
+    return {
+        "task_key": finished.task_key,
+        "status": finished.status,
+        "result": finished.result,
+    }
 
 
 def run_registered_task(
@@ -1133,6 +1202,7 @@ def build_background_task_registry() -> TaskRegistry:
         VISUAL_INDEX_TASK_TYPE: _run_visual_index_task,
         RAG_INDEX_TASK_TYPE: _run_rag_index_task,
         SYSTEM_PROBE_TASK_TYPE: _run_system_probe_task,
+        ACCOUNT_DELETION_TASK_TYPE: _run_account_deletion_task,
     }
     return TaskRegistry(
         TaskSpec(

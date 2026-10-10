@@ -360,7 +360,7 @@ docker compose --env-file /opt/job-hunting-agent/shared/.env \
 | 认证 | `POST /api/auth/verify-email` | 消费邮箱验证令牌 |
 | 认证 | `POST /api/auth/password-reset/request` | 请求密码重置 |
 | 账号 | `GET /api/account/export` | 导出本人数据 |
-| 账号 | `POST /api/account/delete` | 删除或匿名化账号数据 |
+| 账号 | `POST /api/account/delete` | 登记可恢复清理任务，删除或匿名化账号数据 |
 | 档案 | `GET/POST /api/profiles` | 列出或创建候选人档案 |
 | 对话 | `POST /api/chat/stream` | SSE Agent 对话 |
 | 职位 | `POST /api/jobs` | 导入职位文本 |

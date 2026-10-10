@@ -122,6 +122,19 @@ public class AccountAdministrationService {
         return new BootstrapResult(true, accountId);
     }
 
+    @Transactional
+    public AccountResponse prepareDeletion(String sessionToken, String currentPassword, String requestId) {
+        long accountId = sessions.prepareDeletion(sessionToken, currentPassword);
+        jdbc.update("""
+                INSERT INTO admin_audit_events (actor_account_id, target_account_id, action, target_type,
+                  target_id, outcome, summary, details_json, request_id, created_at)
+                VALUES (?, ?, 'account.deletion_requested', 'account', ?, 'succeeded', ?, CAST(? AS jsonb), ?, CURRENT_TIMESTAMP)
+                """, accountId, accountId, Long.toString(accountId),
+                "账号 #" + accountId + " 已通过注销校验并进入异步清理。",
+                json(Map.of("source", "self_service")), cap(requestId));
+        return new AccountResponse(accountById(accountId));
+    }
+
     private long requireAdmin(String sessionToken) {
         long actorId = sessions.requireSession(sessionToken);
         String role = jdbc.queryForObject("SELECT role FROM accounts WHERE id = ?", String.class, actorId);
