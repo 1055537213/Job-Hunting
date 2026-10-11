@@ -113,7 +113,7 @@
 - ClamAV：上传文件病毒扫描。
 - Prometheus/Alertmanager/Grafana/Loki/Tempo：指标、告警、日志、Trace 和可视化。
 - Docker Compose：开发、生产、混合、共存、恢复和验收拓扑。
-- Caddy 或共存 Nginx：HTTPS 入口。
+- Caddy 或共存 Nginx：HTTPS 入口；公网请求统一先进入 Python 安全边缘，再调用 Java 平台服务。
 
 ### 质量与安全
 
@@ -307,7 +307,7 @@ AI、RAG、OCR 和多模态文件处理仍然依赖 Python 生态；Java 更适�
 
 ### Java 服务是否已经替代 Python 全部代码？
 
-没有。当前已迁移账号注册、Session、邮箱验证、邮箱变更、密码重置、管理员账号操作、当前账号资料读取、显示名称写入，以及可选账务事实源。Python 的 Agent、RAG、文件分析、简历生成、Worker 和外部 Web 入口仍然保留。
+没有。当前已迁移账号注册、Session、邮箱验证、邮箱变更、密码重置、管理员账号操作、当前账号资料读取、显示名称写入，以及可选账务事实源。Python 仍保留外部 Web 安全入口和兼容适配层，Agent、RAG、文件分析、简历生成、Worker 等业务也仍由 Python 负责。
 
 ### Java 服务不可用时会不会偷偷回退到 Python？
 
@@ -337,7 +337,7 @@ AI、RAG、OCR 和多模态文件处理仍然依赖 Python 生态；Java 更适�
 
 - [x] 建立 Python + Java 本地联调、内部契约、CI 和独立分支发布流程。
 - [x] 迁移 Java 注册、Session、邮箱验证、邮箱变更、密码重置、管理员账号操作、当前账号资料读取、显示名称写入和账号注销闭环。
-- [x] 将登录、单设备退出、全部退出和修改密码的同源公网入口切到 Java，保留 Python 兼容适配。
+- [x] 由 Python 统一承接公网认证入口，并将认证事实源转交 Java，保留浏览器 API 和安全策略兼容性。
 - [x] 接入 Java 余额查询、演示充值和模型调用扣费的可选路径。
 - [x] 接入邮箱变更验证流程；显示名称写入已由 Java 统一负责。
 - [ ] 接入真实支付、签名 Webhook、退款状态机和渠道对账。

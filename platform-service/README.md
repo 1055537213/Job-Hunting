@@ -111,8 +111,10 @@ Session 原文只返回给 Python 设置 HttpOnly Cookie，数据库只存 SHA-2
 修改密码校验当前密码，同时撤销所有设备并作废验证/重置链接，失败则整体回滚。
 Python 网页 API 保持不变；Java 模式不再通过 Python 创建、解析、续期或撤销用户登录会话。
 当前已将同源公网的登录、单设备退出、全部退出和修改密码路径交给 Java 控制器处理，
-由 Caddy 只转发这四条路径；Java 写入与删除 `job_agent_session`、`job_agent_csrf` Cookie，
-并继续执行 CSRF 双提交校验。`/api/auth/me` 及其他业务入口暂时仍由 Python 适配，
+Python Web 是唯一公网入口，统一执行限流、CSRF、请求观测和安全响应头，再通过内部服务 Token
+调用 Java。Java 负责认证事实源和业务事务；浏览器 Cookie 仍由 Python 适配层维护，避免纯 Python
+部署依赖 Java，也避免共存部署绕过边缘安全控制。`/api/auth/me` 及其他业务入口保持 Python
+兼容 URL，账号读取和认证业务由 Java 提供。
 因此可以逐步切换而不要求前端同时改造。
 管理员账号列表、当前账号读取、显示名称写入、启用/停用、账号注销准入/完成和首次管理员引导现由 Java 原子完成：服务端用真实 Session
 重新校验管理员权限，停用同时撤销目标会话、作废旧账号操作链接并写入审计。Python

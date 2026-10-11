@@ -14,11 +14,9 @@
 		@internal path /internal/*
 		respond @internal 404
 
-		# 已迁移的同源认证写接口由 Java 平台服务直接处理；其余外部 API
-		# 继续进入 Python，便于逐条迁移并保持失败时可回滚。
-		@platform_auth path /api/auth/login /api/auth/logout /api/auth/logout-all /api/account/password
-		reverse_proxy @platform_auth platform-service:8081
-
+		# Python 保持唯一公网安全入口：它统一执行 Redis 限流、CSRF、请求观测、
+		# 安全响应头和错误契约，再通过内部服务 Token 调用 Java 认证事实源。
+		# 这样纯 Python 部署不依赖 platform-service，共存部署也不会绕过边缘保护。
 		# Docker DNS 会为扩容后的 web 服务返回全部容器地址。Caddy 动态刷新地址并轮询，
 		# 避免在容器重建后继续使用旧 IP，也避免全部请求固定落到单个副本。
 		reverse_proxy {

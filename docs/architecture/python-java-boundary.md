@@ -79,14 +79,15 @@ Java 故障一律失败关闭，不退回 Python Session 数据库路径。
 ## 目标入口与发布规则
 
 最终由 Java 接管对外业务 API，Python 提供内部 AI/长任务能力，保持现有前端 URL/API 兼容。
-当前外部入口仍以 Python 为主；登录、单设备退出、全部退出和修改密码已先由同源 Caddy
-路由转发到 Java 公网认证控制器，`/api/auth/me` 和其他业务 API 仍由 Python 适配。
-Java 内部接口继续使用服务 Token，公网认证控制器不复用内部 URL。
+当前外部入口统一进入 Python Web。Python 负责 Redis 限流、CSRF、请求观测、安全响应头
+和稳定的浏览器错误契约，再通过内部服务 Token 调用 Java 认证事实源；登录、注册、邮箱验证、
+密码重置、会话和当前账号读取的业务写入/读取均由 Java 完成。这样纯 Python 部署不依赖
+`platform-service`，共存部署也不会因反向代理绕过边缘安全控制。
 
 本地使用 `compose.yaml + compose.platform.yaml`；生产加载 `compose.yaml`、`compose.prod.yaml`
 和 `compose.hybrid.prod.yaml`，共享 Java 服务配置；共存部署另加 `compose.coexist.yaml`。
 CI 通过后发布相同提交的 `-ai` 和 `-platform` 两个版本镜像，审批部署通过 `Deploy Python Java`
 工作流执行；生产只填环境配置，不需要修改代码/Compose。此分支不自动部署服务器。
 
-后续继续迁移注册、邮箱操作、当前账号读取和管理/账务外部入口。所有 GitHub 推送必须确认对应提交
+后续继续迁移管理/账务外部入口。所有 GitHub 推送必须确认对应提交
 CI 最终通过，镜像发布失败也不视为完成。
