@@ -77,6 +77,15 @@ public class AccountAdministrationController {
         return accounts.prepareDeletion(body.session_token(), body.current_password(), traceId);
     }
 
+    @PostMapping("/delete-complete")
+    public AccountAdministrationService.DeletionResult deleteComplete(
+            @Valid @RequestBody DeleteCompleteRequest body,
+            @RequestHeader(name = "X-Internal-Service-Token", required = false) String token,
+            @RequestHeader(name = "X-Trace-Id", defaultValue = "") String traceId) {
+        tokens.verify(token);
+        return accounts.completeDeletion(body.account_id(), body.task_key(), traceId);
+    }
+
     public record SessionRequest(@NotBlank @Size(max = 128) String session_token) {
         @Override public String toString() { return "SessionRequest[redacted]"; }
     }
@@ -105,5 +114,11 @@ public class AccountAdministrationController {
             @NotBlank @Size(max = 128) String session_token,
             @NotBlank @Size(max = 1024) String current_password) {
         @Override public String toString() { return "DeleteAdmissionRequest[redacted]"; }
+    }
+
+    public record DeleteCompleteRequest(
+            @NotNull @Positive Long account_id,
+            @NotBlank @Size(max = 128) String task_key) {
+        @Override public String toString() { return "DeleteCompleteRequest[redacted]"; }
     }
 }

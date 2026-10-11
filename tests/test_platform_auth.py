@@ -237,6 +237,28 @@ def test_platform_auth_client_reads_current_account_projection(monkeypatch):
     assert calls[0]["json"] == {"session_token": "opaque"}
 
 
+def test_platform_auth_client_completes_account_deletion(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url, *, headers, json=None, timeout):
+        calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        return httpx.Response(200, json={"account_id": 42, "deleted": True})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    client = PlatformAuthClient(PlatformAuthSettings(True, "http://java", "secret", 5))
+
+    result = client.account(
+        "delete-complete",
+        account_id=42,
+        task_key="task-delete",
+        trace_id="trace-delete-complete",
+    )
+
+    assert result == {"account_id": 42, "deleted": True}
+    assert calls[0]["url"].endswith("/internal/v1/auth/accounts/delete-complete")
+    assert calls[0]["json"] == {"account_id": 42, "task_key": "task-delete"}
+
+
 def test_platform_auth_client_updates_current_account_profile(monkeypatch):
     account = {
         "account_id": 42,

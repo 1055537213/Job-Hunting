@@ -602,6 +602,20 @@ def _run_account_deletion_task(
     """
 
     storage_keys = _account_deletion_task_payload(record)
+    java_deletion = backend.platform_auth_client is not None
+    if java_deletion and backend.store.get_account(record.account_id).deleted_at is not None:
+        finished = backend.store.complete_background_task(
+            record.task_key,
+            {
+                "deleted_account_id": record.account_id,
+                "deleted_object_count": len(storage_keys),
+            },
+        )
+        return {
+            "task_key": finished.task_key,
+            "status": finished.status,
+            "result": finished.result,
+        }
     if backend.store.has_running_background_tasks(
         record.account_id,
         exclude_task_key=record.task_key,
@@ -621,7 +635,16 @@ def _run_account_deletion_task(
         f"deleted-{record.account_id}-{uuid4().hex}@invalid.local",
         hash_password(new_action_token()),
         exclude_task_key=record.task_key,
+        preserve_account=java_deletion,
     )
+    if java_deletion:
+        backend.platform_auth_client.account(
+            "delete-complete",
+            trace_id=f"account-deletion-{record.task_key}",
+            account_id=record.account_id,
+            task_key=record.task_key,
+        )
+        completed = backend.store.get_account(record.account_id)
     finished = backend.store.complete_background_task(
         record.task_key,
         {

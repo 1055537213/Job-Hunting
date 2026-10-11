@@ -125,6 +125,32 @@ class AccountAdministrationIntegrationTest {
     }
 
     @Test
+    void deletionCompletionIsIdempotentAndAnonymizesOnlyAfterAdmission() {
+        var user = sessions.login("user@example.com", "password-123", false, null, null);
+
+        assertThatThrownBy(() -> accounts.completeDeletion(2, "task-before-admission", "trace-before"))
+            .isInstanceOf(AuthException.class)
+            .satisfies(error -> assertThat(((AuthException) error).code()).isEqualTo("DELETION_NOT_ADMITTED"));
+
+        accounts.prepareDeletion(user.session_token(), "password-123", "trace-admission");
+        var completed = accounts.completeDeletion(2, "task-delete", "trace-complete");
+
+        assertThat(completed.deleted()).isTrue();
+        assertThat(jdbc.queryForObject("SELECT deleted_at IS NOT NULL FROM accounts WHERE id=2", Boolean.class))
+            .isTrue();
+        assertThat(jdbc.queryForObject("SELECT email FROM accounts WHERE id=2", String.class))
+            .startsWith("deleted-2-");
+        assertThat(jdbc.queryForObject(
+                "SELECT count(*) FROM admin_audit_events WHERE action='account.deletion_completed' AND target_account_id=2",
+                Integer.class)).isEqualTo(1);
+
+        assertThat(accounts.completeDeletion(2, "task-delete", "trace-complete-retry").deleted()).isTrue();
+        assertThat(jdbc.queryForObject(
+                "SELECT count(*) FROM admin_audit_events WHERE action='account.deletion_completed' AND target_account_id=2",
+                Integer.class)).isEqualTo(1);
+    }
+
+    @Test
     void profileUpdateUsesSessionAndWritesAuditAtomically() {
         var user = sessions.login("user@example.com", "password-123", false, null, null);
 

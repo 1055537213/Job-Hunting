@@ -174,7 +174,9 @@ class PlatformAuthClient:
         authorization decision.
         """
 
-        if operation not in {"me", "profile", "list", "status", "bootstrap", "delete-admission"}:
+        if operation not in {
+            "me", "profile", "list", "status", "bootstrap", "delete-admission", "delete-complete"
+        }:
             raise ValueError("Unknown account operation")
         try:
             response = httpx.post(
@@ -208,6 +210,14 @@ class PlatformAuthClient:
             valid = isinstance(accounts, list) and all(_is_safe_account_view(account) for account in accounts)
         elif operation in {"status", "delete-admission"}:
             valid = _is_safe_account_view(payload.get("account"))
+        elif operation == "delete-complete":
+            account_id = payload.get("account_id")
+            valid = (
+                isinstance(account_id, int)
+                and not isinstance(account_id, bool)
+                and account_id > 0
+                and payload.get("deleted") is True
+            )
         else:
             account_id = payload.get("account_id")
             valid = isinstance(payload.get("created"), bool) and (

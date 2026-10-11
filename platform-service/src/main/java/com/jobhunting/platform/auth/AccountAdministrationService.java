@@ -3,6 +3,7 @@ package com.jobhunting.platform.auth;
 import java.sql.Timestamp;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.ObjectMapper;
@@ -30,18 +31,21 @@ public class AccountAdministrationService {
     private final SessionService sessions;
     private final RegistrationService registrations;
     private final AccountActionEmailService emails;
+    private final PasswordHasher passwordHasher;
 
     public AccountAdministrationService(
             JdbcTemplate jdbc,
             ObjectMapper objectMapper,
             SessionService sessions,
             RegistrationService registrations,
-            AccountActionEmailService emails) {
+            AccountActionEmailService emails,
+            PasswordHasher passwordHasher) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.sessions = sessions;
         this.registrations = registrations;
         this.emails = emails;
+        this.passwordHasher = passwordHasher;
     }
 
     @Transactional
@@ -175,6 +179,39 @@ public class AccountAdministrationService {
         return new AccountResponse(accountById(accountId));
     }
 
+    @Transactional
+    public DeletionResult completeDeletion(long accountId, String taskKey, String requestId) {
+        var rows = jdbc.query(
+                "SELECT id, status, deleted_at FROM accounts WHERE id = ? FOR UPDATE",
+                (row, index) -> new DeletionAccount(row.getString("status"), row.getTimestamp("deleted_at") != null),
+                accountId);
+        if (rows.isEmpty()) {
+            throw new AuthException("ACCOUNT_NOT_FOUND", "账号不存在。", HttpStatus.NOT_FOUND);
+        }
+        DeletionAccount account = rows.getFirst();
+        if (account.deleted()) return new DeletionResult(accountId, true);
+        if (!"disabled".equals(account.status())) {
+            throw new AuthException("DELETION_NOT_ADMITTED", "账号尚未通过注销准入。", HttpStatus.CONFLICT);
+        }
+        String deletedAt = UUID.randomUUID().toString();
+        jdbc.update("""
+                UPDATE accounts SET email = ?, password_hash = ?, display_name = NULL,
+                    status = 'disabled', must_change_password = FALSE,
+                    email_verified_at = NULL, deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND deleted_at IS NULL
+                """, "deleted-" + accountId + "-" + deletedAt + "@invalid.local",
+                passwordHasher.encode("deleted-" + UUID.randomUUID()), accountId);
+        emails.invalidateCredentialLinks(accountId);
+        jdbc.update("""
+                INSERT INTO admin_audit_events (actor_account_id, target_account_id, action, target_type,
+                  target_id, outcome, summary, details_json, request_id, created_at)
+                VALUES (?, ?, 'account.deletion_completed', 'account', ?, 'succeeded', ?, CAST(? AS jsonb), ?, CURRENT_TIMESTAMP)
+                """, accountId, accountId, Long.toString(accountId),
+                "账号 #" + accountId + " 已完成注销清理。",
+                json(Map.of("task_key", cap(taskKey))), cap(requestId));
+        return new DeletionResult(accountId, true);
+    }
+
     private long requireAdmin(String sessionToken) {
         long actorId = sessions.requireSession(sessionToken);
         String role = jdbc.queryForObject("SELECT role FROM accounts WHERE id = ?", String.class, actorId);
@@ -249,6 +286,8 @@ public class AccountAdministrationService {
     public record AccountList(List<AccountView> accounts) { }
     public record AccountResponse(AccountView account) { }
     public record BootstrapResult(boolean created, Long account_id) { }
+    public record DeletionResult(long account_id, boolean deleted) { }
+    private record DeletionAccount(String status, boolean deleted) { }
     public record AccountView(
             long account_id,
             String email,

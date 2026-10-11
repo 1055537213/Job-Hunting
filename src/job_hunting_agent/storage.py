@@ -1138,6 +1138,47 @@ class RepositoryStore:
             ]
         return exported
 
+    def collect_account_deletion_storage_keys(self, account_id: int) -> list[str]:
+        """读取账号拥有的对象键，不修改账号或会话状态。"""
+
+        account = self.get_account(account_id)
+        if account.role == "admin":
+            raise ValueError("管理员账号不能通过个人中心自助注销。")
+        if account.deleted_at is not None:
+            raise ValueError("账号已经注销。")
+        with self.connect() as conn:
+            key_rows = conn.execute(
+                """
+                SELECT versions.storage_key FROM knowledge_asset_versions AS versions
+                JOIN knowledge_assets AS assets ON assets.id = versions.asset_id
+                WHERE assets.account_id = ?
+                UNION
+                SELECT files.storage_key FROM project_collection_files AS files
+                JOIN project_collection_sessions AS sessions ON sessions.id = files.collection_id
+                WHERE sessions.account_id = ? AND files.storage_key IS NOT NULL
+                UNION
+                SELECT storage_key FROM visual_knowledge_items WHERE account_id = ?
+                UNION
+                SELECT storage_key FROM resume_artifacts WHERE account_id = ?
+                """,
+                (account_id, account_id, account_id, account_id),
+            ).fetchall()
+        return sorted({str(row["storage_key"]) for row in key_rows if row["storage_key"]})
+
+    def cancel_queued_account_tasks(self, account_id: int) -> None:
+        """取消注销前已排队的 Python 后台任务。"""
+
+        changed_at = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE background_tasks
+                SET status = 'cancelled', finished_at = ?, updated_at = ?
+                WHERE account_id = ? AND status = 'queued'
+                """,
+                (changed_at, changed_at, account_id),
+            )
+
     def prepare_account_deletion(self, account_id: int) -> list[str]:
         """Disable an account and return owned object keys for durable cleanup.
 
@@ -1212,11 +1253,14 @@ class RepositoryStore:
         unusable_password_hash: str,
         *,
         exclude_task_key: str | None = None,
+        preserve_account: bool = False,
     ) -> AccountRecord:
         """Delete personal workload data and retain anonymized financial facts.
 
         A running account-deletion task is excluded from the task-row cleanup so
         it can write its terminal ``succeeded`` state after this transaction.
+        ``preserve_account`` is used by the Java-backed path: Python removes
+        local workload data while Java retains ownership of final anonymization.
         """
 
         deleted_at = now_iso()
@@ -1272,22 +1316,23 @@ class RepositoryStore:
                 """,
                 (account_id,),
             )
-            conn.execute(
-                """
-                UPDATE accounts
-                SET email = ?, password_hash = ?, display_name = NULL,
-                    status = 'disabled', must_change_password = FALSE,
-                    email_verified_at = NULL, deleted_at = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    anonymized_email,
-                    unusable_password_hash,
-                    deleted_at,
-                    deleted_at,
-                    account_id,
-                ),
-            )
+            if not preserve_account:
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET email = ?, password_hash = ?, display_name = NULL,
+                        status = 'disabled', must_change_password = FALSE,
+                        email_verified_at = NULL, deleted_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        anonymized_email,
+                        unusable_password_hash,
+                        deleted_at,
+                        deleted_at,
+                        account_id,
+                    ),
+                )
         return self.get_account(account_id)
 
     def has_running_background_tasks(

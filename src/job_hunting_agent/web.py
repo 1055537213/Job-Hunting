@@ -1188,9 +1188,6 @@ def create_web_app(
         assert account is not None
         if payload.confirmation != "注销账号":
             raise HTTPException(status_code=400, detail="请输入“注销账号”完成确认。")
-        _, current_hash = backend.store.get_account_with_password(account.id)
-        if not verify_password(current_hash, payload.current_password):
-            raise HTTPException(status_code=400, detail="当前密码错误。")
         if backend.platform_auth_client is not None:
             token = request.cookies.get(SESSION_COOKIE_NAME)
             if not token:
@@ -1207,10 +1204,21 @@ def create_web_app(
                     status_code=error.status_code or 503,
                     detail=str(error),
                 ) from error
-        try:
-            storage_keys = backend.store.prepare_account_deletion(account.id)
-        except ValueError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
+            # Java 已在同一事务中校验密码、停用账号、撤销 Session 并写审计。
+            # Python 只读取清理所需的对象键，不再重复写账号/会话/邮件状态。
+            try:
+                storage_keys = backend.store.collect_account_deletion_storage_keys(account.id)
+                backend.store.cancel_queued_account_tasks(account.id)
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+        else:
+            _, current_hash = backend.store.get_account_with_password(account.id)
+            if not verify_password(current_hash, payload.current_password):
+                raise HTTPException(status_code=400, detail="当前密码错误。")
+            try:
+                storage_keys = backend.store.prepare_account_deletion(account.id)
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
         task = backend.store.create_background_task(
             account_id=account.id,
             task_type=ACCOUNT_DELETION_TASK_TYPE,

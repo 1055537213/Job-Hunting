@@ -53,6 +53,10 @@ class AccountAdministrationControllerTest {
                 .contentType(APPLICATION_JSON)
                 .content("{\"session_token\":\"opaque\",\"current_password\":\"password-123\"}"))
             .andExpect(status().isUnauthorized());
+        mvc.perform(post("/internal/v1/auth/accounts/delete-complete")
+                .contentType(APPLICATION_JSON)
+                .content("{\"account_id\":2,\"task_key\":\"task-delete\"}"))
+                .andExpect(status().isUnauthorized());
         verifyNoInteractions(service);
     }
 
@@ -72,6 +76,8 @@ class AccountAdministrationControllerTest {
             .thenReturn(new AccountAdministrationService.BootstrapResult(true, 3L));
         when(service.prepareDeletion("opaque", "password-123", "trace-delete"))
             .thenReturn(new AccountAdministrationService.AccountResponse(account));
+        when(service.completeDeletion(2, "task-delete", "trace-complete"))
+            .thenReturn(new AccountAdministrationService.DeletionResult(2, true));
 
         mvc.perform(post("/internal/v1/auth/accounts/list")
                 .header("X-Internal-Service-Token", "test-token")
@@ -112,6 +118,14 @@ class AccountAdministrationControllerTest {
                 .content("{\"session_token\":\"opaque\",\"current_password\":\"password-123\"}"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.account.account_id").value(2));
+        mvc.perform(post("/internal/v1/auth/accounts/delete-complete")
+                .header("X-Internal-Service-Token", "test-token")
+                .header("X-Trace-Id", "trace-complete")
+                .contentType(APPLICATION_JSON)
+                .content("{\"account_id\":2,\"task_key\":\"task-delete\"}"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.account_id").value(2))
+            .andExpect(jsonPath("$.deleted").value(true));
 
         verify(service).list("opaque");
         verify(service).current("opaque");
@@ -119,6 +133,7 @@ class AccountAdministrationControllerTest {
         verify(service).updateStatus("opaque", 2, "disabled", "trace-2");
         verify(service).bootstrap("admin@example.com", "password-123", null);
         verify(service).prepareDeletion("opaque", "password-123", "trace-delete");
+        verify(service).completeDeletion(2, "task-delete", "trace-complete");
         assertThat(new AccountAdministrationController.SessionRequest("opaque").toString())
             .doesNotContain("opaque");
         assertThat(new AccountAdministrationController.BootstrapRequest(
