@@ -37,6 +37,10 @@ class AccountAdministrationControllerTest {
                 .contentType(APPLICATION_JSON)
                 .content("{\"session_token\":\"opaque\"}"))
             .andExpect(status().isUnauthorized());
+        mvc.perform(post("/internal/v1/auth/accounts/profile")
+                .contentType(APPLICATION_JSON)
+                .content("{\"session_token\":\"opaque\",\"display_name\":\"New Name\"}"))
+            .andExpect(status().isUnauthorized());
         mvc.perform(post("/internal/v1/auth/accounts/status")
                 .contentType(APPLICATION_JSON)
                 .content("{\"session_token\":\"opaque\",\"account_id\":2,\"status\":\"disabled\"}"))
@@ -60,6 +64,8 @@ class AccountAdministrationControllerTest {
         when(service.list("opaque")).thenReturn(new AccountAdministrationService.AccountList(List.of(account)));
         when(service.current("opaque"))
             .thenReturn(new AccountAdministrationService.AccountResponse(account));
+        when(service.updateProfile("opaque", "New Name", "trace-profile"))
+            .thenReturn(new AccountAdministrationService.AccountResponse(account));
         when(service.updateStatus("opaque", 2, "disabled", "trace-2"))
             .thenReturn(new AccountAdministrationService.AccountResponse(account));
         when(service.bootstrap("admin@example.com", "password-123", null))
@@ -77,6 +83,13 @@ class AccountAdministrationControllerTest {
                 .header("X-Internal-Service-Token", "test-token")
                 .contentType(APPLICATION_JSON)
                 .content("{\"session_token\":\"opaque\"}"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.account.account_id").value(2));
+        mvc.perform(post("/internal/v1/auth/accounts/profile")
+                .header("X-Internal-Service-Token", "test-token")
+                .header("X-Trace-Id", "trace-profile")
+                .contentType(APPLICATION_JSON)
+                .content("{\"session_token\":\"opaque\",\"display_name\":\"New Name\"}"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.account.account_id").value(2));
         mvc.perform(post("/internal/v1/auth/accounts/status")
@@ -102,6 +115,7 @@ class AccountAdministrationControllerTest {
 
         verify(service).list("opaque");
         verify(service).current("opaque");
+        verify(service).updateProfile("opaque", "New Name", "trace-profile");
         verify(service).updateStatus("opaque", 2, "disabled", "trace-2");
         verify(service).bootstrap("admin@example.com", "password-123", null);
         verify(service).prepareDeletion("opaque", "password-123", "trace-delete");
@@ -113,6 +127,9 @@ class AccountAdministrationControllerTest {
         assertThat(new AccountAdministrationController.DeleteAdmissionRequest(
                 "opaque", "password-123").toString())
             .doesNotContain("opaque", "password-123");
+        assertThat(new AccountAdministrationController.ProfileRequest(
+                "opaque", "New Name").toString())
+            .doesNotContain("opaque", "New Name");
     }
 
     @Test

@@ -67,6 +67,36 @@ public class AccountAdministrationService {
     }
 
     @Transactional
+    public AccountResponse updateProfile(String sessionToken, String displayName, String requestId) {
+        Long accountId = sessions.resolve(sessionToken);
+        if (accountId == null) {
+            throw new AuthException("SESSION_EXPIRED", "登录状态已过期，请重新登录。", HttpStatus.UNAUTHORIZED);
+        }
+        AccountView current = lockAccount(accountId);
+        if (current == null) {
+            throw new AuthException("ACCOUNT_NOT_FOUND", "账号不存在。", HttpStatus.NOT_FOUND);
+        }
+        String nextDisplayName = displayName == null ? null : displayName.strip();
+        if (nextDisplayName != null && nextDisplayName.isBlank()) nextDisplayName = null;
+        if (!java.util.Objects.equals(current.display_name(), nextDisplayName)) {
+            jdbc.update("UPDATE accounts SET display_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    nextDisplayName, accountId);
+            String details = json(Map.of(
+                    "previous_display_name_present", current.display_name() != null,
+                    "next_display_name_present", nextDisplayName != null));
+            jdbc.update("""
+                    INSERT INTO admin_audit_events (
+                        actor_account_id, target_account_id, action, target_type, target_id,
+                        outcome, summary, details_json, request_id, created_at
+                    ) VALUES (?, ?, 'account.profile_updated', 'account', ?, 'succeeded', ?,
+                              CAST(? AS jsonb), ?, CURRENT_TIMESTAMP)
+                    """, accountId, accountId, Long.toString(accountId),
+                    "账号 #" + accountId + " 更新了显示名称。", details, cap(requestId));
+        }
+        return new AccountResponse(accountById(accountId));
+    }
+
+    @Transactional
     public AccountResponse updateStatus(
             String sessionToken, long targetId, String nextStatus, String requestId) {
         if (!"active".equals(nextStatus) && !"disabled".equals(nextStatus)) {

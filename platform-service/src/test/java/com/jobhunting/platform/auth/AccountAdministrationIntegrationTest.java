@@ -125,6 +125,21 @@ class AccountAdministrationIntegrationTest {
     }
 
     @Test
+    void profileUpdateUsesSessionAndWritesAuditAtomically() {
+        var user = sessions.login("user@example.com", "password-123", false, null, null);
+
+        var updated = accounts.updateProfile(user.session_token(), "Updated User", "trace-profile");
+
+        assertThat(updated.account().display_name()).isEqualTo("Updated User");
+        assertThat(jdbc.queryForObject(
+                "SELECT display_name FROM accounts WHERE id=2", String.class))
+            .isEqualTo("Updated User");
+        assertThat(jdbc.queryForObject(
+                "SELECT action FROM admin_audit_events WHERE target_account_id=2", String.class))
+            .isEqualTo("account.profile_updated");
+    }
+
+    @Test
     void policyProtectsSelfAndLastAdminAndBootstrapIsIdempotent() {
         var admin = sessions.login("admin@example.com", "password-123", false, null, null);
         assertThatThrownBy(() -> accounts.updateStatus(admin.session_token(), 1, "disabled", "trace-self"))

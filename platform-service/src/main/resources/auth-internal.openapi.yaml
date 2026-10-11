@@ -104,6 +104,28 @@ paths:
           $ref: '#/components/responses/InternalUnauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+  /internal/v1/auth/accounts/profile:
+    post:
+      operationId: updateCurrentAccountProfile
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProfileRequest'
+      responses:
+        '200':
+          description: Updated safe projection for the account bound to the session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResponse'
+        '401':
+          $ref: '#/components/responses/InternalUnauthorized'
+        '404':
+          $ref: '#/components/responses/AccountNotFound'
   /internal/v1/auth/accounts/status:
     post:
       operationId: updateAccountStatus
@@ -233,6 +255,18 @@ components:
         status:
           type: string
           enum: [active, disabled]
+    ProfileRequest:
+      type: object
+      required: [session_token]
+      properties:
+        session_token:
+          type: string
+          minLength: 1
+          maxLength: 128
+        display_name:
+          type: string
+          nullable: true
+          maxLength: 128
     BootstrapRequest:
       type: object
       required: [email, password]

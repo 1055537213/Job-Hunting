@@ -42,6 +42,15 @@ public class AccountAdministrationController {
         return accounts.current(body.session_token());
     }
 
+    @PostMapping("/profile")
+    public AccountAdministrationService.AccountResponse profile(
+            @Valid @RequestBody ProfileRequest body,
+            @RequestHeader(name = "X-Internal-Service-Token", required = false) String token,
+            @RequestHeader(name = "X-Trace-Id", defaultValue = "") String traceId) {
+        tokens.verify(token);
+        return accounts.updateProfile(body.session_token(), body.display_name(), traceId);
+    }
+
     @PostMapping("/status")
     public AccountAdministrationService.AccountResponse status(
             @Valid @RequestBody StatusRequest body,
@@ -77,6 +86,12 @@ public class AccountAdministrationController {
             @NotNull @Positive Long account_id,
             @NotBlank @Size(max = 32) String status) {
         @Override public String toString() { return "StatusRequest[redacted]"; }
+    }
+
+    public record ProfileRequest(
+            @NotBlank @Size(max = 128) String session_token,
+            @Size(max = 128) String display_name) {
+        @Override public String toString() { return "ProfileRequest[redacted]"; }
     }
 
     public record BootstrapRequest(

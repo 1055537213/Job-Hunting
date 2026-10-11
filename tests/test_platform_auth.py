@@ -237,6 +237,38 @@ def test_platform_auth_client_reads_current_account_projection(monkeypatch):
     assert calls[0]["json"] == {"session_token": "opaque"}
 
 
+def test_platform_auth_client_updates_current_account_profile(monkeypatch):
+    account = {
+        "account_id": 42,
+        "email": "user@example.com",
+        "display_name": "Updated User",
+        "role": "user",
+        "status": "active",
+        "must_change_password": False,
+        "email_verified_at": None,
+        "deleted_at": None,
+        "created_at": "2026-10-10T00:00:00Z",
+        "updated_at": "2026-10-11T00:00:00Z",
+    }
+    calls = []
+
+    def fake_post(url, *, headers, json=None, timeout):
+        calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        return httpx.Response(200, json={"account": account})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    client = PlatformAuthClient(PlatformAuthSettings(True, "http://java", "secret", 5))
+
+    result = client.account(
+        "profile", session_token="opaque", display_name="Updated User", trace_id="trace-profile"
+    )
+
+    assert result["account"] == account
+    assert calls[0]["url"].endswith("/internal/v1/auth/accounts/profile")
+    assert calls[0]["headers"]["X-Trace-Id"] == "trace-profile"
+    assert calls[0]["json"] == {"session_token": "opaque", "display_name": "Updated User"}
+
+
 
 def test_platform_auth_client_rejects_account_projection_with_password(monkeypatch):
     account = {

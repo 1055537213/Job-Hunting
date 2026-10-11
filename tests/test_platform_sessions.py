@@ -56,6 +56,19 @@ def test_web_uses_java_for_all_session_operations_without_python_writes(tmp_path
 
         def account(self, operation, **data):
             calls.append(("account", data))
+            if operation == "profile":
+                return {"account": {
+                    "account_id": account.id,
+                    "email": "java-authoritative@example.com",
+                    "display_name": data["display_name"],
+                    "role": account.role,
+                    "status": account.status,
+                    "must_change_password": account.must_change_password,
+                    "email_verified_at": account.email_verified_at,
+                    "deleted_at": account.deleted_at,
+                    "created_at": account.created_at,
+                    "updated_at": account.updated_at,
+                }}
             assert operation == "me"
             return {"account": {
                 "account_id": account.id,
@@ -86,6 +99,13 @@ def test_web_uses_java_for_all_session_operations_without_python_writes(tmp_path
         assert auth_me["authenticated"] is True
         assert auth_me["account"]["email"] == "java-authoritative@example.com"
         assert [c[0] for c in calls[before:]] == ["account"]
+        profile = client.patch(
+            "/api/account/profile",
+            headers={"X-CSRF-Token": auth_me["csrf_token"]},
+            json={"display_name": "Updated User"},
+        )
+        assert profile.status_code == 200
+        assert profile.json()["account"]["display_name"] == "Updated User"
         assert client.post("/api/account/password", json={"current_password": "password-123", "new_password": "new-password-123"}).status_code == 200
         assert "job_agent_session" not in client.cookies
         client.cookies.set("job_agent_session", "a" * 64)

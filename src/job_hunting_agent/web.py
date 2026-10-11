@@ -350,6 +350,12 @@ class PasswordChangePayload(BaseModel):
     new_password: str = Field(min_length=8, max_length=1024)
 
 
+class AccountProfilePayload(BaseModel):
+    """登录用户更新账号显示资料；身份事实在混合模式由 Java 写入。"""
+
+    display_name: str | None = Field(default=None, max_length=128)
+
+
 class AccountDeletePayload(BaseModel):
     """账号注销的二次确认。"""
 
@@ -1047,6 +1053,38 @@ def create_web_app(
         response.delete_cookie(SESSION_COOKIE_NAME, path="/")
         delete_csrf_cookie(response)
         return {"ok": True}
+
+    @web_app.patch("/api/account/profile")
+    def update_account_profile(
+        payload: AccountProfilePayload,
+        request: Request,
+    ) -> dict[str, object]:
+        """更新当前账号显示名称，混合模式不直接写 Python 账号表。"""
+
+        account = current_account(request)
+        assert account is not None
+        display_name = normalize_display_name(payload.display_name, "")
+        if backend.platform_auth_client is not None:
+            token = request.cookies.get(SESSION_COOKIE_NAME)
+            if not token:
+                raise HTTPException(status_code=401, detail="登录状态已过期，请重新登录。")
+            try:
+                result = backend.platform_auth_client.account(
+                    "profile",
+                    session_token=token,
+                    display_name=display_name,
+                    trace_id=request.headers.get("x-trace-id"),
+                )
+                updated = platform_account_record(result["account"])
+            except PlatformAuthError as error:
+                raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
+        else:
+            try:
+                updated = backend.store.update_account_display_name(account.id, display_name)
+            except KeyError as error:
+                raise HTTPException(status_code=404, detail="账号不存在。") from error
+        request.state.account = updated
+        return {"account": asdict(updated)}
 
     @web_app.get("/api/account/export")
     def export_account_data(request: Request, response: Response) -> dict[str, object]:

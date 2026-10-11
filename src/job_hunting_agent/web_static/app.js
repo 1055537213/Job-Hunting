@@ -227,6 +227,9 @@ if (!window.Vue) {
         accountActionLoading: false,
         accountActionMessage: "",
         accountActionSuccess: false,
+        accountProfileForm: {
+          displayName: "",
+        },
         accountPasswordForm: {
           currentPassword: "",
           newPassword: "",
@@ -1112,6 +1115,27 @@ if (!window.Vue) {
           this.showAccountAction(data.message || "验证邮件已发送。", true);
         } catch (error) {
           this.showAccountAction(error.message || "验证邮件发送失败。");
+        } finally {
+          this.accountActionLoading = false;
+        }
+      },
+
+      /** 将账号显示名称交给当前身份事实源更新。 */
+      async updateAccountProfile() {
+        this.accountActionLoading = true;
+        this.accountActionMessage = "";
+        try {
+          const data = await this.requestJson("/api/account/profile", {
+            method: "PATCH",
+            body: JSON.stringify({
+              display_name: this.accountProfileForm.displayName || null,
+            }),
+          });
+          this.auth.account = data.account || this.auth.account;
+          this.accountActionMessage = "账号显示名称已更新。";
+          this.accountActionSuccess = true;
+        } catch (error) {
+          this.showAccountAction(error.message || "账号资料更新失败。", false);
         } finally {
           this.accountActionLoading = false;
         }

@@ -851,6 +851,24 @@ class RepositoryStore:
                 )
         return self.get_account(account_id)
 
+    def update_account_display_name(
+        self, account_id: int, display_name: str | None
+    ) -> AccountRecord:
+        """更新纯 Python 模式下的账号显示名称。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM accounts WHERE id = ? AND deleted_at IS NULL",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Account not found: {account_id}")
+            conn.execute(
+                "UPDATE accounts SET display_name = ?, updated_at = ? WHERE id = ?",
+                (display_name, now_iso(), account_id),
+            )
+        return self.get_account(account_id)
+
     def update_account_status_with_audit(
         self,
         account_id: int,

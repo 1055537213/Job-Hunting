@@ -1298,6 +1298,18 @@
 
             <article class="panel profile-account-panel">
               <div class="panel-title-row profile-account-panel-head">
+                <div><p class="eyebrow">Account Profile</p><h2 class="panel-title">账号资料</h2></div>
+              </div>
+              <div class="profile-account-panel-body">
+                <form class="profile-account-form" @submit.prevent="updateAccountProfile">
+                  <label class="field-group" for="accountDisplayName"><span>显示名称</span><input id="accountDisplayName" v-model.trim="accountProfileForm.displayName" class="field" type="text" maxlength="128" autocomplete="nickname" :placeholder="auth.account?.display_name || '未设置'" /></label>
+                  <button class="primary-button" type="submit" :disabled="accountActionLoading">保存资料</button>
+                </form>
+              </div>
+            </article>
+
+            <article class="panel profile-account-panel">
+              <div class="panel-title-row profile-account-panel-head">
                 <div><p class="eyebrow">Password</p><h2 class="panel-title">修改密码</h2></div>
               </div>
               <div class="profile-account-panel-body">

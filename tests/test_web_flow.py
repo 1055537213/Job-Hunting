@@ -448,6 +448,32 @@ def test_password_reset_is_one_time_and_revokes_existing_sessions(tmp_path) -> N
     ).status_code == 200
 
 
+def test_account_profile_updates_display_name_without_changing_email() -> None:
+    web_app = create_web_app()
+    client = TestClient(web_app)
+    email = "profile-write@example.com"
+    password = "password-123"
+    registered = client.post(
+        "/api/auth/register",
+        json={"email": email, "password": password, "display_name": "Old Name"},
+    )
+    assert registered.status_code == 200
+    login = client.post("/api/auth/login", json={"email": email, "password": password})
+    csrf_headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+    updated = client.patch(
+        "/api/account/profile",
+        headers=csrf_headers,
+        json={"display_name": "New Name"},
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["account"]["display_name"] == "New Name"
+    current = client.get("/api/auth/me").json()["account"]
+    assert current["email"] == email
+    assert current["display_name"] == "New Name"
+
+
 def test_account_export_change_password_and_anonymized_deletion() -> None:
     """用户能导出数据；注销清理求职数据，但保留匿名财务事实。"""
 
