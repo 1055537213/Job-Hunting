@@ -35,6 +35,7 @@ class AccountEmailOutboxService:
         account: AccountRecord,
         purpose: str,
         requested_ip: str | None,
+        target_email: str | None = None,
     ) -> AccountEmailOutboxRecord:
         """原子登记邮件和哈希令牌，不调用 SMTP。"""
 
@@ -56,7 +57,8 @@ class AccountEmailOutboxService:
         return self.store.create_account_email_outbox(
             account_id=account.id,
             purpose=purpose,
-            recipient_email=account.email,
+            target_email=target_email,
+            recipient_email=target_email or account.email,
             delivery_key=delivery_key,
             token_hash=action_token_hash(raw_token),
             expires_at=expires_at,
@@ -89,6 +91,8 @@ class AccountEmailOutboxService:
             "verify_email_token"
             if claimed.purpose == "verify_email"
             else "reset_password_token"
+            if claimed.purpose == "reset_password"
+            else "change_email_token"
         )
         action_url = account_action_url(
             self.settings.public_base_url,
@@ -98,8 +102,10 @@ class AccountEmailOutboxService:
         try:
             if claimed.purpose == "verify_email":
                 self.sender.send_verification(claimed.recipient_email, action_url)
-            else:
+            elif claimed.purpose == "reset_password":
                 self.sender.send_password_reset(claimed.recipient_email, action_url)
+            else:
+                self.sender.send_email_change(claimed.recipient_email, action_url)
         except Exception as error:  # noqa: BLE001 - SMTP/relay implementations vary.
             delay = min(
                 3600,

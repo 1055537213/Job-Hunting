@@ -1,0 +1,58 @@
+openapi: 3.1.0
+info:
+  title: Internal Email Change
+  version: 0.1.0
+  description: Java owns the email-change token and delivery state; Python only handles the SMTP worker.
+security:
+  - InternalToken: []
+paths:
+  /internal/v1/auth/email-change/request:
+    post:
+      operationId: requestEmailChange
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, session_token]
+              properties:
+                email: {type: string, format: email, maxLength: 254}
+                session_token: {type: string, minLength: 32, maxLength: 128}
+                source: {type: [string, 'null'], maxLength: 64}
+      responses:
+        '200': {$ref: './email-verification.openapi.yaml#/components/responses/Ok'}
+        '401': {description: Session expired or internal token invalid}
+        '409': {description: Email already registered}
+  /internal/v1/auth/email-change/confirm:
+    post:
+      operationId: confirmEmailChange
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200':
+          description: New email consumed and old sessions revoked atomically
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [account_id]
+                properties:
+                  account_id: {type: integer, minimum: 1}
+        '400': {description: Invalid, expired, consumed or conflicting token}
+        '401': {description: Internal token invalid}
+  /internal/v1/auth/email-change/due:
+    $ref: './email-verification.openapi.yaml#/paths/~1internal~1v1~1auth~1email-verification~1due'
+  /internal/v1/auth/email-change/claim:
+    $ref: './email-verification.openapi.yaml#/paths/~1internal~1v1~1auth~1email-verification~1claim'
+  /internal/v1/auth/email-change/finish:
+    $ref: './email-verification.openapi.yaml#/paths/~1internal~1v1~1auth~1email-verification~1finish'
+  /internal/v1/auth/email-change/observations:
+    $ref: './email-verification.openapi.yaml#/paths/~1internal~1v1~1auth~1email-verification~1observations'

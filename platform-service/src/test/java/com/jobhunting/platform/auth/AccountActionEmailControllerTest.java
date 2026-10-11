@@ -36,7 +36,7 @@ class AccountActionEmailControllerTest {
             {"observations", "{}"}
         };
         for (var request : requests) {
-          for (String action : new String[] {"email-verification", "password-reset"}) {
+          for (String action : new String[] {"email-verification", "password-reset", "email-change"}) {
             for (String token : new String[] {"", "wrong-token"}) {
                 mvc.perform(post("/internal/v1/auth/" + action + "/" + request[0])
                         .contentType(APPLICATION_JSON).content(request[1])
@@ -96,6 +96,22 @@ class AccountActionEmailControllerTest {
         verify(service).claim(AccountActionEmailService.Purpose.RESET_PASSWORD, 1);
         org.assertj.core.api.Assertions.assertThat(new AccountActionEmailController.TokenRequest("opaque-token", "new-password-123").toString())
             .doesNotContain("opaque-token", "new-password-123");
+    }
+
+    @Test
+    void emailChangeRequiresSessionForRequestAndReturnsAccountIdOnConfirmation() throws Exception {
+        mvc.perform(post("/internal/v1/auth/email-change/request")
+                .header("X-Internal-Service-Token", "test-internal-token")
+                .contentType(APPLICATION_JSON)
+                .content("{\"email\":\"new@example.com\",\"source\":\"source\"}"))
+            .andExpect(status().isUnauthorized());
+        when(service.changeEmail("opaque-token")).thenReturn(7L);
+        mvc.perform(post("/internal/v1/auth/email-change/confirm")
+                .header("X-Internal-Service-Token", "test-internal-token")
+                .contentType(APPLICATION_JSON)
+                .content("{\"token\":\"opaque-token\"}"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.account_id").value(7));
+        verify(service).changeEmail("opaque-token");
     }
 
     @Test

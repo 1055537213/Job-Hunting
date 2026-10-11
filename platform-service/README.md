@@ -1,6 +1,6 @@
 # Job Hunting Platform Service
 
-这是求职助手的 Java 平台服务，当前实现账务垂直链路，以及账号注册、凭据校验、邮箱验证、密码重置和会话管理内部接口。
+这是求职助手的 Java 平台服务，当前实现账务垂直链路，以及账号注册、凭据校验、邮箱验证、邮箱变更、密码重置和会话管理内部接口。
 
 运行基线为 Spring Boot 4.0、Spring Framework 7、Jackson 3、Tomcat 11 和 Java 21。
 依赖版本由 Maven 锁定，Tomcat/Jackson 的安全修复版本在 `pom.xml` 中显式覆盖；
@@ -93,10 +93,11 @@ Java 兼容 Python 当前使用的 Argon2id 和 scrypt 哈希格式。Python 的
 零余额摘要行、协议同意记录及待验证账号的邮件任务。重复邮箱返回
 `ACCOUNT_ALREADY_EXISTS`，事务失败不会留下半个账号。
 
-邮箱验证和密码重置共用 Java 独占的 `platform_account_action_emails` 账本；Python SMTP Worker
+邮箱验证、邮箱变更和密码重置共用 Java 独占的 `platform_account_action_emails` 账本；Python SMTP Worker
 通过内部 API 认领并回报投递，不直接更新验证状态。一次性令牌只保存摘要，认领键
 阻止失联 Worker 的迟到结果覆盖新任务状态。`POST /internal/v1/auth/password-reset/confirm`
-在一个事务里消费令牌、更新 Argon2id 密码、撤销所有旧会话并使旧操作链接失效。
+在一个事务里消费令牌、更新 Argon2id 密码、撤销所有旧会话并使旧操作链接失效。邮箱变更由
+`POST /internal/v1/auth/email-change/request` 发起，确认接口消费目标邮箱令牌、更新邮箱并撤销所有旧会话；目标邮箱在签发和消费时都会重新检查唯一性。
 重置链接默认有效 30 分钟，绑定签发时的密码摘要，不能覆盖签发后发生的密码修改。
 Java 在同一事务中锁定账号、验证密码并签发 Session，关闭重置与登录并发窗口。
 

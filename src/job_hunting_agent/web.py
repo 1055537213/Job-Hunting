@@ -356,6 +356,12 @@ class AccountProfilePayload(BaseModel):
     display_name: str | None = Field(default=None, max_length=128)
 
 
+class AccountEmailChangePayload(BaseModel):
+    """登录用户请求验证新的账号邮箱。"""
+
+    new_email: str = Field(min_length=3, max_length=254)
+
+
 class AccountDeletePayload(BaseModel):
     """账号注销的二次确认。"""
 
@@ -806,6 +812,24 @@ def create_web_app(
             raise HTTPException(status_code=400, detail="验证链接无效或已过期。")
         return {"account": asdict(account)}
 
+    @web_app.post("/api/auth/change-email/confirm")
+    def confirm_email_change(payload: AccountActionTokenPayload) -> dict[str, object]:
+        """Consume an email-change token and return the updated account projection."""
+
+        if backend.platform_auth_client is not None:
+            try:
+                result = backend.platform_auth_client.email_change("confirm", token=payload.token)
+                account = backend.store.get_account(int(result["account_id"]))
+            except PlatformAuthUnavailableError as error:
+                raise HTTPException(status_code=503, detail=str(error)) from error
+            except PlatformAuthError as error:
+                raise HTTPException(status_code=error.status_code or 502, detail=str(error)) from error
+        else:
+            account = backend.store.consume_email_change_token(action_token_hash(payload.token))
+        if account is None:
+            raise HTTPException(status_code=400, detail="邮箱变更链接无效或已过期。")
+        return {"account": asdict(account)}
+
     def send_account_action_email(
         account: AccountRecord,
         purpose: str,
@@ -1085,6 +1109,60 @@ def create_web_app(
                 raise HTTPException(status_code=404, detail="账号不存在。") from error
         request.state.account = updated
         return {"account": asdict(updated)}
+
+    @web_app.patch("/api/account/email")
+    def request_account_email_change(
+        payload: AccountEmailChangePayload,
+        request: Request,
+    ) -> dict[str, str]:
+        """Send a confirmation link before replacing the account email."""
+
+        account = current_account(request)
+        assert account is not None
+        try:
+            new_email = backend.auth.normalize_email(payload.new_email)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        if new_email == account.email:
+            raise HTTPException(status_code=400, detail="新邮箱不能与当前邮箱相同。")
+        token = request.cookies.get(SESSION_COOKIE_NAME)
+        if backend.platform_auth_client is not None:
+            if not token:
+                raise HTTPException(status_code=401, detail="登录状态已过期，请重新登录。")
+            try:
+                backend.platform_auth_client.email_change(
+                    "request",
+                    email=new_email,
+                    session_token=token,
+                    source=request.client.host if request.client else None,
+                )
+            except PlatformAuthError as error:
+                raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
+        else:
+            existing = backend.store.get_account_by_email(new_email)
+            if existing is not None and existing[0].id != account.id:
+                raise HTTPException(status_code=409, detail="该邮箱已经注册。")
+            try:
+                record = account_email_outbox.enqueue(
+                    account,
+                    "change_email",
+                    request.client.host if request.client else None,
+                    target_email=new_email,
+                )
+            except AccountEmailRequestSuppressed as error:
+                raise HTTPException(status_code=429, detail="邮箱确认邮件请求过于频繁，请稍后重试。") from error
+            if lifecycle_email_queue is None:
+                web_logger.warning("account email queued without active broker: outbox_id=%s", record.id)
+            else:
+                try:
+                    lifecycle_email_queue.enqueue(record.id)
+                except Exception as error:  # noqa: BLE001 - Beat recovers the pending row.
+                    web_logger.warning(
+                        "account email broker dispatch failed: outbox_id=%s error=%s",
+                        record.id,
+                        type(error).__name__,
+                    )
+        return {"message": "确认邮件已发送，请打开新邮箱中的链接完成变更。"}
 
     @web_app.get("/api/account/export")
     def export_account_data(request: Request, response: Response) -> dict[str, object]:

@@ -333,6 +333,7 @@ class RepositoryStore:
         *,
         account_id: int,
         purpose: str,
+        target_email: str | None = None,
         recipient_email: str,
         delivery_key: str,
         token_hash: str,
@@ -345,7 +346,7 @@ class RepositoryStore:
     ) -> AccountEmailOutboxRecord:
         """原子创建一次性令牌和待投递邮件，并执行持久频率限制。"""
 
-        if purpose not in {"verify_email", "reset_password"}:
+        if purpose not in {"verify_email", "reset_password", "change_email"}:
             raise ValueError("账号操作令牌类型无效。")
         now = datetime.now(UTC)
         created_at = now.isoformat(timespec="seconds")
@@ -415,25 +416,26 @@ class RepositoryStore:
             token_cursor = conn.execute(
                 """
                 INSERT INTO account_action_tokens (
-                    account_id, purpose, token_hash, expires_at,
+                    account_id, purpose, target_email, token_hash, expires_at,
                     consumed_at, created_at, requested_ip
-                ) VALUES (?, ?, ?, ?, NULL, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL)
                 """,
-                (account_id, purpose, token_hash, expires_at, created_at),
+                (account_id, purpose, target_email, token_hash, expires_at, created_at),
             )
             cursor = conn.execute(
                 """
                 INSERT INTO account_email_outbox (
-                    account_id, action_token_id, purpose, recipient_email,
+                    account_id, action_token_id, purpose, target_email, recipient_email,
                     delivery_key, request_source_hash, status, attempt_count,
                     max_attempts, next_attempt_at, claimed_at, sent_at,
                     last_error_type, last_error_summary, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
                 """,
                 (
                     account_id,
                     int(token_cursor.lastrowid),
                     purpose,
+                    target_email,
                     recipient_email,
                     delivery_key,
                     request_source_hash,
@@ -723,6 +725,72 @@ class RepositoryStore:
                 """,
                 (consumed_at, account_id),
             )
+        return self.get_account(account_id)
+
+    def consume_email_change_token(self, token_hash: str) -> AccountRecord | None:
+        """Atomically confirm a new email, revoke sessions, and retire old links."""
+
+        consumed_at = now_iso()
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, account_id, target_email FROM account_action_tokens
+                WHERE token_hash = ? AND purpose = 'change_email'
+                  AND consumed_at IS NULL AND expires_at > ?
+                """,
+                (token_hash, consumed_at),
+            ).fetchone()
+            if row is None or not row["target_email"]:
+                return None
+            account = conn.execute(
+                """
+                SELECT id, email FROM accounts
+                WHERE id = ? AND status = 'active' AND deleted_at IS NULL FOR UPDATE
+                """,
+                (int(row["account_id"]),),
+            ).fetchone()
+            if account is None or account["email"] == row["target_email"]:
+                return None
+            conflict = conn.execute(
+                "SELECT id FROM accounts WHERE email = ? AND id <> ?",
+                (row["target_email"], int(row["account_id"])),
+            ).fetchone()
+            if conflict is not None:
+                return None
+            cursor = conn.execute(
+                """
+                UPDATE account_action_tokens SET consumed_at = ?
+                WHERE id = ? AND consumed_at IS NULL AND expires_at > ?
+                """,
+                (consumed_at, int(row["id"]), consumed_at),
+            )
+            if cursor.rowcount != 1:
+                return None
+            updated = conn.execute(
+                """
+                UPDATE accounts SET email = ?, email_verified_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'active' AND deleted_at IS NULL
+                """,
+                (row["target_email"], consumed_at, consumed_at, int(row["account_id"])),
+            )
+            if updated.rowcount != 1:
+                return None
+            conn.execute(
+                "UPDATE auth_sessions SET revoked_at = ? WHERE account_id = ? AND revoked_at IS NULL",
+                (consumed_at, int(row["account_id"])),
+            )
+            conn.execute(
+                "UPDATE account_action_tokens SET consumed_at = ? WHERE account_id = ? AND consumed_at IS NULL",
+                (consumed_at, int(row["account_id"])),
+            )
+            conn.execute(
+                """
+                UPDATE account_email_outbox SET status = 'cancelled', claimed_at = NULL, updated_at = ?
+                WHERE account_id = ? AND status IN ('pending', 'sending', 'retrying')
+                """,
+                (consumed_at, int(row["account_id"])),
+            )
+            account_id = int(row["account_id"])
         return self.get_account(account_id)
 
     def consume_password_reset_token(

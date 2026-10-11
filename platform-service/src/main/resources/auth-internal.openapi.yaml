@@ -46,6 +46,18 @@ paths:
     $ref: './email-verification.openapi.yaml#/paths/~1internal~1v1~1auth~1email-verification~1finish'
   /internal/v1/auth/email-verification/observations:
     $ref: './email-verification.openapi.yaml#/paths/~1internal~1v1~1auth~1email-verification~1observations'
+  /internal/v1/auth/email-change/request:
+    $ref: './email-change.openapi.yaml#/paths/~1internal~1v1~1auth~1email-change~1request'
+  /internal/v1/auth/email-change/confirm:
+    $ref: './email-change.openapi.yaml#/paths/~1internal~1v1~1auth~1email-change~1confirm'
+  /internal/v1/auth/email-change/due:
+    $ref: './email-change.openapi.yaml#/paths/~1internal~1v1~1auth~1email-change~1due'
+  /internal/v1/auth/email-change/claim:
+    $ref: './email-change.openapi.yaml#/paths/~1internal~1v1~1auth~1email-change~1claim'
+  /internal/v1/auth/email-change/finish:
+    $ref: './email-change.openapi.yaml#/paths/~1internal~1v1~1auth~1email-change~1finish'
+  /internal/v1/auth/email-change/observations:
+    $ref: './email-change.openapi.yaml#/paths/~1internal~1v1~1auth~1email-change~1observations'
   /internal/v1/auth/register:
     post:
       operationId: registerAccount

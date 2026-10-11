@@ -88,10 +88,17 @@ def test_java_dispatch_does_not_process_legacy_mail_and_carries_only_ids(monkeyp
         def password_reset(self, operation):
             return {"records": [{"id": 2, "attempt_count": 1}]}
 
+        def email_change(self, operation):
+            return {"records": [{"id": 3, "attempt_count": 0}]}
+
     monkeypatch.setattr(tasks, "PlatformAuthClient", Client)
     queue = SimpleNamespace(send_task=lambda *args, **kwargs: calls.append(kwargs))
-    assert dispatch_due_account_emails(Store(), queue, tmp_path / "missing.env") == {"dispatched": 2, "dispatch_failed": 0}
-    assert [(call["args"], call["kwargs"]) for call in calls] == [([1], {"purpose": "verify_email"}), ([2], {"purpose": "reset_password"})]
+    assert dispatch_due_account_emails(Store(), queue, tmp_path / "missing.env") == {"dispatched": 3, "dispatch_failed": 0}
+    assert [(call["args"], call["kwargs"]) for call in calls] == [
+        ([1], {"purpose": "verify_email"}),
+        ([2], {"purpose": "reset_password"}),
+        ([3], {"purpose": "change_email"}),
+    ]
 
 
 def test_java_login_failure_cannot_create_python_session(tmp_path):

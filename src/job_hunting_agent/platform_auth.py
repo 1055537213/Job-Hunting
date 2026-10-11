@@ -114,6 +114,9 @@ class PlatformAuthClient:
     def email_verification(self, operation: str, **data: Any) -> dict[str, Any]:
         return self._account_email("email-verification", operation, data)
 
+    def email_change(self, operation: str, **data: Any) -> dict[str, Any]:
+        return self._account_email("email-change", operation, data)
+
     def password_reset(self, operation: str, **data: Any) -> dict[str, Any]:
         return self._account_email("password-reset", operation, data)
 

@@ -30,7 +30,7 @@ public class AccountActionEmailService {
     private final PasswordHasher passwords;
 
     public enum Purpose {
-        VERIFY_EMAIL("verify_email"), RESET_PASSWORD("reset_password");
+        VERIFY_EMAIL("verify_email"), RESET_PASSWORD("reset_password"), CHANGE_EMAIL("change_email");
         final String value;
         Purpose(String value) { this.value = value; }
     }
@@ -80,8 +80,35 @@ public class AccountActionEmailService {
         if (!accounts.isEmpty()) enqueue(purpose, accounts.getFirst(), source);
     }
 
+    @Transactional
+    public void requestEmailChange(String sessionToken, String email, String source) {
+        Long accountId = resolveSession(sessionToken);
+        if (accountId == null) {
+            throw new AuthException("SESSION_EXPIRED", "登录状态已过期，请重新登录。", HttpStatus.UNAUTHORIZED);
+        }
+        String targetEmail = email.strip().toLowerCase(Locale.ROOT);
+        var accounts = jdbc.query("""
+                SELECT email FROM accounts WHERE id = ? AND status = 'active' AND deleted_at IS NULL FOR UPDATE
+                """, (row, i) -> row.getString("email"), accountId);
+        if (accounts.isEmpty()) {
+            throw new AuthException("ACCOUNT_NOT_FOUND", "账号不存在。", HttpStatus.NOT_FOUND);
+        }
+        if (accounts.getFirst().equals(targetEmail)) {
+            throw new AuthException("EMAIL_UNCHANGED", "新邮箱不能与当前邮箱相同。", HttpStatus.BAD_REQUEST);
+        }
+        jdbc.queryForObject("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", Object.class, targetEmail);
+        if (!jdbc.query("SELECT id FROM accounts WHERE email = ? AND id <> ?", (row, i) -> row.getLong(1), targetEmail, accountId).isEmpty()) {
+            throw new AuthException("EMAIL_ALREADY_REGISTERED", "该邮箱已经注册。", HttpStatus.CONFLICT);
+        }
+        enqueue(Purpose.CHANGE_EMAIL, accountId, source, targetEmail);
+    }
+
     // Called inside registration's transaction as well as the resend transaction.
     public void enqueue(Purpose purpose, long accountId, String source) {
+        enqueue(purpose, accountId, source, null);
+    }
+
+    private void enqueue(Purpose purpose, long accountId, String source, String targetEmail) {
         String sourceHash = source == null || source.isBlank() ? null : hash(hmac("request-source:" + source));
         if (sourceHash != null) {
             jdbc.queryForObject("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", Object.class, sourceHash);
@@ -106,22 +133,23 @@ public class AccountActionEmailService {
                 """, accountId, purpose.value);
         String deliveryKey = UUID.randomUUID().toString();
         jdbc.update("""
-                INSERT INTO platform_account_action_emails (account_id, recipient_email, delivery_key, purpose,
+                INSERT INTO platform_account_action_emails (account_id, recipient_email, target_email, delivery_key, purpose,
                   token_hash, credential_hash, request_source_hash, expires_at, status, attempt_count, max_attempts,
                   next_attempt_at, created_at, updated_at)
-                SELECT id, email, ?, ?, ?,
-                  CASE WHEN ? = 'reset_password' THEN encode(sha256(convert_to(password_hash, 'UTF8')), 'hex') ELSE NULL END,
+                 SELECT id, CASE WHEN ? = 'change_email' THEN ? ELSE email END, ?, ?, ?, ?,
+                   CASE WHEN ? = 'reset_password' THEN encode(sha256(convert_to(password_hash, 'UTF8')), 'hex') ELSE NULL END,
                   ?, CURRENT_TIMESTAMP + ? * INTERVAL '1 minute',
                   'pending', 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                 FROM accounts WHERE id = ? AND status = 'active' AND deleted_at IS NULL
-                  AND (? = 'reset_password' OR email_verified_at IS NULL)
-                """, deliveryKey, purpose.value, hash(rawToken(purpose, deliveryKey, accountId)), purpose.value, sourceHash,
+                  AND (? <> 'verify_email' OR email_verified_at IS NULL)
+                """, purpose.value, targetEmail, targetEmail, deliveryKey, purpose.value,
+                hash(rawToken(purpose, deliveryKey, accountId)), purpose.value, sourceHash,
                 purpose == Purpose.RESET_PASSWORD ? resetTtlMinutes : ttlMinutes, maxAttempts, accountId, purpose.value);
     }
 
     @Transactional
     public long verify(String token) {
-        long id = consume(Purpose.VERIFY_EMAIL, token);
+        long id = consume(Purpose.VERIFY_EMAIL, token).accountId();
         jdbc.update("UPDATE accounts SET email_verified_at = COALESCE(email_verified_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = ?", id);
         jdbc.update("""
                 UPDATE platform_account_action_emails SET status = 'cancelled', claim_key = NULL,
@@ -136,7 +164,7 @@ public class AccountActionEmailService {
         if (newPassword == null || newPassword.length() < 8 || newPassword.length() > 1024) {
             throw new AuthException("INVALID_REQUEST", "密码长度应为 8 至 1024 个字符。", HttpStatus.BAD_REQUEST);
         }
-        long id = consume(Purpose.RESET_PASSWORD, token);
+        long id = consume(Purpose.RESET_PASSWORD, token).accountId();
         jdbc.update("""
                 UPDATE accounts SET password_hash = ?, must_change_password = FALSE,
                   email_verified_at = COALESCE(email_verified_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP
@@ -145,6 +173,27 @@ public class AccountActionEmailService {
         jdbc.update("UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE account_id = ? AND revoked_at IS NULL", id);
         invalidateCredentialLinks(id);
         return id;
+    }
+
+    @Transactional
+    public long changeEmail(String token) {
+        ConsumedAction action = consume(Purpose.CHANGE_EMAIL, token);
+        if (action.targetEmail() == null || action.targetEmail().isBlank()) {
+            throw invalidToken(Purpose.CHANGE_EMAIL);
+        }
+        jdbc.queryForObject("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", Object.class, action.targetEmail());
+        if (!jdbc.query("SELECT id FROM accounts WHERE email = ? AND id <> ?", (row, i) -> row.getLong(1),
+                action.targetEmail(), action.accountId()).isEmpty()) {
+            throw new AuthException("EMAIL_ALREADY_REGISTERED", "该邮箱已经注册。", HttpStatus.CONFLICT);
+        }
+        int updated = jdbc.update("""
+                UPDATE accounts SET email = ?, email_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'active' AND deleted_at IS NULL
+                """, action.targetEmail(), action.accountId());
+        if (updated != 1) throw invalidToken(Purpose.CHANGE_EMAIL);
+        jdbc.update("UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE account_id = ? AND revoked_at IS NULL", action.accountId());
+        invalidateCredentialLinks(action.accountId());
+        return action.accountId();
     }
 
     // Caller holds the account lock in the password-change/reset transaction.
@@ -162,24 +211,50 @@ public class AccountActionEmailService {
                 """, id);
     }
 
-    private long consume(Purpose purpose, String token) {
-        var ids = jdbc.query("SELECT account_id FROM platform_account_action_emails WHERE token_hash = ? AND purpose = ?",
-                (row, i) -> row.getLong(1), hash(token), purpose.value);
-        if (ids.isEmpty()) throw invalidToken(purpose);
-        long id = ids.getFirst();
+    private ConsumedAction consume(Purpose purpose, String token) {
+        var actions = jdbc.query("SELECT account_id, target_email FROM platform_account_action_emails WHERE token_hash = ? AND purpose = ?",
+                (row, i) -> new ConsumedAction(row.getLong("account_id"), row.getString("target_email")), hash(token), purpose.value);
+        if (actions.isEmpty()) throw invalidToken(purpose);
+        ConsumedAction action = actions.getFirst();
+        long id = action.accountId();
         // Use the same account-first lock as Java session admission and password changes.
-        var active = jdbc.query("SELECT password_hash FROM accounts WHERE id = ? AND status = 'active' AND deleted_at IS NULL FOR UPDATE",
-                (row, i) -> row.getString(1), id);
+        var active = jdbc.query("SELECT password_hash, email FROM accounts WHERE id = ? AND status = 'active' AND deleted_at IS NULL FOR UPDATE",
+                (row, i) -> new AccountCredential(row.getString("password_hash"), row.getString("email")), id);
         if (active.isEmpty()) throw invalidToken(purpose);
         int updated = jdbc.update("""
                 UPDATE platform_account_action_emails SET consumed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
                 WHERE account_id = ? AND token_hash = ? AND purpose = ? AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP
                   AND status <> 'cancelled'
-                  AND (? = 'verify_email' OR credential_hash = ?)
-                """, id, hash(token), purpose.value, purpose.value,
-                purpose == Purpose.RESET_PASSWORD ? hash(active.getFirst()) : null);
+                  AND ((? = 'verify_email')
+                    OR (? = 'reset_password' AND credential_hash = ?)
+                    OR (? = 'change_email' AND target_email IS NOT NULL AND target_email <> ?
+                        AND NOT EXISTS (SELECT 1 FROM accounts conflict WHERE conflict.email = target_email AND conflict.id <> account_id)))
+                """, id, hash(token), purpose.value, purpose.value, purpose.value,
+                purpose == Purpose.RESET_PASSWORD ? hash(active.getFirst().passwordHash()) : null,
+                purpose.value, active.getFirst().email());
         if (updated != 1) throw invalidToken(purpose);
-        return id;
+        return action;
+    }
+
+    private Long resolveSession(String token) {
+        if (token == null || token.isBlank()) return null;
+        String digest = SessionService.digest(token);
+        var accounts = jdbc.query("""
+                SELECT a.id, a.status, a.deleted_at FROM accounts a
+                JOIN auth_sessions s ON s.account_id = a.id
+                WHERE s.token_hash = ? FOR UPDATE OF a
+                """, (row, i) -> new SessionAccount(row.getLong("id"), row.getString("status"), row.getTimestamp("deleted_at") != null), digest);
+        if (accounts.isEmpty() || accounts.getFirst().deleted()) return null;
+        int valid = jdbc.queryForObject("""
+                SELECT count(*) FROM auth_sessions WHERE token_hash = ? AND revoked_at IS NULL
+                  AND expires_at > CURRENT_TIMESTAMP AND absolute_expires_at > CURRENT_TIMESTAMP
+                """, Integer.class, digest);
+        if (valid == 0) return null;
+        if (!"active".equals(accounts.getFirst().status())) {
+            throw new AuthException("ACCOUNT_DISABLED", "账号已被禁用。", HttpStatus.FORBIDDEN);
+        }
+        jdbc.update("UPDATE auth_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE token_hash = ?", digest);
+        return accounts.getFirst().id();
     }
 
     @Transactional
@@ -191,7 +266,10 @@ public class AccountActionEmailService {
                   OR expires_at <= CURRENT_TIMESTAMP OR NOT EXISTS (SELECT 1 FROM accounts a
                     WHERE a.id = v.account_id AND a.status = 'active' AND a.deleted_at IS NULL
                       AND ((v.purpose = 'reset_password' AND v.credential_hash = encode(sha256(convert_to(a.password_hash, 'UTF8')), 'hex'))
-                        OR (v.purpose = 'verify_email' AND a.email_verified_at IS NULL))))
+                      OR (v.purpose = 'verify_email' AND a.email_verified_at IS NULL)
+                      OR (v.purpose = 'change_email' AND v.target_email IS NOT NULL AND a.email <> v.target_email
+                          AND NOT EXISTS (SELECT 1 FROM accounts conflict
+                                          WHERE conflict.email = v.target_email AND conflict.id <> a.id)))))
                 """);
         jdbc.update("""
                 UPDATE platform_account_action_emails SET status = 'failed', claim_key = NULL,
@@ -224,7 +302,10 @@ public class AccountActionEmailService {
                   AND EXISTS (SELECT 1 FROM accounts a WHERE a.id = v.account_id AND a.status = 'active'
                     AND a.deleted_at IS NULL
                     AND ((v.purpose = 'reset_password' AND v.credential_hash = encode(sha256(convert_to(a.password_hash, 'UTF8')), 'hex'))
-                      OR (v.purpose = 'verify_email' AND a.email_verified_at IS NULL)))
+                      OR (v.purpose = 'verify_email' AND a.email_verified_at IS NULL)
+                      OR (v.purpose = 'change_email' AND v.target_email IS NOT NULL AND a.email <> v.target_email
+                          AND NOT EXISTS (SELECT 1 FROM accounts conflict
+                                          WHERE conflict.email = v.target_email AND conflict.id <> a.id))))
                 RETURNING recipient_email, delivery_key, account_id, attempt_count
                 """, (row, i) -> new Claim(id, key, row.getString(1),
                         baseUrl + "/login?" + purpose.value + "_token=" + rawToken(purpose, row.getString(2), row.getLong(3)), row.getInt(4)), key, id, purpose.value, claimTimeout);
@@ -284,10 +365,17 @@ public class AccountActionEmailService {
         catch (java.security.NoSuchAlgorithmException e) { throw new IllegalStateException("SHA-256 unavailable", e); }
     }
     private static AuthException invalidToken(Purpose purpose) {
-        return purpose == Purpose.VERIFY_EMAIL
-                ? new AuthException("INVALID_VERIFICATION_TOKEN", "验证链接无效或已过期。", HttpStatus.BAD_REQUEST)
-                : new AuthException("INVALID_RESET_TOKEN", "重置链接无效或已过期。", HttpStatus.BAD_REQUEST);
+        if (purpose == Purpose.VERIFY_EMAIL) {
+            return new AuthException("INVALID_VERIFICATION_TOKEN", "验证链接无效或已过期。", HttpStatus.BAD_REQUEST);
+        }
+        if (purpose == Purpose.CHANGE_EMAIL) {
+            return new AuthException("INVALID_EMAIL_CHANGE_TOKEN", "邮箱变更链接无效或已过期。", HttpStatus.BAD_REQUEST);
+        }
+        return new AuthException("INVALID_RESET_TOKEN", "重置链接无效或已过期。", HttpStatus.BAD_REQUEST);
     }
+    private record ConsumedAction(long accountId, String targetEmail) { }
+    private record AccountCredential(String passwordHash, String email) { }
+    private record SessionAccount(long id, String status, boolean deleted) { }
     public record Due(long id, int attempt_count) { }
     public record Claim(long id, String claim_key, String recipient_email, String action_url, int attempt_count) {
         @Override public String toString() { return "Claim[redacted]"; }

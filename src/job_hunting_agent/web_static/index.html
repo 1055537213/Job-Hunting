@@ -1305,6 +1305,10 @@
                   <label class="field-group" for="accountDisplayName"><span>显示名称</span><input id="accountDisplayName" v-model.trim="accountProfileForm.displayName" class="field" type="text" maxlength="128" autocomplete="nickname" :placeholder="auth.account?.display_name || '未设置'" /></label>
                   <button class="primary-button" type="submit" :disabled="accountActionLoading">保存资料</button>
                 </form>
+                <form class="profile-account-form" @submit.prevent="requestAccountEmailChange">
+                  <label class="field-group" for="accountNewEmail"><span>新邮箱</span><input id="accountNewEmail" v-model.trim="accountEmailChangeForm.newEmail" class="field" type="email" maxlength="254" autocomplete="email" placeholder="验证后才会替换当前邮箱" required /></label>
+                  <button class="ghost-button compact" type="submit" :disabled="accountActionLoading">发送确认邮件</button>
+                </form>
               </div>
             </article>
 

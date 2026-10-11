@@ -62,13 +62,14 @@ account_action_tokens = sa.Table(
         nullable=False,
     ),
     sa.Column("purpose", sa.String(32), nullable=False),
+    sa.Column("target_email", sa.String(254)),
     sa.Column("token_hash", sa.String(64), nullable=False, unique=True),
     sa.Column("expires_at", timestamp_type, nullable=False),
     sa.Column("consumed_at", timestamp_type),
     sa.Column("created_at", timestamp_type, nullable=False),
     sa.Column("requested_ip", sa.String(64)),
     sa.CheckConstraint(
-        "purpose IN ('verify_email', 'reset_password')",
+        "purpose IN ('verify_email', 'reset_password', 'change_email')",
         name="account_action_tokens_purpose",
     ),
 )
@@ -100,6 +101,7 @@ account_email_outbox = sa.Table(
         unique=True,
     ),
     sa.Column("purpose", sa.String(32), nullable=False),
+    sa.Column("target_email", sa.String(254)),
     sa.Column("recipient_email", sa.String(254), nullable=False),
     sa.Column("delivery_key", sa.String(64), nullable=False, unique=True),
     sa.Column("request_source_hash", sa.String(64)),
@@ -114,7 +116,7 @@ account_email_outbox = sa.Table(
     sa.Column("created_at", timestamp_type, nullable=False),
     sa.Column("updated_at", timestamp_type, nullable=False),
     sa.CheckConstraint(
-        "purpose IN ('verify_email', 'reset_password')",
+        "purpose IN ('verify_email', 'reset_password', 'change_email')",
         name="account_email_outbox_purpose",
     ),
     sa.CheckConstraint(
@@ -148,8 +150,9 @@ sa.Index(
 platform_account_action_emails = sa.Table(
     "platform_account_action_emails", metadata,
     sa.Column("purpose", sa.String(32), nullable=False, server_default="verify_email"),
+    sa.Column("target_email", sa.String(254)),
     sa.Column("credential_hash", sa.String(64)),
-    sa.CheckConstraint("purpose IN ('verify_email', 'reset_password')", name="platform_action_email_purpose"),
+    sa.CheckConstraint("purpose IN ('verify_email', 'reset_password', 'change_email')", name="platform_action_email_purpose"),
     sa.Column("id", sa.Integer, primary_key=True),
     sa.Column("account_id", sa.Integer, sa.ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False),
     sa.Column("recipient_email", sa.String(254), nullable=False),

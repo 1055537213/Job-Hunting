@@ -27,7 +27,7 @@
 
 | 页面 | 地址 | 内容 |
 | --- | --- | --- |
-| 登录/注册 | http://127.0.0.1:8000/login | 登录、注册、邮箱验证和密码找回 |
+| 登录/注册 | http://127.0.0.1:8000/login | 登录、注册、邮箱验证、邮箱变更和密码找回 |
 | 工作台 | http://127.0.0.1:8000/ | 档案、职位、项目、对话和简历 |
 | 个人中心 | http://127.0.0.1:8000/profile | 余额、演示充值、消费流水和账号安全 |
 | 管理后台 | http://127.0.0.1:8000/admin | 账号、用量、请求观测、审计和工具轨迹 |
@@ -42,6 +42,7 @@
 
 - 多账号隔离、HttpOnly Session Cookie、CSRF、防重放、限流和安全响应头。
 - 注册、登录、邮箱验证、密码重置、修改密码、全部设备退出和账号注销。
+- 登录后可发起邮箱变更；新邮箱确认成功后会撤销旧登录会话，并要求重新登录。
 - Argon2id 密码哈希，Java 兼容现有 Python 哈希格式。
 - 账号导出、可恢复删除任务和管理员启用/停用账号。
 
@@ -276,7 +277,9 @@ ghcr.io/1055537213/job-hunting-platform:sha-<提交前12位>
 | 认证 | POST /api/auth/register | 注册账号 |
 | 认证 | POST /api/auth/login | 登录并设置 Session |
 | 认证 | POST /api/auth/verify-email | 消费邮箱验证令牌 |
+| 认证 | POST /api/auth/change-email/confirm | 消费邮箱变更令牌并撤销旧会话 |
 | 账号 | GET /api/auth/me | 当前账号与余额摘要 |
+| 账号 | PATCH /api/account/email | 发起邮箱变更确认邮件 |
 | 账号 | GET /api/account/export | 导出本人数据 |
 | 档案 | GET/POST /api/profiles | 查询或创建候选人档案 |
 | 对话 | POST /api/chat/stream | SSE Agent 对话 |
@@ -304,7 +307,7 @@ AI、RAG、OCR 和多模态文件处理仍然依赖 Python 生态；Java 更适�
 
 ### Java 服务是否已经替代 Python 全部代码？
 
-没有。当前已迁移账号注册、Session、邮箱验证、密码重置、管理员账号操作、当前账号资料读取、显示名称写入，以及可选账务事实源。Python 的 Agent、RAG、文件分析、简历生成、Worker 和外部 Web 入口仍然保留。
+没有。当前已迁移账号注册、Session、邮箱验证、邮箱变更、密码重置、管理员账号操作、当前账号资料读取、显示名称写入，以及可选账务事实源。Python 的 Agent、RAG、文件分析、简历生成、Worker 和外部 Web 入口仍然保留。
 
 ### Java 服务不可用时会不会偷偷回退到 Python？
 
@@ -335,7 +338,7 @@ AI、RAG、OCR 和多模态文件处理仍然依赖 Python 生态；Java 更适�
 - [x] 建立 Python + Java 本地联调、内部契约、CI 和独立分支发布流程。
 - [x] 迁移 Java 注册、Session、邮箱验证、密码重置、管理员账号操作、当前账号资料读取和显示名称写入。
 - [x] 接入 Java 余额查询、演示充值和模型调用扣费的可选路径。
-- [ ] 接入邮箱变更验证流程；显示名称写入已由 Java 统一负责。
+- [x] 接入邮箱变更验证流程；显示名称写入已由 Java 统一负责。
 - [ ] 接入真实支付、签名 Webhook、退款状态机和渠道对账。
 - [ ] 使用真实行业材料完成正式 RAG 发布集、Top-K/Top-N 和 P95 性能验收。
 - [ ] 增加工业 PDF 表格/图注坐标、父子 Chunk、数值范围检索和 CAD 解析能力。

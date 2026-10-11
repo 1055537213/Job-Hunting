@@ -14,12 +14,15 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.web.bind.annotation.*;
 
 @RestController
-@RequestMapping("/internal/v1/auth/{action:email-verification|password-reset}")
+@RequestMapping("/internal/v1/auth/{action:email-verification|password-reset|email-change}")
 @ConditionalOnProperty(prefix = "platform.auth", name = "enabled", havingValue = "true")
 public class AccountActionEmailController {
     private static AccountActionEmailService.Purpose purpose(String action) {
-        return "password-reset".equals(action) ? AccountActionEmailService.Purpose.RESET_PASSWORD
-                : AccountActionEmailService.Purpose.VERIFY_EMAIL;
+        return switch (action) {
+            case "password-reset" -> AccountActionEmailService.Purpose.RESET_PASSWORD;
+            case "email-change" -> AccountActionEmailService.Purpose.CHANGE_EMAIL;
+            default -> AccountActionEmailService.Purpose.VERIFY_EMAIL;
+        };
     }
     private final AccountActionEmailService service;
     private final InternalTokenVerifier tokens;
@@ -31,15 +34,26 @@ public class AccountActionEmailController {
     public Ok request(@PathVariable String action, @Valid @RequestBody EmailRequest body,
             @RequestHeader(name = "X-Internal-Service-Token", required = false) String token) {
         tokens.verify(token);
-        service.request(purpose(action), body.email(), body.source());
+        if ("email-change".equals(action)) {
+            if (body.session_token() == null || body.session_token().isBlank()) {
+                throw new AuthException("INVALID_REQUEST", "登录状态已过期，请重新登录。", org.springframework.http.HttpStatus.UNAUTHORIZED);
+            }
+            service.requestEmailChange(body.session_token(), body.email(), body.source());
+        } else {
+            service.request(purpose(action), body.email(), body.source());
+        }
         return new Ok(true);
     }
     @PostMapping("/confirm")
     public RegistrationController.Result confirm(@PathVariable String action, @Valid @RequestBody TokenRequest body,
             @RequestHeader(name = "X-Internal-Service-Token", required = false) String token) {
         tokens.verify(token);
-        return new RegistrationController.Result(purpose(action) == AccountActionEmailService.Purpose.RESET_PASSWORD
-                ? service.resetPassword(body.token(), body.new_password()) : service.verify(body.token()));
+        long accountId = switch (purpose(action)) {
+            case RESET_PASSWORD -> service.resetPassword(body.token(), body.new_password());
+            case CHANGE_EMAIL -> service.changeEmail(body.token());
+            default -> service.verify(body.token());
+        };
+        return new RegistrationController.Result(accountId);
     }
     @PostMapping("/due")
     public DueResult due(@PathVariable String action, @RequestHeader(name = "X-Internal-Service-Token", required = false) String token) {
@@ -63,7 +77,8 @@ public class AccountActionEmailController {
         tokens.verify(token);
         return service.observations(purpose(action));
     }
-    public record EmailRequest(@NotBlank @Email @Size(max = 254) String email, @Size(max = 64) String source) { }
+    public record EmailRequest(@NotBlank @Email @Size(max = 254) String email,
+            @Size(max = 64) String source, @Size(max = 128) String session_token) { }
     public record TokenRequest(@NotBlank @Size(max = 128) String token,
             @Size(min = 8, max = 1024) String new_password) {
         @Override public String toString() { return "TokenRequest[redacted]"; }

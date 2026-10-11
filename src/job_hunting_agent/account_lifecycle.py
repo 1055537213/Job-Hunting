@@ -25,6 +25,8 @@ class AccountEmailSender(Protocol):
 
     def send_password_reset(self, email: str, action_url: str) -> None: ...
 
+    def send_email_change(self, email: str, action_url: str) -> None: ...
+
 
 class ConsoleAccountEmailSender:
     """Development no-op sender; tests should inject a recording implementation."""
@@ -33,6 +35,9 @@ class ConsoleAccountEmailSender:
         return None
 
     def send_password_reset(self, email: str, action_url: str) -> None:
+        return None
+
+    def send_email_change(self, email: str, action_url: str) -> None:
         return None
 
 
@@ -60,6 +65,9 @@ class SmtpAccountEmailSender:
 
     def send_password_reset(self, email: str, action_url: str) -> None:
         self._send(email, "重置求职助手账号密码", f"请打开以下链接重置密码：\n\n{action_url}")
+
+    def send_email_change(self, email: str, action_url: str) -> None:
+        self._send(email, "确认求职助手新邮箱", f"请打开以下链接确认新的账号邮箱：\n\n{action_url}")
 
 
 def build_account_email_sender(settings: AccountLifecycleSettings) -> AccountEmailSender:

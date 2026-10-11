@@ -230,6 +230,9 @@ if (!window.Vue) {
         accountProfileForm: {
           displayName: "",
         },
+        accountEmailChangeForm: {
+          newEmail: "",
+        },
         accountPasswordForm: {
           currentPassword: "",
           newPassword: "",
@@ -728,6 +731,7 @@ if (!window.Vue) {
           const params = new URLSearchParams(window.location.search || "");
           const verificationToken = params.get("verify_email_token") || "";
           const resetToken = params.get("reset_password_token") || "";
+          const emailChangeToken = params.get("change_email_token") || "";
           if (verificationToken) {
             this.authLoading = true;
             try {
@@ -745,6 +749,20 @@ if (!window.Vue) {
           } else if (resetToken) {
             this.authMode = "reset";
             this.authForm.actionToken = resetToken;
+          } else if (emailChangeToken) {
+            this.authLoading = true;
+            try {
+              await this.requestJson("/api/auth/change-email/confirm", {
+                method: "POST",
+                body: JSON.stringify({ token: emailChangeToken }),
+              });
+              window.history.replaceState({}, "", FRONTEND_ROUTES.auth);
+              this.showAuthSuccess("邮箱变更完成，旧登录会话已失效，请重新登录。 ");
+            } catch (error) {
+              this.showAuthError(error.message || "邮箱变更失败。");
+            } finally {
+              this.authLoading = false;
+            }
           }
         }
         await this.checkAuth();
@@ -1136,6 +1154,22 @@ if (!window.Vue) {
           this.accountActionSuccess = true;
         } catch (error) {
           this.showAccountAction(error.message || "账号资料更新失败。", false);
+        } finally {
+          this.accountActionLoading = false;
+        }
+      },
+
+      async requestAccountEmailChange() {
+        this.accountActionLoading = true;
+        this.accountActionMessage = "";
+        try {
+          const data = await this.requestJson("/api/account/email", {
+            method: "PATCH",
+            body: JSON.stringify({ new_email: this.accountEmailChangeForm.newEmail }),
+          });
+          this.showAccountAction(data.message || "确认邮件已发送。", true);
+        } catch (error) {
+          this.showAccountAction(error.message || "邮箱变更请求失败。", false);
         } finally {
           this.accountActionLoading = false;
         }

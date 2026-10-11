@@ -65,7 +65,7 @@ class AccountAdministrationIntegrationTest {
         jdbc.execute("""
             CREATE TABLE IF NOT EXISTS platform_account_action_emails (
               id serial PRIMARY KEY, purpose varchar(32), account_id integer REFERENCES accounts(id),
-              recipient_email varchar(254), delivery_key varchar(64) UNIQUE, token_hash varchar(64) UNIQUE,
+              recipient_email varchar(254), target_email varchar(254), delivery_key varchar(64) UNIQUE, token_hash varchar(64) UNIQUE,
               credential_hash varchar(64), request_source_hash varchar(64), expires_at timestamptz NOT NULL,
               consumed_at timestamptz, status varchar(32), attempt_count integer, max_attempts integer,
               next_attempt_at timestamptz, claimed_at timestamptz, claim_key varchar(64), sent_at timestamptz,

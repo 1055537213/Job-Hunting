@@ -71,12 +71,16 @@ class RecordingAccountEmailSender:
     def __init__(self) -> None:
         self.verification_messages: list[tuple[str, str]] = []
         self.password_reset_messages: list[tuple[str, str]] = []
+        self.email_change_messages: list[tuple[str, str]] = []
 
     def send_verification(self, email: str, action_url: str) -> None:
         self.verification_messages.append((email, action_url))
 
     def send_password_reset(self, email: str, action_url: str) -> None:
         self.password_reset_messages.append((email, action_url))
+
+    def send_email_change(self, email: str, action_url: str) -> None:
+        self.email_change_messages.append((email, action_url))
 
 
 class FailingAccountEmailSender(RecordingAccountEmailSender):
@@ -226,6 +230,59 @@ def test_email_verification_is_enqueued_and_delivered_once(tmp_path, monkeypatch
         "/api/auth/login",
         json={"email": "verify-me@example.com", "password": "password-123"},
     ).status_code == 200
+
+
+def test_email_change_waits_for_new_mail_confirmation_and_revokes_session(tmp_path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "JOB_AGENT_ACCOUNT_EMAIL_BACKEND=console\n"
+        "JOB_AGENT_PUBLIC_BASE_URL=https://agent.example.com\n",
+        encoding="utf-8",
+    )
+    sender = RecordingAccountEmailSender()
+    queue = RecordingAccountEmailQueue()
+    web_app = create_web_app(
+        env_file=env_path,
+        account_email_sender=sender,
+        account_email_queue=queue,
+    )
+    client = TestClient(web_app)
+    old_email = "email-change-old@example.com"
+    new_email = "email-change-new@example.com"
+    assert client.post(
+        "/api/auth/register",
+        json={"email": old_email, "password": "password-123"},
+    ).status_code == 200
+    assert client.post(
+        "/api/auth/login",
+        json={"email": old_email, "password": "password-123"},
+    ).status_code == 200
+    auth_me = client.get("/api/auth/me").json()
+    requested = client.patch(
+        "/api/account/email",
+        headers={"X-CSRF-Token": auth_me["csrf_token"]},
+        json={"new_email": new_email},
+    )
+    assert requested.status_code == 200
+    assert web_app.state.backend.store.get_account_by_email(old_email)[0].email == old_email
+    assert len(queue.outbox_ids) == 1
+
+    web_app.state.account_email_outbox.deliver(queue.outbox_ids[0])
+    assert sender.email_change_messages[0][0] == new_email
+    token = parse_qs(urlsplit(sender.email_change_messages[0][1]).query)[
+        "change_email_token"
+    ][0]
+    confirmed = client.post("/api/auth/change-email/confirm", json={"token": token})
+    assert confirmed.status_code == 200
+    assert confirmed.json()["account"]["email"] == new_email
+    assert client.get("/api/auth/me").json()["authenticated"] is False
+    assert client.post(
+        "/api/auth/login",
+        json={"email": new_email, "password": "password-123"},
+    ).status_code == 200
+    assert client.post(
+        "/api/auth/change-email/confirm", json={"token": token}
+    ).status_code == 400
 
 
 def test_account_email_failure_retries_then_stops_at_budget(tmp_path) -> None:

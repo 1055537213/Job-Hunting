@@ -83,6 +83,13 @@ def test_web_uses_java_for_all_session_operations_without_python_writes(tmp_path
                 "updated_at": account.updated_at,
             }}
 
+        def email_change(self, operation, **data):
+            calls.append(("email_change", data))
+            assert operation == "request"
+            assert data["session_token"] == "a" * 64
+            assert data["email"] == "new-java@example.com"
+            return {"ok": True}
+
     app.state.backend.platform_auth_client = Java()
     def forbidden(*a, **k):
         pytest.fail("Hybrid authentication must not read/write Python sessions or password hashes")
@@ -106,13 +113,19 @@ def test_web_uses_java_for_all_session_operations_without_python_writes(tmp_path
         )
         assert profile.status_code == 200
         assert profile.json()["account"]["display_name"] == "Updated User"
+        email_change = client.patch(
+            "/api/account/email",
+            headers={"X-CSRF-Token": auth_me["csrf_token"]},
+            json={"new_email": "new-java@example.com"},
+        )
+        assert email_change.status_code == 200
         assert client.post("/api/account/password", json={"current_password": "password-123", "new_password": "new-password-123"}).status_code == 200
         assert "job_agent_session" not in client.cookies
         client.cookies.set("job_agent_session", "a" * 64)
         assert client.post("/api/auth/logout-all").json()["revoked_sessions"] == 2
         client.cookies.set("job_agent_session", "a" * 64)
         assert client.post("/api/auth/logout").status_code == 200
-    assert {c[0] for c in calls} == {"login", "account", "change-password", "logout", "logout-all"}
+    assert {c[0] for c in calls} == {"login", "account", "email_change", "change-password", "logout", "logout-all"}
 
 
 def test_java_outage_is_not_reported_as_logged_out_or_fallback_auth(tmp_path, monkeypatch):

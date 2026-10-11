@@ -44,7 +44,7 @@ class AccountActionEmailIntegrationTest {
         jdbc.execute("""
             CREATE TABLE IF NOT EXISTS platform_account_action_emails (
               id serial PRIMARY KEY, purpose varchar(32) DEFAULT 'verify_email', account_id integer REFERENCES accounts(id), recipient_email varchar(254),
-              delivery_key varchar(64) UNIQUE, token_hash varchar(64) UNIQUE, credential_hash varchar(64), request_source_hash varchar(64),
+              target_email varchar(254), delivery_key varchar(64) UNIQUE, token_hash varchar(64) UNIQUE, credential_hash varchar(64), request_source_hash varchar(64),
               expires_at timestamptz NOT NULL, consumed_at timestamptz, status varchar(32),
               attempt_count integer, max_attempts integer, next_attempt_at timestamptz,
               claimed_at timestamptz, claim_key varchar(64), sent_at timestamptz, last_error_type varchar(128),
@@ -202,6 +202,30 @@ class AccountActionEmailIntegrationTest {
         }
         assertThat(jdbc.queryForObject("SELECT email_verified_at IS NOT NULL FROM accounts WHERE id=1", Boolean.class)).isTrue();
         assertThatThrownBy(() -> service.verify("invalid")).isInstanceOf(AuthException.class);
+    }
+
+    @Test void changesEmailOnlyAfterTokenConfirmationAndRevokesSessions() {
+        var loggedIn = login();
+        var second = sessions.login("a@example.com", "password-123", true, null, null);
+        service.requestEmailChange(loggedIn.session_token(), "new@example.com", "source");
+        var due = service.due(AccountActionEmailService.Purpose.CHANGE_EMAIL).getFirst();
+        var claim = service.claim(AccountActionEmailService.Purpose.CHANGE_EMAIL, due.id());
+        String raw = claim.action_url().split("change_email_token=")[1];
+        assertThat(jdbc.queryForObject("SELECT email FROM accounts WHERE id=1", String.class)).isEqualTo("a@example.com");
+        assertThat(service.finish(AccountActionEmailService.Purpose.CHANGE_EMAIL, claim.id(), claim.claim_key(), true, null)).isTrue();
+        assertThat(service.changeEmail(raw)).isEqualTo(1L);
+        assertThat(jdbc.queryForObject("SELECT email FROM accounts WHERE id=1", String.class)).isEqualTo("new@example.com");
+        assertThat(jdbc.queryForObject("SELECT email_verified_at IS NOT NULL FROM accounts WHERE id=1", Boolean.class)).isTrue();
+        assertThat(sessions.resolve(loggedIn.session_token())).isNull();
+        assertThat(sessions.resolve(second.session_token())).isNull();
+        assertThatThrownBy(() -> service.changeEmail(raw)).isInstanceOf(AuthException.class);
+    }
+
+    @Test void rejectsEmailChangeToAnExistingAccount() {
+        var loggedIn = login();
+        assertThatThrownBy(() -> service.requestEmailChange(loggedIn.session_token(), "b@example.com", null))
+            .isInstanceOf(AuthException.class)
+            .hasMessageContaining("已经注册");
     }
     @Test void expiredOrDisabledAccountsCannotVerify() {
         service.request(AccountActionEmailService.Purpose.VERIFY_EMAIL, "a@example.com", null);

@@ -263,6 +263,7 @@ def dispatch_due_account_emails(
         client = PlatformAuthClient(auth_settings)
         for purpose, action in (
             ("verify_email", client.email_verification), ("reset_password", client.password_reset),
+            ("change_email", client.email_change),
         ):
             jobs = action("due")["records"]
             for job in jobs:

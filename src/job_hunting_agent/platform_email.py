@@ -13,16 +13,28 @@ def deliver_platform_verification(
 def deliver_platform_account_email(
     client: PlatformAuthClient, sender: AccountEmailSender, job_id: int, purpose: str
 ) -> dict:
-    if purpose not in {"verify_email", "reset_password"}:
+    if purpose not in {"verify_email", "reset_password", "change_email"}:
         raise ValueError("Unknown account email purpose")
-    action = client.email_verification if purpose == "verify_email" else client.password_reset
+    action = (
+        client.email_verification
+        if purpose == "verify_email"
+        else client.password_reset
+        if purpose == "reset_password"
+        else client.email_change
+    )
     claim = action("claim", id=job_id)["claim"]
     if claim is None:
         return {"outbox_id": job_id, "status": "not_claimed"}
     sent = True
     error_type = None
     try:
-        send = sender.send_verification if purpose == "verify_email" else sender.send_password_reset
+        send = (
+            sender.send_verification
+            if purpose == "verify_email"
+            else sender.send_password_reset
+            if purpose == "reset_password"
+            else sender.send_email_change
+        )
         send(claim["recipient_email"], claim["action_url"])
     except Exception:  # noqa: BLE001 - SMTP implementations vary; never persist exception text.
         sent = False
