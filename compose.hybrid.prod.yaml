@@ -41,3 +41,8 @@ services:
     depends_on:
       platform-service:
         condition: service_healthy
+
+  reverse-proxy:
+    depends_on:
+      platform-service:
+        condition: service_healthy

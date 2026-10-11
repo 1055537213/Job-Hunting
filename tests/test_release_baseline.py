@@ -147,6 +147,8 @@ def test_production_compose_does_not_expose_internal_services():
     caddyfile = (ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8")
     assert "@internal path /internal/*" in caddyfile
     assert "respond @internal 404" in caddyfile
+    assert "@platform_auth path /api/auth/login /api/auth/logout /api/auth/logout-all /api/account/password" in caddyfile
+    assert "reverse_proxy @platform_auth platform-service:8081" in caddyfile
     assert "dynamic a web 8000" in caddyfile
     assert "lb_policy round_robin" in caddyfile
 

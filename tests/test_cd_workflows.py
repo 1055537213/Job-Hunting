@@ -487,6 +487,8 @@ def test_hybrid_release_pair_and_production_compose_are_connected():
             assert service["depends_on"]["platform-service"]["condition"] == "service_healthy"
             assert service["environment"]["JOB_AGENT_JAVA_AUTH_ENABLED"] == "true"
             assert service["environment"]["JOB_AGENT_JAVA_AUTH_INTERNAL_TOKEN"] == java["environment"]["PLATFORM_INTERNAL_TOKEN"]
+        if "reverse-proxy" in config["services"]:
+            assert config["services"]["reverse-proxy"]["depends_on"]["platform-service"]["condition"] == "service_healthy"
     workflow = (ROOT / ".github/workflows/deploy-hybrid.yml").read_text(encoding="utf-8")
     for required in ("environment: production", "DEPLOY", "origin/java-platform-migration", ".conclusion == \"success\"",
                      "-ai:$release", "-platform:$release", "org.opencontainers.image.revision", "chmod +x"):
