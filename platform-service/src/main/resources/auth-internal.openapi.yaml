@@ -84,6 +84,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AccountList'
+  /internal/v1/auth/accounts/me:
+    post:
+      operationId: getCurrentAccount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionRequest'
+      responses:
+        '200':
+          description: Safe projection for the account bound to the session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResponse'
+        '401':
+          $ref: '#/components/responses/InternalUnauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
   /internal/v1/auth/accounts/status:
     post:
       operationId: updateAccountStatus

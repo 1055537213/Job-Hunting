@@ -182,7 +182,14 @@ class FakePlatformBilling:
         self.charges: list[dict[str, object]] = []
 
     def get_balance(self, account_id: int) -> PlatformBalanceProjection:
-        return PlatformBalanceProjection(account_id, 10_000_000, 10_000_000, 0, 0)
+        consumed = sum(int(item["amount_micro_yuan"]) for item in self.charges)
+        return PlatformBalanceProjection(
+            account_id,
+            max(0, 10_000_000 - consumed),
+            10_000_000,
+            consumed,
+            len(self.charges),
+        )
 
     def consume(self, **kwargs):
         self.charges.append(kwargs)
@@ -226,7 +233,28 @@ def test_repository_uses_java_as_the_only_balance_writer_when_enabled(database_u
 
     assert fake.charges[0]["amount_micro_yuan"] == 2_000_000
     assert fake.charges[0]["source_reference"] == "call-java-billing-1"
-    assert store.get_account_balance_summary(account.id).balance_micro_yuan == 0
+    assert store.get_account_balance_summary(account.id).balance_micro_yuan == 8_000_000
+    store.close()
+
+
+def test_balance_reads_use_java_projection_when_platform_billing_is_enabled(database_url):
+    """Java 账务开启后，余额查询不能返回旧的 Python 本地投影。"""
+
+    store = SQLAlchemyStore(database_url)
+    store.initialize()
+    store.configure_billing(BillingSettings(price_per_million_tokens_yuan=25))
+    store.configure_platform_billing(FakePlatformBilling())
+    account = store.create_account("java-billing-read@example.com", "not-used")
+
+    summary = store.get_account_balance_summary(account.id)
+
+    assert summary.account_id == account.id
+    assert summary.balance_micro_yuan == 10_000_000
+    assert summary.total_recharge_micro_yuan == 10_000_000
+    assert summary.total_consumed_micro_yuan == 0
+    assert summary.ledger_entry_count == 0
+    assert summary.state == "low_balance"
+    assert summary.state_label == "低余额"
     store.close()
 
 

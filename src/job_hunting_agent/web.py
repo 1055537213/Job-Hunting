@@ -232,6 +232,12 @@ def platform_account_view(value: dict[str, object]) -> dict[str, object]:
     }
 
 
+def platform_account_record(value: dict[str, object]) -> AccountRecord:
+    """Convert Java's safe account projection into the Python domain object."""
+
+    return AccountRecord(**platform_account_view(value))
+
+
 class NoCacheStaticFiles(StaticFiles):
     """开发期静态资源服务。
 
@@ -550,12 +556,20 @@ def create_web_app(
         if not hasattr(request.state, "platform_session_result"):
             token = request.cookies.get(SESSION_COOKIE_NAME)
             try:
-                request.state.platform_session_result = (
-                    platform_session(request, "resolve", session_token=token)["account_id"]
-                    if token and len(token) <= 128 else None
-                )
-            except HTTPException as error:
-                request.state.platform_session_error = error
+                if token and len(token) <= 128:
+                    result = backend.platform_auth_client.account(
+                        "me", session_token=token,
+                        trace_id=request.headers.get("x-trace-id") or getattr(request.state, "request_id", None),
+                    )
+                    request.state.platform_account = platform_account_record(result["account"])
+                    request.state.platform_session_result = request.state.platform_account.id
+                else:
+                    request.state.platform_session_result = None
+            except PlatformAuthError as error:
+                if error.code != "SESSION_EXPIRED" or error.status_code != 401:
+                    request.state.platform_session_error = HTTPException(
+                        status_code=error.status_code or 503, detail=str(error),
+                    )
                 request.state.platform_session_result = None
         if hasattr(request.state, "platform_session_error"):
             raise request.state.platform_session_error
@@ -636,10 +650,7 @@ def create_web_app(
                 if required:
                     raise HTTPException(status_code=401, detail="登录状态已过期，请重新登录。")
                 return None
-            try:
-                account = backend.store.get_account(account_id)
-            except KeyError as error:
-                raise HTTPException(status_code=401, detail="登录账号不存在。") from error
+            account = request.state.platform_account
             if account.status != "active":
                 raise HTTPException(status_code=403, detail="账号已被禁用。")
             request.state.account = account
@@ -2935,6 +2946,77 @@ def create_web_app(
             "offset": offset,
         }
 
+    @web_app.get("/api/admin/tasks")
+    def admin_background_tasks(
+        request: Request,
+        account_id: int | None = Query(default=None, ge=1),
+        task_type: str | None = Query(default=None, min_length=1, max_length=80),
+        status: str | None = Query(default=None, min_length=1, max_length=20),
+        limit: int = Query(default=ADMIN_LEDGER_PAGE_SIZE, ge=1, le=ADMIN_LEDGER_PAGE_SIZE),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, object]:
+        """管理员查看后台任务低敏状态，默认按最近更新时间倒序分页。"""
+
+        require_admin(request)
+        allowed_statuses = {"queued", "running", "succeeded", "failed", "cancelled"}
+        if status is not None and status not in allowed_statuses:
+            raise HTTPException(status_code=400, detail="无效的后台任务状态。")
+        tasks = backend.store.list_background_tasks_for_admin(
+            account_id=account_id,
+            task_type=task_type.strip() if task_type else None,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+        total = backend.store.count_background_tasks_for_admin(
+            account_id=account_id,
+            task_type=task_type.strip() if task_type else None,
+            status=status,
+        )
+        return {
+            "tasks": [serialize_admin_background_task(task) for task in tasks],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "page_size": ADMIN_LEDGER_PAGE_SIZE,
+            "max_pages": ADMIN_LEDGER_MAX_PAGES,
+        }
+
+    @web_app.post("/api/admin/tasks/{task_key}/retry")
+    def admin_retry_background_task(task_key: str, request: Request) -> dict[str, object]:
+        """管理员重试失败任务；重试动作写入审计并重新投递队列。"""
+
+        actor = require_admin(request)
+        try:
+            task = backend.store.get_background_task(task_key)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="后台任务不存在。") from error
+        audit_event = AdminAuditEventRecord(
+            id=0,
+            actor_account_id=actor.id,
+            target_account_id=task.account_id,
+            action="background_task.retry_requested",
+            target_type="background_task",
+            target_id=task.task_key,
+            outcome="succeeded",
+            summary="管理员重新投递失败后台任务。",
+            details={},
+            request_id=getattr(request.state, "request_id", None),
+        )
+        try:
+            retried = backend.retry_background_task(task.task_key, audit_event=audit_event)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="后台任务不存在。") from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except TaskQueueError as error:
+            raise HTTPException(
+                status_code=503,
+                detail="后台任务队列暂时不可用，请稍后重试。",
+                headers={"Retry-After": "3"},
+            ) from error
+        return {"task": serialize_admin_background_task(retried)}
+
     @web_app.post("/api/admin/tasks/probe")
     def admin_task_queue_probe(request: Request) -> dict[str, object]:
         """管理员登记一个无业务数据的 Worker 探针，用于运维验证。"""
@@ -3892,6 +3974,16 @@ def serialize_background_task(task: BackgroundTaskRecord) -> dict[str, object]:
         "started_at": task.started_at,
         "finished_at": task.finished_at,
         "updated_at": task.updated_at,
+    }
+
+
+def serialize_admin_background_task(task: BackgroundTaskRecord) -> dict[str, object]:
+    """返回管理员任务列表所需的归属字段，但仍不暴露任务 payload。"""
+
+    return {
+        **serialize_background_task(task),
+        "account_id": task.account_id,
+        "candidate_id": task.candidate_id,
     }
 
 

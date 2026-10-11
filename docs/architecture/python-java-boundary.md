@@ -29,7 +29,7 @@
 - `billing-internal.openapi.yaml`：余额、消费、充值、退款内部契约。
 - Java 账务垂直链路：余额查询、模拟充值和模型调用扣费，默认关闭且未接入生产流量。
 - Python `RepositoryStore` 已支持通过 `JOB_AGENT_JAVA_BILLING_ENABLED` 切换到 Java 充值和扣费；充值幂等键沿用充值请求的 `idempotency_key`，模型调用使用 `call_id`。
-- 开关关闭时 Python 保持原有账务写入路径；开关打开后 Java 独占余额、充值订单、余额流水和支付事件的写入权，Python 只调用接口并读取已提交结果。
+- 开关关闭时 Python 保持原有账务读写路径；开关打开后 Java 独占余额、充值订单、余额流水和支付事件的事实权，Python 只调用接口并读取已提交结果。当前已完成余额摘要的 Java 读路径迁移，外部 `/api/auth/me` 和 `/api/me/balance` 仍保持 Python URL 契约不变。
 - CI 的 Python-Java contract check 会验证模拟充值、模型扣费、数据库流水和幂等重试。
 
 ## 第二阶段交付：凭据校验迁移
@@ -59,17 +59,19 @@ Java 模式不再派发任何旧 Python 账号邮件，旧队列消息也被跳�
 Java 接管登录、会话解析/续期、单设备退出、全部设备退出和修改密码。
 账号行锁统一串行化登录、修改密码和密码重置；登录校验与会话写入不再跨服务分两步。
 Session 原文不入库、不写日志，只用于 Python 网页设置 Cookie；保留闲置 7 天/绝对 30 天语义。
-Python 保留外部 API、Cookie/CSRF 和账号展示读取，一次 HTTP 请求内共享 Java 会话解析结果。
+Python 保留外部 API、Cookie/CSRF 和页面适配；账号展示读取通过 Java 的安全账号投影完成，一次 HTTP 请求内共享 Java 会话解析结果。
 Java 故障一律失败关闭，不退回 Python Session 数据库路径。
 纯 Python 分支和关闭开关的兼容模式仍依赖 `auth.py` 与仓储方法，因此不能直接删除整个模块。
 已删除混合模式原有的“Java 校验、Python 签发”的中间流程。
 
-管理员账号列表、启用/停用、首次管理员引导和注销前的 Java 账号停用已经迁移到 Java。Java 在真实 Session
+管理员账号列表、当前账号资料读取、启用/停用、首次管理员引导和注销前的 Java 账号停用已经迁移到 Java。Java 在真实 Session
 校验后执行管理员授权，并在同一事务内完成状态变更、目标会话撤销、旧账号操作链接
 失效和管理员审计；Python 只做网页 API 兼容转换。注销的数据清理仍保留在 Python
 后台任务中，因为它还需要对象存储、知识库、后台任务和财务保留数据的可恢复删除编排，
 不能用一次同步 SQL 搬运替代。Python 只登记 `account_deletion` 任务，Java 负责在
 真实 Session 和密码校验后立即停用账号、撤销 Java Session 和失效账号操作链接。
+当前账号资料通过 `/internal/v1/auth/accounts/me` 返回安全投影，Python 只把它转换成原有 `AccountRecord`
+供外部 API 使用，不再从本地 `accounts` 表补全 Java 模式下的当前账号。开关关闭时仍使用原有本地读取路径。
 本阶段不改变数据库结构，不需要新增迁移；跨数据库版本生产回滚仍需单独验收。
 
 ## 目标入口与发布规则

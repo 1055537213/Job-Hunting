@@ -166,6 +166,12 @@ if (!window.Vue) {
             summary: {},
             records: [],
           },
+          backgroundTasks: [],
+          backgroundTaskTotal: 0,
+          backgroundTaskPage: 1,
+          backgroundTaskLoading: false,
+          backgroundTaskError: "",
+          backgroundTaskRequestVersion: 0,
           activeDetailTab: "tokens",
           selectedAccountId: 0,
           loadingEvents: false,
@@ -1199,12 +1205,18 @@ if (!window.Vue) {
           return;
         }
         this.admin.activeSection = section;
+        if (section === "audit") {
+          this.loadAdminBackgroundTasks(1);
+        }
       },
 
       /** 按当前后台模块刷新对应数据，默认先保住“用量与账号”的首屏体验。 */
       async refreshAdminSection() {
         if (this.admin.activeSection === "audit") {
-          await this.loadAdminAuditEvents();
+          await Promise.all([
+            this.loadAdminAuditEvents(),
+            this.loadAdminBackgroundTasks(1),
+          ]);
           return;
         }
         await this.loadAdminData();
@@ -1276,6 +1288,58 @@ if (!window.Vue) {
           if (requestVersion === this.admin.auditRequestVersion) {
             this.admin.loadingAuditEvents = false;
           }
+        }
+      },
+
+      /** 读取管理员可见的后台任务摘要；不会返回任务 payload。 */
+      async loadAdminBackgroundTasks(page = this.admin.backgroundTaskPage) {
+        const requestedPage = Math.max(1, Math.floor(Number(page) || 1));
+        const pageSize = Math.max(1, Number(this.admin.ledgerPageSize || ADMIN_LEDGER_PAGE_SIZE));
+        const requestVersion = this.admin.backgroundTaskRequestVersion + 1;
+        this.admin.backgroundTaskRequestVersion = requestVersion;
+        this.admin.backgroundTaskLoading = true;
+        this.admin.backgroundTaskError = "";
+        this.admin.backgroundTaskPage = requestedPage;
+        try {
+          const data = await this.requestJson(
+            `/api/admin/tasks?limit=${encodeURIComponent(pageSize)}&offset=${encodeURIComponent((requestedPage - 1) * pageSize)}`
+          );
+          if (requestVersion !== this.admin.backgroundTaskRequestVersion) return;
+          const total = Number(data.total || 0);
+          const pageCount = this.adminLedgerPageCount(total);
+          if (pageCount > 0 && requestedPage > pageCount) {
+            await this.loadAdminBackgroundTasks(pageCount);
+            return;
+          }
+          this.admin.backgroundTasks = data.tasks || [];
+          this.admin.backgroundTaskTotal = total;
+          this.admin.backgroundTaskPage = pageCount > 0 ? requestedPage : 1;
+        } catch (error) {
+          if (requestVersion !== this.admin.backgroundTaskRequestVersion) return;
+          this.admin.backgroundTasks = [];
+          this.admin.backgroundTaskTotal = 0;
+          this.admin.backgroundTaskError = error.message || "后台任务加载失败，请稍后重试。";
+        } finally {
+          if (requestVersion === this.admin.backgroundTaskRequestVersion) {
+            this.admin.backgroundTaskLoading = false;
+          }
+        }
+      },
+
+      /** 管理员重新投递一个失败后台任务，并立即刷新任务与审计记录。 */
+      async retryAdminBackgroundTask(taskKey) {
+        if (!taskKey) return;
+        try {
+          await this.requestJson(`/api/admin/tasks/${encodeURIComponent(taskKey)}/retry`, {
+            method: "POST",
+          });
+          this.showAccountAction("后台任务已重新排队。", true);
+          await Promise.all([
+            this.loadAdminBackgroundTasks(this.admin.backgroundTaskPage),
+            this.loadAdminAuditEvents(),
+          ]);
+        } catch (error) {
+          this.showAccountAction(error.message || "后台任务重试失败。", false);
         }
       },
 
@@ -1783,6 +1847,7 @@ if (!window.Vue) {
           "auth.logout_all_devices": "退出所有设备",
           "system.probe_enqueued": "系统探针",
           "balance.manual_credit": "管理员补款",
+          "background_task.retry_requested": "后台任务重试",
         };
         return labels[action] || action || "管理员操作";
       },

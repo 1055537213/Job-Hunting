@@ -164,14 +164,14 @@ class PlatformAuthClient:
         return payload
 
     def account(self, operation: str, *, trace_id: str | None = None, **data: Any) -> dict[str, Any]:
-        """Call Java-owned administrator account operations.
+        """Call Java-owned current-account and administrator operations.
 
         Account listing/status changes authenticate with the real session token
         inside Java. Python must not turn a locally read account id into an
         authorization decision.
         """
 
-        if operation not in {"list", "status", "bootstrap", "delete-admission"}:
+        if operation not in {"me", "list", "status", "bootstrap", "delete-admission"}:
             raise ValueError("Unknown account operation")
         try:
             response = httpx.post(
@@ -198,7 +198,9 @@ class PlatformAuthClient:
                 response.status_code,
             )
 
-        if operation == "list":
+        if operation == "me":
+            valid = _is_safe_account_view(payload.get("account"))
+        elif operation == "list":
             accounts = payload.get("accounts")
             valid = isinstance(accounts, list) and all(_is_safe_account_view(account) for account in accounts)
         elif operation in {"status", "delete-admission"}:
@@ -314,10 +316,9 @@ def _is_safe_account_view(value: Any) -> bool:
         and value["account_id"] > 0
         and isinstance(value["email"], str)
         and (value["display_name"] is None or isinstance(value["display_name"], str))
-        and isinstance(value["role"], str)
-        and isinstance(value["status"], str)
+        and value["role"] in ("user", "admin")
+        and value["status"] in ("active", "disabled")
         and isinstance(value["must_change_password"], bool)
-        and all(value[field] is None or isinstance(value[field], str) for field in (
-            "email_verified_at", "deleted_at", "created_at", "updated_at"
-        ))
+        and all(isinstance(value[field], str) and value[field] for field in ("created_at", "updated_at"))
+        and all(value[field] is None or isinstance(value[field], str) for field in ("email_verified_at", "deleted_at"))
     )

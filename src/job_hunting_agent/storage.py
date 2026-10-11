@@ -1243,6 +1243,31 @@ class RepositoryStore:
         """读取单个账号的余额与消费汇总，必要时自动补初始化余额。"""
 
         account = self.get_account(account_id)
+        if self._platform_billing_client is not None:
+            # Java 是账务事实源时，Web 读路径也必须读取同一个服务，不能因为
+            # 本地 account_balances 表仍存在就把旧投影误当成最新余额。
+            projection = self._platform_billing_client.get_balance(account_id)
+            threshold_micro_yuan = round(
+                self.billing_settings().low_balance_threshold_yuan * 1_000_000
+            )
+            return AccountBalanceSummary(
+                account_id=projection.account_id,
+                balance_micro_yuan=projection.balance_micro_yuan,
+                total_recharge_micro_yuan=projection.total_recharge_micro_yuan,
+                total_consumed_micro_yuan=projection.total_consumed_micro_yuan,
+                ledger_entry_count=projection.ledger_entry_count,
+                low_balance_threshold_micro_yuan=threshold_micro_yuan,
+                state=self._balance_state_value(
+                    projection.balance_micro_yuan,
+                    threshold_micro_yuan,
+                    account.status,
+                ),
+                state_label=self._balance_state_label(
+                    projection.balance_micro_yuan,
+                    threshold_micro_yuan,
+                    account.status,
+                ),
+            )
         with self.connect() as conn:
             self._ensure_account_billing_row(conn, account_id)
             row = conn.execute(
@@ -3245,6 +3270,70 @@ class RepositoryStore:
             ).fetchall()
         return [background_task_from_row(row) for row in rows]
 
+    def list_background_tasks_for_admin(
+        self,
+        *,
+        account_id: int | None = None,
+        task_type: str | None = None,
+        status: str | None = None,
+        limit: int = ADMIN_LEDGER_PAGE_SIZE,
+        offset: int = 0,
+    ) -> list[BackgroundTaskRecord]:
+        """列出管理员可见的任务摘要，不把 payload 暴露给管理端。"""
+
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            parameters.append(account_id)
+        if task_type is not None:
+            conditions.append("task_type = ?")
+            parameters.append(task_type)
+        if status is not None:
+            conditions.append("status = ?")
+            parameters.append(status)
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        parameters.extend((max(1, min(int(limit), 200)), max(0, int(offset))))
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM background_tasks
+                {where_clause}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                tuple(parameters),
+            ).fetchall()
+        return [background_task_from_row(row) for row in rows]
+
+    def count_background_tasks_for_admin(
+        self,
+        *,
+        account_id: int | None = None,
+        task_type: str | None = None,
+        status: str | None = None,
+    ) -> int:
+        """统计管理员任务列表总数，供分页使用。"""
+
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            parameters.append(account_id)
+        if task_type is not None:
+            conditions.append("task_type = ?")
+            parameters.append(task_type)
+        if status is not None:
+            conditions.append("status = ?")
+            parameters.append(status)
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM background_tasks {where_clause}",
+                tuple(parameters),
+            ).fetchone()
+        return int(row["count"] if row is not None else 0)
+
     def claim_background_task(self, task_key: str) -> BackgroundTaskRecord | None:
         """原子认领 queued 任务；没有取得执行权时返回 ``None``。
 
@@ -3273,7 +3362,11 @@ class RepositoryStore:
             return None
         return self.get_background_task(task_key)
 
-    def retry_failed_background_task(self, task_key: str) -> BackgroundTaskRecord:
+    def retry_failed_background_task(
+        self,
+        task_key: str,
+        audit_event: AdminAuditEventRecord | None = None,
+    ) -> BackgroundTaskRecord:
         """把失败任务恢复为 queued，让同一幂等请求可以重新投递。
 
         任务 payload 和 task_key 保持不变，便于审计和前端继续轮询；尝试次数归零，
@@ -3282,7 +3375,15 @@ class RepositoryStore:
         """
 
         with self.connect() as conn:
-            conn.execute(
+            row = conn.execute(
+                "SELECT * FROM background_tasks WHERE task_key = ?",
+                (task_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Background task not found: {task_key}")
+            if str(row["status"]) != "failed":
+                raise ValueError("只有失败状态的后台任务可以人工重试。")
+            cursor = conn.execute(
                 """
                 UPDATE background_tasks
                 SET status = 'queued', progress = 0, attempt = 0,
@@ -3292,6 +3393,22 @@ class RepositoryStore:
                 """,
                 (json.dumps({}, ensure_ascii=False), now_iso(), task_key),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("后台任务状态已变化，请刷新后重试。")
+            if audit_event is not None:
+                if audit_event.target_type != "background_task":
+                    raise ValueError("后台任务审计的目标类型必须是 background_task。")
+                event = replace(
+                    audit_event,
+                    target_id=task_key,
+                    details={
+                        **(audit_event.details or {}),
+                        "task_key": task_key,
+                        "task_type": str(row["task_type"]),
+                        "previous_status": "failed",
+                    },
+                )
+                self._insert_admin_audit_event(conn, event)
         return self.get_background_task(task_key)
 
     def update_background_task_progress(self, task_key: str, progress: int) -> BackgroundTaskRecord:

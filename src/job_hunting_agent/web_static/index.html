@@ -1925,6 +1925,50 @@
               <p class="admin-observability-lede">
                 记录账号状态变更、系统探针和管理员会话撤销等低敏操作，便于后续排查和追责。
               </p>
+              <section class="admin-task-panel" aria-labelledby="adminTaskPanelTitle">
+                <div class="admin-task-panel-head">
+                  <div>
+                    <p class="eyebrow">Background Tasks</p>
+                    <h3 id="adminTaskPanelTitle">后台任务</h3>
+                  </div>
+                  <span>失败任务可重新排队</span>
+                </div>
+                <div v-if="admin.backgroundTaskLoading" class="admin-usage-notice" role="status">正在加载后台任务...</div>
+                <div v-else-if="admin.backgroundTaskError" class="inline-error" role="alert">{{ admin.backgroundTaskError }}</div>
+                <div v-else-if="!admin.backgroundTasks.length" class="empty-state compact-empty">
+                  <strong>暂无后台任务</strong><span>项目分析、导入和账号注销等异步任务会显示在这里。</span>
+                </div>
+                <div v-else class="admin-task-list">
+                  <article v-for="task in admin.backgroundTasks" :key="task.task_key" class="admin-task-row">
+                    <div class="admin-task-main">
+                      <strong>{{ task.task_type }}</strong>
+                      <span>账号 #{{ task.account_id }} · {{ formatDate(task.updated_at) }} · 第 {{ task.attempt }} / {{ task.max_attempts }} 次</span>
+                      <small v-if="task.error_summary" class="admin-task-error">{{ task.error_summary }}</small>
+                    </div>
+                    <div class="admin-task-actions">
+                      <span class="admin-task-status" :data-state="task.status">{{ task.status }}</span>
+                      <button v-if="task.status === 'failed'" class="admin-ledger-page-button" type="button" @click="retryAdminBackgroundTask(task.task_key)">重新排队</button>
+                    </div>
+                  </article>
+                </div>
+                <div class="admin-ledger-pagination" role="navigation" aria-label="后台任务分页">
+                  <span class="admin-ledger-page-info">{{ adminLedgerPageInfo(admin.backgroundTaskTotal) }}</span>
+                  <div class="admin-ledger-page-nav">
+                    <button class="admin-ledger-page-button" type="button" :disabled="admin.backgroundTaskPage <= 1" @click="loadAdminBackgroundTasks(admin.backgroundTaskPage - 1)">上一页</button>
+                    <button
+                      v-for="page in adminLedgerPageNumbers(admin.backgroundTaskTotal)"
+                      :key="`task-page-${page}`"
+                      class="admin-ledger-page-button"
+                      type="button"
+                      :aria-selected="String(admin.backgroundTaskPage === page)"
+                      @click="loadAdminBackgroundTasks(page)"
+                    >
+                      {{ page }}
+                    </button>
+                    <button class="admin-ledger-page-button" type="button" :disabled="admin.backgroundTaskPage >= adminLedgerPageCount(admin.backgroundTaskTotal)" @click="loadAdminBackgroundTasks(admin.backgroundTaskPage + 1)">下一页</button>
+                  </div>
+                </div>
+              </section>
               <div v-if="admin.loadingAuditEvents" class="admin-usage-notice" role="status">正在加载管理员审计...</div>
               <div v-else-if="admin.auditLoadError" class="inline-error" role="alert">{{ admin.auditLoadError }}</div>
               <div v-else-if="!adminAuditEvents.length" class="empty-state compact-empty">

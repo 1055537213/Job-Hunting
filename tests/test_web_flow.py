@@ -927,6 +927,88 @@ def test_admin_account_status_change_is_visible_in_audit_log(tmp_path) -> None:
     assert "audit-target@example.com" not in event["summary"]
 
 
+def test_admin_can_inspect_and_retry_failed_background_task(tmp_path) -> None:
+    """失败后台任务可由管理员安全查看、重试，并留下审计记录。"""
+
+    class RecordingTaskQueue:
+        def __init__(self) -> None:
+            self.task_keys: list[str] = []
+
+        def health_check(self) -> None:
+            return None
+
+        def enqueue(self, task_key: str) -> None:
+            self.task_keys.append(task_key)
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "JOB_AGENT_BOOTSTRAP_ADMIN_EMAIL=task-admin@example.com",
+                "JOB_AGENT_BOOTSTRAP_ADMIN_PASSWORD=strong-password-123",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    queue = RecordingTaskQueue()
+    app = create_web_app(env_file=env_path, task_queue=queue)
+    admin_client = TestClient(app)
+    user_client = TestClient(app)
+    target = admin_client.post(
+        "/api/auth/register",
+        json={"email": "task-target@example.com", "password": "password-123"},
+    ).json()["account"]
+    admin_login = admin_client.post(
+        "/api/auth/login",
+        json={"email": "task-admin@example.com", "password": "strong-password-123"},
+    )
+    login_test_account(user_client, "task-target@example.com")
+    assert admin_login.status_code == 200
+
+    store = app.state.backend.store
+    task = store.create_background_task(
+        account_id=target["id"],
+        task_type="account_deletion",
+        payload={"storage_keys": ["accounts/test/controlled-object"]},
+        max_attempts=8,
+        idempotency_key="account-deletion:test-target",
+    )
+    store.fail_queued_background_task(task.task_key, "对象存储暂时不可用。")
+
+    forbidden = user_client.get("/api/admin/tasks")
+    listed = admin_client.get(
+        "/api/admin/tasks?status=failed&task_type=account_deletion"
+    )
+    assert forbidden.status_code == 403
+    assert listed.status_code == 200
+    assert listed.json()["total"] == 1
+    listed_task = listed.json()["tasks"][0]
+    assert listed_task["task_key"] == task.task_key
+    assert listed_task["account_id"] == target["id"]
+    assert listed_task["error_summary"] == "对象存储暂时不可用。"
+    assert "payload" not in listed_task
+
+    retried = admin_client.post(
+        f"/api/admin/tasks/{task.task_key}/retry",
+        headers={"X-Request-ID": "task-retry-request"},
+    )
+    assert retried.status_code == 200
+    assert retried.json()["task"]["status"] == "queued"
+    assert queue.task_keys == [task.task_key]
+
+    audit = admin_client.get("/api/admin/audit/events?limit=10")
+    assert audit.status_code == 200
+    event = audit.json()["events"][0]
+    assert event["action"] == "background_task.retry_requested"
+    assert event["target_type"] == "background_task"
+    assert event["target_id"] == task.task_key
+    assert event["request_id"] == "task-retry-request"
+    assert event["details"]["task_type"] == "account_deletion"
+
+    repeated = admin_client.post(f"/api/admin/tasks/{task.task_key}/retry")
+    assert repeated.status_code == 409
+
+
 def test_web_bootstraps_initial_admin_once_from_env(tmp_path) -> None:
     """首次管理员只能由私有环境配置引导，公开注册接口不能提升普通用户。"""
 

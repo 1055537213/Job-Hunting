@@ -373,6 +373,40 @@ class JobHuntingApp:
 
         return self.store.get_background_task(task_key, account_id=account_id)
 
+    def retry_background_task(
+        self,
+        task_key: str,
+        *,
+        audit_event: AdminAuditEventRecord | None = None,
+    ) -> BackgroundTaskRecord:
+        """重置失败任务并重新投递；数据库状态和队列投递保持可追踪。"""
+
+        if self.task_queue is None:
+            raise TaskQueueError("当前运行环境未启用后台任务队列。")
+        record = self.store.retry_failed_background_task(task_key, audit_event)
+        try:
+            self.task_queue.enqueue(record.task_key)
+        except TaskQueueError as error:
+            self.store.fail_queued_background_task(
+                record.task_key,
+                "管理员重试时任务投递失败。",
+            )
+            if audit_event is not None:
+                self.store.record_admin_audit_event(
+                    replace(
+                        audit_event,
+                        action="background_task.retry_failed",
+                        outcome="failed",
+                        summary="管理员重试后台任务时投递失败。",
+                        details={
+                            **(audit_event.details or {}),
+                            "error_type": type(error).__name__,
+                        },
+                    )
+                )
+            raise
+        return self.store.get_background_task(record.task_key)
+
     def enqueue_system_probe(
         self,
         account_id: int,

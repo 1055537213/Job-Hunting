@@ -34,6 +34,14 @@ public class AccountAdministrationController {
         return accounts.list(body.session_token());
     }
 
+    @PostMapping("/me")
+    public AccountAdministrationService.AccountResponse me(
+            @Valid @RequestBody SessionRequest body,
+            @RequestHeader(name = "X-Internal-Service-Token", required = false) String token) {
+        tokens.verify(token);
+        return accounts.current(body.session_token());
+    }
+
     @PostMapping("/status")
     public AccountAdministrationService.AccountResponse status(
             @Valid @RequestBody StatusRequest body,

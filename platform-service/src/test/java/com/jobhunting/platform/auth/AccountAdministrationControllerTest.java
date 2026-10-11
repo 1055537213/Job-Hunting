@@ -33,6 +33,10 @@ class AccountAdministrationControllerTest {
                 .contentType(APPLICATION_JSON)
                 .content("{\"session_token\":\"opaque\"}"))
             .andExpect(status().isUnauthorized());
+        mvc.perform(post("/internal/v1/auth/accounts/me")
+                .contentType(APPLICATION_JSON)
+                .content("{\"session_token\":\"opaque\"}"))
+            .andExpect(status().isUnauthorized());
         mvc.perform(post("/internal/v1/auth/accounts/status")
                 .contentType(APPLICATION_JSON)
                 .content("{\"session_token\":\"opaque\",\"account_id\":2,\"status\":\"disabled\"}"))
@@ -54,6 +58,8 @@ class AccountAdministrationControllerTest {
                 2, "user@example.com", "User", "user", "active", false,
                 null, null, "2026-10-10T00:00:00Z", "2026-10-10T00:00:00Z");
         when(service.list("opaque")).thenReturn(new AccountAdministrationService.AccountList(List.of(account)));
+        when(service.current("opaque"))
+            .thenReturn(new AccountAdministrationService.AccountResponse(account));
         when(service.updateStatus("opaque", 2, "disabled", "trace-2"))
             .thenReturn(new AccountAdministrationService.AccountResponse(account));
         when(service.bootstrap("admin@example.com", "password-123", null))
@@ -67,6 +73,12 @@ class AccountAdministrationControllerTest {
                 .content("{\"session_token\":\"opaque\"}"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.accounts[0].account_id").value(2));
+        mvc.perform(post("/internal/v1/auth/accounts/me")
+                .header("X-Internal-Service-Token", "test-token")
+                .contentType(APPLICATION_JSON)
+                .content("{\"session_token\":\"opaque\"}"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.account.account_id").value(2));
         mvc.perform(post("/internal/v1/auth/accounts/status")
                 .header("X-Internal-Service-Token", "test-token")
                 .header("X-Trace-Id", "trace-2")
@@ -89,6 +101,7 @@ class AccountAdministrationControllerTest {
             .andExpect(jsonPath("$.account.account_id").value(2));
 
         verify(service).list("opaque");
+        verify(service).current("opaque");
         verify(service).updateStatus("opaque", 2, "disabled", "trace-2");
         verify(service).bootstrap("admin@example.com", "password-123", null);
         verify(service).prepareDeletion("opaque", "password-123", "trace-delete");

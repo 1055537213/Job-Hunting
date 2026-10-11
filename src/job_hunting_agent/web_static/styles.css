@@ -3278,6 +3278,65 @@ textarea:focus-visible,
   display: grid;
   gap: var(--space-md);
 }
+.admin-task-panel {
+  min-width: 0;
+  display: grid;
+  gap: var(--space-sm);
+  padding: var(--space-md);
+  background: var(--auth-paper);
+  border: 1px solid var(--auth-rule);
+}
+.admin-task-panel-head,
+.admin-task-row,
+.admin-task-actions {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+.admin-task-panel-head { align-items: flex-start; }
+.admin-task-panel-head .eyebrow { margin: 0 0 var(--space-3xs); }
+.admin-task-panel-head h3 { margin: 0; color: var(--auth-ink); font-family: var(--font-display); font-size: var(--text-md); }
+.admin-task-panel-head > span,
+.admin-task-main span,
+.admin-task-main small {
+  color: var(--auth-muted);
+  font-size: var(--text-sm);
+}
+.admin-task-list {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+  background: var(--auth-rule);
+  border: 1px solid var(--auth-rule);
+}
+.admin-task-row {
+  padding: var(--space-sm) var(--space-md);
+  background: var(--auth-paper-2);
+}
+.admin-task-main {
+  min-width: 0;
+  display: grid;
+  gap: var(--space-3xs);
+}
+.admin-task-main strong,
+.admin-task-main span,
+.admin-task-main small { overflow-wrap: anywhere; }
+.admin-task-error { color: var(--color-error) !important; }
+.admin-task-actions { flex: 0 0 auto; }
+.admin-task-status {
+  min-height: var(--space-lg);
+  display: inline-grid;
+  place-items: center;
+  padding-inline: var(--space-xs);
+  color: var(--auth-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  border: 1px solid var(--auth-rule);
+}
+.admin-task-status[data-state="succeeded"] { color: var(--color-success); }
+.admin-task-status[data-state="failed"] { color: var(--color-error); }
 .admin-audit-list {
   min-width: 0;
   display: grid;
@@ -4013,6 +4072,9 @@ textarea:focus-visible,
   .admin-observability-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .admin-observability-grid { grid-template-columns: 1fr; }
   .admin-audit-event-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-task-panel-head,
+  .admin-task-row { flex-direction: column; align-items: flex-start; }
+  .admin-task-actions { width: 100%; justify-content: space-between; }
   .admin-account-workspace { grid-template-columns: 1fr; }
   .admin-account-directory { border-inline-end: 0; border-block-end: 1px solid var(--auth-rule); }
   .admin-account-list { max-block-size: min(20rem, 42svh); }

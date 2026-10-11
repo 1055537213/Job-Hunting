@@ -57,6 +57,16 @@ public class AccountAdministrationService {
     }
 
     @Transactional
+    public AccountResponse current(String sessionToken) {
+        // Resolution locks the account and renews the idle window in this transaction.
+        Long accountId = sessions.resolve(sessionToken);
+        if (accountId == null) {
+            throw new AuthException("SESSION_EXPIRED", "登录状态已过期，请重新登录。", HttpStatus.UNAUTHORIZED);
+        }
+        return new AccountResponse(accountById(accountId));
+    }
+
+    @Transactional
     public AccountResponse updateStatus(
             String sessionToken, long targetId, String nextStatus, String requestId) {
         if (!"active".equals(nextStatus) && !"disabled".equals(nextStatus)) {

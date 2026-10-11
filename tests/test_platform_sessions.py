@@ -54,6 +54,22 @@ def test_web_uses_java_for_all_session_operations_without_python_writes(tmp_path
                 return {"ok": True, "revoked_sessions": 2}
             return {"ok": True}
 
+        def account(self, operation, **data):
+            calls.append(("account", data))
+            assert operation == "me"
+            return {"account": {
+                "account_id": account.id,
+                "email": "java-authoritative@example.com",
+                "display_name": "Java authoritative profile",
+                "role": account.role,
+                "status": account.status,
+                "must_change_password": account.must_change_password,
+                "email_verified_at": account.email_verified_at,
+                "deleted_at": account.deleted_at,
+                "created_at": account.created_at,
+                "updated_at": account.updated_at,
+            }}
+
     app.state.backend.platform_auth_client = Java()
     def forbidden(*a, **k):
         pytest.fail("Hybrid authentication must not read/write Python sessions or password hashes")
@@ -66,21 +82,26 @@ def test_web_uses_java_for_all_session_operations_without_python_writes(tmp_path
         assert logged_in.status_code == 200
         assert "HttpOnly" in logged_in.headers["set-cookie"]
         before = len(calls)
-        assert client.get("/api/auth/me").json()["authenticated"] is True
-        assert [c[0] for c in calls[before:]] == ["resolve"]
+        auth_me = client.get("/api/auth/me").json()
+        assert auth_me["authenticated"] is True
+        assert auth_me["account"]["email"] == "java-authoritative@example.com"
+        assert [c[0] for c in calls[before:]] == ["account"]
         assert client.post("/api/account/password", json={"current_password": "password-123", "new_password": "new-password-123"}).status_code == 200
         assert "job_agent_session" not in client.cookies
         client.cookies.set("job_agent_session", "a" * 64)
         assert client.post("/api/auth/logout-all").json()["revoked_sessions"] == 2
         client.cookies.set("job_agent_session", "a" * 64)
         assert client.post("/api/auth/logout").status_code == 200
-    assert {c[0] for c in calls} == {"login", "resolve", "change-password", "logout", "logout-all"}
+    assert {c[0] for c in calls} == {"login", "account", "change-password", "logout", "logout-all"}
 
 
 def test_java_outage_is_not_reported_as_logged_out_or_fallback_auth(tmp_path, monkeypatch):
     app = create_web_app(env_file=tmp_path / "missing.env")
     class Java:
         def session(self, *a, **k):
+            raise PlatformAuthUnavailableError()
+
+        def account(self, *a, **k):
             raise PlatformAuthUnavailableError()
     app.state.backend.platform_auth_client = Java()
     def forbidden(*a, **k):

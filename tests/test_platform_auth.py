@@ -208,6 +208,36 @@ def test_platform_auth_client_validates_java_admin_account_projection(monkeypatc
     assert "password" not in str(calls[0])
 
 
+def test_platform_auth_client_reads_current_account_projection(monkeypatch):
+    account = {
+        "account_id": 42,
+        "email": "user@example.com",
+        "display_name": "User",
+        "role": "user",
+        "status": "active",
+        "must_change_password": False,
+        "email_verified_at": None,
+        "deleted_at": None,
+        "created_at": "2026-10-10T00:00:00Z",
+        "updated_at": "2026-10-10T00:00:00Z",
+    }
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url, *, headers, json=None, timeout):
+        calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        return httpx.Response(200, json={"account": account})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    client = PlatformAuthClient(
+        PlatformAuthSettings(True, "http://platform-service:8081", "secret", 5)
+    )
+
+    assert client.account("me", session_token="opaque", trace_id="trace-me")["account"] == account
+    assert calls[0]["url"].endswith("/internal/v1/auth/accounts/me")
+    assert calls[0]["json"] == {"session_token": "opaque"}
+
+
+
 def test_platform_auth_client_rejects_account_projection_with_password(monkeypatch):
     account = {
         "account_id": 42,
