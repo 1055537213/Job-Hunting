@@ -1,12 +1,12 @@
 # Job Hunting Platform Service
 
-这是求职助手的 Java 平台服务，当前实现账务垂直链路，以及账号注册、凭据校验、邮箱验证、邮箱变更、密码重置和会话管理内部接口。
+这是求职助手的 Java 平台服务，当前实现账务垂直链路，以及账号注册、凭据校验、邮箱验证、邮箱变更、密码重置和会话管理。混合网关把公开的浏览器认证路径直达 Java；其余页面/API 仍到 Python。
 
 运行基线为 Spring Boot 4.0、Spring Framework 7、Jackson 3、Tomcat 11 和 Java 21。
 依赖版本由 Maven 锁定，Tomcat/Jackson 的安全修复版本在 `pom.xml` 中显式覆盖；
 CI 会扫描传递依赖，不通过忽略漏洞绕过门禁。
 
-默认配置不会连接数据库，账务或认证模块必须显式设置 `PLATFORM_BILLING_ENABLED=true` 或 `PLATFORM_AUTH_ENABLED=true` 后才会启用 PostgreSQL。启用迁移模块后，Java 接管对应写入，Python 仍是网页入口并负责 SMTP/后台任务。本分支不接管现有生产流量。
+默认配置不会连接数据库，账务或认证模块必须显式设置 `PLATFORM_BILLING_ENABLED=true` 或 `PLATFORM_AUTH_ENABLED=true` 后才会启用 PostgreSQL。启用迁移模块后，Java 接管对应写入，Python 仍提供页面、其他 API 及 SMTP/后台任务。本分支尚未部署到现有生产服务器。
 
 Python 侧通过 `JOB_AGENT_JAVA_BILLING_ENABLED=true` 开启调用 Java 的扣费路径；这两个开关必须同时打开，并且两边使用同一个 PostgreSQL、内部 Token 和价格配置。开发环境可使用：
 
@@ -109,22 +109,20 @@ Session 原文只返回给 Python 设置 HttpOnly Cookie，数据库只存 SHA-2
 7 天，绝对有效期 30 天。解析时顺延闲置期限，但不超过绝对期限。
 单设备退出不影响其他设备；全部退出包含当前设备，管理员操作与审计同事务提交。
 修改密码校验当前密码，同时撤销所有设备并作废验证/重置链接，失败则整体回滚。
-Python 网页 API 保持不变；Java 模式不再通过 Python 创建、解析、续期或撤销用户登录会话。
-Java 提供登录、单设备退出、全部退出和修改密码的浏览器兼容控制器，尚未切换公网流量。
-Python Web 是唯一公网入口，统一执行限流、CSRF、请求观测和安全响应头，再通过内部服务 Token
-调用 Java。Java 负责认证事实源和业务事务；浏览器 Cookie 仍由 Python 适配层维护，避免纯 Python
-部署依赖 Java，也避免共存部署绕过边缘安全控制。`/api/auth/me` 及其他业务入口保持 Python
-兼容 URL，账号读取和认证业务由 Java 提供。
-因此可以逐步切换而不要求前端同时改造。
+Python 网页 API 的外部 URL 保持不变；混合网关将 `/api/auth/*` 与 `/api/account/password`
+直达 Java，其他页面/API 仍由 Python 提供。Java 浏览器控制器完成注册、登录、邮箱验证/变更、
+找回密码、当前账号/余额投影、退出和改密，并设置 Session/CSRF Cookie。Java 独立执行这些
+路径的安全过滤；Python 保留其余业务接口，经内部 Token 调用同一 Java 认证事实源。
+纯 Python 分支及关闭迁移开关的开发拓扑不依赖 Java；本分支尚未切换真实生产流量。
 
 ## Java Web 安全基础
 
 本地 Compose 和联合生产 Compose 均启用 `PLATFORM_WEB_SECURITY_ENABLED=true`，
-由 `WebSecurityFilter` 保护 Java `/api/*`。公网仍统一经过 Python；内部 `/internal/*`
+由 `WebSecurityFilter` 保护 Java `/api/*`。浏览器认证经网关直达 Java；内部 `/internal/*`
 继续使用服务 Token，不依赖浏览器 Cookie，邮件和账务任务不会被浏览器限流拦截。
 
 - 匿名白名单以外的接口必须通过真实 Java Session 校验，`/api/admin/*` 还要求管理员角色。
-  `GET /api/admin/security` 可查看非敏感的安全配置状态，仅允许管理员访问；当前经 Java 本地端口验收，尚未接入 Python 公网路由。
+  `GET /api/admin/security` 可查看非敏感的安全配置状态，仅允许管理员访问；管理 API 当前未被网关转发到 Java。
 - 请求先按直连 IP 限流，已登录账号再按账号限流。Redis TIME + 原子滑动窗口 Lua 保证副本共享窗口，
   429 返回 `Retry-After`；Redis/账号查询故障返回 503，不回退到本地认证或放行。
 - Redis 使用同步 Jedis 和有界连接池，连接/读写/池等待均为 1 秒。
@@ -145,14 +143,16 @@ Python Web 是唯一公网入口，统一执行限流、CSRF、请求观测和�
 Java+Python Compose 要求 `JOB_AGENT_PLATFORM_METRICS_TOKEN` 为独立的 32 位以上随机令牌，不能复用业务内部 Token。
 该令牌通过 `platform_metrics_token` Compose Secret 提供给 Java 和 Prometheus，不写入采集 YAML。
 `deploy/prometheus/prometheus.hybrid.yml` 增加 `job-hunting-platform` DNS target，保留 Python target；
-生产 Java 端口不映射到公网，当前 Caddy/Nginx 不代理该内部指标路径。
+生产 Java 端口不映射到公网，Caddy/Nginx 不代理该内部指标路径。
 Prometheus 中可查询 `up{job="job-hunting-platform"}`、`platform_web_requests_total` 和
-`platform_web_duration_seconds_bucket`。公网认证入口未切换前，Java 浏览器计数可以很低，内部认证流量还可查看框架的 `http_server_requests_seconds_count`。
+`platform_web_duration_seconds_bucket`。浏览器认证切换到混合网关后，Java 浏览器计数应随认证流量增长；内部认证流量还可查看框架的 `http_server_requests_seconds_count`。
 
 `scripts/validate_python_java_local.py` 会创建临时 Redis 容器和隔离 schema，实测 Java 登录、
 管理员权限、CSRF、429、请求 ID、Redis 停机/恢复和生产错误配置拒绝启动，并在结束时移除临时资源。`RedisRequestLimiterIntegrationTest`
 通过 Testcontainers 实测多副本并发窗口和恢复；Docker 验收也启用相同安全过滤器。
-验收同时检查可信代理下的独立客户端限流、伪造链拦截和指标令牌；Docker 验收会启动真实 Prometheus，确认 Java target 为 UP。
+验收同时检查可信代理下的独立客户端限流、伪造链拦截和指标令牌；Docker 验收经真实
+Caddy 网关完成 Java 注册/登录、Python 余额读取和改密后的跨服务会话撤销，并启动 Prometheus
+确认 Java target 为 UP。
 本地 Docker Hub 不可达时，Docker 验收脚本支持 `--java-jar platform-service/target/platform-service-0.1.0-SNAPSHOT.jar`，
 在已有 Java 21 运行镜像中挂载新打包产物；此选项不替代 CI 对正式 Dockerfile 的构建与安全扫描。
 管理员账号列表、当前账号读取、显示名称写入、启用/停用、账号注销准入/完成和首次管理员引导现由 Java 原子完成：服务端用真实 Session

@@ -13,7 +13,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 /** Browser-only validation contract; internal billing validation keeps its existing advice. */
 @Order(Ordered.HIGHEST_PRECEDENCE)
-@RestControllerAdvice(assignableTypes = PublicAuthController.class)
+@RestControllerAdvice(assignableTypes = {PublicAuthController.class, PublicAuthLifecycleController.class})
 public class PublicAuthErrorHandler {
     @ExceptionHandler(AuthException.class)
     public ResponseEntity<Map<String, Object>> auth(AuthException error, HttpServletRequest request) {

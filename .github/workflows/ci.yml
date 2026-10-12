@@ -190,9 +190,14 @@ jobs:
           docker compose --env-file .env.example \
             -f compose.yaml -f compose.platform.yaml config --quiet
           docker compose --env-file .env.example \
+            -f compose.yaml -f compose.platform.yaml --profile hybrid-local config --quiet
+          docker compose --env-file .env.example \
             -f compose.yaml -f compose.prod.yaml -f compose.hybrid.prod.yaml config --quiet
           docker compose --env-file .env.example \
             -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml -f compose.hybrid.prod.yaml config --quiet
+          docker compose --env-file .env.example \
+            -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml \
+            -f compose.hybrid.prod.yaml -f compose.hybrid.coexist.yaml config --quiet
 
       - name: Validate coexist Nginx HTTPS configuration
         env:
@@ -215,6 +220,20 @@ jobs:
             -v "$PWD/deploy/nginx/coexist-ip-https.conf.template:/etc/nginx/templates/default.conf.template:ro" \
             -v "$CERT_ROOT:/etc/letsencrypt:ro" \
             "$NGINX_IMAGE" nginx -t
+          docker run --rm \
+            --add-host web:127.0.0.1 --add-host platform-service:127.0.0.1 \
+            -e JOB_AGENT_PUBLIC_IP=203.0.113.10 \
+            -e NGINX_ENVSUBST_FILTER=JOB_AGENT_PUBLIC_IP \
+            -v "$PWD/deploy/nginx/coexist-hybrid-ip-https.conf.template:/etc/nginx/templates/default.conf.template:ro" \
+            -v "$CERT_ROOT:/etc/letsencrypt:ro" \
+            "$NGINX_IMAGE" nginx -t
+          docker run --rm \
+            -e JOB_AGENT_DOMAIN=agent.example.com -e JOB_AGENT_TLS_EMAIL=ops@example.com \
+            -v "$PWD/deploy/Caddyfile.hybrid:/etc/caddy/Caddyfile:ro" \
+            caddy:2.9.1-alpine caddy validate --config /etc/caddy/Caddyfile
+          docker run --rm \
+            -v "$PWD/deploy/Caddyfile.hybrid.local:/etc/caddy/Caddyfile:ro" \
+            caddy:2.9.1-alpine caddy validate --config /etc/caddy/Caddyfile
 
       - name: Validate Prometheus configuration and alert rules
         run: |

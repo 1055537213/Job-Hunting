@@ -151,7 +151,7 @@ public class PublicAuthController {
         return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
     }
 
-    private static String cookie(HttpServletRequest request, String name) {
+    static String cookie(HttpServletRequest request, String name) {
         if (request.getCookies() == null) return null;
         for (Cookie cookie : request.getCookies()) {
             if (name.equals(cookie.getName())) return cookie.getValue();
@@ -174,7 +174,7 @@ public class PublicAuthController {
         return value.substring(0, Math.min(maxLength, value.length()));
     }
 
-    private static Map<String, Object> publicAccount(AccountAdministrationService.AccountView account) {
+    static Map<String, Object> publicAccount(AccountAdministrationService.AccountView account) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("id", account.account_id());
         result.put("email", account.email());

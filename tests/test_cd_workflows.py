@@ -17,6 +17,8 @@ def _production_compose_config(*extra_files: str) -> dict:
         {
             "COMPOSE_PROFILES": "",
             "JOB_AGENT_ACCOUNT_ACTION_SECRET": "test-account-action-secret-that-is-long-enough",
+            "JOB_AGENT_TERMS_VERSION": "test-terms-v1",
+            "JOB_AGENT_PRIVACY_VERSION": "test-privacy-v1",
             "JOB_AGENT_ALERT_EMAIL_TO": "alerts@example.invalid",
             "JOB_AGENT_COEXIST_ALERTMANAGER_PORT": "19093",
             "JOB_AGENT_COEXIST_PROMETHEUS_PORT": "19090",
@@ -517,6 +519,34 @@ def test_hybrid_release_pair_and_production_compose_are_connected(monkeypatch):
     for required in ("compose.hybrid.prod.yaml", "ACTIVE_PLATFORM_IMAGE", "PREVIOUS_PLATFORM_IMAGE",
                      '"$PLATFORM_REVISION" == "$IMAGE_REVISION"', "current-platform-image"):
         assert required in script
+
+
+def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
+    standalone = _production_compose_config("compose.hybrid.prod.yaml")
+    assert any(volume["source"].endswith("Caddyfile.hybrid")
+               for volume in standalone["services"]["reverse-proxy"]["volumes"])
+    coexist = _production_compose_config("compose.coexist.yaml", "compose.hybrid.prod.yaml",
+                                         "compose.hybrid.coexist.yaml")
+    https = coexist["services"]["coexist-https"]
+    assert any(volume["source"].endswith("coexist-hybrid-ip-https.conf.template")
+               for volume in https["volumes"])
+    assert https["depends_on"]["platform-service"]["condition"] == "service_healthy"
+    assert https["ports"] == [{"mode": "ingress", "host_ip": "0.0.0.0", "target": 8443,
+                               "published": "8443", "protocol": "tcp"}]
+    for name in ("Caddyfile.hybrid", "Caddyfile.hybrid.local"):
+        edge = (ROOT / "deploy" / name).read_text(encoding="utf-8")
+        assert "@browser_auth path /api/auth/* /api/account/password" in edge
+        assert "reverse_proxy @browser_auth platform-service:8081" in edge
+        assert "respond @internal 404" in edge
+    nginx = (ROOT / "deploy/nginx/coexist-hybrid-ip-https.conf.template").read_text(encoding="utf-8")
+    assert "proxy_pass http://platform-service:8081" in nginx
+    assert "location ^~ /api/auth/" in nginx
+    assert "location = /api/account/password" in nginx
+    assert "location ^~ /internal/" in nginx
+    workflow = (ROOT / ".github/workflows/deploy-hybrid.yml").read_text(encoding="utf-8")
+    assert "compose.hybrid.coexist.yaml deploy scripts" in workflow
+    deploy = (ROOT / "scripts/deploy_production.sh").read_text(encoding="utf-8")
+    assert 'compose_arguments+=(-f "${ACTIVE_RELEASE_DIR}/compose.hybrid.coexist.yaml")' in deploy
 
 
 def test_production_operations_preserve_hybrid_configuration():

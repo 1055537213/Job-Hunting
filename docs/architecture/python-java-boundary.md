@@ -29,7 +29,7 @@
 - `billing-internal.openapi.yaml`：余额、消费、充值、退款内部契约。
 - Java 账务垂直链路：余额查询、模拟充值和模型调用扣费，默认关闭且未接入生产流量。
 - Python `RepositoryStore` 已支持通过 `JOB_AGENT_JAVA_BILLING_ENABLED` 切换到 Java 充值和扣费；充值幂等键沿用充值请求的 `idempotency_key`，模型调用使用 `call_id`。
-- 开关关闭时 Python 保持原有账务读写路径；开关打开后 Java 独占余额、充值订单、余额流水和支付事件的事实权，Python 只调用接口并读取已提交结果。当前已完成余额摘要的 Java 读路径迁移，外部 `/api/auth/me` 和 `/api/me/balance` 仍保持 Python URL 契约不变。
+- 开关关闭时 Python 保持原有账务读写路径；开关打开后 Java 独占余额、充值订单、余额流水和支付事件的事实权，Python 只调用接口并读取已提交结果。当前已完成余额摘要的 Java 读路径迁移，外部 `/api/auth/me` 和 `/api/me/balance` 的 URL 与响应契约保持不变。
 - CI 的 Python-Java contract check 会验证模拟充值、模型扣费、数据库流水和幂等重试。
 
 ## 第二阶段交付：凭据校验迁移
@@ -58,8 +58,8 @@ Java 模式不再派发任何旧 Python 账号邮件，旧队列消息也被跳�
 
 Java 接管登录、会话解析/续期、单设备退出、全部设备退出和修改密码。
 账号行锁统一串行化登录、修改密码和密码重置；登录校验与会话写入不再跨服务分两步。
-Session 原文不入库、不写日志，只用于 Python 网页设置 Cookie；保留闲置 7 天/绝对 30 天语义。
-Python 保留外部 API、Cookie/CSRF 和页面适配；账号展示读取通过 Java 的安全账号投影完成，一次 HTTP 请求内共享 Java 会话解析结果。
+Session 原文不入库、不写日志；迁移前由 Python 网页适配层设置 Cookie，当前直达 Java 的认证路径由 Java 设置；保留闲置 7 天/绝对 30 天语义。
+Python 保留未分流的外部 API、Cookie/CSRF 和页面适配；账号展示读取通过 Java 的安全账号投影完成，一次 HTTP 请求内共享 Java 会话解析结果。
 Java 故障一律失败关闭，不退回 Python Session 数据库路径。
 纯 Python 分支和关闭开关的兼容模式仍依赖 `auth.py` 与仓储方法，因此不能直接删除整个模块。
 已删除混合模式原有的“Java 校验、Python 签发”的中间流程。
@@ -79,13 +79,17 @@ Java 故障一律失败关闭，不退回 Python Session 数据库路径。
 ## 目标入口与发布规则
 
 最终由 Java 接管对外业务 API，Python 提供内部 AI/长任务能力，保持现有前端 URL/API 兼容。
-当前外部入口统一进入 Python Web。Python 负责 Redis 限流、CSRF、请求观测、安全响应头
-和稳定的浏览器错误契约，再通过内部服务 Token 调用 Java 认证事实源；登录、注册、邮箱验证、
-密码重置、会话和当前账号读取的业务写入/读取均由 Java 完成。这样纯 Python 部署不依赖
-`platform-service`，共存部署也不会因反向代理绕过边缘安全控制。
+混合部署的公网入口现在按路径分流：`/api/auth/*` 与 `/api/account/password` 由 Caddy 或
+共存 Nginx 直达 Java，其他页面与 API 仍进入 Python Web。Java 独立执行 Session、Redis
+限流、CSRF、安全响应头和请求观测；Python 通过内部 Token 调用 Java 认证事实源处理尚未
+迁移的账号 API。两端共享 Java Session 和同一个 PostgreSQL，但只有 Java 写认证事实。
+纯 Python 分支的入口和代码不受这个混合路由影响。网关拒绝公网 `/internal/*`。
 
-本地使用 `compose.yaml + compose.platform.yaml`；生产加载 `compose.yaml`、`compose.prod.yaml`
-和 `compose.hybrid.prod.yaml`，共享 Java 服务配置；共存部署另加 `compose.coexist.yaml`。
+本地使用 `compose.yaml + compose.platform.yaml`，可通过 `hybrid-local` profile 在
+`127.0.0.1:18082` 验收同一分流；生产加载 `compose.yaml`、`compose.prod.yaml` 和
+`compose.hybrid.prod.yaml`；共存部署另加 `compose.coexist.yaml` 与
+`compose.hybrid.coexist.yaml`。运行环境需将 `PLATFORM_TRUSTED_PROXY_CIDRS` 限定为
+实际受控网关的地址段，避免所有访客共享一个 Java IP 限流桶。
 CI 通过后发布相同提交的 `-ai` 和 `-platform` 两个版本镜像，审批部署通过 `Deploy Python Java`
 工作流执行；生产只填环境配置，不需要修改代码/Compose。此分支不自动部署服务器。
 
@@ -100,8 +104,9 @@ Java `/api/*` 已增加真实 Session/RBAC、Redis 原子滑动窗口限流、CS
 Compose 本地/联合生产都启用安全过滤器，生产关闭安全开关、CSRF、Secure Cookie 或缺少 Redis
 密码/强内部 Token 时拒绝启动。Redis 不可用拒绝请求，不用进程内计数替代。
 
-这一阶段没有把公网流量切给 Java：Caddy/Nginx 仍只进入 Python，内部服务调用继续使用 Token，
-与浏览器安全过滤器分开。Java 默认不信任转发头；显式配置的代理 IP/CIDR 才能提供有界、
+原安全入口准备阶段没有切换公网流量；当前混合网关已将浏览器认证路由切到 Java，
+内部服务调用仍使用 Token，与浏览器安全过滤器分开。Java 默认不信任转发头；显式配置的代理 IP/CIDR 才能提供有界、
 从右向左校验的来源链，解析后的同一个 IP 用于限流和设备记录。不会信任客户端自报的协议或全网代理范围。
 Java 指标已通过独立 Compose Secret 供 Prometheus 抓取，公网反向代理不开放 `/internal/metrics`。
-下一阶段继续迁移剩余浏览器认证契约并验收切换路由，不得直接放开生产 Java 端口。
+本地 Docker 已验收网关登录、Java `/api/auth/me`、Python 余额接口和改密后跨服务会话失效；
+仍不得直接开放生产 Java 端口，本分支尚未部署到服务器。

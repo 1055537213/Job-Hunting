@@ -25,6 +25,66 @@ from validate_python_java_local import (
 )
 
 
+def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str) -> None:
+    """Verify that the same browser session crosses the Java/Python proxy boundary."""
+    from urllib.parse import parse_qs, urlsplit
+
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+    from job_hunting_agent.platform_email import deliver_platform_verification
+
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
+    email = f"gateway-{os.urandom(12).hex()}@example.com"
+    password = "gateway-password-123"
+
+    class RecordingSender:
+        url = ""
+
+        def send_verification(self, recipient, url):
+            assert recipient == email
+            self.url = url
+
+    with httpx.Client(base_url=gateway_url, timeout=10) as browser:
+        assert browser.get("/internal/metrics").status_code == 404
+        assert browser.get("/api/health").json()["status"] == "ok"
+        config_response = browser.get("/api/auth/config")
+        assert config_response.status_code == 200, config_response.text[:500]
+        config = config_response.json()
+        assert config["email_verification_required"] is True
+        assert browser.get("/api/auth/me").json()["authenticated"] is False
+        registered = browser.post("/api/auth/register", json={
+            "email": email, "password": password, "display_name": "Gateway acceptance",
+        })
+        assert registered.status_code == 200, registered.text[:300]
+        assert registered.json()["verification_required"] is True
+        assert browser.post("/api/auth/login", json={"email": email, "password": password}).status_code == 403
+        pending = auth.email_verification("due")["records"]
+        assert len(pending) == 1
+        sender = RecordingSender()
+        assert deliver_platform_verification(auth, sender, pending[0]["id"])["accepted"]
+        token = parse_qs(urlsplit(sender.url).query)["verify_email_token"][0]
+        confirmed = browser.post("/api/auth/verify-email", json={"token": token})
+        assert confirmed.status_code == 200, confirmed.text[:300]
+        login = browser.post("/api/auth/login", json={"email": email, "password": password})
+        assert login.status_code == 200, login.text[:300]
+        assert "job_agent_session" in browser.cookies
+        java_me = browser.get("/api/auth/me")
+        assert java_me.status_code == 200 and java_me.json()["authenticated"]
+        assert java_me.json()["billing"]["balance_micro_yuan"] == 0
+        python_balance = browser.get("/api/me/balance")
+        assert python_balance.status_code == 200, python_balance.text[:300]
+        assert python_balance.json()["summary"]["account_id"] == registered.json()["account"]["id"]
+        old_cookies = dict(browser.cookies)
+        changed = browser.post("/api/account/password", json={
+            "current_password": password, "new_password": "gateway-new-password-456",
+        }, headers={"X-CSRF-Token": login.json()["csrf_token"]})
+        assert changed.status_code == 200, changed.text[:300]
+        with httpx.Client(base_url=web_url, cookies=old_cookies) as old_session:
+            assert old_session.get("/api/auth/me").json()["authenticated"] is False
+        assert browser.get("/api/auth/me").json()["authenticated"] is False
+        print("==> Java browser auth gateway -> Python account route -> password revocation: PASS")
+
+
 def docker(*args: str) -> str:
     result = subprocess.run(
         ["docker", *args], capture_output=True, text=True, check=False
@@ -59,6 +119,7 @@ def main() -> None:
         raise ValueError("Invalid acceptance port")
     assert_port_available(args.port)
     assert_port_available(args.port + 1)
+    assert_port_available(args.port + 2)
     for image in (args.java_image, args.ai_image):
         docker("image", "inspect", image)
     jar_mount = []
@@ -71,6 +132,7 @@ def main() -> None:
     schema = f"job_agent_java_local_{suffix}"
     prefix = f"job-agent-hybrid-test-{suffix}"
     java, web = f"{prefix}-java", f"{prefix}-web"
+    gateway = f"{prefix}-gateway"
     prometheus = f"{prefix}-prometheus"
     redis_name = f"{prefix}-redis"
     redis_password = os.urandom(24).hex()
@@ -186,6 +248,7 @@ def main() -> None:
             "--name",
             web,
             *common,
+            "--network-alias", "web",
             "-p",
             f"127.0.0.1:{args.port + 1}:8000",
             *env_args,
@@ -198,6 +261,15 @@ def main() -> None:
             base_url=f"http://127.0.0.1:{args.port}",
             internal_token=token,
         )
+        root = Path(__file__).resolve().parents[1]
+        docker("run", "-d", "--name", gateway, "--network", prefix,
+               "-p", f"127.0.0.1:{args.port + 2}:8080",
+               "--mount", f"type=bind,source={root / 'deploy/Caddyfile.hybrid.local'},target=/etc/caddy/Caddyfile,readonly",
+               "caddy:2.9.1-alpine")
+        wait(f"http://127.0.0.1:{args.port + 2}/api/health")
+        run_browser_gateway_flow(f"http://127.0.0.1:{args.port + 2}",
+                                 f"http://127.0.0.1:{args.port + 1}",
+                                 f"http://127.0.0.1:{args.port}", token)
         run_java_security_flow(f"http://127.0.0.1:{args.port}", token, admin_credentials, redis_name)
         run_java_ingress_flow(f"http://127.0.0.1:{args.port}", metrics_token, token)
         with tempfile.TemporaryDirectory(prefix="job-agent-prometheus-") as scratch:
@@ -228,7 +300,7 @@ def main() -> None:
                 docker("rm", "-f", prometheus)
         print("Docker Python-Java account and billing acceptance: PASS")
     finally:
-        for name in (prometheus, web, java, redis_name):
+        for name in (prometheus, gateway, web, java, redis_name):
             subprocess.run(
                 ["docker", "rm", "-f", name], capture_output=True, check=False
             )

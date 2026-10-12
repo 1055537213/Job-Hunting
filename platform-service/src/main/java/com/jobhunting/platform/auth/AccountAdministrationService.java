@@ -244,7 +244,7 @@ public class AccountAdministrationService {
         return rows.isEmpty() ? null : rows.getFirst();
     }
 
-    private AccountView accountById(long id) {
+    AccountView accountById(long id) {
         return jdbc.queryForObject("""
                 SELECT id, email, display_name, role, status, must_change_password,
                        email_verified_at, deleted_at, created_at, updated_at

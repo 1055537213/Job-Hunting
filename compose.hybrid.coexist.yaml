@@ -1,0 +1,16 @@
+# Load after compose.coexist.yaml and compose.hybrid.prod.yaml.
+services:
+  coexist-https:
+    volumes: !override
+      - ./deploy/nginx/coexist-hybrid-ip-https.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - type: bind
+        source: "${JOB_AGENT_LETSENCRYPT_DIR:-/etc/letsencrypt}/live/${JOB_AGENT_PUBLIC_IP}"
+        target: "/etc/letsencrypt/live/${JOB_AGENT_PUBLIC_IP}"
+        read_only: true
+      - type: bind
+        source: "${JOB_AGENT_LETSENCRYPT_DIR:-/etc/letsencrypt}/archive/${JOB_AGENT_PUBLIC_IP}"
+        target: "/etc/letsencrypt/archive/${JOB_AGENT_PUBLIC_IP}"
+        read_only: true
+    depends_on:
+      platform-service:
+        condition: service_healthy

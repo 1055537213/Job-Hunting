@@ -32,6 +32,9 @@ if [[ -n "$PLATFORM_IMAGE" ]]; then
   [[ "$PLATFORM_IMAGE" =~ ^ghcr\.io/[a-z0-9._/-]+-platform:sha-[0-9a-f]{12}$ ]]
   [[ "${PLATFORM_IMAGE##*:}" == "${ACTIVE_IMAGE##*:}" ]]
   COMPOSE_FILES+=(-f "${CURRENT_DIR}/compose.hybrid.prod.yaml")
+  if [[ -f "${CURRENT_DIR}/compose.hybrid.coexist.yaml" ]]; then
+    COMPOSE_FILES+=(-f "${CURRENT_DIR}/compose.hybrid.coexist.yaml")
+  fi
 fi
 
 compose_current() {

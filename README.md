@@ -12,9 +12,9 @@
 
 这是一个 Python + Java 的企业化演进项目：
 
-- Python 负责 FastAPI 外部 Web API、Agent、RAG、文件分析、简历生成和异步 AI 任务。
+- Python 负责其余 FastAPI Web API、Agent、RAG、文件分析、简历生成和异步 AI 任务。
 - Java Spring Boot 平台服务分阶段接管账号、Session、权限和账务等平台能力。
-- 前端仍由 Python Web 提供，外部 URL 和接口保持兼容，迁移通过环境开关控制。
+- 前端仍由 Python Web 提供；混合网关将浏览器认证路径分流给 Java，外部 URL 保持不变。
 - master 保留纯 Python 版本；java-platform-migration 是独立的 Python+Java 版本。
 
 ### 解决的问题
@@ -87,7 +87,7 @@
 ### 运维与可观测性
 
 - Prometheus 请求指标和 Web 不可用、5xx、慢响应、安全拦截、高并发告警规则。
-- Java 支持显式可信代理、独立监控令牌和 Prometheus DNS 抓取；公网入口仍保持 Python，不开放 Java 内部指标路径。
+- Java 支持显式可信代理、独立监控令牌和 Prometheus DNS 抓取；混合网关仅转发公开认证路径，不开放 Java 内部指标路径。
 - Alertmanager、SMTP、Loki、Alloy、Tempo、OpenTelemetry 和 Grafana 配置。
 - PostgreSQL/对象存储备份、恢复演练、Worker 恢复和 ClamAV 上传扫描验收脚本。
 
@@ -114,7 +114,7 @@
 - ClamAV：上传文件病毒扫描。
 - Prometheus/Alertmanager/Grafana/Loki/Tempo：指标、告警、日志、Trace 和可视化。
 - Docker Compose：开发、生产、混合、共存、恢复和验收拓扑。
-- Caddy 或共存 Nginx：HTTPS 入口；公网请求统一先进入 Python 安全边缘，再调用 Java 平台服务。
+- Caddy 或共存 Nginx：HTTPS 入口；浏览器认证到 Java，其余页面/API 到 Python。
 
 ### 质量与安全
 
@@ -225,7 +225,12 @@ docker compose -f compose.yaml -f compose.platform.yaml ps
 .\scripts\validate_python_java_local.ps1
 ~~~
 
-联调脚本使用随机 PostgreSQL schema，验证注册、邮箱验证、登录、密码重置、Session 撤销、管理员账号操作、演示充值和扣费，结束后删除临时 schema，不清理现有用户数据。当前 Java+Python 分支只做本地联调，不自动部署服务器。
+默认页面位于 http://127.0.0.1:8000 。要在本地验收与生产一致的浏览器分流，
+将 `.env` 的 `JOB_AGENT_BROWSER_BASE_URL` 设为 `http://localhost:18082`，再运行
+`docker compose -f compose.yaml -f compose.platform.yaml --profile hybrid-local up -d --build`，
+从 http://127.0.0.1:18082/login 进入。联调脚本使用随机 PostgreSQL schema，验证注册、
+邮箱验证、登录、密码重置、Session 撤销、管理员账号操作、演示充值和扣费，结束后
+删除临时 schema，不清理现有用户数据。当前 Java+Python 分支不自动部署服务器。
 
 ### 本地质量检查
 
@@ -243,6 +248,7 @@ Compose 配置检查（以下均为占位测试值，不用于生产部署）：
 ~~~powershell
 $env:JOB_AGENT_REDIS_PASSWORD = 'ci-redis-password'
 $env:JOB_AGENT_PLATFORM_INTERNAL_TOKEN = 'ci-platform-shared-internal-token'
+$env:JOB_AGENT_PLATFORM_METRICS_TOKEN = 'ci-independent-platform-metrics-token'
 $env:JOB_AGENT_POSTGRES_PASSWORD = 'ci-postgres-password'
 $env:JOB_AGENT_RUNTIME_ENV_FILE = '.env.example'
 $env:JOB_AGENT_IMAGE = 'ghcr.io/example/job-hunting-ai:sha-0123456789ab'
@@ -256,6 +262,7 @@ $env:JOB_AGENT_GRAFANA_ADMIN_PASSWORD = 'ci-grafana-password'
 docker compose --env-file .env.example -f compose.yaml config --quiet
 docker compose --env-file .env.example -f compose.yaml -f compose.platform.yaml config --quiet
 docker compose --env-file .env.example -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml -f compose.hybrid.prod.yaml config --quiet
+docker compose --env-file .env.example -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml -f compose.hybrid.prod.yaml -f compose.hybrid.coexist.yaml config --quiet
 ~~~
 
 ### CI/CD
@@ -267,7 +274,9 @@ ghcr.io/1055537213/job-hunting-ai:sha-<提交前12位>
 ghcr.io/1055537213/job-hunting-platform:sha-<提交前12位>
 ~~~
 
-本分支当前以本地验收为主；未来部署使用完整提交 SHA、人工批准和 compose.hybrid.prod.yaml。服务器仍需预先准备生产环境变量、证书和部署权限，但无需临时修改应用代码。操作步骤见 [Python + Java 部署指南](docs/learning/python-java-deployment.md)。
+本分支当前以本地验收为主；未来部署使用完整提交 SHA、人工批准和 `compose.hybrid.prod.yaml`
+（共存时再加 `compose.hybrid.coexist.yaml`）。服务器仍需预先准备生产环境变量、证书和部署权限，
+但无需临时修改应用代码。操作步骤见 [Python + Java 部署指南](docs/learning/python-java-deployment.md)。
 
 ## 8. 接口文档
 
@@ -308,7 +317,7 @@ AI、RAG、OCR 和多模态文件处理仍然依赖 Python 生态；Java 更适�
 
 ### Java 服务是否已经替代 Python 全部代码？
 
-没有。当前已迁移账号注册、Session、邮箱验证、邮箱变更、密码重置、管理员账号操作、当前账号资料读取、显示名称写入，以及可选账务事实源。Python 仍保留外部 Web 安全入口和兼容适配层，Agent、RAG、文件分析、简历生成、Worker 等业务也仍由 Python 负责。
+没有。当前已迁移账号注册、Session、邮箱验证、邮箱变更、密码重置、管理员账号操作、当前账号资料读取、显示名称写入，以及可选账务事实源。浏览器认证经网关直达 Java；Python 仍处理其余 Web API、兼容适配、Agent、RAG、文件分析、简历生成和 Worker。
 
 ### Java 服务不可用时会不会偷偷回退到 Python？
 
@@ -338,8 +347,8 @@ AI、RAG、OCR 和多模态文件处理仍然依赖 Python 生态；Java 更适�
 
 - [x] 建立 Python + Java 本地联调、内部契约、CI 和独立分支发布流程。
 - [x] 迁移 Java 注册、Session、邮箱验证、邮箱变更、密码重置、管理员账号操作、当前账号资料读取、显示名称写入和账号注销闭环。
-- [x] 由 Python 统一承接公网认证入口，并将认证事实源转交 Java，保留浏览器 API 和安全策略兼容性。
-- [x] 补齐 Java Web 的 Session/管理员权限、Redis 分布式限流、CSRF、安全响应头、请求 ID 和低基数指标；生产弱配置拒绝启动，公网暂不切换。
+- [x] 将浏览器认证公开路径由混合网关分流到 Java，其余页面/API 仍由 Python 提供。
+- [x] 补齐 Java Web 的 Session/管理员权限、Redis 分布式限流、CSRF、安全响应头、请求 ID 和低基数指标；生产弱配置拒绝启动。
 - [x] 接入 Java 余额查询、演示充值和模型调用扣费的可选路径。
 - [x] 接入邮箱变更验证流程；显示名称写入已由 Java 统一负责。
 - [ ] 接入真实支付、签名 Webhook、退款状态机和渠道对账。

@@ -100,6 +100,9 @@ compose_active() {
   fi
   if [[ -n "$ACTIVE_PLATFORM_IMAGE" ]]; then
     compose_arguments+=(-f "${ACTIVE_RELEASE_DIR}/compose.hybrid.prod.yaml")
+    if [[ "$ACTIVE_TOPOLOGY" == "coexist" && -f "${ACTIVE_RELEASE_DIR}/compose.hybrid.coexist.yaml" ]]; then
+      compose_arguments+=(-f "${ACTIVE_RELEASE_DIR}/compose.hybrid.coexist.yaml")
+    fi
   fi
   COMPOSE_PROFILES="" \
     JOB_AGENT_IMAGE="$ACTIVE_IMAGE" \
@@ -431,6 +434,11 @@ IMAGE_REVISION="$(docker image inspect "$IMAGE_REF" --format '{{ index .Config.L
 if [[ -n "$PLATFORM_IMAGE" ]]; then
   [[ -f "${RELEASE_DIR}/compose.hybrid.prod.yaml" && -f "${RELEASE_DIR}/compose.platform.yaml" ]]
   [[ -f "${RELEASE_DIR}/deploy/prometheus/prometheus.hybrid.yml" ]]
+  [[ -f "${RELEASE_DIR}/deploy/Caddyfile.hybrid" ]]
+  if [[ "$DEPLOY_TOPOLOGY" == "coexist" ]]; then
+    [[ -f "${RELEASE_DIR}/compose.hybrid.coexist.yaml" ]]
+    [[ -f "${RELEASE_DIR}/deploy/nginx/coexist-hybrid-ip-https.conf.template" ]]
+  fi
   docker image inspect "$PLATFORM_IMAGE" >/dev/null
   PLATFORM_REVISION="$(docker image inspect "$PLATFORM_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
   [[ "$PLATFORM_REVISION" == "$IMAGE_REVISION" ]]

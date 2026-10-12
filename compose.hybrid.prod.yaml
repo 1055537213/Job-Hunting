@@ -15,6 +15,10 @@ services:
       PLATFORM_WEB_SECURITY_ENABLED: "true"
       JOB_AGENT_ACCOUNT_ACTION_SECRET: "${JOB_AGENT_ACCOUNT_ACTION_SECRET:?set JOB_AGENT_ACCOUNT_ACTION_SECRET}"
       JOB_AGENT_PUBLIC_BASE_URL: "${JOB_AGENT_PUBLIC_BASE_URL:?set JOB_AGENT_PUBLIC_BASE_URL}"
+      JOB_AGENT_REGISTRATION_ENABLED: "${JOB_AGENT_REGISTRATION_ENABLED:-true}"
+      JOB_AGENT_CONSENT_REQUIRED: "${JOB_AGENT_CONSENT_REQUIRED:-true}"
+      JOB_AGENT_TERMS_VERSION: "${JOB_AGENT_TERMS_VERSION:?set JOB_AGENT_TERMS_VERSION}"
+      JOB_AGENT_PRIVACY_VERSION: "${JOB_AGENT_PRIVACY_VERSION:?set JOB_AGENT_PRIVACY_VERSION}"
       JOB_AGENT_EMAIL_VERIFICATION_REQUIRED: "${JOB_AGENT_EMAIL_VERIFICATION_REQUIRED:-true}"
       JOB_AGENT_COOKIE_SECURE: "${JOB_AGENT_COOKIE_SECURE:-true}"
       JOB_AGENT_CSRF_ENABLED: "${JOB_AGENT_CSRF_ENABLED:-true}"
@@ -47,6 +51,10 @@ services:
         condition: service_healthy
 
   reverse-proxy:
+    volumes: !override
+      - ./deploy/Caddyfile.hybrid:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
     depends_on:
       platform-service:
         condition: service_healthy

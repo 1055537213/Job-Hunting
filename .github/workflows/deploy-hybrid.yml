@@ -91,7 +91,7 @@ jobs:
           done
           remote="/tmp/job-agent-hybrid-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
           tar -czf "$RUNNER_TEMP/hybrid.tar.gz" compose.yaml compose.prod.yaml compose.coexist.yaml \
-            compose.platform.yaml compose.hybrid.prod.yaml deploy scripts
+            compose.platform.yaml compose.hybrid.prod.yaml compose.hybrid.coexist.yaml deploy scripts
           SSH=(-i "$HOME/.ssh/deploy_key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=12)
           scp "${SSH[@]}" -P "${PORT:-22}" "$RUNNER_TEMP/hybrid.tar.gz" "$USER@$HOST:$remote"
           ssh "${SSH[@]}" -p "${PORT:-22}" "$USER@$HOST" \

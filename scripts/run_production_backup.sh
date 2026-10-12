@@ -85,6 +85,9 @@ if [[ -n "$PLATFORM_IMAGE" ]]; then
   [[ "$PLATFORM_IMAGE" =~ ^ghcr\.io/[a-z0-9._/-]+-platform:sha-[0-9a-f]{12}$ ]]
   [[ "${PLATFORM_IMAGE##*:}" == "${IMAGE_REF##*:}" ]]
   COMPOSE_FILES+=( -f "${RELEASE_DIR}/compose.hybrid.prod.yaml" )
+  if [[ "$TOPOLOGY" == "coexist" && -f "${RELEASE_DIR}/compose.hybrid.coexist.yaml" ]]; then
+    COMPOSE_FILES+=( -f "${RELEASE_DIR}/compose.hybrid.coexist.yaml" )
+  fi
 fi
 
 compose_production() {

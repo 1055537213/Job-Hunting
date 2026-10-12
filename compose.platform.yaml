@@ -30,7 +30,11 @@ services:
       JOB_AGENT_RATE_LIMIT_DEFAULT_REQUESTS: "${JOB_AGENT_RATE_LIMIT_DEFAULT_REQUESTS:-240}"
       PLATFORM_INTERNAL_TOKEN: "${JOB_AGENT_PLATFORM_INTERNAL_TOKEN:?set JOB_AGENT_PLATFORM_INTERNAL_TOKEN}"
       JOB_AGENT_ACCOUNT_ACTION_SECRET: "${JOB_AGENT_ACCOUNT_ACTION_SECRET:-development-only-account-action-secret}"
-      JOB_AGENT_PUBLIC_BASE_URL: "${JOB_AGENT_PUBLIC_BASE_URL:-http://localhost:8000}"
+      JOB_AGENT_PUBLIC_BASE_URL: "${JOB_AGENT_BROWSER_BASE_URL:-http://localhost:8000}"
+      JOB_AGENT_REGISTRATION_ENABLED: "${JOB_AGENT_REGISTRATION_ENABLED:-true}"
+      JOB_AGENT_CONSENT_REQUIRED: "${JOB_AGENT_CONSENT_REQUIRED:-false}"
+      JOB_AGENT_TERMS_VERSION: "${JOB_AGENT_TERMS_VERSION:-development}"
+      JOB_AGENT_PRIVACY_VERSION: "${JOB_AGENT_PRIVACY_VERSION:-development}"
       JOB_AGENT_EMAIL_VERIFICATION_REQUIRED: "${JOB_AGENT_EMAIL_VERIFICATION_REQUIRED:-false}"
       JOB_AGENT_COOKIE_SECURE: "${JOB_AGENT_COOKIE_SECURE:-false}"
       JOB_AGENT_CSRF_ENABLED: "${JOB_AGENT_CSRF_ENABLED:-true}"
@@ -61,6 +65,18 @@ services:
     secrets:
       - platform_metrics_token
     depends_on:
+      platform-service:
+        condition: service_healthy
+  auth-gateway:
+    profiles: ["hybrid-local"]
+    image: caddy:2.9.1-alpine
+    ports:
+      - "127.0.0.1:${JOB_AGENT_BROWSER_GATEWAY_PORT:-18082}:8080"
+    volumes:
+      - ./deploy/Caddyfile.hybrid.local:/etc/caddy/Caddyfile:ro
+    depends_on:
+      web:
+        condition: service_healthy
       platform-service:
         condition: service_healthy
   web:
