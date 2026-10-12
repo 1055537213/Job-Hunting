@@ -430,6 +430,7 @@ IMAGE_REVISION="$(docker image inspect "$IMAGE_REF" --format '{{ index .Config.L
 [[ "sha-${IMAGE_REVISION:0:12}" == "$RELEASE_ID" ]]
 if [[ -n "$PLATFORM_IMAGE" ]]; then
   [[ -f "${RELEASE_DIR}/compose.hybrid.prod.yaml" && -f "${RELEASE_DIR}/compose.platform.yaml" ]]
+  [[ -f "${RELEASE_DIR}/deploy/prometheus/prometheus.hybrid.yml" ]]
   docker image inspect "$PLATFORM_IMAGE" >/dev/null
   PLATFORM_REVISION="$(docker image inspect "$PLATFORM_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
   [[ "$PLATFORM_REVISION" == "$IMAGE_REVISION" ]]

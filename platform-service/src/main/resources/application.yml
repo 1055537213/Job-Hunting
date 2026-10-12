@@ -29,6 +29,7 @@ spring:
         enabled: false
 
 server:
+  forward-headers-strategy: none
   port: ${SERVER_PORT:8081}
   shutdown: graceful
   tomcat:
@@ -38,6 +39,12 @@ app:
   version: ${APP_VERSION:0.1.0}
 
 platform:
+  ingress:
+    trusted-proxy-cidrs: ${PLATFORM_TRUSTED_PROXY_CIDRS:}
+  metrics:
+    enabled: ${PLATFORM_METRICS_ENABLED:false}
+    token: ${PLATFORM_METRICS_TOKEN:}
+    token-file: ${PLATFORM_METRICS_TOKEN_FILE:}
   internal-token: ${PLATFORM_INTERNAL_TOKEN:}
   auth:
     enabled: ${PLATFORM_AUTH_ENABLED:false}
@@ -71,6 +78,10 @@ platform:
     low-balance-threshold-micro-yuan: ${PLATFORM_LOW_BALANCE_THRESHOLD_MICRO_YUAN:10000000}
 
 management:
+  metrics:
+    distribution:
+      percentiles-histogram:
+        platform.web.duration: true
   health:
     redis:
       enabled: ${PLATFORM_WEB_SECURITY_ENABLED:false}

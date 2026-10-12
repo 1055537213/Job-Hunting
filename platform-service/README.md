@@ -134,12 +134,25 @@ Python Web 是唯一公网入口，统一执行限流、CSRF、请求观测和�
   生产要求 HTTPS 公网地址、Secure Cookie、CSRF、Redis 密码和至少 32 字符的内部 Token，否则拒绝启动。
 - 规范化 `X-Request-ID` / `X-Trace-Id`，日志不写请求正文、密码、Cookie 或账号标识；
   Micrometer 记录 `platform.web.requests` 和 `platform.web.duration`，标签仅用请求组/状态族/结果。
-  当前不额外公开指标接口，公网切换前再接入 Java 指标抓取。
-- 不信任客户端的 `X-Forwarded-For`，切换公网前必须补齐可信代理策略，否则 Java 会把代理 IP 作为来源。
+  `/internal/metrics` 使用独立 Bearer 令牌供 Prometheus 抓取，Actuator 不公开 Prometheus 端点。
+- `PLATFORM_TRUSTED_PROXY_CIDRS` 默认留空，不信任任何转发头。仅当直连对端属于已配置 IP/CIDR 时，
+  才从右向左检查 `X-Forwarded-For`，取首个不可信跳点作为来源；同一地址也用于 Java 登录设备记录。
+  IPv4/IPv6 规范化后用于限流，禁止主机名、端口、重复头、超过 16 跳的链和全网信任网段。
+  不使用 `Forwarded` 或 `X-Forwarded-Proto` 决定认证/HTTPS，Tomcat 自动转发处理明确关闭。
+
+### Prometheus 抓取
+
+Java+Python Compose 要求 `JOB_AGENT_PLATFORM_METRICS_TOKEN` 为独立的 32 位以上随机令牌，不能复用业务内部 Token。
+该令牌通过 `platform_metrics_token` Compose Secret 提供给 Java 和 Prometheus，不写入采集 YAML。
+`deploy/prometheus/prometheus.hybrid.yml` 增加 `job-hunting-platform` DNS target，保留 Python target；
+生产 Java 端口不映射到公网，当前 Caddy/Nginx 不代理该内部指标路径。
+Prometheus 中可查询 `up{job="job-hunting-platform"}`、`platform_web_requests_total` 和
+`platform_web_duration_seconds_bucket`。公网认证入口未切换前，Java 浏览器计数可以很低，内部认证流量还可查看框架的 `http_server_requests_seconds_count`。
 
 `scripts/validate_python_java_local.py` 会创建临时 Redis 容器和隔离 schema，实测 Java 登录、
 管理员权限、CSRF、429、请求 ID、Redis 停机/恢复和生产错误配置拒绝启动，并在结束时移除临时资源。`RedisRequestLimiterIntegrationTest`
 通过 Testcontainers 实测多副本并发窗口和恢复；Docker 验收也启用相同安全过滤器。
+验收同时检查可信代理下的独立客户端限流、伪造链拦截和指标令牌；Docker 验收会启动真实 Prometheus，确认 Java target 为 UP。
 本地 Docker Hub 不可达时，Docker 验收脚本支持 `--java-jar platform-service/target/platform-service-0.1.0-SNAPSHOT.jar`，
 在已有 Java 21 运行镜像中挂载新打包产物；此选项不替代 CI 对正式 Dockerfile 的构建与安全扫描。
 管理员账号列表、当前账号读取、显示名称写入、启用/停用、账号注销准入/完成和首次管理员引导现由 Java 原子完成：服务端用真实 Session

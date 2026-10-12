@@ -50,3 +50,11 @@ services:
     depends_on:
       platform-service:
         condition: service_healthy
+  prometheus:
+    extends:
+      file: compose.platform.yaml
+      service: prometheus
+
+secrets:
+  platform_metrics_token:
+    environment: JOB_AGENT_PLATFORM_METRICS_TOKEN

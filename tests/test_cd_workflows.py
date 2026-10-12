@@ -27,6 +27,7 @@ def _production_compose_config(*extra_files: str) -> dict:
             "JOB_AGENT_IMAGE": "ghcr.io/example/job-agent:sha-0123456789ab",
             "JOB_AGENT_PLATFORM_IMAGE": "ghcr.io/example/job-platform:sha-0123456789ab",
             "JOB_AGENT_PLATFORM_INTERNAL_TOKEN": "test-platform-secret",
+            "JOB_AGENT_PLATFORM_METRICS_TOKEN": "test-independent-metrics-secret-at-least-32",
             "JOB_AGENT_DOMAIN": "agent.example.invalid",
             "JOB_AGENT_OBJECT_STORAGE_ACCESS_KEY": "test-access-key",
             "JOB_AGENT_OBJECT_STORAGE_SECRET_KEY": "test-secret-key",
@@ -486,6 +487,13 @@ def test_hybrid_release_pair_and_production_compose_are_connected(monkeypatch):
         assert java["environment"]["PLATFORM_REDIS_HOST"] == "redis"
         assert java["environment"]["PLATFORM_REDIS_PASSWORD"]
         assert java["environment"]["PLATFORM_RATE_LIMIT_KEY_PREFIX"] == "job_agent:ci_platform_limit"
+        assert java["environment"]["PLATFORM_METRICS_ENABLED"] == "true"
+        assert java["environment"]["PLATFORM_METRICS_TOKEN_FILE"] == "/run/secrets/platform_metrics_token"
+        assert "PLATFORM_METRICS_TOKEN" not in java["environment"]
+        assert java["secrets"][0]["source"] == "platform_metrics_token"
+        prometheus = config["services"]["prometheus"]
+        assert prometheus["secrets"][0]["source"] == "platform_metrics_token"
+        assert any(volume["source"].endswith("prometheus.hybrid.yml") for volume in prometheus["volumes"])
         assert java["depends_on"]["redis"]["condition"] == "service_healthy"
         assert java["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
         for name in ("web", "worker", "beat"):
@@ -500,6 +508,12 @@ def test_hybrid_release_pair_and_production_compose_are_connected(monkeypatch):
                      "-ai:$release", "-platform:$release", "org.opencontainers.image.revision", "chmod +x"):
         assert required in workflow
     script = (ROOT / "scripts/deploy_production.sh").read_text(encoding="utf-8")
+    assert '"${RELEASE_DIR}/deploy/prometheus/prometheus.hybrid.yml"' in script
+    metrics_config = (ROOT / "deploy/prometheus/prometheus.hybrid.yml").read_text(encoding="utf-8")
+    assert "credentials_file: /run/secrets/platform_metrics_token" in metrics_config
+    assert "credentials:" not in metrics_config
+    nginx = (ROOT / "deploy/nginx/coexist-ip-https.conf.template").read_text(encoding="utf-8")
+    assert "location ^~ /internal/ {\n        return 404;\n    }" in nginx
     for required in ("compose.hybrid.prod.yaml", "ACTIVE_PLATFORM_IMAGE", "PREVIOUS_PLATFORM_IMAGE",
                      '"$PLATFORM_REVISION" == "$IMAGE_REVISION"', "current-platform-image"):
         assert required in script

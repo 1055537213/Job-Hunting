@@ -179,6 +179,7 @@ jobs:
           JOB_AGENT_TLS_EMAIL: ops@example.com
           JOB_AGENT_GRAFANA_ADMIN_PASSWORD: ci-grafana-password
           JOB_AGENT_PLATFORM_INTERNAL_TOKEN: ci-platform-shared-internal-token
+          JOB_AGENT_PLATFORM_METRICS_TOKEN: ci-independent-platform-metrics-token
           JOB_AGENT_PLATFORM_IMAGE: ghcr.io/example/job-hunting-platform:sha-0123456789ab
           JOB_AGENT_ACCOUNT_ACTION_SECRET: ci-account-action-secret-at-least-32-characters
         run: |
@@ -216,11 +217,13 @@ jobs:
             "$NGINX_IMAGE" nginx -t
 
       - name: Validate Prometheus configuration and alert rules
-        run: >-
-          docker run --rm --entrypoint /bin/promtool
-          -v "$PWD/deploy/prometheus:/etc/prometheus:ro"
-          prom/prometheus:v3.13.1
-          check config /etc/prometheus/prometheus.yml
+        run: |
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/deploy/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.13.1 check config /etc/prometheus/prometheus.yml
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/deploy/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.13.1 check config --syntax-only /etc/prometheus/prometheus.hybrid.yml
 
       - name: Validate observability configurations
         shell: bash

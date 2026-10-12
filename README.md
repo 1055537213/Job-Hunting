@@ -87,6 +87,7 @@
 ### 运维与可观测性
 
 - Prometheus 请求指标和 Web 不可用、5xx、慢响应、安全拦截、高并发告警规则。
+- Java 支持显式可信代理、独立监控令牌和 Prometheus DNS 抓取；公网入口仍保持 Python，不开放 Java 内部指标路径。
 - Alertmanager、SMTP、Loki、Alloy、Tempo、OpenTelemetry 和 Grafana 配置。
 - PostgreSQL/对象存储备份、恢复演练、Worker 恢复和 ClamAV 上传扫描验收脚本。
 

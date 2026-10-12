@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import time
+import tempfile
 from pathlib import Path
 
 import httpx
@@ -18,6 +20,7 @@ from validate_python_java_local import (
     jdbc_schema_url,
     run_web_billing_flow,
     run_java_security_flow,
+    run_java_ingress_flow,
     schema_database_url,
 )
 
@@ -68,6 +71,7 @@ def main() -> None:
     schema = f"job_agent_java_local_{suffix}"
     prefix = f"job-agent-hybrid-test-{suffix}"
     java, web = f"{prefix}-java", f"{prefix}-web"
+    prometheus = f"{prefix}-prometheus"
     redis_name = f"{prefix}-redis"
     redis_password = os.urandom(24).hex()
     base_url = os.environ.get("JOB_AGENT_TEST_DATABASE_URL", DEFAULT_DATABASE_URL)
@@ -79,6 +83,7 @@ def main() -> None:
     )
     jdbc, username, password = jdbc_schema_url(container_url, schema)
     token = f"acceptance-internal-{os.urandom(16).hex()}"
+    metrics_token = f"acceptance-metrics-{os.urandom(24).hex()}"
     engine = sa.create_engine(base_url, pool_pre_ping=True)
     schema_created = False
     network_created = False
@@ -88,6 +93,8 @@ def main() -> None:
         schema_created = True
         docker("network", "create", prefix)
         network_created = True
+        network_info = json.loads(docker("network", "inspect", prefix))
+        trusted_subnet = network_info[0]["IPAM"]["Config"][0]["Subnet"]
         common = [
             "--network",
             prefix,
@@ -123,6 +130,9 @@ def main() -> None:
             "PLATFORM_AUTH_ENABLED=true",
             "-e",
             "PLATFORM_WEB_SECURITY_ENABLED=true",
+            "-e", f"PLATFORM_TRUSTED_PROXY_CIDRS={trusted_subnet}",
+            "-e", "PLATFORM_METRICS_ENABLED=true",
+            "-e", f"PLATFORM_METRICS_TOKEN={metrics_token}",
             "-e",
             "PLATFORM_REDIS_HOST=security-redis",
             "-e",
@@ -189,9 +199,36 @@ def main() -> None:
             internal_token=token,
         )
         run_java_security_flow(f"http://127.0.0.1:{args.port}", token, admin_credentials, redis_name)
+        run_java_ingress_flow(f"http://127.0.0.1:{args.port}", metrics_token, token)
+        with tempfile.TemporaryDirectory(prefix="job-agent-prometheus-") as scratch:
+            credential = Path(scratch) / "platform_metrics_token"
+            credential.write_text(metrics_token, encoding="utf-8")
+            credential.chmod(0o644)
+            root = Path(__file__).resolve().parents[1]
+            docker("run", "-d", "--name", prometheus, "--network", prefix,
+                   "-p", "127.0.0.1::9090",
+                   "--mount", f"type=bind,source={root / 'deploy/prometheus/prometheus.hybrid.yml'},target=/etc/prometheus/prometheus.yml,readonly",
+                   "--mount", f"type=bind,source={root / 'deploy/prometheus/alerts.yml'},target=/etc/prometheus/alerts.yml,readonly",
+                   "--mount", f"type=bind,source={credential},target=/run/secrets/platform_metrics_token,readonly",
+                   "prom/prometheus:v3.13.1", "--config.file=/etc/prometheus/prometheus.yml")
+            try:
+                port = json.loads(docker("inspect", prometheus))[0]["NetworkSettings"]["Ports"]["9090/tcp"][0]["HostPort"]
+                prometheus_url = f"http://127.0.0.1:{port}"
+                wait(f"{prometheus_url}/-/healthy")
+                deadline = time.monotonic() + 45
+                while time.monotonic() < deadline:
+                    result = httpx.get(f"{prometheus_url}/api/v1/query", params={"query": 'up{job="job-hunting-platform"}'}, timeout=5)
+                    values = result.json().get("data", {}).get("result", [])
+                    if values and all(value["value"][1] == "1" for value in values):
+                        break
+                    time.sleep(1)
+                assert values and all(value["value"][1] == "1" for value in values), "Prometheus Java target was not UP"
+                print("==> Real Prometheus -> protected Java metrics target UP: PASS")
+            finally:
+                docker("rm", "-f", prometheus)
         print("Docker Python-Java account and billing acceptance: PASS")
     finally:
-        for name in (web, java, redis_name):
+        for name in (prometheus, web, java, redis_name):
             subprocess.run(
                 ["docker", "rm", "-f", name], capture_output=True, check=False
             )

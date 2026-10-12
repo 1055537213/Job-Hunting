@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 5s
+  evaluation_interval: 30s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: job-hunting-agent-web
+    metrics_path: /internal/metrics
+    dns_sd_configs:
+      - names: ["web"]
+        type: A
+        port: 8000
+        refresh_interval: 5s
+  - job_name: job-hunting-platform
+    metrics_path: /internal/metrics
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/platform_metrics_token
+    dns_sd_configs:
+      - names: ["platform-service"]
+        type: A
+        port: 8081
+        refresh_interval: 5s

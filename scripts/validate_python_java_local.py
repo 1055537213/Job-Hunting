@@ -479,6 +479,29 @@ def run_java_security_flow(base_url: str, internal_token: str, admin: tuple[str,
     print("==> Java public security -> Session/RBAC/CSRF/Redis 429/outage recovery/request IDs: PASS")
 
 
+def run_java_ingress_flow(base_url: str, metrics_token: str, internal_token: str) -> None:
+    with httpx.Client(base_url=base_url, timeout=10) as client:
+        assert client.get("/internal/metrics", headers={"Accept": "text/plain"}).status_code == 401
+        assert client.get("/internal/metrics", headers={"Authorization": f"Bearer {internal_token}"}).status_code == 401
+        for _ in range(21):
+            limited = client.post("/api/auth/login", json={}, headers={"X-Forwarded-For": "198.51.100.21"})
+            if limited.status_code == 429:
+                break
+        assert limited.status_code == 429
+        spoofed = client.post("/api/auth/login", json={}, headers={"X-Forwarded-For": "1.2.3.4, 198.51.100.21"})
+        assert spoofed.status_code == 429, "Forged left-hand forwarding hop bypassed the limiter"
+        different = client.post("/api/auth/login", json={}, headers={"X-Forwarded-For": "198.51.100.22"})
+        assert different.status_code == 422, "Distinct clients behind a trusted proxy shared one IP limit"
+        assert client.post("/api/auth/login", json={}, headers={"X-Forwarded-For": "evil.invalid"}).status_code == 400
+        metrics = client.get("/internal/metrics", headers={"Authorization": f"Bearer {metrics_token}"})
+        assert metrics.status_code == 200
+        assert "platform_web_requests_total" in metrics.text and 'status="4xx"' in metrics.text
+        assert "platform_web_duration_seconds_bucket" in metrics.text
+        assert metrics_token not in metrics.text and "198.51.100.21" not in metrics.text
+        assert client.get("/actuator/prometheus").status_code == 404
+    print("==> Trusted proxy identities/forged headers/independent protected Prometheus metrics: PASS")
+
+
 def main() -> int:
     args = parse_args()
     if not 1024 <= args.port <= 65535:
@@ -494,6 +517,7 @@ def main() -> int:
     jdbc_url, jdbc_username, jdbc_password = jdbc_schema_url(base_url, schema)
     service_url = f"http://127.0.0.1:{args.port}"
     internal_token = f"local-java-contract-{os.urandom(16).hex()}"
+    metrics_token = f"local-java-metrics-{os.urandom(24).hex()}"
     schema_engine = sa.create_engine(base_url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
     schema_created = False
     process: subprocess.Popen[str] | None = None
@@ -534,6 +558,9 @@ def main() -> int:
                 "PLATFORM_BILLING_ENABLED": "true",
                 "PLATFORM_AUTH_ENABLED": "true",
                 "PLATFORM_WEB_SECURITY_ENABLED": "true",
+                "PLATFORM_TRUSTED_PROXY_CIDRS": "127.0.0.1/32",
+                "PLATFORM_METRICS_ENABLED": "true",
+                "PLATFORM_METRICS_TOKEN": metrics_token,
                 "PLATFORM_REDIS_HOST": "127.0.0.1",
                 "PLATFORM_REDIS_PORT": redis_port,
                 "PLATFORM_REDIS_PASSWORD": redis_password,
@@ -662,6 +689,7 @@ def main() -> int:
             internal_token=internal_token,
         )
         run_java_security_flow(service_url, internal_token, admin_credentials, security_redis)
+        run_java_ingress_flow(service_url, metrics_token, internal_token)
 
         contract_environment = os.environ.copy()
         contract_environment.update(

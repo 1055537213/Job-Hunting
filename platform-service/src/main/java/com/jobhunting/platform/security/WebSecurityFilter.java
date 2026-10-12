@@ -37,26 +37,22 @@ public class WebSecurityFilter extends OncePerRequestFilter {
     private final WebSecuritySettings settings;
     private final ObjectMapper mapper;
     private final MeterRegistry metrics;
+    private final ClientAddressResolver addresses;
 
     public WebSecurityFilter(AccountAdministrationService accounts, RedisRequestLimiter limiter,
-            WebSecuritySettings settings, ObjectMapper mapper, MeterRegistry metrics) {
+            WebSecuritySettings settings, ObjectMapper mapper, MeterRegistry metrics, ClientAddressResolver addresses) {
         this.accounts = accounts;
         this.limiter = limiter;
         this.settings = settings;
         this.mapper = mapper;
         this.metrics = metrics;
+        this.addresses = addresses;
     }
 
     @Override
     protected void doFilterInternal(HttpServletRequest raw, HttpServletResponse response, FilterChain chain)
             throws IOException, ServletException {
         String id = requestId(raw.getHeader("X-Request-ID"), raw.getHeader("X-Trace-Id"));
-        var request = new HttpServletRequestWrapper(raw) {
-            @Override public String getHeader(String name) {
-                if ("X-Request-ID".equalsIgnoreCase(name) || "X-Trace-Id".equalsIgnoreCase(name)) return id;
-                return super.getHeader(name);
-            }
-        };
         String previous = MDC.get("request_id");
         MDC.put("request_id", id);
         headers(response, id);
@@ -66,17 +62,24 @@ public class WebSecurityFilter extends OncePerRequestFilter {
                 reject(response, status, "HTTP_ERROR", "请求无法处理。", id, 0);
             }
         };
-        String group = group(request);
+        String group = group(raw);
         String outcome = "handled";
         Timer.Sample timer = Timer.start(metrics);
         try {
-            String path = request.getRequestURI();
+            String path = raw.getRequestURI();
             if (path.contains("%") || path.contains(";") || path.contains("\\") || path.contains("//")) {
                 outcome = "invalid_path";
                 reject(response, 400, "INVALID_REQUEST", "请求路径无效。", id, 0);
                 return;
             }
-            // Never trust client-supplied forwarding headers; a future edge cutover needs a trusted-proxy policy.
+            String clientAddress = addresses.resolve(raw);
+            var request = new HttpServletRequestWrapper(raw) {
+                @Override public String getRemoteAddr() { return clientAddress; }
+                @Override public String getHeader(String name) {
+                    if ("X-Request-ID".equalsIgnoreCase(name) || "X-Trace-Id".equalsIgnoreCase(name)) return id;
+                    return super.getHeader(name);
+                }
+            };
             long retry = limiter.check("ip:" + request.getRemoteAddr(), group);
             if (retry > 0) {
                 outcome = "rate_limited";
@@ -121,6 +124,9 @@ public class WebSecurityFilter extends OncePerRequestFilter {
                 return;
             }
             chain.doFilter(request, guardedResponse);
+        } catch (ClientAddressResolver.InvalidAddress error) {
+            outcome = "invalid_address";
+            reject(response, 400, "INVALID_REQUEST", "请求来源地址无效。", id, 0);
         } catch (RedisRequestLimiter.Unavailable error) {
             outcome = "protection_unavailable";
             reject(response, 503, "PROTECTION_UNAVAILABLE", "请求保护服务暂时不可用，请稍后重试。", id, 1);

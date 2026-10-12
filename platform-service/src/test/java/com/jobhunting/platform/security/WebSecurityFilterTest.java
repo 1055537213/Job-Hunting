@@ -27,7 +27,7 @@ class WebSecurityFilterTest {
     }
 
     @BeforeEach void setup() {
-        filter = new WebSecurityFilter(accounts, limiter, settings(), new ObjectMapper(), metrics);
+        filter = new WebSecurityFilter(accounts, limiter, settings(), new ObjectMapper(), metrics, new ClientAddressResolver(""));
         called = false;
     }
 
@@ -124,6 +124,8 @@ class WebSecurityFilterTest {
     }
 
     @Test void productionCannotDisableRequiredProtections() {
+        assertThatThrownBy(() -> new WebSecurityConfiguration(settings(), "", "")
+                .clientAddressResolver("", "framework")).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new WebSecuritySettings(false, "production", true, true,
                 "https://example.com", "test", 60, 20, 120, 120, 240)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new WebSecuritySettings(false, " PRODUCTION ", true, true,

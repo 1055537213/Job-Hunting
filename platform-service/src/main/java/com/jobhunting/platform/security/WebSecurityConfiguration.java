@@ -24,6 +24,15 @@ public class WebSecurityConfiguration {
     }
 
     @Bean
+    ClientAddressResolver clientAddressResolver(@Value("${platform.ingress.trusted-proxy-cidrs:}") String cidrs,
+            @Value("${server.forward-headers-strategy:none}") String strategy) {
+        if (!"none".equalsIgnoreCase(strategy.strip())) {
+            throw new IllegalArgumentException("Automatic forwarding must be disabled; use explicit trusted proxies");
+        }
+        return new ClientAddressResolver(cidrs);
+    }
+
+    @Bean
     @ConditionalOnExpression("${platform.web-security.enabled:false} and ${platform.auth.enabled:false}")
     RedisRequestLimiter requestLimiter(StringRedisTemplate redis, WebSecuritySettings settings) {
         return new RedisRequestLimiter(redis, settings);
@@ -33,8 +42,8 @@ public class WebSecurityConfiguration {
     @ConditionalOnExpression("${platform.web-security.enabled:false} and ${platform.auth.enabled:false}")
     FilterRegistrationBean<WebSecurityFilter> webSecurityFilter(
             AccountAdministrationService accounts, RedisRequestLimiter limiter,
-            WebSecuritySettings settings, ObjectMapper mapper, MeterRegistry metrics) {
-        var registration = new FilterRegistrationBean<>(new WebSecurityFilter(accounts, limiter, settings, mapper, metrics));
+            WebSecuritySettings settings, ObjectMapper mapper, MeterRegistry metrics, ClientAddressResolver addresses) {
+        var registration = new FilterRegistrationBean<>(new WebSecurityFilter(accounts, limiter, settings, mapper, metrics, addresses));
         registration.addUrlPatterns("/api/*");
         registration.setOrder(Ordered.HIGHEST_PRECEDENCE);
         return registration;

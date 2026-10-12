@@ -27,6 +27,9 @@ Java 中断时受保护接口返回 503，不将故障伪装成未登录，也�
 
 ```ini
 JOB_AGENT_PLATFORM_INTERNAL_TOKEN=<随机生成至少32字符的服务间密钥>
+JOB_AGENT_PLATFORM_METRICS_TOKEN=<另一个随机生成至少32字符的监控密钥>
+# 默认留空；需要代理时仅填实际受控代理的精确 IP/CIDR，不能填全网范围。
+PLATFORM_TRUSTED_PROXY_CIDRS=
 JOB_AGENT_JAVA_AUTH_ENABLED=true
 JOB_AGENT_JAVA_BILLING_ENABLED=true
 JOB_AGENT_ACCOUNT_ACTION_SECRET=<随机生成至少32字符的令牌派生密钥>
@@ -49,6 +52,8 @@ docker compose -f compose.yaml -f compose.platform.yaml up -d --build
 脚本使用真实 Python Web/Java 进程和 Docker PostgreSQL验证注册、邮箱验证、密码重置、旧会话撤销、重复确认、登录、
 模拟充值及扣费；测试发送器捕获邮件，不向真实收件人发送。
 CI 还构建两份镜像，运行 `scripts/validate_python_java_docker.py` 验证容器间相同链路。
+Docker 验收还运行真实 Prometheus，验证独立凭据和 Java target UP；本地 Prometheus 默认在
+`http://127.0.0.1:9090`，可查询 `up{job="job-hunting-platform"}`。不要把监控令牌提交到 Git。
 该验收使用测试发送器，不等同于真实 SMTP/完整 Worker 队列验收。
 Java 默认测试不启动 PostgreSQL 容器，完整集成测试：
 
