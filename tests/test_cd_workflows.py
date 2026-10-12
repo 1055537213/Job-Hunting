@@ -474,7 +474,8 @@ def test_java_platform_release_has_healthcheck_and_security_gates():
         assert required in ci
 
 
-def test_hybrid_release_pair_and_production_compose_are_connected():
+def test_hybrid_release_pair_and_production_compose_are_connected(monkeypatch):
+    monkeypatch.setenv("PLATFORM_RATE_LIMIT_KEY_PREFIX", "job_agent:ci_platform_limit")
     for extra in (("compose.hybrid.prod.yaml",), ("compose.coexist.yaml", "compose.hybrid.prod.yaml")):
         config = _production_compose_config(*extra)
         java = config["services"]["platform-service"]
@@ -484,6 +485,7 @@ def test_hybrid_release_pair_and_production_compose_are_connected():
         assert java["environment"]["PLATFORM_WEB_SECURITY_ENABLED"] == "true"
         assert java["environment"]["PLATFORM_REDIS_HOST"] == "redis"
         assert java["environment"]["PLATFORM_REDIS_PASSWORD"]
+        assert java["environment"]["PLATFORM_RATE_LIMIT_KEY_PREFIX"] == "job_agent:ci_platform_limit"
         assert java["depends_on"]["redis"]["condition"] == "service_healthy"
         assert java["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
         for name in ("web", "worker", "beat"):
