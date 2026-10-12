@@ -1,32 +1,20 @@
 package com.jobhunting.platform.auth;
 
 import jakarta.servlet.http.HttpServletRequest;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
-import org.springframework.web.bind.MethodArgumentNotValidException;
+import com.jobhunting.platform.security.WebSecurityFilter;
 
 @RestControllerAdvice
 public class AuthErrorHandler {
     @ExceptionHandler(AuthException.class)
     public ResponseEntity<ErrorResponse> authError(AuthException exception, HttpServletRequest request) {
-        String trace = request.getHeader("X-Trace-Id");
+        String raw = request.getHeader("X-Trace-Id");
+        String trace = raw != null && raw.matches("[A-Za-z0-9._:-]{1,128}")
+                ? raw : WebSecurityFilter.requestId(request.getHeader("X-Request-ID"), null);
         return ResponseEntity.status(exception.status()).body(new ErrorResponse(
-                exception.code(), exception.getMessage(), exception.getMessage(), trace == null ? "missing" : trace));
-    }
-
-    @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ResponseEntity<ErrorResponse> validationError(
-            MethodArgumentNotValidException exception, HttpServletRequest request) {
-        String detail = exception.getBindingResult().getFieldErrors().stream()
-                .findFirst()
-                .map(error -> error.getField() + " 参数无效。")
-                .orElse("请求参数无效。")
-                .strip();
-        String trace = request.getHeader("X-Trace-Id");
-        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY).body(new ErrorResponse(
-                "INVALID_REQUEST", detail, detail, trace == null ? "missing" : trace));
+                exception.code(), exception.getMessage(), exception.getMessage(), trace));
     }
 
     public record ErrorResponse(String code, String message, String detail, String trace_id) { }

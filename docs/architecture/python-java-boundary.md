@@ -91,3 +91,15 @@ CI 通过后发布相同提交的 `-ai` 和 `-platform` 两个版本镜像，审
 
 后续继续迁移管理/账务外部入口。所有 GitHub 推送必须确认对应提交
 CI 最终通过，镜像发布失败也不视为完成。
+
+## Java 安全入口准备阶段
+
+Java `/api/*` 已增加真实 Session/RBAC、Redis 原子滑动窗口限流、CSRF、安全响应头、
+请求 ID、低基数 Micrometer 指标及脱敏错误响应。同步 Jedis 有界连接池规避 Windows Java 25
+下 Lettuce NIO selector 兼容问题，也与当前 Servlet 同步访问模型一致。
+Compose 本地/联合生产都启用安全过滤器，生产关闭安全开关、CSRF、Secure Cookie 或缺少 Redis
+密码/强内部 Token 时拒绝启动。Redis 不可用拒绝请求，不用进程内计数替代。
+
+这一阶段没有把公网流量切给 Java：Caddy/Nginx 仍只进入 Python，内部服务调用继续使用 Token，
+与浏览器安全过滤器分开。Java 暂不信任转发头；下一阶段先建立可信代理与统一指标抓取，
+再迁移剩余浏览器认证契约并切换路由，不得直接放开生产 Java 端口。

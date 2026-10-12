@@ -481,6 +481,10 @@ def test_hybrid_release_pair_and_production_compose_are_connected():
         assert not java.get("ports")
         assert "build" not in java
         assert java["environment"]["PLATFORM_AUTH_ENABLED"] == "true"
+        assert java["environment"]["PLATFORM_WEB_SECURITY_ENABLED"] == "true"
+        assert java["environment"]["PLATFORM_REDIS_HOST"] == "redis"
+        assert java["environment"]["PLATFORM_REDIS_PASSWORD"]
+        assert java["depends_on"]["redis"]["condition"] == "service_healthy"
         assert java["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
         for name in ("web", "worker", "beat"):
             service = config["services"][name]

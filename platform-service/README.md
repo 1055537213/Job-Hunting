@@ -110,12 +110,38 @@ Session 原文只返回给 Python 设置 HttpOnly Cookie，数据库只存 SHA-2
 单设备退出不影响其他设备；全部退出包含当前设备，管理员操作与审计同事务提交。
 修改密码校验当前密码，同时撤销所有设备并作废验证/重置链接，失败则整体回滚。
 Python 网页 API 保持不变；Java 模式不再通过 Python 创建、解析、续期或撤销用户登录会话。
-当前已将同源公网的登录、单设备退出、全部退出和修改密码路径交给 Java 控制器处理，
+Java 提供登录、单设备退出、全部退出和修改密码的浏览器兼容控制器，尚未切换公网流量。
 Python Web 是唯一公网入口，统一执行限流、CSRF、请求观测和安全响应头，再通过内部服务 Token
 调用 Java。Java 负责认证事实源和业务事务；浏览器 Cookie 仍由 Python 适配层维护，避免纯 Python
 部署依赖 Java，也避免共存部署绕过边缘安全控制。`/api/auth/me` 及其他业务入口保持 Python
 兼容 URL，账号读取和认证业务由 Java 提供。
 因此可以逐步切换而不要求前端同时改造。
+
+## Java Web 安全基础
+
+本地 Compose 和联合生产 Compose 均启用 `PLATFORM_WEB_SECURITY_ENABLED=true`，
+由 `WebSecurityFilter` 保护 Java `/api/*`。公网仍统一经过 Python；内部 `/internal/*`
+继续使用服务 Token，不依赖浏览器 Cookie，邮件和账务任务不会被浏览器限流拦截。
+
+- 匿名白名单以外的接口必须通过真实 Java Session 校验，`/api/admin/*` 还要求管理员角色。
+  `GET /api/admin/security` 可查看非敏感的安全配置状态，仅允许管理员访问；当前经 Java 本地端口验收，尚未接入 Python 公网路由。
+- 请求先按直连 IP 限流，已登录账号再按账号限流。Redis TIME + 原子滑动窗口 Lua 保证副本共享窗口，
+  429 返回 `Retry-After`；Redis/账号查询故障返回 503，不回退到本地认证或放行。
+- Redis 使用同步 Jedis 和有界连接池，连接/读写/池等待均为 1 秒。
+- 默认窗口 60 秒，认证 20、管理/写入 120、其他 240 次，可沿用 `JOB_AGENT_RATE_LIMIT_*` 配置。
+  Java key 前缀默认 `job_agent:platform_rate_limit`，与 Python 的计数隔离，避免同一请求被重复计数。
+- 已携带会话 Cookie 的写请求执行 CSRF 双提交校验，登录/注册豁免；设置安全响应头和 `no-store`。
+  生产要求 HTTPS 公网地址、Secure Cookie、CSRF、Redis 密码和至少 32 字符的内部 Token，否则拒绝启动。
+- 规范化 `X-Request-ID` / `X-Trace-Id`，日志不写请求正文、密码、Cookie 或账号标识；
+  Micrometer 记录 `platform.web.requests` 和 `platform.web.duration`，标签仅用请求组/状态族/结果。
+  当前不额外公开指标接口，公网切换前再接入 Java 指标抓取。
+- 不信任客户端的 `X-Forwarded-For`，切换公网前必须补齐可信代理策略，否则 Java 会把代理 IP 作为来源。
+
+`scripts/validate_python_java_local.py` 会创建临时 Redis 容器和隔离 schema，实测 Java 登录、
+管理员权限、CSRF、429、请求 ID、Redis 停机/恢复和生产错误配置拒绝启动，并在结束时移除临时资源。`RedisRequestLimiterIntegrationTest`
+通过 Testcontainers 实测多副本并发窗口和恢复；Docker 验收也启用相同安全过滤器。
+本地 Docker Hub 不可达时，Docker 验收脚本支持 `--java-jar platform-service/target/platform-service-0.1.0-SNAPSHOT.jar`，
+在已有 Java 21 运行镜像中挂载新打包产物；此选项不替代 CI 对正式 Dockerfile 的构建与安全扫描。
 管理员账号列表、当前账号读取、显示名称写入、启用/停用、账号注销准入/完成和首次管理员引导现由 Java 原子完成：服务端用真实 Session
 重新校验管理员权限，停用同时撤销目标会话、作废旧账号操作链接并写入审计。Python
 网页接口只把 Java 的安全账号投影转换回原有字段名，因此前端 URL 不变。账号注销准入和最终匿名化已由

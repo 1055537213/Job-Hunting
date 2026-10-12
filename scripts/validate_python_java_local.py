@@ -150,7 +150,7 @@ def run_web_billing_flow(
     database_url: str,
     base_url: str,
     internal_token: str,
-) -> None:
+) -> tuple[str, str]:
     """Exercise the real Web routes and the production Python usage path."""
 
     sys.path.insert(0, str(ROOT / "src"))
@@ -417,6 +417,66 @@ def run_web_billing_flow(
         finally:
             store.close()
     print("Local Python Web + Java billing flow: PASS")
+    return admin_email, admin_password
+
+
+def run_java_security_flow(base_url: str, internal_token: str, admin: tuple[str, str], redis_container: str) -> None:
+    """Exercise the Java filter on real HTTP, using disposable acceptance accounts only."""
+
+    from job_hunting_agent.config import PlatformAuthSettings  # noqa: PLC0415
+    from job_hunting_agent.platform_auth import PlatformAuthClient  # noqa: PLC0415
+
+    email = f"security-contract-{os.urandom(12).hex()}@example.com"
+    password = "security-contract-password-123"
+    auth = PlatformAuthClient(PlatformAuthSettings(True, base_url, internal_token, 10))
+    auth.register_account(email=email, password=password, display_name=None, email_verified=True, consents=[])
+    with httpx.Client(base_url=base_url, timeout=10) as client:
+        invalid = client.post("/api/auth/login", json={"email": email})
+        assert invalid.status_code == 422 and "detail" in invalid.json()
+        login = client.post("/api/auth/login", json={"email": email, "password": password},
+                            headers={"X-Request-ID": "security-contract-123"})
+        assert login.status_code == 200, "Java public login failed"
+        assert login.headers["x-request-id"] == "security-contract-123"
+        assert login.headers["x-frame-options"] == "DENY"
+        assert "HttpOnly" in login.headers["set-cookie"]
+        csrf = login.json()["csrf_token"]
+        assert client.get("/api/admin/security").status_code == 403
+        assert client.post("/api/auth/logout-all").status_code == 403
+        revoked = client.post("/api/auth/logout-all", headers={"X-CSRF-Token": csrf})
+        assert revoked.status_code == 200 and revoked.json()["revoked_sessions"] == 1
+        assert "job_agent_session" not in client.cookies
+        assert client.post("/api/account/password", json={
+            "current_password": password, "new_password": "new-security-password-123",
+        }).status_code == 401
+        admin_login = client.post("/api/auth/login", json={"email": admin[0], "password": admin[1]})
+        assert admin_login.status_code == 200
+        admin_status = client.get("/api/admin/security")
+        assert admin_status.status_code == 200 and admin_status.json()["rate_limit_backend"] == "redis"
+        assert client.post("/api/auth/logout", headers={"X-CSRF-Token": admin_login.json()["csrf_token"]}).status_code == 200
+        wrong_method = client.get("/api/auth/login")
+        assert wrong_method.status_code == 405 and "detail" in wrong_method.json()
+        for _ in range(25):
+            limited = client.post("/api/auth/login", json={})
+            if limited.status_code == 429:
+                break
+        assert limited.status_code == 429 and int(limited.headers["retry-after"]) > 0
+        assert limited.json()["code"] == "RATE_LIMITED"
+        subprocess.run(["docker", "stop", "--time", "1", redis_container], check=True,
+                       stdout=subprocess.DEVNULL, timeout=30)
+        try:
+            unavailable = client.get("/api/account/password")
+            assert unavailable.status_code == 503 and unavailable.json()["code"] == "PROTECTION_UNAVAILABLE"
+        finally:
+            subprocess.run(["docker", "start", redis_container], check=True,
+                           stdout=subprocess.DEVNULL, timeout=30)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            recovered = client.get("/api/account/password")
+            if recovered.status_code == 401:
+                break
+            time.sleep(0.5)
+        assert recovered.status_code == 401, "Redis protection did not recover"
+    print("==> Java public security -> Session/RBAC/CSRF/Redis 429/outage recovery/request IDs: PASS")
 
 
 def main() -> int:
@@ -439,6 +499,8 @@ def main() -> int:
     process: subprocess.Popen[str] | None = None
     web_process: subprocess.Popen[str] | None = None
     acceptance_passed = False
+    security_redis = f"job-agent-security-test-{os.urandom(12).hex()}"
+    redis_started = False
     log_dir = Path(tempfile.mkdtemp(prefix="job-agent-java-local-"))
     log_path = log_dir / "platform-service.log"
     web_log_path = log_dir / "python-web.log"
@@ -454,12 +516,34 @@ def main() -> int:
         upgrade_database(isolated_url)
         print("==> Alembic migrations passed")
 
+        redis_password = os.urandom(24).hex()
+        # Docker allocates a new host port on restart if the mapping has no explicit port.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            redis_port = str(probe.getsockname()[1])
+        subprocess.run([
+            "docker", "run", "-d", "--name", security_redis, "-p", f"127.0.0.1:{redis_port}:6379",
+            "redis:7.4-alpine", "redis-server", "--requirepass", redis_password,
+        ], check=True, stdout=subprocess.DEVNULL, timeout=120)
+        redis_started = True
+
         java_environment = os.environ.copy()
         java_environment.update(
             {
                 "SERVER_PORT": str(args.port),
                 "PLATFORM_BILLING_ENABLED": "true",
                 "PLATFORM_AUTH_ENABLED": "true",
+                "PLATFORM_WEB_SECURITY_ENABLED": "true",
+                "PLATFORM_REDIS_HOST": "127.0.0.1",
+                "PLATFORM_REDIS_PORT": redis_port,
+                "PLATFORM_REDIS_PASSWORD": redis_password,
+                "PLATFORM_REDIS_DATABASE": "1",
+                "PLATFORM_RATE_LIMIT_KEY_PREFIX": f"test:platform:{schema}",
+                "JOB_AGENT_ENVIRONMENT": "test",
+                "JOB_AGENT_CSRF_ENABLED": "true",
+                "JOB_AGENT_COOKIE_SECURE": "false",
+                "JOB_AGENT_EMAIL_VERIFICATION_REQUIRED": "true",
+                "JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS": "20",
                 "PLATFORM_INTERNAL_TOKEN": internal_token,
                 "SPRING_DATASOURCE_URL": jdbc_url,
                 "SPRING_DATASOURCE_USERNAME": jdbc_username,
@@ -481,6 +565,14 @@ def main() -> int:
             raise RuntimeError("Java platform packaging failed")
         java_home = java_environment.get("JAVA_HOME")
         java = str(Path(java_home) / "bin" / ("java.exe" if os.name == "nt" else "java")) if java_home else "java"
+        rejected = subprocess.run([
+            java, "-jar", "target/platform-service-0.1.0-SNAPSHOT.jar",
+            "--platform.auth.enabled=false", "--platform.web-security.environment=PRODUCTION",
+            "--platform.web-security.enabled=false",
+        ], cwd=ROOT / "platform-service", env=java_environment, capture_output=True, text=True, timeout=45,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        assert rejected.returncode != 0 and "Production requires web security" in rejected.stdout + rejected.stderr
+        print("==> Java production rejects disabled protections even with auth disabled: PASS")
         process = subprocess.Popen(
             [java, "-jar", "target/platform-service-0.1.0-SNAPSHOT.jar"],
             cwd=ROOT / "platform-service",
@@ -563,12 +655,13 @@ def main() -> int:
         print(f"==> Started Python Web on {web_url}")
         wait_for_http_ok(f"{web_url}/api/health", web_process, args.startup_timeout)
         print("==> Python Web health is OK")
-        run_web_billing_flow(
+        admin_credentials = run_web_billing_flow(
             web_url=web_url,
             database_url=isolated_url,
             base_url=service_url,
             internal_token=internal_token,
         )
+        run_java_security_flow(service_url, internal_token, admin_credentials, security_redis)
 
         contract_environment = os.environ.copy()
         contract_environment.update(
@@ -594,6 +687,9 @@ def main() -> int:
     finally:
         stop_process(web_process)
         stop_process(process)
+        if redis_started:
+            subprocess.run(["docker", "rm", "-f", security_redis], check=True,
+                           stdout=subprocess.DEVNULL, timeout=30)
         if log_file is not None:
             log_file.close()
         if web_log_file is not None:

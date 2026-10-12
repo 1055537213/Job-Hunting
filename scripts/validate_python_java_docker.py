@@ -6,6 +6,7 @@ import argparse
 import os
 import subprocess
 import time
+from pathlib import Path
 
 import httpx
 import sqlalchemy as sa
@@ -16,6 +17,7 @@ from validate_python_java_local import (
     assert_port_available,
     jdbc_schema_url,
     run_web_billing_flow,
+    run_java_security_flow,
     schema_database_url,
 )
 
@@ -47,6 +49,7 @@ def main() -> None:
         "--java-image", default="job-hunting-platform:hybrid-validation"
     )
     parser.add_argument("--ai-image", default="job-hunting-agent:hybrid-validation")
+    parser.add_argument("--java-jar", type=Path, help="仅供本地离线验收：在已有 Java 21 运行镜像中挂载新构建的 jar")
     parser.add_argument("--port", type=int, default=18085)
     args = parser.parse_args()
     if not 1024 <= args.port <= 65534:
@@ -55,10 +58,18 @@ def main() -> None:
     assert_port_available(args.port + 1)
     for image in (args.java_image, args.ai_image):
         docker("image", "inspect", image)
+    jar_mount = []
+    if args.java_jar is not None:
+        jar = args.java_jar.resolve(strict=True)
+        if not jar.is_file() or jar.suffix != ".jar":
+            raise ValueError("--java-jar must point to a packaged jar")
+        jar_mount = ["--mount", f"type=bind,source={jar},target=/app/platform-service.jar,readonly"]
     suffix = os.urandom(12).hex()
     schema = f"job_agent_java_local_{suffix}"
     prefix = f"job-agent-hybrid-test-{suffix}"
     java, web = f"{prefix}-java", f"{prefix}-web"
+    redis_name = f"{prefix}-redis"
+    redis_password = os.urandom(24).hex()
     base_url = os.environ.get("JOB_AGENT_TEST_DATABASE_URL", DEFAULT_DATABASE_URL)
     isolated_url = schema_database_url(base_url, schema)
     container_url = (
@@ -83,6 +94,9 @@ def main() -> None:
             "--add-host",
             "host.docker.internal:host-gateway",
         ]
+        docker("run", "-d", "--name", redis_name, "--network", prefix,
+               "--network-alias", "security-redis", "redis:7.4-alpine",
+               "redis-server", "--requirepass", redis_password)
         docker(
             "run",
             "--rm",
@@ -108,6 +122,20 @@ def main() -> None:
             "-e",
             "PLATFORM_AUTH_ENABLED=true",
             "-e",
+            "PLATFORM_WEB_SECURITY_ENABLED=true",
+            "-e",
+            "PLATFORM_REDIS_HOST=security-redis",
+            "-e",
+            f"PLATFORM_REDIS_PASSWORD={redis_password}",
+            "-e",
+            "JOB_AGENT_CSRF_ENABLED=true",
+            "-e",
+            "JOB_AGENT_COOKIE_SECURE=false",
+            "-e",
+            "JOB_AGENT_EMAIL_VERIFICATION_REQUIRED=true",
+            "-e",
+            "JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS=20",
+            "-e",
             "PLATFORM_BILLING_ENABLED=true",
             "-e",
             f"PLATFORM_INTERNAL_TOKEN={token}",
@@ -117,6 +145,7 @@ def main() -> None:
             f"SPRING_DATASOURCE_USERNAME={username}",
             "-e",
             f"SPRING_DATASOURCE_PASSWORD={password}",
+            *jar_mount,
             args.java_image,
         )
         wait(f"http://127.0.0.1:{args.port}/actuator/health")
@@ -153,15 +182,16 @@ def main() -> None:
             args.ai_image,
         )
         wait(f"http://127.0.0.1:{args.port + 1}/api/health")
-        run_web_billing_flow(
+        admin_credentials = run_web_billing_flow(
             web_url=f"http://127.0.0.1:{args.port + 1}",
             database_url=isolated_url,
             base_url=f"http://127.0.0.1:{args.port}",
             internal_token=token,
         )
+        run_java_security_flow(f"http://127.0.0.1:{args.port}", token, admin_credentials, redis_name)
         print("Docker Python-Java account and billing acceptance: PASS")
     finally:
-        for name in (web, java):
+        for name in (web, java, redis_name):
             subprocess.run(
                 ["docker", "rm", "-f", name], capture_output=True, check=False
             )
