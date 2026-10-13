@@ -107,6 +107,33 @@ class BillingControllerTest {
                 .andExpect(jsonPath("$.total_recharge_micro_yuan").value(20_000_000));
     }
 
+    @Test
+    void creditRequiresBothInternalTokenAndSessionAndReturnsCommittedLedger() throws Exception {
+        String body = """
+                {"account_id":42,"actor_account_id":1,"amount_micro_yuan":1000000,
+                 "idempotency_key":"admin-credit-test-0001","reason":"payment correction","session_token":"admin-session"}
+                """;
+        mockMvc.perform(post("/internal/v1/billing/credit")
+                        .header("Idempotency-Key", "admin-credit-test-0001")
+                        .header("X-Trace-Id", "trace-credit")
+                        .contentType(APPLICATION_JSON).content(body))
+                .andExpect(status().isUnauthorized());
+        mockMvc.perform(post("/internal/v1/billing/credit")
+                        .header("Idempotency-Key", "admin-credit-test-0001")
+                        .header("X-Trace-Id", "trace-credit")
+                        .header("X-Internal-Service-Token", "platform-secret")
+                        .contentType(APPLICATION_JSON).content(body.replace("admin-session", "")))
+                .andExpect(status().isUnprocessableEntity());
+        mockMvc.perform(post("/internal/v1/billing/credit")
+                        .header("Idempotency-Key", "admin-credit-test-0001")
+                        .header("X-Trace-Id", "trace-credit")
+                        .header("X-Internal-Service-Token", "platform-secret")
+                        .contentType(APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.ledger_entry_id").value(8))
+                .andExpect(jsonPath("$.replayed").value(false));
+    }
+
     @TestConfiguration
     static class StubBillingConfiguration {
 
@@ -146,6 +173,11 @@ class BillingControllerTest {
                 BillingDtos.RechargeRequest request,
                 String idempotencyKey) {
             return new BillingDtos.BalanceProjection(request.account_id(), 18_000_000, 20_000_000, 2_000_000, 3);
+        }
+
+        @Override
+        public BillingDtos.CreditResponse credit(BillingDtos.CreditRequest request, String key, String traceId) {
+            return new BillingDtos.CreditResponse(request.account_id(), 9_000_000, 8, false);
         }
     }
 }

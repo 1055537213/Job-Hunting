@@ -68,7 +68,7 @@ docker compose -f compose.yaml -f compose.platform.yaml --profile hybrid-local u
 
 验收脚本使用随机 PostgreSQL schema，结束后删除自己的测试 schema，不清空现有用户数据。
 脚本使用真实 Python Web/Java 进程和 Docker PostgreSQL 验证注册、邮箱验证、密码重置、旧会话撤销、重复确认、登录、
-模拟充值及扣费；测试发送器捕获邮件，不向真实收件人发送。
+模拟充值及扣费、管理员人工补款（含重复请求、冲突和会话撤销）；测试发送器捕获邮件，不向真实收件人发送。
 CI 还构建两份镜像，运行 `scripts/validate_python_java_docker.py` 验证容器间相同链路、
 浏览器经网关走 Java 认证与 Python 余额接口，以及改密后的跨服务会话撤销。
 Docker 验收还运行真实 Prometheus，验证独立凭据和 Java target UP；本地 Prometheus 默认在
@@ -80,6 +80,10 @@ Java 默认测试不启动 PostgreSQL 容器，完整集成测试：
 cd platform-service
 mvn -B -ntp "-Dtest=BillingServiceIntegrationTest,AccountActionEmailIntegrationTest" "-Drun.integration.tests=true" test
 ```
+
+`BillingServiceIntegrationTest` 会用独立 PostgreSQL 容器验证补款与扣费并发、跨管理员补款、
+审计失败回滚和权限校验。人工补款需要 Java 认证和账务同时启用，接口地址和后台表单不变，
+无需修改服务器代码或另外配置补款凭据。
 
 ## 生产指令
 

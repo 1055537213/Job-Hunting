@@ -45,6 +45,14 @@ class PlatformChargeResult:
     charged_micro_yuan: int
 
 
+@dataclass(frozen=True)
+class PlatformCreditResult:
+    account_id: int
+    balance_micro_yuan: int
+    ledger_entry_id: int
+    replayed: bool
+
+
 class PlatformBillingClient:
     """调用 Java 账务接口；每次请求都携带服务 Token 和 trace id。"""
 
@@ -108,6 +116,46 @@ class PlatformBillingClient:
                 "INVALID_PLATFORM_RESPONSE",
                 "平台账务服务返回了无效余额数据。",
             ) from error
+
+    def credit(
+        self,
+        *,
+        account_id: int,
+        actor_account_id: int,
+        amount_micro_yuan: int,
+        idempotency_key: str,
+        reason: str,
+        session_token: str | None,
+        trace_id: str | None = None,
+    ) -> PlatformCreditResult:
+        if not session_token:
+            raise PlatformBillingError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
+        payload = self._request(
+            "POST",
+            "/internal/v1/billing/credit",
+            trace_id=trace_id,
+            idempotency_key=idempotency_key,
+            json={
+                "account_id": int(account_id),
+                "actor_account_id": int(actor_account_id),
+                "amount_micro_yuan": int(amount_micro_yuan),
+                "idempotency_key": idempotency_key,
+                "reason": reason,
+                "session_token": session_token,
+            },
+        )
+        try:
+            result = PlatformCreditResult(
+                account_id=int(payload["account_id"]),
+                balance_micro_yuan=int(payload["balance_micro_yuan"]),
+                ledger_entry_id=int(payload["ledger_entry_id"]),
+                replayed=payload["replayed"],
+            )
+            if result.account_id != account_id or result.ledger_entry_id <= 0 or not isinstance(result.replayed, bool):
+                raise ValueError("Invalid credit identity")
+            return result
+        except (KeyError, TypeError, ValueError) as error:
+            raise PlatformBillingError("INVALID_PLATFORM_RESPONSE", "平台账务服务返回了无效补款数据。") from error
 
     def consume(
         self,

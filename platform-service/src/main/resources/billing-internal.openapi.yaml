@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Job Hunting Billing Internal Contract
-  version: 0.1.0
+  version: 0.2.0
   description: >-
     Python AI service calls this internal contract after the billing module is
     migrated to the Spring Boot platform service. The contract is defined
@@ -72,6 +72,52 @@ paths:
           $ref: '#/components/responses/IdempotencyConflict'
         '422':
           $ref: '#/components/responses/InvalidRequest'
+  /internal/v1/billing/credit:
+    post:
+      operationId: creditAccountBalance
+      description: >-
+        Requires the internal service token and an active administrator session.
+        Balance, adjustment ledger and administrator audit commit atomically.
+        The idempotency key is scoped to the verified actor. Replays require the
+        same target account, amount and trimmed reason and create no extra audit.
+        Manual credit does not create a payment order or increase recharge totals.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TraceId'
+        - name: X-Internal-Service-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreditRequest'
+      responses:
+        '200':
+          description: Committed adjustment or the original idempotent result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditResponse'
+        '401':
+          $ref: '#/components/responses/InternalUnauthorized'
+        '403':
+          description: Session owner is disabled, not an admin, or differs from actor_account_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BusinessError'
+        '404':
+          $ref: '#/components/responses/AccountNotFound'
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
+        '422':
+          $ref: '#/components/responses/InvalidRequest'
+        '503':
+          description: Java authentication or billing is unavailable; no Python write fallback
   /internal/v1/billing/refund:
     post:
       operationId: refundBalance
@@ -180,6 +226,51 @@ components:
         description:
           type: string
           maxLength: 512
+    CreditRequest:
+      type: object
+      required: [account_id, actor_account_id, amount_micro_yuan, idempotency_key, reason, session_token]
+      properties:
+        account_id:
+          type: integer
+          format: int64
+          minimum: 1
+        actor_account_id:
+          type: integer
+          format: int64
+          minimum: 1
+        amount_micro_yuan:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 1000000000000
+        idempotency_key:
+          type: string
+          minLength: 16
+          maxLength: 128
+        reason:
+          type: string
+          minLength: 2
+          maxLength: 500
+        session_token:
+          type: string
+          minLength: 1
+          maxLength: 128
+          writeOnly: true
+    CreditResponse:
+      type: object
+      required: [account_id, balance_micro_yuan, ledger_entry_id, replayed]
+      properties:
+        account_id:
+          type: integer
+          format: int64
+        balance_micro_yuan:
+          type: integer
+          format: int64
+        ledger_entry_id:
+          type: integer
+          format: int64
+        replayed:
+          type: boolean
     RefundRequest:
       type: object
       required: [account_id, amount_micro_yuan, source_reference]
@@ -242,7 +333,7 @@ components:
       properties:
         code:
           type: string
-          enum: [ACCOUNT_NOT_FOUND, INSUFFICIENT_BALANCE, IDEMPOTENCY_CONFLICT, INVALID_REQUEST, INTERNAL_UNAUTHORIZED]
+          enum: [ACCOUNT_NOT_FOUND, INSUFFICIENT_BALANCE, IDEMPOTENCY_CONFLICT, INVALID_REQUEST, INTERNAL_UNAUTHORIZED, SESSION_EXPIRED, ADMIN_REQUIRED, ACCOUNT_DISABLED, AUTH_UNAVAILABLE]
         message:
           type: string
         trace_id:

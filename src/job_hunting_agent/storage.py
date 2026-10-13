@@ -1795,6 +1795,7 @@ class RepositoryStore:
         reason: str,
         idempotency_key: str,
         audit_event: AdminAuditEventRecord,
+        session_token: str | None = None,
     ) -> BalanceLedgerRecord:
         """管理员人工补款；余额、流水和审计必须在同一事务提交。"""
 
@@ -1813,6 +1814,39 @@ class RepositoryStore:
             raise ValueError("管理员补款原因不能超过 500 个字符。")
         key = self._validated_idempotency_key(idempotency_key)
         ledger_reference = f"admin-credit:{actor_account_id}:{key}"
+        if self._platform_billing_client is not None:
+            try:
+                result = self._platform_billing_client.credit(
+                    account_id=account_id,
+                    actor_account_id=actor_account_id,
+                    amount_micro_yuan=amount_micro_yuan,
+                    idempotency_key=key,
+                    reason=clean_reason,
+                    session_token=session_token,
+                    trace_id=audit_event.request_id,
+                )
+            except PlatformBillingError as error:
+                if error.code == "IDEMPOTENCY_CONFLICT":
+                    raise IdempotencyConflictError(str(error)) from error
+                if error.code == "INVALID_REQUEST":
+                    raise ValueError(str(error)) from error
+                raise
+            with self.connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM account_balance_ledger WHERE id = ? AND source_reference = ?",
+                    (result.ledger_entry_id, ledger_reference),
+                ).fetchone()
+            if (
+                row is None
+                or int(row["account_id"]) != account_id
+                or str(row["entry_kind"]) != "adjustment"
+                or int(row["amount_micro_yuan"]) != amount_micro_yuan
+                or row.get("operator_account_id") != actor_account_id
+                or _json_object(row["details_json"]).get("reason") != clean_reason
+                or int(row["balance_after_micro_yuan"]) != result.balance_micro_yuan
+            ):
+                raise PlatformBillingError("INVALID_PLATFORM_RESPONSE", "平台补款结果与已提交的流水不一致。")
+            return self._balance_ledger_from_row(row)
         with self.connect() as conn:
             self._ensure_account_billing_row(conn, account_id)
             balance_row = self._lock_account_billing_row(conn, account_id)

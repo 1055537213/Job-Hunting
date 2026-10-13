@@ -29,7 +29,7 @@
 - `billing-internal.openapi.yaml`：余额、消费、充值、退款内部契约。
 - Java 账务垂直链路：余额查询、模拟充值和模型调用扣费，默认关闭且未接入生产流量。
 - Python `RepositoryStore` 已支持通过 `JOB_AGENT_JAVA_BILLING_ENABLED` 切换到 Java 充值和扣费；充值幂等键沿用充值请求的 `idempotency_key`，模型调用使用 `call_id`。
-- 开关关闭时 Python 保持原有账务读写路径；开关打开后 Java 独占余额、充值订单、余额流水和支付事件的事实权，Python 只调用接口并读取已提交结果。当前已完成余额摘要的 Java 读路径迁移，外部 `/api/auth/me` 和 `/api/me/balance` 的 URL 与响应契约保持不变。
+- 开关关闭时 Python 保持原有账务读写路径；开关打开后，余额查询、演示充值、模型扣费和人工补款由 Java 负责，Python 在这些路径只调用接口并读取已提交结果。支付 Webhook/退款等尚未迁移的路径不能据此视为 Java 所有。外部 `/api/auth/me` 和 `/api/me/balance` 的 URL 与响应契约保持不变。
 - CI 的 Python-Java contract check 会验证模拟充值、模型扣费、数据库流水和幂等重试。
 
 ## 第二阶段交付：凭据校验迁移
@@ -95,6 +95,24 @@ Java 故障一律失败关闭，不退回 Python Session 数据库路径。
 
 后续继续迁移管理/账务外部入口。所有 GitHub 推送必须确认对应提交的快速 CI 通过；
 发布里程碑则必须确认完整 CI 和双镜像发布均成功。
+
+## 管理员人工补款迁移
+
+混合模式下，`POST /api/admin/accounts/{account_id}/balance/credit` 保留 Python 网页适配入口，
+但资金写入统一调用 Java `POST /internal/v1/billing/credit`。需要同时启用 Java 账务与认证；
+Java 验证内部服务 Token、真实管理员 Session、目标账号、金额、补款原因和幂等键。
+过期、撤销或停用的会话即使重放已成功的补款也不能通过；Java 不信任仅由 Python 提供的操作者 ID。
+
+补款只创建 `adjustment` 流水，不创建支付订单、不增加充值收入。余额、流水与
+`balance.manual_credit` 审计在同一个 Java 事务提交；审计失败会整体回滚。
+幂等键沿用 `admin-credit:<管理员ID>:<请求幂等键>`，重复请求返回原始流水，
+同一键修改目标账号、金额或原因返回 409。会话明文不写入流水、审计或错误日志。
+
+管理员操作复用账号管理的事务级策略锁，账务写入先锁账号再锁余额，账号锁允许外键检查，
+避免两个管理员互相补款或管理员自补款与模型扣费之间形成锁循环。
+Python 收到成功响应后只读取已提交的流水；Java 错误或网络超时不会触发 Python 余额写入。
+关闭 Java 账务开关时仍保留本地兼容路径；支付 Webhook/退款等剩余入口尚需独立迁移，
+本阶段不代表全部账务入口均已完成迁移。
 
 ## Java 安全入口准备阶段
 

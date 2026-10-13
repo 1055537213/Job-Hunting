@@ -52,4 +52,14 @@ public class BillingController {
         tokenVerifier.verify(internalToken);
         return ResponseEntity.ok(billingService.recharge(request, idempotencyKey));
     }
+
+    @PostMapping("/credit")
+    public BillingDtos.CreditResponse credit(
+            @Valid @RequestBody BillingDtos.CreditRequest request,
+            @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @RequestHeader("X-Trace-Id") String traceId,
+            @RequestHeader(name = "X-Internal-Service-Token", required = false) String internalToken) {
+        tokenVerifier.verify(internalToken);
+        return billingService.credit(request, idempotencyKey, traceId);
+    }
 }

@@ -11,4 +11,9 @@ public interface BillingOperations {
     BillingDtos.BalanceProjection recharge(
             BillingDtos.RechargeRequest request,
             String idempotencyKey);
+
+    BillingDtos.CreditResponse credit(
+            BillingDtos.CreditRequest request,
+            String idempotencyKey,
+            String traceId);
 }

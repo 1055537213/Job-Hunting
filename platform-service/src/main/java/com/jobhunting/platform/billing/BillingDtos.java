@@ -1,6 +1,7 @@
 package com.jobhunting.platform.billing;
 
 import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
@@ -34,6 +35,23 @@ public final class BillingDtos {
             long total_recharge_micro_yuan,
             long total_consumed_micro_yuan,
             long ledger_entry_count) {
+    }
+
+    public record CreditRequest(
+            @NotNull @Min(1) Long account_id,
+            @NotNull @Min(1) Long actor_account_id,
+            @NotNull @Min(1) @Max(1_000_000_000_000L) Long amount_micro_yuan,
+            @NotBlank @Size(min = 16, max = 128) String idempotency_key,
+            @NotBlank @Size(min = 2, max = 500) String reason,
+            @NotBlank @Size(max = 128) String session_token) {
+        @Override public String toString() { return "CreditRequest[redacted]"; }
+    }
+
+    public record CreditResponse(
+            long account_id,
+            long balance_micro_yuan,
+            long ledger_entry_id,
+            boolean replayed) {
     }
 
     public record ChargeResponse(

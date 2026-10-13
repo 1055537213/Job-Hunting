@@ -140,7 +140,7 @@ from .project_evidence import (
     ProjectManifestItem,
 )
 from .platform_auth import PlatformAuthError, PlatformAuthUnavailableError
-from .platform_billing import PlatformBillingUnavailableError
+from .platform_billing import PlatformBillingError, PlatformBillingUnavailableError
 from .rag import RAGProviderRequestError
 from .rate_limiting import RateLimiter
 from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
@@ -2891,11 +2891,16 @@ def create_web_app(
                 reason=clean_reason,
                 idempotency_key=payload.idempotency_key,
                 audit_event=audit_event,
+                session_token=request.cookies.get(SESSION_COOKIE_NAME),
             )
         except IdempotencyConflictError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         except (PermissionError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+        except PlatformBillingUnavailableError:
+            raise
+        except PlatformBillingError as error:
+            raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
         return {
             "entry": asdict(entry),
             "summary": asdict(backend.store.get_account_balance_summary(target.id)),

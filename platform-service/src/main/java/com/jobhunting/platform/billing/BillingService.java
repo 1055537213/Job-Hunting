@@ -7,10 +7,13 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Map;
 import java.util.UUID;
 
+import com.jobhunting.platform.auth.SessionService;
+
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.ObjectMapper;
 
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.dao.EmptyResultDataAccessException;
@@ -25,14 +28,17 @@ public class BillingService implements BillingOperations {
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
     private final BigDecimal pricePerMillionTokensYuan;
+    private final ObjectProvider<SessionService> sessions;
 
     public BillingService(
             JdbcTemplate jdbcTemplate,
             ObjectMapper objectMapper,
-            @Value("${platform.billing.price-per-million-tokens-yuan:25.0}") BigDecimal pricePerMillionTokensYuan) {
+            @Value("${platform.billing.price-per-million-tokens-yuan:25.0}") BigDecimal pricePerMillionTokensYuan,
+            ObjectProvider<SessionService> sessions) {
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
         this.pricePerMillionTokensYuan = pricePerMillionTokensYuan;
+        this.sessions = sessions;
     }
 
     @Transactional(readOnly = true)
@@ -298,7 +304,123 @@ public class BillingService implements BillingOperations {
         return getBalance(accountId);
     }
 
+    @Transactional
+    public BillingDtos.CreditResponse credit(
+            BillingDtos.CreditRequest request, String idempotencyKey, String traceId) {
+        String key = request.idempotency_key().strip();
+        String reason = request.reason().strip();
+        if (!key.equals(idempotencyKey) || key.length() < 16 || key.length() > 128
+                || !key.codePoints().allMatch(c -> Character.isLetterOrDigit(c) || c == '-' || c == '_' || c == ':')
+                || reason.length() < 2 || reason.length() > 500
+                || request.amount_micro_yuan() <= 0 || request.amount_micro_yuan() > 1_000_000_000_000L) {
+            throw new BillingException("INVALID_REQUEST", "补款金额、原因或幂等键无效。",
+                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+        SessionService auth = sessions.getIfAvailable();
+        if (auth == null) {
+            throw new BillingException("AUTH_UNAVAILABLE", "补款需要启用 Java 认证服务。",
+                    org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE);
+        }
+        // Match account administration's lock order, including cross-admin credits and disables.
+        jdbcTemplate.queryForObject("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                Object.class, "platform-admin-policy-v1");
+        long actorId = auth.requireSession(request.session_token());
+        String actorRole = jdbcTemplate.queryForObject("SELECT role FROM accounts WHERE id = ?", String.class, actorId);
+        if (!"admin".equals(actorRole) || actorId != request.actor_account_id()) {
+            throw new BillingException("ADMIN_REQUIRED", "需要管理员权限。",
+                    org.springframework.http.HttpStatus.FORBIDDEN);
+        }
+        long accountId = request.account_id();
+        var targetRoles = jdbcTemplate.query("""
+                SELECT role FROM accounts WHERE id = ? AND deleted_at IS NULL FOR NO KEY UPDATE
+                """, (row, index) -> row.getString("role"), accountId);
+        if (targetRoles.isEmpty()) {
+            throw new BillingException("ACCOUNT_NOT_FOUND", "账号不存在。", org.springframework.http.HttpStatus.NOT_FOUND);
+        }
+        String reference = "admin-credit:" + actorId + ":" + key;
+        ExistingCredit existing = findExistingCredit(reference);
+        if (existing != null) return replayCredit(existing, request, reason);
+        BalanceRow balance = lockBalance(accountId);
+        existing = findExistingCredit(reference);
+        if (existing != null) return replayCredit(existing, request, reason);
+        long after;
+        try {
+            after = Math.addExact(balance.balanceMicroYuan(), request.amount_micro_yuan());
+        } catch (ArithmeticException exception) {
+            throw new BillingException("INVALID_REQUEST", "补款后的余额超出支持范围。",
+                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+        long ledgerId;
+        try {
+            ledgerId = jdbcTemplate.queryForObject("""
+                    INSERT INTO account_balance_ledger (
+                        account_id, entry_kind, amount_micro_yuan, balance_before_micro_yuan,
+                        balance_after_micro_yuan, source_reference, summary, details_json,
+                        operator_account_id, created_at
+                    ) VALUES (?, 'adjustment', ?, ?, ?, ?, ?, CAST(? AS jsonb), ?, CURRENT_TIMESTAMP)
+                    RETURNING id
+                    """, Long.class, accountId, request.amount_micro_yuan(), balance.balanceMicroYuan(), after,
+                    reference, "管理员人工补款", json(Map.of("reason", reason, "adjustment_type", "manual_credit")), actorId);
+        } catch (DuplicateKeyException exception) {
+            throw creditConflict();
+        }
+        jdbcTemplate.update("UPDATE account_balances SET balance_micro_yuan = ?, updated_at = CURRENT_TIMESTAMP WHERE account_id = ?",
+                after, accountId);
+        jdbcTemplate.update("""
+                INSERT INTO admin_audit_events (
+                    actor_account_id, target_account_id, action, target_type, target_id,
+                    outcome, summary, details_json, request_id, created_at
+                ) VALUES (?, ?, 'balance.manual_credit', 'account_balance', ?, 'succeeded', ?,
+                          CAST(? AS jsonb), ?, CURRENT_TIMESTAMP)
+                """, actorId, accountId, Long.toString(accountId), "管理员为账号 #" + accountId + " 执行人工补款。",
+                json(Map.of("target_role", targetRoles.getFirst(), "amount_micro_yuan", request.amount_micro_yuan(),
+                        "balance_before_micro_yuan", balance.balanceMicroYuan(), "balance_after_micro_yuan", after,
+                        "reason", reason, "ledger_reference", reference)),
+                traceId != null && traceId.matches("[A-Za-z0-9._:-]{1,128}") ? traceId : null);
+        return new BillingDtos.CreditResponse(accountId, after, ledgerId, false);
+    }
+
+    private ExistingCredit findExistingCredit(String reference) {
+        return jdbcTemplate.query("""
+                SELECT id, account_id, entry_kind, amount_micro_yuan, balance_after_micro_yuan,
+                       operator_account_id, details_json->>'reason' AS reason,
+                       details_json->>'adjustment_type' AS adjustment_type
+                FROM account_balance_ledger WHERE source_reference = ?
+                """, (row, index) -> new ExistingCredit(row.getLong("id"), row.getLong("account_id"),
+                row.getString("entry_kind"), row.getLong("amount_micro_yuan"), row.getLong("balance_after_micro_yuan"),
+                row.getLong("operator_account_id"), row.getString("reason"), row.getString("adjustment_type")),
+                reference).stream().findFirst().orElse(null);
+    }
+
+    private BillingDtos.CreditResponse replayCredit(ExistingCredit existing, BillingDtos.CreditRequest request, String reason) {
+        if (existing.accountId() != request.account_id() || existing.actorId() != request.actor_account_id()
+                || existing.amount() != request.amount_micro_yuan() || !"adjustment".equals(existing.kind())
+                || !"manual_credit".equals(existing.adjustmentType()) || !reason.equals(existing.reason())) {
+            throw creditConflict();
+        }
+        return new BillingDtos.CreditResponse(existing.accountId(), existing.balanceAfter(), existing.id(), true);
+    }
+
+    private BillingException creditConflict() {
+        return new BillingException("IDEMPOTENCY_CONFLICT", "该幂等键已用于另一笔管理员补款。",
+                org.springframework.http.HttpStatus.CONFLICT);
+    }
+
+    private String json(Map<String, Object> details) {
+        try {
+            return objectMapper.writeValueAsString(details);
+        } catch (JacksonException exception) {
+            throw new IllegalStateException("补款明细序列化失败。", exception);
+        }
+    }
+
+    private record ExistingCredit(long id, long accountId, String kind, long amount, long balanceAfter,
+            long actorId, String reason, String adjustmentType) { }
+
     private BalanceRow lockBalance(long accountId) {
+        // Account before balance; NO KEY UPDATE remains compatible with ledger foreign-key checks.
+        jdbcTemplate.query("SELECT id FROM accounts WHERE id = ? FOR NO KEY UPDATE",
+                (row, index) -> row.getLong(1), accountId);
         try {
             return jdbcTemplate.queryForObject(
                     """

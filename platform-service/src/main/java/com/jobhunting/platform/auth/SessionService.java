@@ -130,9 +130,9 @@ public class SessionService {
         return jdbc.update("UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE account_id = ? AND revoked_at IS NULL", id);
     }
 
-    // Package-private so other Java-owned account operations can reuse the exact
-    // session lock and expiry checks instead of trusting an account id from Python.
-    long requireSession(String token) {
+    // Account and billing operations share the same session lock and expiry policy.
+    @Transactional
+    public long requireSession(String token) {
         Long id = lockAccount(token);
         if (id == null) {
             throw new AuthException("SESSION_EXPIRED", "登录状态已过期，请重新登录。", HttpStatus.UNAUTHORIZED);
@@ -141,9 +141,10 @@ public class SessionService {
     }
 
     private Long lockAccount(String token) {
+        // Protect status/credentials without blocking financial foreign-key KEY SHARE checks.
         var rows = jdbc.query("""
                 SELECT a.id, a.status, a.deleted_at FROM accounts a
-                JOIN auth_sessions s ON s.account_id = a.id WHERE s.token_hash = ? FOR UPDATE OF a
+                JOIN auth_sessions s ON s.account_id = a.id WHERE s.token_hash = ? FOR NO KEY UPDATE OF a
                 """, (row, i) -> new Account(row.getLong(1), row.getString(2), row.getTimestamp(3) != null), digest(token));
         if (rows.isEmpty() || rows.getFirst().deleted()) return null;
         // Check session eligibility before exposing disabled account status.

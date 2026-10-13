@@ -414,6 +414,40 @@ def run_web_billing_flow(
             balance_after_rejection = client.get("/api/me/balance")
             if balance_after_rejection.json()["summary"]["balance_micro_yuan"] != 8_000_000:
                 raise AssertionError(balance_after_rejection.json())
+
+            credit_path = f"/api/admin/accounts/{account_id}/balance/credit"
+            credit_key = f"web-credit-{suffix}"
+            credit_body = {"amount_yuan": 7, "reason": "payment correction", "idempotency_key": credit_key}
+            if client.post(credit_path, json=credit_body).status_code != 403:
+                raise AssertionError("Ordinary account was allowed to issue a manual credit")
+            with httpx.Client(base_url=web_url, timeout=10) as admin_client:
+                admin_client.post("/api/auth/login", json={"email": admin_email, "password": admin_password}).raise_for_status()
+                trace_id = f"web-credit-trace-{suffix}"
+                credited = admin_client.post(credit_path, json=credit_body, headers={"X-Request-ID": trace_id})
+                credited.raise_for_status()
+                replay = admin_client.post(credit_path, json=credit_body)
+                replay.raise_for_status()
+                assert credited.json()["entry"]["id"] == replay.json()["entry"]["id"]
+                assert replay.json()["summary"]["balance_micro_yuan"] == 15_000_000
+                assert replay.json()["summary"]["total_recharge_micro_yuan"] == 10_000_000
+                assert replay.json()["entry"]["entry_kind"] == "adjustment"
+                assert replay.json()["entry"]["recharge_order_id"] is None
+                for changed in ({**credit_body, "amount_yuan": 8}, {**credit_body, "reason": "different reason"}):
+                    assert admin_client.post(credit_path, json=changed).status_code == 409
+                audit = [e for e in store.list_admin_audit_events(limit=100)
+                         if e.action == "balance.manual_credit" and e.target_account_id == account_id]
+                assert len(audit) == 1 and audit[0].request_id == trace_id
+                session = admin_client.cookies["job_agent_session"]
+                admin_client.post("/api/auth/logout").raise_for_status()
+                # Even an idempotent replay must revalidate the real administrator session in Java.
+                denied = httpx.post(f"{base_url}/internal/v1/billing/credit", headers={
+                    "X-Internal-Service-Token": internal_token, "X-Trace-Id": "revoked-credit", "Idempotency-Key": credit_key,
+                }, json={"account_id": account_id, "actor_account_id": bootstrapped["account_id"],
+                         "amount_micro_yuan": 7_000_000, "idempotency_key": credit_key,
+                         "reason": "payment correction", "session_token": session}, timeout=10)
+                assert denied.status_code == 401
+            assert client.get("/api/me/balance").json()["summary"]["balance_micro_yuan"] == 15_000_000
+            print("==> Web manual credit -> Java Session/RBAC -> atomic ledger/audit -> replay/conflict/revocation: PASS")
         finally:
             store.close()
     print("Local Python Web + Java billing flow: PASS")
