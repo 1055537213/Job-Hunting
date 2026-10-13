@@ -267,14 +267,22 @@ docker compose --env-file .env.example -f compose.yaml -f compose.prod.yaml -f c
 
 ### CI/CD
 
-推送到 java-platform-migration 后，CI 会运行 Python、前端、Java、PostgreSQL 联调、Compose、安全扫描和容器连接测试。CI 通过后，工作流发布同一提交的：
+推送到 `java-platform-migration` 后，CI 只运行聚焦的 Python 测试、前端回归、Java 单元测试、
+Ruff 和工作流语法检查；此时不会构建或发布镜像。完成一个迁移里程碑后，在推送的最后一条
+提交说明中加入 `[full ci]`，即可触发完整验收。完整验收包含全部
+Python/Java 测试、PostgreSQL 联调、Compose、安全扫描和容器连接测试；通过后才发布同一提交的：
 
 ~~~text
 ghcr.io/1055537213/job-hunting-ai:sha-<提交前12位>
 ghcr.io/1055537213/job-hunting-platform:sha-<提交前12位>
 ~~~
 
-本分支当前以本地验收为主；未来部署使用完整提交 SHA、人工批准和 `compose.hybrid.prod.yaml`
+也可以用空提交主动触发：`git commit --allow-empty -m "ci: full acceptance [full ci]"`，
+然后执行 `git push origin java-platform-migration`。工作流同时保留 `workflow_dispatch`；
+网页 `Run workflow` 按钮需要默认分支也配置该触发器，当前可直接使用上述提交方式。
+
+PR 和 `master` 推送仍运行完整验收。部署门禁要求目标 SHA 的完整验收及双镜像发布均成功，
+快速检查通过不代表可部署。本分支当前以本地验收为主；未来部署使用完整提交 SHA、人工批准和 `compose.hybrid.prod.yaml`
 （共存时再加 `compose.hybrid.coexist.yaml`）。服务器仍需预先准备生产环境变量、证书和部署权限，
 但无需临时修改应用代码。操作步骤见 [Python + Java 部署指南](docs/learning/python-java-deployment.md)。
 

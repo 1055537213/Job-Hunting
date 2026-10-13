@@ -60,15 +60,28 @@ jobs:
           ref: ${{ inputs.commit_sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Require exact successful migration CI
+      - name: Require exact successful full migration CI and published images
         shell: bash
         run: |
           set -euo pipefail
           [[ "$(git rev-parse HEAD)" == "$SHA" ]]
           git merge-base --is-ancestor "$SHA" origin/java-platform-migration
-          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&per_page=100" \
-            --jq '.workflow_runs | sort_by(.id) | last | select(.head_branch == "java-platform-migration" and .conclusion == "success") | .id' > "$RUNNER_TEMP/ci-id"
-          [[ -s "$RUNNER_TEMP/ci-id" ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
+            --jq ".workflow_runs | map(select(.head_sha == \"$SHA\" and .head_branch == \"java-platform-migration\" and .conclusion == \"success\" and (.event == \"push\" or .event == \"workflow_dispatch\"))) | sort_by(.id) | reverse | .[].id" > "$RUNNER_TEMP/ci-candidates"
+          verified=false
+          while IFS= read -r ci_id; do
+            [[ "$ci_id" =~ ^[0-9]+$ ]]
+            completed_jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$ci_id/jobs?per_page=100&filter=latest" \
+              --jq '[.jobs[] | select((.name == "checks" or .name == "publish-platform") and .conclusion == "success") | .name] | unique | sort | join(",")')"
+            if [[ "$completed_jobs" == "checks,publish-platform" ]]; then
+              verified=true
+              break
+            fi
+          done < "$RUNNER_TEMP/ci-candidates"
+          if [[ "$verified" != true ]]; then
+            echo "This commit requires successful full CI and both published images. Fast checks alone are insufficient."
+            exit 1
+          fi
       - name: Configure SSH trust
         shell: bash
         run: |

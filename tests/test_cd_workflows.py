@@ -477,6 +477,31 @@ def test_java_platform_release_has_healthcheck_and_security_gates():
         assert required in ci
 
 
+def test_migration_push_runs_fast_checks_and_only_full_ci_publishes():
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "branches: [master, java-platform-migration]" in ci
+    assert "workflow_dispatch:" in ci
+    assert "fast-checks:\n    if: github.event_name == 'push' && github.ref == 'refs/heads/java-platform-migration' && !contains(github.event.head_commit.message, '[full ci]')" in ci
+    assert "checks:\n    if: github.event_name != 'push' || github.ref != 'refs/heads/java-platform-migration' || contains(github.event.head_commit.message, '[full ci]')" in ci
+    assert "publish-platform:\n    if: github.ref == 'refs/heads/java-platform-migration' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[full ci]')))" in ci
+    for required in (
+        "Run focused Python tests",
+        "tests/test_platform_auth.py",
+        "tests/test_platform_billing.py",
+        "Run frontend regression tests",
+        "Run Java platform service tests",
+        "Validate GitHub Actions workflows",
+    ):
+        assert required in ci
+
+    deploy = (ROOT / ".github" / "workflows" / "deploy-hybrid.yml").read_text(encoding="utf-8")
+    assert "head_sha=$SHA&per_page=100" in deploy
+    assert '.head_sha == \\"$SHA\\"' in deploy
+    assert '.name == "checks" or .name == "publish-platform"' in deploy
+    assert '[[ "$completed_jobs" == "checks,publish-platform" ]]' in deploy
+    assert 'if [[ "$verified" != true ]]; then' in deploy
+
+
 def test_hybrid_release_pair_and_production_compose_are_connected(monkeypatch):
     monkeypatch.setenv("PLATFORM_RATE_LIMIT_KEY_PREFIX", "job_agent:ci_platform_limit")
     for extra in (("compose.hybrid.prod.yaml",), ("compose.coexist.yaml", "compose.hybrid.prod.yaml")):

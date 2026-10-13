@@ -83,13 +83,24 @@ mvn -B -ntp "-Dtest=BillingServiceIntegrationTest,AccountActionEmailIntegrationT
 
 ## 生产指令
 
-CI 为 `java-platform-migration` 的同一个完整 SHA 发布两份独立镜像：
+日常推送到 `java-platform-migration` 只执行快速检查，不发布镜像。迁移里程碑完成时，
+在推送的最后一条提交说明中加入 `[full ci]` 运行完整验收，也可以主动创建空提交：
+
+```powershell
+git switch java-platform-migration
+git commit --allow-empty -m "ci: full acceptance [full ci]"
+git push origin java-platform-migration
+```
+
+`workflow_dispatch` 也已保留；网页手动运行按钮需要默认分支配置该触发器。
+完整验收通过后，才为该次运行的同一个完整 SHA 发布两份独立镜像：
 `ghcr.io/1055537213/job-hunting-ai:sha-<前12位>` 与
 `ghcr.io/1055537213/job-hunting-platform:sha-<前12位>`，不覆盖纯 Python 镜像。
 
 首次部署需要先准备服务器 Docker、`<app-root>/shared/.env`、镜像仓库拉取权限，以及 HTTPS/证书。
 在 GitHub `Deploy Python Java` 选择完整 SHA、拓扑，输入 `DEPLOY`，并审批 production 环境。
-工作流核对精确提交的 CI 成功、两个镜像标签及 revision 一致，然后上传部署文件，执行：
+工作流核对精确提交的完整 CI、`checks` 和 `publish-platform` 作业均成功，
+并验证两个镜像标签及 revision 一致，然后上传部署文件，执行：
 
 ```bash
 bash <release-dir>/scripts/deploy_production.sh \

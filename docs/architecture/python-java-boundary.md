@@ -90,11 +90,11 @@ Java 故障一律失败关闭，不退回 Python Session 数据库路径。
 `compose.hybrid.prod.yaml`；共存部署另加 `compose.coexist.yaml` 与
 `compose.hybrid.coexist.yaml`。运行环境需将 `PLATFORM_TRUSTED_PROXY_CIDRS` 限定为
 实际受控网关的地址段，避免所有访客共享一个 Java IP 限流桶。
-CI 通过后发布相同提交的 `-ai` 和 `-platform` 两个版本镜像，审批部署通过 `Deploy Python Java`
+日常推送只运行快速 CI；提交说明包含 `[full ci]` 或手动触发完整 CI，通过后才发布相同提交的 `-ai` 和 `-platform` 两个版本镜像，审批部署通过 `Deploy Python Java`
 工作流执行；生产只填环境配置，不需要修改代码/Compose。此分支不自动部署服务器。
 
-后续继续迁移管理/账务外部入口。所有 GitHub 推送必须确认对应提交
-CI 最终通过，镜像发布失败也不视为完成。
+后续继续迁移管理/账务外部入口。所有 GitHub 推送必须确认对应提交的快速 CI 通过；
+发布里程碑则必须确认完整 CI 和双镜像发布均成功。
 
 ## Java 安全入口准备阶段
 

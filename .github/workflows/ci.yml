@@ -4,12 +4,94 @@ on:
   push:
     branches: [master, java-platform-migration]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  fast-checks:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/java-platform-migration' && !contains(github.event.head_commit.message, '[full ci]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: job_agent
+          POSTGRES_USER: job_agent
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U job_agent -d job_agent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      JOB_AGENT_TEST_DATABASE_URL: postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent
+      ACTIONLINT_IMAGE: rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            requirements-dev.lock
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22.x"
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Install locked dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.lock -r requirements-dev.lock
+
+      - name: Validate GitHub Actions workflows
+        run: docker run --rm -v "$PWD:/repo" -w /repo "$ACTIONLINT_IMAGE"
+
+      - name: Run focused Python tests
+        run: >-
+          python -m pytest -q
+          tests/test_cd_workflows.py
+          tests/test_platform_auth.py
+          tests/test_platform_billing.py
+          tests/test_platform_email.py
+          tests/test_platform_password_reset.py
+          tests/test_platform_sessions.py
+
+      - name: Run lint
+        run: ruff check src tests alembic
+
+      - name: Compile Python sources
+        run: python -m compileall -q src tests alembic
+
+      - name: Run frontend regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test_file in tests/frontend_*.mjs; do
+            node "$test_file"
+          done
+
+      - name: Run Java platform service tests
+        working-directory: platform-service
+        run: mvn -B -ntp test
+
   checks:
+    if: github.event_name != 'push' || github.ref != 'refs/heads/java-platform-migration' || contains(github.event.head_commit.message, '[full ci]')
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -347,7 +429,7 @@ jobs:
           fi
 
   publish-platform:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/java-platform-migration'
+    if: github.ref == 'refs/heads/java-platform-migration' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[full ci]')))
     needs: checks
     runs-on: ubuntu-24.04
     timeout-minutes: 45
