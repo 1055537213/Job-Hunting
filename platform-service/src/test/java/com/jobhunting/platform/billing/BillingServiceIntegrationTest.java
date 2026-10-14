@@ -28,7 +28,8 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE,
-        properties = {"platform.billing.enabled=true", "platform.auth.enabled=true"})
+        properties = {"platform.billing.enabled=true", "platform.auth.enabled=true",
+                "JOB_AGENT_BILLING_LOW_BALANCE_THRESHOLD_YUAN=12.5"})
 @Testcontainers
 @EnabledIfSystemProperty(named = "run.integration.tests", matches = "true")
 class BillingServiceIntegrationTest {
@@ -54,6 +55,7 @@ class BillingServiceIntegrationTest {
 
     @Autowired private SessionService sessions;
     @Autowired private PasswordHasher passwords;
+    @Autowired private BillingQueryService queries;
 
     @BeforeEach
     void resetDatabase() {
@@ -365,6 +367,72 @@ class BillingServiceIntegrationTest {
         assertThat(billing.getBalance(44).balance_micro_yuan()).isEqualTo(11_000_000);
         assertThat(billing.getBalance(42).balance_micro_yuan()).isEqualTo(12_000_000);
         assertThat(jdbc.queryForObject("SELECT count(*) FROM admin_audit_events", Integer.class)).isEqualTo(2);
+    }
+
+    @Test
+    void personalBalancePagesAreOwnerScopedOrderedAndKeepNullableFinancialFields() {
+        billing.consume(request(42, 1_000_000, "query-charge-first"), "query-charge-first");
+        billing.consume(request(42, 1_000_000, "query-charge-second"), "query-charge-second");
+        billing.recharge(rechargeRequest(42, 1_000_000, "query-recharge-first"), "query-recharge-first");
+        var credit = creditRequest(42, 42, login(42), 1_000_000, "query-credit-first", "correction");
+        billing.credit(credit, credit.idempotency_key(), "query-trace");
+        billing.consume(request(43, 1, "query-other-owner"), "query-other-owner");
+        jdbc.update("UPDATE account_balance_ledger SET created_at = '2026-10-14T00:00:00.123456+00:00'");
+        var first = queries.balance(queryAccount("active"), 2, 0);
+        var second = queries.balance(queryAccount("active"), 2, 2);
+        assertThat(first.total()).isEqualTo(4);
+        assertThat(first.max_pages()).isNull();
+        assertThat(first.summary().get("ledger_entry_count")).isEqualTo(4L);
+        assertThat(first.summary().get("low_balance_threshold_micro_yuan")).isEqualTo(12_500_000L);
+        assertThat(first.entries()).extracting(BillingQueryService.LedgerEntry::entry_kind)
+                .containsExactly("adjustment", "recharge");
+        assertThat(first.entries()).allSatisfy(row -> {
+            assertThat(row.account_id()).isEqualTo(42);
+            assertThat(row.token_count()).isNull();
+            assertThat(row.price_per_million_tokens_yuan()).isNull();
+            assertThat(row.created_at()).isEqualTo("2026-10-14T00:00:00.123456+00:00");
+        });
+        assertThat(first.entries().getFirst().details().get("reason")).isEqualTo("correction");
+        assertThat(second.entries()).extracting(BillingQueryService.LedgerEntry::source_reference)
+                .containsExactly("query-charge-second", "query-charge-first");
+        assertThat(second.entries().getFirst().price_per_million_tokens_yuan()).isEqualByComparingTo("25");
+        assertThat(queries.balance(queryAccount("active"), 2, 4).entries()).isEmpty();
+    }
+
+    @Test
+    void personalOrdersExcludeOtherAccountsAndManualCredits() {
+        billing.recharge(rechargeRequest(42, 1_000_000, "query-orders-first-0001"), "query-orders-first-0001");
+        billing.recharge(rechargeRequest(42, 2_000_000, "query-orders-second-0001"), "query-orders-second-0001");
+        billing.recharge(rechargeRequest(43, 1_000_000, "query-orders-other-0001"), "query-orders-other-0001");
+        jdbc.update("UPDATE recharge_orders SET created_at = '2026-10-14T00:00:00+00:00'");
+        var first = queries.orders(queryAccount("active"), 1, 0);
+        var second = queries.orders(queryAccount("active"), 1, 1);
+        assertThat(first.total()).isEqualTo(2);
+        assertThat(first.orders().getFirst().idempotency_key()).isEqualTo("query-orders-second-0001");
+        assertThat(second.orders().getFirst().idempotency_key()).isEqualTo("query-orders-first-0001");
+        assertThat(first.orders().getFirst().cancelled_at()).isNull();
+        assertThat(first.orders().getFirst().refunded_at()).isNull();
+        assertThat(first.orders().getFirst().details().get("payment_provider")).isEqualTo("simulated");
+        assertThat(queries.orders(queryAccount("active"), 100, 2).orders()).isEmpty();
+    }
+
+    @Test
+    void personalSummaryUsesConfiguredThresholdAndDoesNotInventMissingBalances() {
+        jdbc.update("UPDATE account_balances SET balance_micro_yuan = 0 WHERE account_id = 42");
+        assertThat(queries.balance(queryAccount("active"), 100, 0).summary().get("state")).isEqualTo("suspended");
+        jdbc.update("UPDATE account_balances SET balance_micro_yuan = 12500000 WHERE account_id = 42");
+        assertThat(queries.summary(queryAccount("active")).get("state")).isEqualTo("low_balance");
+        jdbc.update("UPDATE account_balances SET balance_micro_yuan = 12500001 WHERE account_id = 42");
+        assertThat(queries.summary(queryAccount("active")).get("state")).isEqualTo("balance");
+        assertThat(queries.summary(queryAccount("disabled")).get("state")).isEqualTo("suspended");
+        jdbc.update("DELETE FROM account_balances WHERE account_id = 42");
+        assertThatThrownBy(() -> queries.summary(queryAccount("active"))).isInstanceOf(BillingException.class)
+                .extracting("code").isEqualTo("ACCOUNT_NOT_FOUND");
+    }
+
+    private com.jobhunting.platform.auth.AccountAdministrationService.AccountView queryAccount(String status) {
+        return new com.jobhunting.platform.auth.AccountAdministrationService.AccountView(42L, "billing-42@example.com",
+                null, "admin", status, false, null, null, "2026-10-14T00:00:00+00:00", "2026-10-14T00:00:00+00:00");
     }
 
     private String login(int id) {

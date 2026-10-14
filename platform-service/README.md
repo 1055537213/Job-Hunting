@@ -1,6 +1,6 @@
 # Job Hunting Platform Service
 
-这是求职助手的 Java 平台服务，当前实现账务垂直链路，以及账号注册、凭据校验、邮箱验证、邮箱变更、密码重置和会话管理。混合网关把公开的浏览器认证路径直达 Java；其余页面/API 仍到 Python。
+这是求职助手的 Java 平台服务，当前实现账务垂直链路，以及账号注册、凭据校验、邮箱验证、邮箱变更、密码重置和会话管理。混合网关把公开的浏览器认证路径与个人账务查询直达 Java；其余页面/API 仍到 Python。
 
 运行基线为 Spring Boot 4.0、Spring Framework 7、Jackson 3、Tomcat 11 和 Java 21。
 依赖版本由 Maven 锁定，Tomcat/Jackson 的安全修复版本在 `pom.xml` 中显式覆盖；
@@ -167,6 +167,15 @@ Java 模式下不派发旧 Python 邮件任务；关闭迁移开关时仍保留�
 充值和扣费接口都要求 `Idempotency-Key` 与请求中的 `source_reference` 相同。Java 在充值时同一事务写入 `recharge_orders`、`account_balance_ledger` 和 `payment_events`，重复充值只返回原账务结果，不会重复到账。余额不足时返回 `INSUFFICIENT_BALANCE` 和 `余额不足，请先充值后重试`。余额行使用 PostgreSQL 行锁，账务流水使用唯一约束保证重试不会重复写入。Python 在远端扣费失败时保留 `usage_events`，后续使用同一个 `call_id` 重试，不会重复扣费。
 
 ## 迁移规则
+
+个人中心 `GET /api/me/balance` 和 `GET /api/me/recharge/orders` 经混合网关直接到 Java，
+响应字段及前端保持不变。Java 从真实 Session 获取账号，不能通过请求中的账号 ID 查询他人流水。
+余额摘要、总数和分页在只读 Repeatable Read 事务中读取；每页最多 100 条，按时间和 ID 倒序。
+资金事实不采用 Token/工具日志的五页淘汰规则。查询契约见
+[`billing-personal.openapi.yaml`](src/main/resources/billing-personal.openapi.yaml)。
+Python 在 Java 账务模式下只转发这两项查询，Java 故障返回 503，不回读本地账务表。
+价格、低余额阈值和演示充值配置沿用同一组 `JOB_AGENT_BILLING_*` / `JOB_AGENT_DEMO_RECHARGE_*`
+环境参数；生产默认关闭演示充值。管理员账务查询及公开充值写入口暂仍由 Python 适配。
 
 - Java 服务和 Python 服务不能同时写同一组账务表。
 - Java 账务开关关闭时，`account_balances`、`recharge_orders`、`account_balance_ledger` 仍由 Python 独占写入；开关打开后，余额、模拟充值和模型扣费由 Java 独占写入。

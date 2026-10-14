@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from job_hunting_agent.config import (
     BillingSettings,
@@ -17,6 +18,89 @@ from job_hunting_agent.platform_billing import (
 )
 from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
 from job_hunting_agent.storage import IdempotencyConflictError, InsufficientBalanceError
+from job_hunting_agent.web import create_web_app
+
+
+@pytest.mark.parametrize("resource", ["balance", "recharge/orders"])
+def test_personal_billing_pages_forward_session_not_account_identity(monkeypatch, resource):
+    page = {"entries": [], "orders": [], "total": 0, "limit": 3, "offset": 6,
+            "summary": {"account_id": 42}, "settings": {}, "page_size": 100, "max_pages": None}
+    captured = {}
+
+    def request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return httpx.Response(200, json=page)
+
+    monkeypatch.setattr(httpx, "request", request)
+    client = PlatformBillingClient(PlatformBillingSettings(True, "http://platform-service:8081", "secret", 5))
+    assert client.personal_page(resource, account_id=42, session_token="session", limit=3, offset=6,
+                                trace_id="read-trace") == page
+    assert captured["method"] == "POST"
+    assert captured["url"].endswith(f"/internal/v1/billing/me/{resource}")
+    assert captured["json"] == {"session_token": "session", "limit": 3, "offset": 6}
+    assert captured["headers"]["X-Trace-Id"] == "read-trace"
+    assert captured["headers"]["X-Internal-Service-Token"] == "secret"
+
+
+@pytest.mark.parametrize("resource,field,value", [
+    ("balance", "summary", {"account_id": 99}),
+    ("balance", "entries", [{"account_id": 99}]),
+    ("recharge/orders", "orders", [{"account_id": 99}]),
+    ("balance", "total", -1),
+    ("balance", "total", True),
+    ("balance", "limit", 5),
+    ("balance", "offset", 1),
+    ("balance", "max_pages", 5),
+    ("balance", "entries", [{"account_id": 42}, {"account_id": 42}]),
+])
+def test_personal_billing_pages_reject_invalid_or_cross_account_data(monkeypatch, resource, field, value):
+    page = {"entries": [], "orders": [], "total": 0, "limit": 1, "offset": 0,
+            "summary": {"account_id": 42}, "settings": {}, "page_size": 100, "max_pages": None}
+    page[field] = value
+    monkeypatch.setattr(httpx, "request", lambda *args, **kwargs: httpx.Response(200, json=page))
+    client = PlatformBillingClient(PlatformBillingSettings(True, "http://platform-service:8081", "secret", 5))
+    with pytest.raises(PlatformBillingError, match="无效分页数据"):
+        client.personal_page(resource, account_id=42, session_token="session", limit=1, offset=0)
+
+
+@pytest.mark.parametrize("status,exception", [(502, PlatformBillingUnavailableError), (200, PlatformBillingError)])
+def test_platform_billing_handles_non_json_response_without_false_success(monkeypatch, status, exception):
+    monkeypatch.setattr(httpx, "request", lambda *args, **kwargs: httpx.Response(status, text="<html>Error</html>"))
+    client = PlatformBillingClient(PlatformBillingSettings(True, "http://platform-service:8081", "secret", 5))
+    with pytest.raises(exception) as error:
+        client.personal_page("balance", account_id=42, session_token="session", limit=1, offset=0)
+    assert error.value.status_code is None
+
+
+@pytest.mark.parametrize("resource", ["balance", "recharge/orders"])
+@pytest.mark.parametrize("available", [True, False])
+def test_python_personal_billing_routes_never_fall_back_to_local_queries(tmp_path, monkeypatch, resource, available):
+    app = create_web_app(env_file=tmp_path / "missing.env")
+    with TestClient(app) as browser:
+        registered = browser.post("/api/auth/register", json={"email": "wallet@example.com", "password": "password-123"})
+        assert registered.status_code == 200, registered.text
+        login = browser.post("/api/auth/login", json={"email": "wallet@example.com", "password": "password-123"})
+        assert login.status_code == 200, login.text
+        account_id = login.json()["account"]["id"]
+
+        def request(method, url, **kwargs):
+            assert kwargs["json"]["session_token"]
+            if not available:
+                return httpx.Response(503, text="temporarily unavailable")
+            return httpx.Response(200, json={"entries": [], "orders": [], "total": 0, "limit": 1, "offset": 0,
+                                            "summary": {"account_id": account_id}, "settings": {},
+                                            "page_size": 100, "max_pages": None})
+
+        monkeypatch.setattr(httpx, "request", request)
+        app.state.backend.platform_billing_client = PlatformBillingClient(
+            PlatformBillingSettings(True, "http://platform-service:8081", "secret", 5))
+        for name in ("get_account_balance_summary", "list_account_balance_ledger", "count_account_balance_ledger",
+                     "list_recharge_orders", "count_recharge_orders"):
+            monkeypatch.setattr(app.state.backend.store, name, lambda *args, **kwargs: pytest.fail("Local billing fallback"))
+        response = browser.get(f"/api/me/{resource}?limit=1&account_id=99")
+        assert response.status_code == (200 if available else 503), response.text
+        if available:
+            assert response.json()["total"] == 0
 
 
 def test_platform_billing_settings_are_disabled_and_validated_by_default(tmp_path):

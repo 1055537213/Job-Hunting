@@ -157,11 +157,12 @@ class JobHuntingApp:
         self.store = SQLAlchemyStore(resolved_database_url)
         self.store.configure_billing(load_billing_settings(self.env_path))
         platform_billing_settings = load_platform_billing_settings(self.env_path)
-        self.store.configure_platform_billing(
+        self.platform_billing_client = (
             PlatformBillingClient(platform_billing_settings)
             if platform_billing_settings.enabled
             else None
         )
+        self.store.configure_platform_billing(self.platform_billing_client)
         platform_auth_settings = load_platform_auth_settings(self.env_path)
         self.platform_auth_client = (
             PlatformAuthClient(platform_auth_settings)

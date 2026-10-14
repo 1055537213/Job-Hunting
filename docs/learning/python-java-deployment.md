@@ -2,7 +2,8 @@
 
 ## 当前边界
 
-混合部署通过 Caddy/Nginx 分流：`/api/auth/*` 和 `/api/account/password` 直达 Java；
+混合部署通过 Caddy/Nginx 分流：`/api/auth/*`、`/api/account/password`，以及
+`GET /api/me/balance`、`GET /api/me/recharge/orders` 直达 Java；
 页面及其他 API 仍到 Python。Java 负责账号注册、密码校验、邮箱验证、密码重置、
 登录会话、退出、修改密码和可选账务。
 Java 使用 Spring Boot 4.0 / Java 21，JSON 序列化使用 Jackson 3；
@@ -70,7 +71,9 @@ docker compose -f compose.yaml -f compose.platform.yaml --profile hybrid-local u
 脚本使用真实 Python Web/Java 进程和 Docker PostgreSQL 验证注册、邮箱验证、密码重置、旧会话撤销、重复确认、登录、
 模拟充值及扣费、管理员人工补款（含重复请求、冲突和会话撤销）；测试发送器捕获邮件，不向真实收件人发送。
 CI 还构建两份镜像，运行 `scripts/validate_python_java_docker.py` 验证容器间相同链路、
-浏览器经网关走 Java 认证与 Python 余额接口，以及改密后的跨服务会话撤销。
+浏览器经网关走 Java 认证和个人余额/订单查询，Python 充值写入适配，以及改密后的跨服务会话撤销。
+还会暂停隔离的 Python Web，确认 Java 余额和订单查询继续响应；不会停止正常开发容器。
+价格、低余额阈值和演示充值限额共用 `.env` 参数，生产默认关闭演示充值，无需修改业务代码。
 Docker 验收还运行真实 Prometheus，验证独立凭据和 Java target UP；本地 Prometheus 默认在
 `http://127.0.0.1:9090`，可查询 `up{job="job-hunting-platform"}`。不要把监控令牌提交到 Git。
 该验收使用测试发送器，不等同于真实 SMTP/完整 Worker 队列验收。

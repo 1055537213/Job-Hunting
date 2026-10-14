@@ -71,6 +71,47 @@ class PlatformBillingClient:
         )
         return self._balance_projection(payload)
 
+    def personal_page(
+        self,
+        resource: str,
+        *,
+        account_id: int,
+        session_token: str | None,
+        limit: int,
+        offset: int,
+        trace_id: str | None = None,
+    ) -> dict[str, Any]:
+        if resource not in {"balance", "recharge/orders"}:
+            raise ValueError("Unsupported personal billing resource")
+        if not session_token:
+            raise PlatformBillingError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
+        payload = self._request(
+            "POST", f"/internal/v1/billing/me/{resource}", trace_id=trace_id,
+            json={"session_token": session_token, "limit": limit, "offset": offset},
+        )
+        try:
+            entries = payload["entries" if resource == "balance" else "orders"]
+            if (
+                not isinstance(entries, list)
+                or len(entries) > limit
+                or any(not isinstance(row, dict) or row.get("account_id") != account_id for row in entries)
+                or type(payload["total"]) is not int
+                or payload["total"] < 0
+                or payload["limit"] != limit
+                or payload["offset"] != offset
+            ):
+                raise ValueError("Invalid page or owner")
+            if resource == "balance" and (
+                payload["summary"]["account_id"] != account_id
+                or not isinstance(payload["settings"], dict)
+                or payload["page_size"] != 100
+                or payload["max_pages"] is not None
+            ):
+                raise ValueError("Invalid balance projection")
+        except (KeyError, TypeError, ValueError) as error:
+            raise PlatformBillingError("INVALID_PLATFORM_RESPONSE", "平台账务服务返回了无效分页数据。") from error
+        return payload
+
     def recharge(
         self,
         *,
@@ -221,22 +262,22 @@ class PlatformBillingClient:
             )
         except httpx.HTTPError as error:
             raise PlatformBillingUnavailableError() from error
+        if response.status_code >= 500:
+            raise PlatformBillingUnavailableError()
         try:
             payload = response.json()
         except ValueError as error:
             raise PlatformBillingError(
                 "INVALID_PLATFORM_RESPONSE",
                 "平台账务服务返回了无法解析的响应。",
-                response.status_code,
+                response.status_code if response.is_error else None,
             ) from error
         if not isinstance(payload, dict):
             raise PlatformBillingError(
                 "INVALID_PLATFORM_RESPONSE",
                 "平台账务服务返回了无效响应。",
-                response.status_code,
+                response.status_code if response.is_error else None,
             )
-        if response.status_code >= 500:
-            raise PlatformBillingUnavailableError()
         if response.is_error:
             raise PlatformBillingError(
                 str(payload.get("code") or "PLATFORM_BILLING_ERROR"),

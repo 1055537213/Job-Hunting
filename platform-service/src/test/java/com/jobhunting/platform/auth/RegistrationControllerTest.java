@@ -85,7 +85,9 @@ class RegistrationControllerTest {
 
         @Bean
         RegistrationService registrationService() {
-            return new RegistrationService(null, null, null, 10_000_000) {
+            return new RegistrationService(null, null, null, new com.jobhunting.platform.billing.BillingReadSettings(
+                    java.math.BigDecimal.valueOf(25), java.math.BigDecimal.ZERO, null, 10_000_000, null,
+                    java.math.BigDecimal.valueOf(20), java.math.BigDecimal.valueOf(50), "test")) {
                 @Override
                 public long register(
                         String email,

@@ -2954,6 +2954,8 @@ def create_web_app(
         """当前登录账号查看自己的余额与消费流水。"""
 
         account = current_account(request)
+        if backend.platform_billing_client is not None:
+            return platform_personal_billing_page(request, "balance", account.id, limit, offset)
         summary = backend.store.get_account_balance_summary(account.id)
         entries = backend.store.list_account_balance_ledger(account.id, limit=limit, offset=offset)
         total = backend.store.count_account_balance_ledger(account.id)
@@ -2977,6 +2979,8 @@ def create_web_app(
         """当前账号分页查看自己的充值订单。"""
 
         account = current_account(request)
+        if backend.platform_billing_client is not None:
+            return platform_personal_billing_page(request, "recharge/orders", account.id, limit, offset)
         orders = backend.store.list_recharge_orders(account.id, limit=limit, offset=offset)
         return {
             "orders": [asdict(order) for order in orders],
@@ -2984,6 +2988,22 @@ def create_web_app(
             "limit": limit,
             "offset": offset,
         }
+
+    def platform_personal_billing_page(
+        request: Request, resource: str, account_id: int, limit: int, offset: int,
+    ) -> dict[str, object]:
+        if backend.platform_billing_client is None:
+            raise HTTPException(status_code=503, detail="平台账务服务未配置。")
+        try:
+            return backend.platform_billing_client.personal_page(
+                resource, account_id=account_id, session_token=request.cookies.get(SESSION_COOKIE_NAME),
+                limit=limit, offset=offset, trace_id=getattr(request.state, "request_id", None),
+            )
+        except PlatformBillingUnavailableError:
+            raise
+        except PlatformBillingError as error:
+            status = error.status_code if error.status_code is not None and 400 <= error.status_code < 500 else 503
+            raise HTTPException(status_code=status, detail=str(error)) from error
 
     @web_app.post("/api/me/balance/recharge")
     def recharge_my_balance(payload: BalanceRechargePayload, request: Request) -> dict[str, object]:

@@ -1,0 +1,205 @@
+openapi: 3.1.0
+info:
+  title: Personal Billing Query Contract
+  version: 1.0.0
+  description: >-
+    Java owns these personal queries. Identity comes from the active session,
+    never a supplied account ID. Rows are ordered by created_at DESC, id DESC.
+    Read-only repeatable-read transactions keep counts and pages consistent.
+    Financial facts are retained without the five-page usage-log deletion rule.
+security:
+  - SessionCookie: []
+paths:
+  /api/me/balance:
+    get:
+      operationId: personalBalance
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Balance, ledger and non-secret settings; Cache-Control no-store
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BalancePage'}
+        '401': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+        '429': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+  /api/me/recharge/orders:
+    get:
+      operationId: personalRechargeOrders
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Current account's orders; Cache-Control no-store
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OrdersPage'}
+        '401': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+        '429': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+  /internal/v1/billing/me/balance:
+    post:
+      operationId: internalPersonalBalance
+      description: Python compatibility adapter; verifies service token and real session.
+      security: [{InternalServiceToken: []}]
+      requestBody: {$ref: '#/components/requestBodies/SessionPage'}
+      responses:
+        '200':
+          description: Same personal balance projection
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BalancePage'}
+        '401': {$ref: '#/components/responses/Error'}
+        '403': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+  /internal/v1/billing/me/recharge/orders:
+    post:
+      operationId: internalPersonalRechargeOrders
+      security: [{InternalServiceToken: []}]
+      requestBody: {$ref: '#/components/requestBodies/SessionPage'}
+      responses:
+        '200':
+          description: Same personal order page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OrdersPage'}
+        '401': {$ref: '#/components/responses/Error'}
+        '403': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    SessionCookie: {type: apiKey, in: cookie, name: job_agent_session}
+    InternalServiceToken: {type: apiKey, in: header, name: X-Internal-Service-Token}
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 100, default: 100}
+    Offset:
+      name: offset
+      in: query
+      schema: {type: integer, format: int64, minimum: 0, default: 0}
+  requestBodies:
+    SessionPage:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [session_token, limit, offset]
+            properties:
+              session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+              limit: {type: integer, minimum: 1, maximum: 100}
+              offset: {type: integer, format: int64, minimum: 0}
+  schemas:
+    BalancePage:
+      type: object
+      required: [summary, entries, total, limit, offset, page_size, max_pages, settings]
+      properties:
+        summary: {$ref: '#/components/schemas/Summary'}
+        entries: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/LedgerEntry'}}
+        total: {type: integer, format: int64, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 100}
+        offset: {type: integer, format: int64, minimum: 0}
+        page_size: {type: integer, const: 100}
+        max_pages: {type: 'null'}
+        settings: {$ref: '#/components/schemas/Settings'}
+    OrdersPage:
+      type: object
+      required: [orders, total, limit, offset]
+      properties:
+        orders: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/RechargeOrder'}}
+        total: {type: integer, format: int64, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 100}
+        offset: {type: integer, format: int64, minimum: 0}
+    Summary:
+      type: object
+      required: [account_id, balance_micro_yuan, total_recharge_micro_yuan, total_consumed_micro_yuan,
+                 ledger_entry_count, low_balance_threshold_micro_yuan, state, state_label]
+      properties:
+        account_id: {type: integer, format: int64}
+        balance_micro_yuan: {type: integer, format: int64}
+        total_recharge_micro_yuan: {type: integer, format: int64}
+        total_consumed_micro_yuan: {type: integer, format: int64}
+        ledger_entry_count: {type: integer, format: int64}
+        low_balance_threshold_micro_yuan: {type: integer, format: int64}
+        state: {type: string, enum: [balance, low_balance, suspended]}
+        state_label: {type: string, enum: [余额, 低余额, 停用]}
+    Settings:
+      type: object
+      required: [configured, price_per_million_tokens_yuan, starting_balance_yuan,
+                 low_balance_threshold_yuan, demo_recharge_enabled,
+                 demo_recharge_max_amount_yuan, demo_recharge_max_total_yuan]
+      properties:
+        configured: {type: boolean, const: true}
+        price_per_million_tokens_yuan: {type: number}
+        starting_balance_yuan: {type: number}
+        low_balance_threshold_yuan: {type: number}
+        demo_recharge_enabled: {type: boolean}
+        demo_recharge_max_amount_yuan: {type: number}
+        demo_recharge_max_total_yuan: {type: number}
+    LedgerEntry:
+      type: object
+      required: [id, account_id, entry_kind, amount_micro_yuan, balance_before_micro_yuan,
+                 balance_after_micro_yuan, token_count, price_per_million_tokens_yuan,
+                 source_reference, summary, operator_account_id, recharge_order_id, details, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        account_id: {type: integer, format: int64}
+        entry_kind: {type: string}
+        amount_micro_yuan: {type: integer, format: int64}
+        balance_before_micro_yuan: {type: integer, format: int64}
+        balance_after_micro_yuan: {type: integer, format: int64}
+        token_count: {type: [integer, 'null'], format: int64}
+        price_per_million_tokens_yuan: {type: [number, 'null']}
+        source_reference: {type: [string, 'null']}
+        summary: {type: string}
+        operator_account_id: {type: [integer, 'null'], format: int64}
+        recharge_order_id: {type: [integer, 'null'], format: int64}
+        details: {type: object, additionalProperties: true}
+        created_at: {type: string, format: date-time}
+    RechargeOrder:
+      type: object
+      required: [id, order_number, account_id, created_by_account_id, amount_micro_yuan, status,
+                 payment_provider, provider_order_id, idempotency_key, description, failure_reason,
+                 details, created_at, updated_at, paid_at, cancelled_at, refunded_at]
+      properties:
+        id: {type: integer, format: int64}
+        order_number: {type: string}
+        account_id: {type: integer, format: int64}
+        created_by_account_id: {type: [integer, 'null'], format: int64}
+        amount_micro_yuan: {type: integer, format: int64}
+        status: {type: string}
+        payment_provider: {type: string}
+        provider_order_id: {type: [string, 'null']}
+        idempotency_key: {type: string}
+        description: {type: string}
+        failure_reason: {type: [string, 'null']}
+        details: {type: object, additionalProperties: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        paid_at: {type: [string, 'null'], format: date-time}
+        cancelled_at: {type: [string, 'null'], format: date-time}
+        refunded_at: {type: [string, 'null'], format: date-time}
+    Error:
+      type: object
+      required: [code, detail, request_id]
+      properties:
+        code: {type: string}
+        detail: {type: string}
+        message: {type: string}
+        request_id: {type: string}
+        trace_id: {type: string}
+  responses:
+    Error:
+      description: Authentication, validation, throttling or infrastructure error; no Python read fallback
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}

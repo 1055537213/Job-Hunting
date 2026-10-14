@@ -3,7 +3,7 @@ package com.jobhunting.platform.auth;
 import java.util.List;
 import java.util.Locale;
 
-import org.springframework.beans.factory.annotation.Value;
+import com.jobhunting.platform.billing.BillingReadSettings;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -22,12 +22,11 @@ public class RegistrationService {
             JdbcTemplate jdbc,
             PasswordHasher passwords,
             AccountActionEmailService verification,
-            @Value("${platform.billing.low-balance-threshold-micro-yuan:10000000}")
-            long lowBalanceThresholdMicroYuan) {
+            BillingReadSettings billingSettings) {
         this.jdbc = jdbc;
         this.passwords = passwords;
         this.verification = verification;
-        this.lowBalanceThresholdMicroYuan = lowBalanceThresholdMicroYuan;
+        this.lowBalanceThresholdMicroYuan = billingSettings.thresholdMicroYuan();
     }
 
     @Transactional

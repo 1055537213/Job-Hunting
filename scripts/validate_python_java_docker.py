@@ -25,7 +25,7 @@ from validate_python_java_local import (
 )
 
 
-def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str) -> None:
+def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str, web_container: str) -> None:
     """Verify that the same browser session crosses the Java/Python proxy boundary."""
     from urllib.parse import parse_qs, urlsplit
 
@@ -52,6 +52,8 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
         config = config_response.json()
         assert config["email_verification_required"] is True
         assert browser.get("/api/auth/me").json()["authenticated"] is False
+        assert browser.get("/api/me/balance").status_code == 401
+        assert browser.get("/api/me/recharge/orders").status_code == 401
         registered = browser.post("/api/auth/register", json={
             "email": email, "password": password, "display_name": "Gateway acceptance",
         })
@@ -71,9 +73,34 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
         java_me = browser.get("/api/auth/me")
         assert java_me.status_code == 200 and java_me.json()["authenticated"]
         assert java_me.json()["billing"]["balance_micro_yuan"] == 0
-        python_balance = browser.get("/api/me/balance")
-        assert python_balance.status_code == 200, python_balance.text[:300]
-        assert python_balance.json()["summary"]["account_id"] == registered.json()["account"]["id"]
+        balance = browser.get("/api/me/balance")
+        assert balance.status_code == 200, balance.text[:300]
+        assert balance.json()["summary"] == java_me.json()["billing"]
+        assert balance.json()["entries"] == [] and balance.json()["max_pages"] is None
+        assert balance.headers["cache-control"] == "no-store"
+        for amount in (1, 2):
+            recharged = browser.post("/api/me/balance/recharge", json={
+                "amount_yuan": amount, "idempotency_key": f"gateway-recharge-{amount}-{os.urandom(12).hex()}",
+            }, headers={"X-CSRF-Token": login.json()["csrf_token"]})
+            assert recharged.status_code == 200, recharged.text[:300]
+        order_page = browser.get("/api/me/recharge/orders?limit=1&offset=0&account_id=999999").json()
+        older_page = browser.get("/api/me/recharge/orders?limit=1&offset=1").json()
+        assert order_page["total"] == 2 and order_page["orders"][0]["amount_micro_yuan"] == 2_000_000
+        assert older_page["orders"][0]["amount_micro_yuan"] == 1_000_000
+        assert order_page["orders"][0]["account_id"] == registered.json()["account"]["id"]
+        assert browser.get("/api/me/balance?limit=101").status_code == 422
+        docker("stop", "--time", "1", web_container)
+        try:
+            independent = browser.get("/api/me/balance?limit=1&offset=0&account_id=999999")
+            assert independent.status_code == 200, "Personal balance still depends on Python Web"
+            assert independent.json()["summary"]["balance_micro_yuan"] == 3_000_000
+            assert independent.json()["total"] == 2 and len(independent.json()["entries"]) == 1
+            assert independent.json()["entries"][0]["account_id"] == registered.json()["account"]["id"]
+            assert browser.get("/api/me/recharge/orders").json()["total"] == 2
+        finally:
+            docker("start", web_container)
+            wait(f"{web_url}/api/health")
+        print("==> Java wallet reads -> Python recharge -> owner-scoped pagination -> reads with Python stopped: PASS")
         old_cookies = dict(browser.cookies)
         changed = browser.post("/api/account/password", json={
             "current_password": password, "new_password": "gateway-new-password-456",
@@ -82,6 +109,8 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
         with httpx.Client(base_url=web_url, cookies=old_cookies) as old_session:
             assert old_session.get("/api/auth/me").json()["authenticated"] is False
         assert browser.get("/api/auth/me").json()["authenticated"] is False
+        assert browser.get("/api/me/balance").status_code == 401
+        assert browser.get("/api/me/recharge/orders").status_code == 401
         print("==> Java browser auth gateway -> Python account route -> password revocation: PASS")
 
 
@@ -269,7 +298,7 @@ def main() -> None:
         wait(f"http://127.0.0.1:{args.port + 2}/api/health")
         run_browser_gateway_flow(f"http://127.0.0.1:{args.port + 2}",
                                  f"http://127.0.0.1:{args.port + 1}",
-                                 f"http://127.0.0.1:{args.port}", token)
+                                 f"http://127.0.0.1:{args.port}", token, web)
         run_java_security_flow(f"http://127.0.0.1:{args.port}", token, admin_credentials, redis_name)
         run_java_ingress_flow(f"http://127.0.0.1:{args.port}", metrics_token, token)
         with tempfile.TemporaryDirectory(prefix="job-agent-prometheus-") as scratch:

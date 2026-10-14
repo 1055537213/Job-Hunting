@@ -114,6 +114,19 @@ Python 收到成功响应后只读取已提交的流水；Java 错误或网络�
 关闭 Java 账务开关时仍保留本地兼容路径；支付 Webhook/退款等剩余入口尚需独立迁移，
 本阶段不代表全部账务入口均已完成迁移。
 
+## 个人账务查询直达 Java
+
+混合网关把 `GET /api/me/balance`、`GET /api/me/recharge/orders` 路由至 Java，
+原有页面、URL、JSON 字段及 100 条分页上限不变。`POST /api/me/balance/recharge` 仍由
+Python 适配后调用 Java 写接口，不会被新的 GET 路由误匹配。
+Java 从 Web 安全过滤器校验后的 Session 获取账号，内部适配接口也要求服务 Token 和真实 Session，
+不接受调用方指定查询归属。余额摘要、统计和列表通过只读 Repeatable Read 事务提供同一快照，
+时间相同的记录按 ID 倒序，保留空字段及 UTC 来源时间。`/api/auth/me` 复用同一余额查询服务。
+Java 模式的 Python 个人查询不再直接读取本地流水或订单；故障失败关闭，不返回旧余额。
+价格、低余额阈值及演示充值开关由 Compose 将同一环境参数注入两端；生产默认关闭演示充值。
+资金事实不自动淘汰。管理员查询、充值外部写入口、支付/退款仍是后续迁移范围。
+验收在隔离数据下暂停 Python Web，验证网关余额及订单查询仍由 Java 正常响应；不会暂停开发或生产服务。
+
 ## Java 安全入口准备阶段
 
 Java `/api/*` 已增加真实 Session/RBAC、Redis 原子滑动窗口限流、CSRF、安全响应头、

@@ -6,14 +6,13 @@ import static org.springframework.http.MediaType.APPLICATION_JSON;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
-import java.sql.ResultSet;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.context.annotation.Import;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.jdbc.core.RowMapper;
+import com.jobhunting.platform.billing.BillingQueryService;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
@@ -31,7 +30,7 @@ class PublicAuthLifecycleControllerTest {
     @MockitoBean RegistrationService registrations;
     @MockitoBean AccountActionEmailService emails;
     @MockitoBean AccountAdministrationService accounts;
-    @MockitoBean JdbcTemplate jdbc;
+    @MockitoBean BillingQueryService billing;
 
     @Test
     void registrationUsesConfiguredConsentVersionsAndRealSource() throws Exception {
@@ -62,17 +61,9 @@ class PublicAuthLifecycleControllerTest {
         mvc.perform(get("/api/auth/me"))
             .andExpect(status().isOk()).andExpect(jsonPath("$.authenticated").value(false))
             .andExpect(jsonPath("$.billing").value(org.hamcrest.Matchers.nullValue()));
-        verifyNoInteractions(jdbc);
-        when(jdbc.queryForObject(anyString(), org.mockito.ArgumentMatchers.<RowMapper<java.util.Map<String, Object>>>any(), eq(2L)))
-            .thenAnswer(invocation -> {
-                @SuppressWarnings("unchecked")
-                RowMapper<java.util.Map<String, Object>> mapper = invocation.getArgument(1);
-                ResultSet row = mock(ResultSet.class);
-                when(row.getLong("account_id")).thenReturn(2L);
-                when(row.getLong("balance_micro_yuan")).thenReturn(5_000_000L);
-                when(row.getLong("low_balance_threshold_micro_yuan")).thenReturn(10_000_000L);
-                return mapper.mapRow(row, 0);
-            });
+        verifyNoInteractions(billing);
+        when(billing.summary(account())).thenReturn(Map.of("account_id", 2L,
+                "balance_micro_yuan", 5_000_000L, "low_balance_threshold_micro_yuan", 10_000_000L, "state", "low_balance"));
         mvc.perform(get("/api/auth/me").with(request -> {
                 request.setAttribute(WebSecurityFilter.ACCOUNT_ATTRIBUTE, account());
                 return request;

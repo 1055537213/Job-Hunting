@@ -16,7 +16,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseCookie;
-import org.springframework.jdbc.core.JdbcTemplate;
+import com.jobhunting.platform.billing.BillingQueryService;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -35,12 +35,12 @@ public class PublicAuthLifecycleController {
     private final RegistrationService registrations;
     private final AccountActionEmailService emails;
     private final AccountAdministrationService accounts;
-    private final JdbcTemplate jdbc;
+    private final BillingQueryService billing;
     private final boolean registrationEnabled, verificationRequired, consentRequired, cookieSecure;
     private final String termsVersion, privacyVersion;
 
     public PublicAuthLifecycleController(RegistrationService registrations, AccountActionEmailService emails,
-            AccountAdministrationService accounts, JdbcTemplate jdbc,
+            AccountAdministrationService accounts, BillingQueryService billing,
             @Value("${JOB_AGENT_REGISTRATION_ENABLED:true}") boolean registrationEnabled,
             @Value("${JOB_AGENT_EMAIL_VERIFICATION_REQUIRED:false}") boolean verificationRequired,
             @Value("${JOB_AGENT_CONSENT_REQUIRED:false}") boolean consentRequired,
@@ -50,7 +50,7 @@ public class PublicAuthLifecycleController {
         this.registrations = registrations;
         this.emails = emails;
         this.accounts = accounts;
-        this.jdbc = jdbc;
+        this.billing = billing;
         this.registrationEnabled = registrationEnabled;
         this.verificationRequired = verificationRequired;
         this.consentRequired = consentRequired;
@@ -107,7 +107,7 @@ public class PublicAuthLifecycleController {
                     .httpOnly(false).secure(cookieSecure).sameSite("Lax").path("/")
                     .maxAge(CSRF_MAX_AGE_SECONDS).build().toString());
             result.put("csrf_token", csrf);
-            result.put("billing", balance(account));
+            result.put("billing", billing.summary(account));
         }
         return result;
     }
@@ -138,30 +138,6 @@ public class PublicAuthLifecycleController {
     public Map<String, Boolean> confirmReset(@Valid @RequestBody ResetRequest body) {
         emails.resetPassword(body.token(), body.new_password());
         return Map.of("ok", true);
-    }
-
-    private Map<String, Object> balance(AccountAdministrationService.AccountView account) {
-        return jdbc.queryForObject("""
-                SELECT b.account_id, b.balance_micro_yuan, b.total_recharge_micro_yuan,
-                       b.total_consumed_micro_yuan, b.low_balance_threshold_micro_yuan,
-                       (SELECT COUNT(*) FROM account_balance_ledger WHERE account_id = b.account_id) AS ledger_entry_count
-                FROM account_balances b WHERE b.account_id = ?
-                """, (row, index) -> {
-                    long amount = row.getLong("balance_micro_yuan");
-                    long threshold = row.getLong("low_balance_threshold_micro_yuan");
-                    String state = !"active".equals(account.status()) || amount <= 0 ? "suspended"
-                            : amount <= threshold ? "low_balance" : "balance";
-                    return Map.of("account_id", row.getLong("account_id"), "balance_micro_yuan", amount,
-                            "total_recharge_micro_yuan", row.getLong("total_recharge_micro_yuan"),
-                            "total_consumed_micro_yuan", row.getLong("total_consumed_micro_yuan"),
-                            "ledger_entry_count", row.getLong("ledger_entry_count"),
-                            "low_balance_threshold_micro_yuan", threshold, "state", state,
-                            "state_label", switch (state) {
-                                case "balance" -> "余额";
-                                case "low_balance" -> "低余额";
-                                default -> "停用";
-                            });
-                }, account.account_id());
     }
 
     private static String header(HttpServletRequest request, String name, int limit) {

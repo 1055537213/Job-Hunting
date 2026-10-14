@@ -504,12 +504,18 @@ def test_migration_push_runs_fast_checks_and_only_full_ci_publishes():
 
 def test_hybrid_release_pair_and_production_compose_are_connected(monkeypatch):
     monkeypatch.setenv("PLATFORM_RATE_LIMIT_KEY_PREFIX", "job_agent:ci_platform_limit")
+    monkeypatch.setenv("JOB_AGENT_DEMO_RECHARGE_ENABLED", "")
+    monkeypatch.setenv("JOB_AGENT_BILLING_PRICE_PER_MILLION_TOKENS_YUAN", "30")
+    monkeypatch.setenv("JOB_AGENT_BILLING_LOW_BALANCE_THRESHOLD_YUAN", "12.5")
     for extra in (("compose.hybrid.prod.yaml",), ("compose.coexist.yaml", "compose.hybrid.prod.yaml")):
         config = _production_compose_config(*extra)
         java = config["services"]["platform-service"]
         assert not java.get("ports")
         assert "build" not in java
         assert java["environment"]["PLATFORM_AUTH_ENABLED"] == "true"
+        assert java["environment"]["JOB_AGENT_DEMO_RECHARGE_ENABLED"] == "false"
+        assert java["environment"]["JOB_AGENT_BILLING_PRICE_PER_MILLION_TOKENS_YUAN"] == "30"
+        assert java["environment"]["JOB_AGENT_BILLING_LOW_BALANCE_THRESHOLD_YUAN"] == "12.5"
         assert java["environment"]["PLATFORM_WEB_SECURITY_ENABLED"] == "true"
         assert java["environment"]["PLATFORM_REDIS_HOST"] == "redis"
         assert java["environment"]["PLATFORM_REDIS_PASSWORD"]
@@ -562,11 +568,16 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
         edge = (ROOT / "deploy" / name).read_text(encoding="utf-8")
         assert "@browser_auth path /api/auth/* /api/account/password" in edge
         assert "reverse_proxy @browser_auth platform-service:8081" in edge
+        assert "method GET" in edge
+        assert "path /api/me/balance /api/me/recharge/orders" in edge
+        assert "reverse_proxy @billing_reads platform-service:8081" in edge
         assert "respond @internal 404" in edge
     nginx = (ROOT / "deploy/nginx/coexist-hybrid-ip-https.conf.template").read_text(encoding="utf-8")
     assert "proxy_pass http://platform-service:8081" in nginx
     assert "location ^~ /api/auth/" in nginx
     assert "location = /api/account/password" in nginx
+    assert "location = /api/me/balance" in nginx
+    assert "location = /api/me/recharge/orders" in nginx
     assert "location ^~ /internal/" in nginx
     workflow = (ROOT / ".github/workflows/deploy-hybrid.yml").read_text(encoding="utf-8")
     assert "compose.hybrid.coexist.yaml deploy scripts" in workflow
