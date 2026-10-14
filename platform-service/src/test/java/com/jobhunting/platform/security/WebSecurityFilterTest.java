@@ -61,6 +61,18 @@ class WebSecurityFilterTest {
         verifyNoInteractions(accounts);
     }
 
+    @Test void rechargeRequiresSessionCsrfAndWriteRateLimit() throws Exception {
+        assertThat(request("/api/me/balance/recharge", "POST", false, false).getStatus()).isEqualTo(401);
+        account("user");
+        assertThat(request("/api/me/balance/recharge", "POST", true, false).getStatus()).isEqualTo(403);
+        assertThat(called).isFalse();
+        assertThat(request("/api/me/balance/recharge", "POST", true, true).getStatus()).isEqualTo(200);
+        when(limiter.check("account:2", "write")).thenReturn(11L);
+        called = false;
+        assertThat(request("/api/me/balance/recharge", "POST", true, true).getStatus()).isEqualTo(429);
+        assertThat(called).isFalse();
+    }
+
     @Test void rejectsExcessAndDoesNotTrustForwardedIdentity() throws Exception {
         when(limiter.check("ip:127.0.0.1", "auth")).thenReturn(17L);
         var response = request("/api/auth/login", "POST", false, false);

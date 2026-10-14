@@ -291,7 +291,7 @@ def run_web_billing_flow(
             raise RuntimeError("Java password reset confirmation failed")
         if client.post("/api/auth/password-reset/confirm", json=reset_body).status_code != 400:
             raise RuntimeError("Password reset token was reusable")
-        with httpx.Client(base_url=web_url, cookies=old_cookies) as old_client:
+        with httpx.Client(base_url=web_url, cookies=old_cookies, timeout=10) as old_client:
             if old_client.get("/api/auth/me").json()["authenticated"]:
                 raise RuntimeError("Pre-reset session remained valid")
         if client.post("/api/auth/login", json={"email": email, "password": password}).status_code != 401:
@@ -300,7 +300,7 @@ def run_web_billing_flow(
             raise RuntimeError("New password could not log in after reset")
         print("==> Java reset -> Python SMTP worker -> Web confirm -> old session revoked: PASS")
 
-        with httpx.Client(base_url=web_url) as device:
+        with httpx.Client(base_url=web_url, timeout=10) as device:
             if device.post("/api/auth/login", json={"email": email, "password": new_password}).status_code != 200:
                 raise RuntimeError("Second device login failed")
             if device.post("/api/auth/logout").status_code != 200:
@@ -322,7 +322,7 @@ def run_web_billing_flow(
             raise RuntimeError("Wrong current password was accepted")
         change_cookies = dict(client.cookies)
         client.post("/api/account/password", json={"current_password": new_password, "new_password": changed_password}).raise_for_status()
-        with httpx.Client(base_url=web_url, cookies=change_cookies) as invalidated:
+        with httpx.Client(base_url=web_url, cookies=change_cookies, timeout=10) as invalidated:
             if invalidated.get("/api/auth/me").json()["authenticated"]:
                 raise RuntimeError("Password change left old session authenticated")
         if client.post("/api/auth/login", json={"email": email, "password": new_password}).status_code != 401:

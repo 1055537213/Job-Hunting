@@ -64,11 +64,7 @@ public class BillingQueryService {
         var entries = jdbc.query("""
                 SELECT * FROM account_balance_ledger WHERE account_id = ?
                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
-                """, (row, index) -> new LedgerEntry(row.getLong("id"), row.getLong("account_id"), row.getString("entry_kind"),
-                row.getLong("amount_micro_yuan"), row.getLong("balance_before_micro_yuan"), row.getLong("balance_after_micro_yuan"),
-                nullableLong(row, "token_count"), row.getBigDecimal("price_per_million_tokens_yuan"),
-                row.getString("source_reference"), row.getString("summary"), nullableLong(row, "operator_account_id"),
-                nullableLong(row, "recharge_order_id"), details(row), timestamp(row, "created_at")),
+                """, (row, index) -> ledger(row),
                 account.account_id(), limit, offset);
         return new BalancePage(summary, entries, ((Number) summary.get("ledger_entry_count")).longValue(),
                 limit, offset, PAGE_SIZE, null, settings.publicView());
@@ -80,13 +76,41 @@ public class BillingQueryService {
         long count = jdbc.queryForObject("SELECT COUNT(*) FROM recharge_orders WHERE account_id = ?", Long.class, account.account_id());
         var orders = jdbc.query("""
                 SELECT * FROM recharge_orders WHERE account_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
-                """, (row, index) -> new RechargeOrder(row.getLong("id"), row.getString("order_number"), row.getLong("account_id"),
+                """, (row, index) -> order(row),
+                account.account_id(), limit, offset);
+        return new OrdersPage(orders, count, limit, offset);
+    }
+
+    @Transactional(readOnly = true)
+    public RechargeResult rechargeResult(AccountAdministrationService.AccountView account, String key) {
+        var orders = jdbc.query("SELECT * FROM recharge_orders WHERE account_id = ? AND idempotency_key = ?",
+                (row, index) -> order(row), account.account_id(), key);
+        if (orders.size() != 1 || !"paid".equals(orders.getFirst().status())) {
+            throw new BillingException("RECHARGE_INCOMPLETE", "模拟充值订单尚未完成，请稍后重试。", HttpStatus.SERVICE_UNAVAILABLE);
+        }
+        var order = orders.getFirst();
+        var entries = jdbc.query("SELECT * FROM account_balance_ledger WHERE account_id = ? AND recharge_order_id = ? AND entry_kind = 'recharge'",
+                (row, index) -> ledger(row), account.account_id(), order.id());
+        if (entries.size() != 1) {
+            throw new BillingException("RECHARGE_INCOMPLETE", "模拟充值流水尚未完成，请稍后重试。", HttpStatus.SERVICE_UNAVAILABLE);
+        }
+        return new RechargeResult(order, entries.getFirst(), summary(account));
+    }
+
+    private LedgerEntry ledger(ResultSet row) throws SQLException {
+        return new LedgerEntry(row.getLong("id"), row.getLong("account_id"), row.getString("entry_kind"),
+                row.getLong("amount_micro_yuan"), row.getLong("balance_before_micro_yuan"), row.getLong("balance_after_micro_yuan"),
+                nullableLong(row, "token_count"), row.getBigDecimal("price_per_million_tokens_yuan"),
+                row.getString("source_reference"), row.getString("summary"), nullableLong(row, "operator_account_id"),
+                nullableLong(row, "recharge_order_id"), details(row), timestamp(row, "created_at"));
+    }
+
+    private RechargeOrder order(ResultSet row) throws SQLException {
+        return new RechargeOrder(row.getLong("id"), row.getString("order_number"), row.getLong("account_id"),
                 nullableLong(row, "created_by_account_id"), row.getLong("amount_micro_yuan"), row.getString("status"),
                 row.getString("payment_provider"), row.getString("provider_order_id"), row.getString("idempotency_key"),
                 row.getString("description"), row.getString("failure_reason"), details(row), timestamp(row, "created_at"),
-                timestamp(row, "updated_at"), timestamp(row, "paid_at"), timestamp(row, "cancelled_at"), timestamp(row, "refunded_at")),
-                account.account_id(), limit, offset);
-        return new OrdersPage(orders, count, limit, offset);
+                timestamp(row, "updated_at"), timestamp(row, "paid_at"), timestamp(row, "cancelled_at"), timestamp(row, "refunded_at"));
     }
 
     private static void validatePage(int limit, long offset) {
@@ -123,4 +147,5 @@ public class BillingQueryService {
     public record BalancePage(Map<String, Object> summary, List<LedgerEntry> entries, long total, int limit,
             long offset, int page_size, Integer max_pages, Map<String, Object> settings) { }
     public record OrdersPage(List<RechargeOrder> orders, long total, int limit, long offset) { }
+    public record RechargeResult(RechargeOrder order, LedgerEntry entry, Map<String, Object> summary) { }
 }

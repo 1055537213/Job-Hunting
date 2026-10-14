@@ -127,6 +127,64 @@ def test_platform_billing_settings_are_disabled_and_validated_by_default(tmp_pat
     assert enabled.timeout_seconds == 7
 
 
+def test_personal_recharge_forwards_decimal_session_and_checks_response_owner(monkeypatch):
+    captured = {}
+    response = {"order": {"id": 9, "account_id": 42, "status": "paid", "payment_provider": "simulated"},
+                "entry": {"account_id": 42, "recharge_order_id": 9, "entry_kind": "recharge"},
+                "summary": {"account_id": 42}}
+
+    def request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return httpx.Response(200, json=response)
+
+    monkeypatch.setattr(httpx, "request", request)
+    client = PlatformBillingClient(PlatformBillingSettings(True, "http://platform-service:8081", "secret", 5))
+    args = dict(account_id=42, session_token="session", amount_yuan="1.000001", note=None,
+                idempotency_key="personal-client-0001", trace_id="recharge-trace")
+    assert client.personal_recharge(**args) == response
+    assert captured["url"].endswith("/internal/v1/billing/me/recharge")
+    assert captured["json"] == {"session_token": "session", "payload": {
+        "amount_yuan": "1.000001", "note": None, "idempotency_key": "personal-client-0001"}}
+    assert captured["headers"]["X-Trace-Id"] == "recharge-trace"
+    for section in ("order", "entry", "summary"):
+        response[section]["account_id"] = 99
+        with pytest.raises(PlatformBillingError, match="无效充值数据"):
+            client.personal_recharge(**args)
+        response[section]["account_id"] = 42
+
+
+@pytest.mark.parametrize("status", [200, 400, 409, 503])
+def test_python_personal_recharge_is_only_an_adapter_in_java_mode(tmp_path, monkeypatch, status):
+    env = tmp_path / ".env"
+    env.write_text("JOB_AGENT_DEMO_RECHARGE_ENABLED=false\n", encoding="utf-8")
+    app = create_web_app(env_file=env)
+    with TestClient(app) as browser:
+        credentials = {"email": "recharge-adapter@example.com", "password": "password-123"}
+        assert browser.post("/api/auth/register", json=credentials).status_code == 200
+        account_id = browser.post("/api/auth/login", json=credentials).json()["account"]["id"]
+        captured = {}
+
+        def request(method, url, **kwargs):
+            captured.update(kwargs["json"])
+            if status != 200:
+                return httpx.Response(status, json={"code": "INVALID_REQUEST", "message": "Java rejected recharge"})
+            return httpx.Response(200, json={
+                "order": {"id": 9, "account_id": account_id, "status": "paid", "payment_provider": "simulated"},
+                "entry": {"account_id": account_id, "recharge_order_id": 9, "entry_kind": "recharge"},
+                "summary": {"account_id": account_id}})
+
+        monkeypatch.setattr(httpx, "request", request)
+        app.state.backend.platform_billing_client = PlatformBillingClient(
+            PlatformBillingSettings(True, "http://platform-service:8081", "secret", 5))
+        for name in ("create_simulated_recharge_order", "get_account_balance_summary"):
+            monkeypatch.setattr(app.state.backend.store, name, lambda *args, **kwargs: pytest.fail("Local recharge fallback"))
+        result = browser.post("/api/me/balance/recharge", json={
+            "amount_yuan": "1.000001", "idempotency_key": "personal-adapter-0001", "account_id": 99})
+        assert result.status_code == status, result.text
+        assert captured["payload"]["amount_yuan"] == "1.000001"
+        assert "account_id" not in captured
+
+
 def test_platform_billing_requires_endpoint_and_token(tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text("JOB_AGENT_JAVA_BILLING_ENABLED=true\n", encoding="utf-8")

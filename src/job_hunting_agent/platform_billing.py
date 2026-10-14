@@ -143,6 +143,27 @@ class PlatformBillingClient:
         )
         return self._balance_projection(payload)
 
+    def personal_recharge(
+        self, *, account_id: int, session_token: str | None, amount_yuan: str,
+        note: str | None, idempotency_key: str | None, trace_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not session_token:
+            raise PlatformBillingError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
+        payload = self._request("POST", "/internal/v1/billing/me/recharge", trace_id=trace_id, json={
+            "session_token": session_token,
+            "payload": {"amount_yuan": amount_yuan, "note": note, "idempotency_key": idempotency_key},
+        })
+        try:
+            order, entry, summary = payload["order"], payload["entry"], payload["summary"]
+            if (any(not isinstance(row, dict) or row["account_id"] != account_id for row in (order, entry, summary))
+                    or order["status"] != "paid" or order["payment_provider"] != "simulated"
+                    or type(order["id"]) is not int or order["id"] <= 0
+                    or entry["recharge_order_id"] != order["id"] or entry["entry_kind"] != "recharge"):
+                raise ValueError("Invalid recharge identity")
+        except (KeyError, TypeError, ValueError) as error:
+            raise PlatformBillingError("INVALID_PLATFORM_RESPONSE", "平台账务服务返回了无效充值数据。") from error
+        return payload
+
     def _balance_projection(self, payload: dict[str, Any]) -> PlatformBalanceProjection:
         try:
             return PlatformBalanceProjection(

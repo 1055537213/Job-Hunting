@@ -216,7 +216,8 @@ public class BillingService implements BillingOperations {
                     Long.class,
                     accountId);
             if (simulatedTotal != null
-                    && simulatedTotal + amount > request.max_total_micro_yuan()) {
+                    && (simulatedTotal > request.max_total_micro_yuan()
+                        || amount > request.max_total_micro_yuan() - simulatedTotal)) {
                 throw new BillingException(
                         "INVALID_REQUEST",
                         "该账号已达到模拟充值累计演示额度上限。",
@@ -231,7 +232,13 @@ public class BillingService implements BillingOperations {
         String description = request.description() == null || request.description().isBlank()
                 ? "个人中心模拟充值"
                 : request.description().trim();
-        long after = balance.balanceMicroYuan() + amount;
+        long after;
+        try {
+            after = Math.addExact(balance.balanceMicroYuan(), amount);
+        } catch (ArithmeticException exception) {
+            throw new BillingException("INVALID_REQUEST", "充值后的余额超出支持范围。",
+                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
+        }
         long orderId = jdbcTemplate.queryForObject(
                 """
                 INSERT INTO recharge_orders (

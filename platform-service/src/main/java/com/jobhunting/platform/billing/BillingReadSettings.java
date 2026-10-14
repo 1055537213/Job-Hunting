@@ -30,6 +30,11 @@ public record BillingReadSettings(
         if (lowBalanceThresholdYuan != null) {
             lowBalanceThresholdYuan.movePointRight(6).setScale(0, RoundingMode.HALF_EVEN).longValueExact();
         }
+        for (BigDecimal limit : new BigDecimal[]{demoRechargeMaxAmountYuan, demoRechargeMaxTotalYuan}) {
+            if (limit.movePointRight(6).setScale(0, RoundingMode.DOWN).longValueExact() < 1) {
+                throw new IllegalArgumentException("Demo recharge limits must be at least one micro yuan");
+            }
+        }
     }
 
     public long thresholdMicroYuan() {
@@ -41,8 +46,12 @@ public record BillingReadSettings(
         return Map.of("configured", true, "price_per_million_tokens_yuan", pricePerMillionTokensYuan,
                 "starting_balance_yuan", startingBalanceYuan,
                 "low_balance_threshold_yuan", BigDecimal.valueOf(thresholdMicroYuan(), 6),
-                "demo_recharge_enabled", demoRechargeEnabled == null ? !"production".equals(environment) : demoRechargeEnabled,
+                "demo_recharge_enabled", demoEnabled(),
                 "demo_recharge_max_amount_yuan", demoRechargeMaxAmountYuan,
                 "demo_recharge_max_total_yuan", demoRechargeMaxTotalYuan);
+    }
+
+    public boolean demoEnabled() {
+        return demoRechargeEnabled == null ? !"production".equals(environment) : demoRechargeEnabled;
     }
 }

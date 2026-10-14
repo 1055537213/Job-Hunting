@@ -78,6 +78,7 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
         assert balance.json()["summary"] == java_me.json()["billing"]
         assert balance.json()["entries"] == [] and balance.json()["max_pages"] is None
         assert balance.headers["cache-control"] == "no-store"
+        assert browser.post("/api/me/balance/recharge", json={"amount_yuan": 1}).status_code == 403
         for amount in (1, 2):
             recharged = browser.post("/api/me/balance/recharge", json={
                 "amount_yuan": amount, "idempotency_key": f"gateway-recharge-{amount}-{os.urandom(12).hex()}",
@@ -91,16 +92,31 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
         assert browser.get("/api/me/balance?limit=101").status_code == 422
         docker("stop", "--time", "1", web_container)
         try:
+            key = f"gateway-java-only-{os.urandom(12).hex()}"
+            payload = {"amount_yuan": "0.000001", "idempotency_key": key,
+                       "account_id": 999999, "max_total_micro_yuan": 999999999}
+            credited = browser.post("/api/me/balance/recharge", json=payload,
+                                    headers={"X-CSRF-Token": login.json()["csrf_token"]})
+            assert credited.status_code == 200, credited.text[:300]
+            replay = browser.post("/api/me/balance/recharge", json=payload,
+                                  headers={"X-CSRF-Token": login.json()["csrf_token"]})
+            assert replay.status_code == 200 and replay.json()["order"]["id"] == credited.json()["order"]["id"]
+            conflict = browser.post("/api/me/balance/recharge", json={**payload, "amount_yuan": "1"},
+                                    headers={"X-CSRF-Token": login.json()["csrf_token"]})
+            assert conflict.status_code == 409
+            excessive = browser.post("/api/me/balance/recharge", json={"amount_yuan": 21},
+                                     headers={"X-CSRF-Token": login.json()["csrf_token"]})
+            assert excessive.status_code == 400
             independent = browser.get("/api/me/balance?limit=1&offset=0&account_id=999999")
             assert independent.status_code == 200, "Personal balance still depends on Python Web"
-            assert independent.json()["summary"]["balance_micro_yuan"] == 3_000_000
-            assert independent.json()["total"] == 2 and len(independent.json()["entries"]) == 1
+            assert independent.json()["summary"]["balance_micro_yuan"] == 3_000_001
+            assert independent.json()["total"] == 3 and len(independent.json()["entries"]) == 1
             assert independent.json()["entries"][0]["account_id"] == registered.json()["account"]["id"]
-            assert browser.get("/api/me/recharge/orders").json()["total"] == 2
+            assert browser.get("/api/me/recharge/orders").json()["total"] == 3
         finally:
             docker("start", web_container)
             wait(f"{web_url}/api/health")
-        print("==> Java wallet reads -> Python recharge -> owner-scoped pagination -> reads with Python stopped: PASS")
+        print("==> Java wallet read/write -> owner-scoped pagination -> recharge/replay/conflict with Python stopped: PASS")
         old_cookies = dict(browser.cookies)
         changed = browser.post("/api/account/password", json={
             "current_password": password, "new_password": "gateway-new-password-456",
@@ -111,6 +127,7 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
         assert browser.get("/api/auth/me").json()["authenticated"] is False
         assert browser.get("/api/me/balance").status_code == 401
         assert browser.get("/api/me/recharge/orders").status_code == 401
+        assert browser.post("/api/me/balance/recharge", json={"amount_yuan": 1}).status_code == 401
         print("==> Java browser auth gateway -> Python account route -> password revocation: PASS")
 
 

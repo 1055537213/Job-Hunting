@@ -3010,6 +3010,18 @@ def create_web_app(
         """当前账号发起一次受限演示充值。"""
 
         account = current_account(request)
+        if backend.platform_billing_client is not None:
+            try:
+                return backend.platform_billing_client.personal_recharge(
+                    account_id=account.id, session_token=request.cookies.get(SESSION_COOKIE_NAME),
+                    amount_yuan=str(payload.amount_yuan), note=payload.note, idempotency_key=payload.idempotency_key,
+                    trace_id=getattr(request.state, "request_id", None),
+                )
+            except PlatformBillingUnavailableError:
+                raise
+            except PlatformBillingError as error:
+                status = error.status_code if error.status_code is not None and 400 <= error.status_code < 500 else 503
+                raise HTTPException(status_code=status, detail=str(error)) from error
         if not billing_settings.demo_recharge_enabled:
             raise HTTPException(status_code=503, detail="演示充值当前未开放，请联系管理员。")
         try:

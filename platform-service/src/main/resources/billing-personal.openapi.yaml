@@ -1,15 +1,67 @@
 openapi: 3.1.0
 info:
-  title: Personal Billing Query Contract
-  version: 1.0.0
+  title: Personal Billing Contract
+  version: 1.1.0
   description: >-
-    Java owns these personal queries. Identity comes from the active session,
+    Java owns personal queries and simulated recharge. Identity comes from the active session,
     never a supplied account ID. Rows are ordered by created_at DESC, id DESC.
     Read-only repeatable-read transactions keep counts and pages consistent.
     Financial facts are retained without the five-page usage-log deletion rule.
 security:
   - SessionCookie: []
 paths:
+  /api/me/balance/recharge:
+    post:
+      operationId: personalRecharge
+      description: >-
+        Requires active session, matching CSRF cookie/header and write rate limit.
+        Java revalidates the session inside the transaction. Demo switch and amount
+        caps come only from server settings. Order, ledger, balance and payment event
+        commit atomically. Same owner/key/amount returns the original order and ledger,
+        with the current summary; changed amount returns 409. A missing key generates
+        a new operation, so clients must reuse the body key when retrying. No real payment.
+      parameters:
+        - name: X-CSRF-Token
+          in: header
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RechargeRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/RechargeResult'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Error'}
+        '403': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+        '429': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+  /internal/v1/billing/me/recharge:
+    post:
+      operationId: internalPersonalRecharge
+      description: Python compatibility adapter uses the same Java session and server-side limits.
+      security: [{InternalServiceToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_token, payload]
+              properties:
+                session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+                payload: {$ref: '#/components/schemas/RechargeRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/RechargeResult'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Error'}
+        '403': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
   /api/me/balance:
     get:
       operationId: personalBalance
@@ -99,6 +151,20 @@ components:
               limit: {type: integer, minimum: 1, maximum: 100}
               offset: {type: integer, format: int64, minimum: 0}
   schemas:
+    RechargeRequest:
+      type: object
+      required: [amount_yuan]
+      properties:
+        amount_yuan: {type: number, exclusiveMinimum: 0, maximum: 1000000, multipleOf: 0.000001}
+        note: {type: [string, 'null'], maxLength: 120}
+        idempotency_key: {type: [string, 'null'], minLength: 16, maxLength: 128}
+    RechargeResult:
+      type: object
+      required: [order, entry, summary]
+      properties:
+        order: {$ref: '#/components/schemas/RechargeOrder'}
+        entry: {$ref: '#/components/schemas/LedgerEntry'}
+        summary: {$ref: '#/components/schemas/Summary'}
     BalancePage:
       type: object
       required: [summary, entries, total, limit, offset, page_size, max_pages, settings]
@@ -198,6 +264,11 @@ components:
         request_id: {type: string}
         trace_id: {type: string}
   responses:
+    RechargeResult:
+      description: Settled simulated order, corresponding ledger and current balance; Cache-Control no-store
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/RechargeResult'}
     Error:
       description: Authentication, validation, throttling or infrastructure error; no Python read fallback
       content:
