@@ -166,6 +166,52 @@ class PlatformAuthClient:
             raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502)
         return payload
 
+    def admin_tool_traces(self, resource: str, *, session_token: str | None, trace_id: str | None = None,
+                          **filters: Any) -> dict[str, Any]:
+        """Read Java-owned projections without local trace fallback or cache."""
+        if resource not in {"list", "detail"}:
+            raise ValueError("Unknown tool trace resource")
+        if not session_token:
+            raise PlatformAuthError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
+        path = "" if resource == "list" else "/detail"
+        try:
+            response = httpx.post(f"{self.base_url}/internal/v1/admin/tools/traces{path}", headers={
+                "X-Internal-Service-Token": self.internal_token,
+                "X-Trace-Id": trace_id or f"platform-tools-{uuid4().hex}",
+            }, json={"session_token": session_token, **filters}, timeout=self.timeout_seconds)
+        except httpx.HTTPError as error:
+            raise PlatformAuthUnavailableError() from error
+        if response.status_code >= 500:
+            raise PlatformAuthUnavailableError()
+        try:
+            result = response.json()
+        except ValueError as error:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台工具记录响应无效。", _platform_response_error_status(response)) from error
+        if not isinstance(result, dict):
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台工具记录响应无效。", _platform_response_error_status(response))
+        if response.is_error:
+            raise PlatformAuthError(str(result.get("code") or "PLATFORM_AUTH_ERROR"),
+                                    str(result.get("message") or result.get("detail") or "工具记录查询失败。"), response.status_code)
+        try:
+            if resource == "detail":
+                valid = (_valid_tool_trace(result["trace"], detail=True)
+                         and result["trace"]["root_request_id"] == filters["root_request_id"])
+            else:
+                valid = (type(result["total"]) is int and result["total"] >= 0
+                         and type(result["limit"]) is int and result["limit"] == filters["limit"]
+                         and type(result["offset"]) is int and result["offset"] == filters["offset"]
+                         and result["page_size"] == 100 and result["max_pages"] == 5
+                         and isinstance(result["traces"], list)
+                         and len(result["traces"]) <= min(filters["limit"], max(0, result["total"] - filters["offset"]))
+                         and all(_valid_tool_trace(row, detail=False)
+                                 and (filters.get("account_id") is None or row["account_id"] == filters["account_id"])
+                                 for row in result["traces"]))
+            if not valid:
+                raise ValueError("Invalid tool trace projection")
+        except (KeyError, TypeError, ValueError) as error:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台工具记录响应无效。", 502) from error
+        return result
+
     def admin_usage(self, resource: str, *, session_token: str | None, trace_id: str | None = None,
                     **filters: Any) -> dict[str, Any]:
         """Forward administrator reads; never consult Python's summary cache in Java mode."""
@@ -389,6 +435,25 @@ class PlatformAuthClient:
                 "INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502
             )
         return payload
+
+
+def _valid_tool_trace(value: Any, *, detail: bool) -> bool:
+    if not isinstance(value, dict):
+        return False
+    fields = {"id", "account_id", "candidate_id", "session_id", "root_request_id", "title", "status", "source",
+              "step_count", "attempt_count", "last_step_name", "last_error_summary", "created_at", "started_at", "finished_at", "updated_at"}
+    if detail:
+        fields.add("trace")
+    if set(value) != fields:
+        return False
+    return (all(type(value[key]) is int and value[key] > 0 for key in ("id", "account_id"))
+            and (value["candidate_id"] is None or type(value["candidate_id"]) is int)
+            and all(isinstance(value[key], str) for key in ("root_request_id", "title", "source", "created_at", "updated_at"))
+            and value["status"] in {"running", "waiting_confirmation", "completed", "failed", "cancelled"}
+            and all(type(value[key]) is int and value[key] >= 0 for key in ("step_count", "attempt_count"))
+            and all(value[key] is None or isinstance(value[key], str)
+                    for key in ("session_id", "last_step_name", "last_error_summary", "started_at", "finished_at"))
+            and (not detail or isinstance(value["trace"], dict)))
 
 
 def _is_safe_account_view(value: Any) -> bool:

@@ -1,0 +1,132 @@
+openapi: 3.1.0
+info:
+  title: Administrator Tool Trace Read Contract
+  version: 1.0.0
+  description: >-
+    Real active administrator session required. Python owns execution, low-sensitivity
+    snapshots and physical retention. Java preserves ordered steps, attempts, results,
+    errors and approval state. No raw arguments, hidden reasoning or extra provider data
+    are added. Reads are uncached and use read-only Repeatable Read snapshots.
+security: [{SessionCookie: []}]
+paths:
+  /api/admin/tools/traces:
+    get:
+      operationId: adminToolTraceList
+      parameters:
+        - {name: account_id, in: query, schema: {type: integer, format: int64}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 100}}
+        - {name: offset, in: query, schema: {type: integer, format: int64, minimum: 0, default: 0}}
+      responses:
+        '200': {$ref: '#/components/responses/Page'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/admin/tools/traces/{root_request_id}:
+    get:
+      operationId: adminToolTraceDetail
+      parameters:
+        - {name: root_request_id, in: path, required: true, schema: {type: string, minLength: 1, maxLength: 128}}
+      responses:
+        '200': {$ref: '#/components/responses/Detail'}
+        default: {$ref: '#/components/responses/Error'}
+  /internal/v1/admin/tools/traces:
+    post:
+      operationId: internalAdminToolTraceList
+      security: [{InternalServiceToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - {$ref: 'admin-usage.openapi.yaml#/components/schemas/SessionRequest'}
+                - type: object
+                  required: [limit, offset]
+                  properties:
+                    account_id: {type: [integer, 'null'], format: int64}
+                    limit: {type: integer, minimum: 1, maximum: 100}
+                    offset: {type: integer, format: int64, minimum: 0}
+      responses:
+        '200': {$ref: '#/components/responses/Page'}
+        default: {$ref: '#/components/responses/Error'}
+  /internal/v1/admin/tools/traces/detail:
+    post:
+      operationId: internalAdminToolTraceDetail
+      security: [{InternalServiceToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - {$ref: 'admin-usage.openapi.yaml#/components/schemas/SessionRequest'}
+                - type: object
+                  required: [root_request_id]
+                  properties:
+                    root_request_id: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200': {$ref: '#/components/responses/Detail'}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    SessionCookie: {$ref: 'billing-personal.openapi.yaml#/components/securitySchemes/SessionCookie'}
+    InternalServiceToken: {$ref: 'billing-personal.openapi.yaml#/components/securitySchemes/InternalServiceToken'}
+  schemas:
+    TraceSummary:
+      type: object
+      required: [id, account_id, candidate_id, session_id, root_request_id, title, status, source, step_count,
+                 attempt_count, last_step_name, last_error_summary, created_at, started_at, finished_at, updated_at]
+      properties:
+        id: {type: integer, format: int64}
+        account_id: {type: integer, format: int64}
+        candidate_id: {type: [integer, 'null'], format: int64}
+        session_id: {type: [string, 'null']}
+        root_request_id: {type: string, minLength: 1, maxLength: 128}
+        title: {type: string}
+        status: {type: string, enum: [running, waiting_confirmation, completed, failed, cancelled]}
+        source: {type: string}
+        step_count: {type: integer, minimum: 0}
+        attempt_count: {type: integer, minimum: 0}
+        last_step_name: {type: [string, 'null']}
+        last_error_summary: {type: [string, 'null']}
+        created_at: {type: string, format: date-time}
+        started_at: {type: [string, 'null'], format: date-time}
+        finished_at: {type: [string, 'null'], format: date-time}
+        updated_at: {type: string, format: date-time}
+    TraceDetail:
+      allOf:
+        - {$ref: '#/components/schemas/TraceSummary'}
+        - type: object
+          required: [trace]
+          properties:
+            trace:
+              type: object
+              description: Existing low-sensitivity snapshot with original ordered steps/attempts, result summaries and approval; no reconstruction
+    TracePage:
+      type: object
+      required: [traces, total, limit, offset, page_size, max_pages]
+      properties:
+        traces: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/TraceSummary'}}
+        total: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 100}
+        offset: {type: integer, format: int64, minimum: 0}
+        page_size: {const: 100}
+        max_pages: {const: 5}
+  responses:
+    Page:
+      description: Latest 500 tasks per account, ordered by updated_at then ID descending; summaries only, Cache-Control no-store
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/TracePage'}
+    Detail:
+      description: Only retained tasks are accessible, Cache-Control no-store
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [trace]
+            properties:
+              trace: {$ref: '#/components/schemas/TraceDetail'}
+    Error:
+      description: 401 invalid session/token; 403 non-admin; 404 missing/expired task; 422 invalid page/task ID; 429 rate limit; 503 dependency failure
+      content:
+        application/json:
+          schema: {$ref: 'billing-personal.openapi.yaml#/components/schemas/Error'}

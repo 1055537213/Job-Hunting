@@ -13,6 +13,92 @@ from job_hunting_agent.platform_auth import (
 from job_hunting_agent.web import create_web_app
 
 
+def _tool_trace_projection():
+    return {"id": 1, "account_id": 3, "candidate_id": None, "session_id": None, "root_request_id": "task-1",
+            "title": "Task", "status": "failed", "source": "chat", "step_count": 2, "attempt_count": 3,
+            "last_step_name": "analyze_project", "last_error_summary": "provider unavailable",
+            "created_at": "2026-10-16T00:00:00+00:00", "started_at": None, "finished_at": None,
+            "updated_at": "2026-10-16T00:00:01+00:00"}
+
+
+@pytest.mark.parametrize("resource", ["list", "detail"])
+@pytest.mark.parametrize("status", [200, 403, 404, 503])
+def test_tool_trace_adapter_never_reads_or_prunes_local_records(tmp_path, monkeypatch, resource, status):
+    app = create_web_app(env_file=tmp_path / "missing.env")
+    with TestClient(app) as browser:
+        credentials = {"email": "tools-adapter@example.com", "password": "password-123"}
+        assert browser.post("/api/auth/register", json=credentials).status_code == 200
+        assert browser.post("/api/auth/login", json=credentials).status_code == 200
+        trace = _tool_trace_projection()
+        if resource == "detail":
+            trace["trace"] = {"steps": [{"name": "search"}, {"name": "analyze_project", "result": {"ok": False, "error": "provider unavailable"}}]}
+            payload = {"trace": trace}
+            filters = {"root_request_id": "task-1"}
+            path = "/api/admin/tools/traces/task-1"
+        else:
+            payload = {"traces": [trace], "total": 5, "limit": 2, "offset": 4, "page_size": 100, "max_pages": 5}
+            filters = {"account_id": 3, "limit": 2, "offset": 4}
+            path = "/api/admin/tools/traces?account_id=3&limit=2&offset=4"
+
+        def request(url, **kwargs):
+            if url.endswith("/internal/v1/auth/accounts/me"):
+                return httpx.Response(401, json={"code": "SESSION_EXPIRED", "message": "expired"})
+            assert url.endswith("/internal/v1/admin/tools/traces" + ("/detail" if resource == "detail" else ""))
+            assert kwargs["json"] == {"session_token": browser.cookies["job_agent_session"], **filters}
+            assert kwargs["headers"]["X-Trace-Id"] == "tools-adapter-trace"
+            return httpx.Response(status, json=payload if status == 200 else {"code": "TRACE_NOT_FOUND", "message": "not allowed"})
+
+        monkeypatch.setattr(httpx, "post", request)
+        app.state.backend.platform_auth_client = PlatformAuthClient(PlatformAuthSettings(True, "http://java", "secret", 5))
+        for method in ("list_tool_call_traces", "get_tool_call_trace", "count_tool_call_traces", "prune_tool_call_traces_to_limit", "prune_usage_events_to_limit"):
+            monkeypatch.setattr(app.state.backend.store, method, lambda *a, **k: pytest.fail("Local tool trace fallback"))
+        result = browser.get(path, headers={"X-Request-ID": "tools-adapter-trace"})
+        assert result.status_code == status, result.text
+        if status == 200:
+            assert result.json() == payload
+
+
+@pytest.mark.parametrize("invalid", ["html", "missing", "wrong-root", "raw-json", "wrong-account", "bad-count"])
+def test_tool_trace_client_rejects_invalid_upstream(monkeypatch, invalid):
+    client = PlatformAuthClient(PlatformAuthSettings(True, "http://java", "secret", 5))
+    trace = _tool_trace_projection()
+    if invalid in {"wrong-account", "bad-count"}:
+        if invalid == "wrong-account":
+            trace["account_id"] = 999
+        else:
+            trace["step_count"] = True
+        payload = {"traces": [trace], "total": 1, "limit": 2, "offset": 0, "page_size": 100, "max_pages": 5}
+        resource, filters = "list", {"account_id": 3, "limit": 2, "offset": 0}
+    else:
+        trace["trace"] = {}
+        if invalid == "wrong-root":
+            trace["root_request_id"] = "other-task"
+        if invalid == "raw-json":
+            trace["trace_json"] = "must-not-leak"
+        payload = {} if invalid == "missing" else {"trace": trace}
+        resource, filters = "detail", {"root_request_id": "task-1"}
+    response = httpx.Response(200, text="html") if invalid == "html" else httpx.Response(200, json=payload)
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: response)
+    with pytest.raises(PlatformAuthError) as error:
+        client.admin_tool_traces(resource, session_token="opaque", **filters)
+    assert error.value.status_code == 502
+
+
+def test_tool_trace_client_requires_session_and_handles_outages(monkeypatch):
+    client = PlatformAuthClient(PlatformAuthSettings(True, "http://java", "secret", 5))
+    with pytest.raises(PlatformAuthError) as error:
+        client.admin_tool_traces("list", session_token=None, limit=100, offset=0)
+    assert error.value.status_code == 401
+    def offline(*a, **k):
+        raise httpx.ConnectError("offline")
+    monkeypatch.setattr(httpx, "post", offline)
+    with pytest.raises(PlatformAuthUnavailableError):
+        client.admin_tool_traces("detail", session_token="opaque", root_request_id="task-1")
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(503, text="html"))
+    with pytest.raises(PlatformAuthUnavailableError):
+        client.admin_tool_traces("detail", session_token="opaque", root_request_id="task-1")
+
+
 @pytest.mark.parametrize("resource", ["summary", "events"])
 @pytest.mark.parametrize("status", [200, 403, 503])
 def test_usage_adapter_bypasses_cache_local_reads_and_cleanup(tmp_path, monkeypatch, resource, status):

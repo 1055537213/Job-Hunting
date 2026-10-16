@@ -35,6 +35,8 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
     from job_hunting_agent.platform_email import deliver_platform_verification
     from job_hunting_agent.models import UsageEventRecord
     from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
+    from job_hunting_agent.tool_audit import build_tool_trace_record
+    from job_hunting_agent.web import new_task_trace, start_task_step, complete_task_step
 
     auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
     email = f"gateway-{os.urandom(12).hex()}@example.com"
@@ -72,6 +74,19 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
                     operation="chat", input_tokens=8, output_tokens=2, total_tokens=10, usage_source="estimated",
                     status="succeeded", attempt=1, provider_request_id=None, raw_usage={"total_tokens": 10},
                     created_at=datetime.now(UTC).isoformat(timespec="seconds"), billable=False, pricing_version=None))
+                task = new_task_trace(f"gateway-tool-{registered.json()['account']['id']}-{index}")
+                start_task_step(task, "search_candidate_evidence")
+                complete_task_step(task, "search_candidate_evidence", {"results": [{"id": 1}, {"id": 2}]})
+                if index == 1:
+                    start_task_step(task, "analyze_project")
+                    complete_task_step(task, "analyze_project", {"error": "provider unavailable"})
+                    task["status"] = "failed"
+                    task["finished_at"] = task["updated_at"]
+                else:
+                    task["status"] = "waiting_confirmation"
+                    task["approval"] = {"status": "pending"}
+                store.record_tool_call_trace(build_tool_trace_record(task, account_id=registered.json()["account"]["id"],
+                    candidate_id=None, session_id="gateway-usage"))
         finally:
             store.close()
         assert browser.post("/api/auth/login", json={"email": email, "password": password}).status_code == 403
@@ -154,7 +169,8 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
                                    account_id: int, order_id: int, user_credentials: tuple[str, str]) -> None:
     """Runs while the isolated Python Web is stopped; every tested route must reach Java."""
     paths = ["/api/admin/balance/events", "/api/admin/recharge/orders", f"/api/admin/recharge/orders/{order_id}/events",
-             "/api/admin/accounts", "/api/admin/audit/events", "/api/admin/usage/summary", "/api/admin/usage/events"]
+             "/api/admin/accounts", "/api/admin/audit/events", "/api/admin/usage/summary", "/api/admin/usage/events",
+             "/api/admin/tools/traces", f"/api/admin/tools/traces/gateway-tool-{account_id}-1"]
     for path in paths:
         assert user.get(path).status_code == 403
     path = f"/api/admin/accounts/{account_id}/balance/credit"
@@ -212,6 +228,26 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
         assert all(row["account_id"] == account_id for row in token_page.json()["events"])
         assert admin.get("/api/admin/usage/events?limit=101").status_code == 422
         assert admin.get("/api/admin/usage/events?offset=-1").status_code == 422
+        traces = admin.get(f"/api/admin/tools/traces?account_id={account_id}&limit=1&offset=0")
+        assert traces.status_code == 200 and traces.headers["cache-control"] == "no-store", traces.text[:300]
+        assert traces.json()["total"] == 2 and traces.json()["page_size"] == 100 and traces.json()["max_pages"] == 5
+        assert len(traces.json()["traces"]) == 1 and "trace" not in traces.json()["traces"][0]
+        assert "trace_json" not in traces.json()["traces"][0]
+        older = admin.get(f"/api/admin/tools/traces?account_id={account_id}&limit=1&offset=1").json()
+        assert older["total"] == 2 and older["traces"][0]["id"] != traces.json()["traces"][0]["id"]
+        detail = admin.get(f"/api/admin/tools/traces/gateway-tool-{account_id}-1")
+        assert detail.status_code == 200 and detail.headers["cache-control"] == "no-store", detail.text[:300]
+        task = detail.json()["trace"]
+        assert task["account_id"] == account_id and task["status"] == "failed" and task["last_error_summary"] == "provider unavailable"
+        assert [step["name"] for step in task["trace"]["steps"]] == ["search_candidate_evidence", "analyze_project"]
+        assert task["trace"]["steps"][0]["result"] == {"ok": True, "result_count": 2}
+        assert task["trace"]["steps"][1]["attempts"][0]["result"] == {"ok": False, "error": "provider unavailable"}
+        pending = admin.get(f"/api/admin/tools/traces/gateway-tool-{account_id}-0").json()["trace"]
+        assert pending["status"] == "waiting_confirmation" and pending["trace"]["approval"]["status"] == "pending"
+        assert admin.get("/api/admin/tools/traces/missing-task").status_code == 404
+        assert admin.get("/api/admin/tools/traces?limit=101").status_code == 422
+        assert admin.get("/api/admin/tools/traces?offset=-1").status_code == 422
+        assert admin.get("/api/admin/tools/traces/" + "a" * 129).status_code == 422
         status_path = f"/api/admin/accounts/{account_id}/status"
         assert user.patch(status_path, json={"status": "disabled"},
                           headers={"X-CSRF-Token": user.cookies["job_agent_csrf"]}).status_code == 403
@@ -249,10 +285,13 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
             assert revoked.get("/api/admin/audit/events").status_code == 401
             assert revoked.get("/api/admin/usage/summary").status_code == 401
             assert revoked.get("/api/admin/usage/events").status_code == 401
+            assert revoked.get("/api/admin/tools/traces").status_code == 401
+            assert revoked.get(f"/api/admin/tools/traces/gateway-tool-{account_id}-1").status_code == 401
             assert revoked.post(path, json=body, headers=headers).status_code == 401
     print("==> Java admin billing -> RBAC/CSRF/pagination/events/self-credit/replay/revocation with Python stopped: PASS")
     print("==> Java admin account list/status/audit -> safe fields/CSRF/session revocation/pagination with Python stopped: PASS")
     print("==> Java usage summary/events -> RBAC/pagination/current balance/status without Python or summary cache: PASS")
+    print("==> Java tool traces -> Python persisted results/order/errors/approval -> list/detail/RBAC/revocation with Python stopped: PASS")
 
 
 def docker(*args: str) -> str:

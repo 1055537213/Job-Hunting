@@ -190,7 +190,7 @@ Java 用真实 Session 校验管理员权限，补款不信任请求中的操作
 停用账号收到补款后仍保持停用。查询每页最多 100 条，不自动淘汰资金事实；
 契约见 [`billing-admin.openapi.yaml`](src/main/resources/billing-admin.openapi.yaml)。
 Python 在 Java 模式下仅转发这四类请求，不能回读旧数据或回退本地补款。
-工具调用明细、后台任务及请求观测仍在 Python。
+工具执行和轨迹写入、后台任务及请求观测仍在 Python。
 
 `GET /api/admin/accounts`、`PATCH /api/admin/accounts/{account_id}/status` 和
 `GET /api/admin/audit/events` 也由混合网关直达 Java，启用/停用复用原有策略锁和账号事务。
@@ -206,6 +206,12 @@ Python Java 模式只转发这些请求，状态更新会透传规范化请求 I
 Python 仍负责用量写入及物理清理，Java 不写运维记录，不裁剪资金流水。
 混合模式绕过 Python 的旧汇总缓存，Java 直接查询最新已提交数据；暂不引入跨语言共享缓存。
 契约见 [`admin-usage.openapi.yaml`](src/main/resources/admin-usage.openapi.yaml)。
+
+工具调用列表和详情 `/api/admin/tools/traces[/{root_request_id}]` 同样经网关直达 Java。
+列表只查询 16 个摘要字段，详情才加载 Python 保存的低敏步骤、重试、结果和失败原因；不缓存或重排轨迹。
+两者共享每账号最近 500 条的窗口，旧链接无法查询被淘汰任务；列表保留原有分页/可空字段。
+Python 保留执行、写入和定期物理清理职责，Java 不写工具表。
+契约见 [`admin-tools.openapi.yaml`](src/main/resources/admin-tools.openapi.yaml)。
 
 - Java 服务和 Python 服务不能同时写同一组账务表。
 - Java 账务开关关闭时，`account_balances`、`recharge_orders`、`account_balance_ledger` 仍由 Python 独占写入；开关打开后，余额、模拟充值和模型扣费由 Java 独占写入。

@@ -3285,6 +3285,8 @@ def create_web_app(
     ) -> dict[str, object]:
         """管理员分页查看最近固定窗口内的工具调用任务摘要。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_admin_tool_traces(request, "list", account_id=account_id, limit=limit, offset=offset)
         require_admin(request)
         prune_admin_retention_window()
         traces = backend.store.list_tool_call_traces(
@@ -3306,6 +3308,8 @@ def create_web_app(
     def admin_tool_trace_detail(root_request_id: str, request: Request) -> dict[str, object]:
         """管理员按需查看某次任务的工具调用流程和安全结果摘要。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_admin_tool_traces(request, "detail", root_request_id=root_request_id)
         require_admin(request)
         prune_admin_retention_window()
         try:
@@ -3315,6 +3319,14 @@ def create_web_app(
         except KeyError as error:
             raise HTTPException(status_code=404, detail="工具调用记录不存在。") from error
         return {"trace": serialize_tool_trace_detail(trace)}
+
+    def platform_admin_tool_traces(request: Request, resource: str, **filters) -> dict[str, object]:
+        try:
+            return backend.platform_auth_client.admin_tool_traces(resource,
+                session_token=request.cookies.get(SESSION_COOKIE_NAME),
+                trace_id=getattr(request.state, "request_id", None), **filters)
+        except PlatformAuthError as error:
+            raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
 
     install_http_tracing(
         web_app,

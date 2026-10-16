@@ -600,6 +600,8 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
         assert "reverse_proxy @admin_account_status platform-service:8081" in edge
         assert "path /api/admin/usage/summary /api/admin/usage/events" in edge
         assert "reverse_proxy @admin_usage platform-service:8081" in edge
+        assert "path_regexp adminToolTraces ^/api/admin/tools/traces(/[^/]+)?$" in edge
+        assert "reverse_proxy @admin_tool_traces platform-service:8081" in edge
         assert "path_regexp adminAccountStatus ^/api/admin/accounts/[0-9]+/status$" in edge
         assert "path_regexp adminBillingReads ^/api/admin/(balance/events|recharge/orders|recharge/orders/[0-9]+/events)$" in edge
         assert "path_regexp adminCredit ^/api/admin/accounts/[0-9]+/balance/credit$" in edge
@@ -614,6 +616,7 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
     assert "location ~ ^/api/admin/(balance/events|recharge/orders|recharge/orders/[0-9]+/events|accounts/[0-9]+/balance/credit)$" in nginx
     assert "location ~ ^/api/admin/(accounts|audit/events|accounts/[0-9]+/status)$" in nginx
     assert "location ~ ^/api/admin/usage/(summary|events)$" in nginx
+    assert "location ~ ^/api/admin/tools/traces(/[^/]+)?$" in nginx
     assert "location ^~ /internal/" in nginx
     workflow = (ROOT / ".github/workflows/deploy-hybrid.yml").read_text(encoding="utf-8")
     assert "compose.hybrid.coexist.yaml deploy scripts" in workflow

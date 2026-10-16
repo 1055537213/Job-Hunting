@@ -11,6 +11,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import com.jobhunting.platform.usage.AdminUsageQueryService;
 import com.jobhunting.platform.usage.AdminUsageService;
+import com.jobhunting.platform.usage.AdminToolTraceService;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -40,6 +41,7 @@ class AccountAdministrationIntegrationTest {
     @Autowired AdminAuditService audit;
     @Autowired AdminUsageQueryService usageQueries;
     @Autowired AdminUsageService usage;
+    @Autowired AdminToolTraceService toolTraces;
 
     @BeforeEach
     void reset() {
@@ -103,7 +105,11 @@ class AccountAdministrationIntegrationTest {
             """);
         jdbc.execute("""
             CREATE TABLE IF NOT EXISTS tool_call_traces (id serial PRIMARY KEY, account_id integer REFERENCES accounts(id),
-              status text, updated_at timestamptz DEFAULT CURRENT_TIMESTAMP)
+              candidate_id integer, session_id text, root_request_id varchar(128) UNIQUE, title text DEFAULT 'Task',
+              status text, source text DEFAULT 'chat', step_count integer DEFAULT 0, attempt_count integer DEFAULT 0,
+              last_step_name text, last_error_summary text, trace_json jsonb DEFAULT '{}',
+              created_at timestamptz DEFAULT CURRENT_TIMESTAMP, started_at timestamptz, finished_at timestamptz,
+              updated_at timestamptz DEFAULT CURRENT_TIMESTAMP)
             """);
         jdbc.execute("""
             CREATE TABLE IF NOT EXISTS account_balance_ledger (id serial PRIMARY KEY, account_id integer REFERENCES accounts(id))
@@ -318,6 +324,73 @@ class AccountAdministrationIntegrationTest {
         assertThatThrownBy(() -> usageQueries.events(null, null, null, 1, -1)).isInstanceOf(AuthException.class);
         sessions.logout(admin);
         assertThatThrownBy(() -> usage.summary(admin)).isInstanceOf(AuthException.class).extracting("code").isEqualTo("SESSION_EXPIRED");
+    }
+
+    @Test void toolTraceListAndDetailShareAccountRetentionAndStableOrder() {
+        String admin = sessions.login("admin@example.com", "password-123", false, null, null).session_token();
+        jdbc.execute("INSERT INTO tool_call_traces(account_id,root_request_id,status,updated_at) SELECT 2,'tool-' || n,'completed','2026-10-16T00:00:00.123456Z' FROM generate_series(1,501) n");
+        jdbc.execute("INSERT INTO tool_call_traces(account_id,root_request_id,status) VALUES (1,'admin-tool','running')");
+        var page = toolTraces.list(admin, 2L, 100, 400);
+        assertThat(page.total()).isEqualTo(500);
+        assertThat(page.traces()).hasSize(100);
+        var last = page.traces().getLast();
+        assertThat(last.get("root_request_id")).isEqualTo("tool-2");
+        assertThat(last.get("updated_at")).isEqualTo("2026-10-16T00:00:00.123456+00:00");
+        assertThat(last).hasSize(16).doesNotContainKeys("trace", "trace_json", "position");
+        assertThat(last.get("candidate_id")).isNull();
+        assertThat(last.get("started_at")).isNull();
+        assertThat(toolTraces.list(admin, 2L, 100, 500).traces()).isEmpty();
+        assertThat(toolTraces.list(admin, 999L, 1, 0).total()).isZero();
+        assertThat(toolTraces.list(admin, null, 100, 0).total()).isEqualTo(501);
+        assertThatThrownBy(() -> toolTraces.detail(admin, "tool-1")).isInstanceOf(AuthException.class).extracting("code").isEqualTo("TRACE_NOT_FOUND");
+        assertThat(toolTraces.detail(admin, "tool-2")).containsKey("trace");
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM tool_call_traces", Long.class)).isEqualTo(502);
+    }
+
+    @Test void toolTraceDetailsPreserveStepAndRetryOrderResultsErrorsAndUpdates() {
+        String admin = sessions.login("admin@example.com", "password-123", false, null, null).session_token();
+        String trace = """
+            {"version":1,"status":"failed","steps":[
+              {"name":"search_candidate_evidence","status":"completed","result":{"ok":true,"result_count":2}},
+              {"name":"analyze_project","status":"failed","attempts":[
+                {"attempt":1,"status":"failed","result":{"ok":false,"error":"timeout"}},
+                {"attempt":2,"status":"failed","result":{"ok":false,"error":"provider unavailable"}}]}]}
+            """;
+        jdbc.update("""
+            INSERT INTO tool_call_traces(account_id,root_request_id,status,step_count,attempt_count,last_step_name,last_error_summary,trace_json)
+            VALUES (2,'detail-task','failed',2,3,'analyze_project','provider unavailable',CAST(? AS jsonb))
+            """, trace);
+        var detail = (java.util.Map<?, ?>) toolTraces.detail(admin, "detail-task").get("trace");
+        assertThat(detail).hasSize(17);
+        assertThat(detail.get("last_error_summary")).isEqualTo("provider unavailable");
+        var snapshot = (java.util.Map<?, ?>) detail.get("trace");
+        var steps = (java.util.List<?>) snapshot.get("steps");
+        assertThat(((java.util.Map<?, ?>) steps.getFirst()).get("name")).isEqualTo("search_candidate_evidence");
+        var retries = (java.util.List<?>) ((java.util.Map<?, ?>) steps.getLast()).get("attempts");
+        var error = (java.util.Map<?, ?>) ((java.util.Map<?, ?>) retries.getLast()).get("result");
+        assertThat(error.get("error")).isEqualTo("provider unavailable");
+        jdbc.execute("UPDATE tool_call_traces SET status='waiting_confirmation', trace_json='{\"steps\":[],\"approval\":{\"status\":\"pending\"}}' WHERE root_request_id='detail-task'");
+        assertThat(((java.util.Map<?, ?>) toolTraces.detail(admin, "detail-task").get("trace")).get("status")).isEqualTo("waiting_confirmation");
+        jdbc.execute("UPDATE tool_call_traces SET trace_json='[]' WHERE root_request_id='detail-task'");
+        assertThat(((java.util.Map<?, ?>) toolTraces.detail(admin, "detail-task").get("trace")).get("trace")).isEqualTo(java.util.Map.of());
+        jdbc.execute("UPDATE tool_call_traces SET trace_json=NULL WHERE root_request_id='detail-task'");
+        assertThat(((java.util.Map<?, ?>) toolTraces.detail(admin, "detail-task").get("trace")).get("trace")).isEqualTo(java.util.Map.of());
+        assertThatThrownBy(() -> toolTraces.detail(admin, "x' OR 1=1 --")).isInstanceOf(AuthException.class).extracting("code").isEqualTo("TRACE_NOT_FOUND");
+    }
+
+    @Test void toolTraceReadsRejectUsersDisabledAndRevokedSessions() {
+        String user = sessions.login("user@example.com", "password-123", false, null, null).session_token();
+        assertThatThrownBy(() -> toolTraces.list(user, null, 100, 0)).isInstanceOf(AuthException.class).extracting("code").isEqualTo("ADMIN_REQUIRED");
+        assertThatThrownBy(() -> toolTraces.detail(user, "missing")).isInstanceOf(AuthException.class).extracting("code").isEqualTo("ADMIN_REQUIRED");
+        String admin = sessions.login("admin@example.com", "password-123", false, null, null).session_token();
+        assertThatThrownBy(() -> toolTraces.list(admin, null, 101, 0)).isInstanceOf(AuthException.class);
+        assertThatThrownBy(() -> toolTraces.list(admin, null, 1, -1)).isInstanceOf(AuthException.class);
+        assertThatThrownBy(() -> toolTraces.detail(admin, "a".repeat(129))).isInstanceOf(AuthException.class);
+        jdbc.execute("UPDATE accounts SET status='disabled' WHERE id=1");
+        assertThatThrownBy(() -> toolTraces.detail(admin, "missing")).isInstanceOf(AuthException.class).extracting("code").isEqualTo("ACCOUNT_DISABLED");
+        jdbc.execute("UPDATE accounts SET status='active' WHERE id=1");
+        sessions.logout(admin);
+        assertThatThrownBy(() -> toolTraces.list(admin, null, 100, 0)).isInstanceOf(AuthException.class).extracting("code").isEqualTo("SESSION_EXPIRED");
     }
 
     private void insertAccount(int id, String email, String role, String status) {
