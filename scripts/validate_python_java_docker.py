@@ -34,7 +34,7 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
     from job_hunting_agent.platform_auth import PlatformAuthClient
     from job_hunting_agent.platform_email import deliver_platform_verification
     from job_hunting_agent.models import UsageEventRecord
-    from job_hunting_agent.storage import SQLAlchemyStore
+    from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
 
     auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
     email = f"gateway-{os.urandom(12).hex()}@example.com"

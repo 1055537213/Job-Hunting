@@ -3,12 +3,30 @@
 from __future__ import annotations
 
 import json
+import importlib
 import os
 from pathlib import Path
 import subprocess
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_hybrid_browser_acceptance_imports_before_network_or_docker(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    module = importlib.import_module("validate_python_java_docker")
+
+    class DependenciesImported(Exception):
+        pass
+
+    def stop_before_network(**kwargs):
+        raise DependenciesImported()
+
+    monkeypatch.setattr(module.httpx, "Client", stop_before_network)
+    with pytest.raises(DependenciesImported):
+        module.run_browser_gateway_flow("http://gateway", "http://web", "http://java", "secret",
+                                        "unused-container", ("admin@example.com", "unused"), "unused-database")
 
 
 def _production_compose_config(*extra_files: str) -> dict:
