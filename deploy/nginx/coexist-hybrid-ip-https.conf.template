@@ -94,6 +94,16 @@ server {
         proxy_read_timeout 300s;
     }
 
+    location ~ ^/api/admin/usage/(summary|events)$ {
+        proxy_pass http://platform-service:8081;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_cache off;
+        proxy_read_timeout 300s;
+    }
+
     location / {
         proxy_pass http://web:8000;
         proxy_http_version 1.1;

@@ -166,6 +166,53 @@ class PlatformAuthClient:
             raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502)
         return payload
 
+    def admin_usage(self, resource: str, *, session_token: str | None, trace_id: str | None = None,
+                    **filters: Any) -> dict[str, Any]:
+        """Forward administrator reads; never consult Python's summary cache in Java mode."""
+        if resource not in {"summary", "events"}:
+            raise ValueError("Unknown usage resource")
+        if not session_token:
+            raise PlatformAuthError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
+        try:
+            response = httpx.post(f"{self.base_url}/internal/v1/admin/usage/{resource}", headers={
+                "X-Internal-Service-Token": self.internal_token,
+                "X-Trace-Id": trace_id or f"platform-usage-{uuid4().hex}",
+            }, json={"session_token": session_token, **filters}, timeout=self.timeout_seconds)
+        except httpx.HTTPError as error:
+            raise PlatformAuthUnavailableError() from error
+        if response.status_code >= 500:
+            raise PlatformAuthUnavailableError()
+        try:
+            result = response.json()
+        except ValueError as error:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台用量服务响应无效。", _platform_response_error_status(response)) from error
+        if not isinstance(result, dict):
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台用量服务响应无效。", _platform_response_error_status(response))
+        if response.is_error:
+            raise PlatformAuthError(str(result.get("code") or "PLATFORM_AUTH_ERROR"),
+                                    str(result.get("message") or result.get("detail") or "平台用量查询失败。"), response.status_code)
+        try:
+            if result["page_size"] != 100 or result["max_pages"] != 5:
+                raise ValueError("Invalid retention window")
+            if resource == "summary":
+                valid = (isinstance(result["summary"], dict) and isinstance(result["by_account"], list)
+                         and isinstance(result["tool_calls_by_account"], list) and isinstance(result["billing"], dict)
+                         and isinstance(result["billing"]["summary"], dict) and isinstance(result["billing"]["settings"], dict)
+                         and isinstance(result["billing"]["by_account"], list))
+            else:
+                valid = (isinstance(result["events"], list) and len(result["events"]) <= filters["limit"]
+                         and type(result["total"]) is int and result["total"] >= len(result["events"])
+                         and result["limit"] == filters["limit"] and result["offset"] == filters["offset"]
+                         and all(isinstance(row, dict) and type(row["id"]) is int and row["id"] > 0
+                                 and type(row["account_id"]) is int and isinstance(row["raw_usage"], dict)
+                                 and isinstance(row["billable"], bool) and isinstance(row["created_at"], str)
+                                 for row in result["events"]))
+            if not valid:
+                raise ValueError("Invalid usage response")
+        except (KeyError, TypeError, ValueError) as error:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台用量服务响应无效。", 502) from error
+        return result
+
     def audit_events(self, *, session_token: str | None, limit: int, offset: int,
                     trace_id: str | None = None) -> dict[str, Any]:
         if not session_token:

@@ -43,6 +43,11 @@
 			path_regexp adminAccountStatus ^/api/admin/accounts/[0-9]+/status$
 		}
 		reverse_proxy @admin_account_status platform-service:8081
+		@admin_usage {
+			method GET
+			path /api/admin/usage/summary /api/admin/usage/events
+		}
+		reverse_proxy @admin_usage platform-service:8081
 
 		reverse_proxy {
 			dynamic a web 8000 {

@@ -2796,6 +2796,8 @@ def create_web_app(
     def admin_usage_summary(request: Request) -> dict[str, object]:
         """管理员查看全局 Token 和工具调用汇总。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_admin_usage(request, "summary")
         require_admin(request)
 
         def load_summary() -> dict[str, object]:
@@ -2831,6 +2833,14 @@ def create_web_app(
             }
 
         return backend.cached_admin_usage_summary(load_summary)
+
+    def platform_admin_usage(request: Request, resource: str, **filters) -> dict[str, object]:
+        try:
+            return backend.platform_auth_client.admin_usage(resource,
+                session_token=request.cookies.get(SESSION_COOKIE_NAME),
+                trace_id=getattr(request.state, "request_id", None), **filters)
+        except PlatformAuthError as error:
+            raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
 
     @web_app.get("/api/admin/balance/events")
     def admin_balance_events(
@@ -3244,6 +3254,9 @@ def create_web_app(
     ) -> dict[str, object]:
         """管理员查看用量流水，保留来源、操作类型和是否可计费状态。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_admin_usage(request, "events", account_id=account_id, candidate_id=candidate_id,
+                                        session_id=session_id, limit=limit, offset=offset)
         require_admin(request)
         prune_admin_retention_window()
         events = backend.store.list_usage_events(

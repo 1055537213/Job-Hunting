@@ -9,6 +9,8 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
+import com.jobhunting.platform.usage.AdminUsageQueryService;
+import com.jobhunting.platform.usage.AdminUsageService;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -36,6 +38,8 @@ class AccountAdministrationIntegrationTest {
     @Autowired PasswordHasher hasher;
     @Autowired SessionService sessions;
     @Autowired AdminAuditService audit;
+    @Autowired AdminUsageQueryService usageQueries;
+    @Autowired AdminUsageService usage;
 
     @BeforeEach
     void reset() {
@@ -89,7 +93,24 @@ class AccountAdministrationIntegrationTest {
               request_id varchar(128), created_at timestamptz)
             """);
         jdbc.execute("""
-            TRUNCATE platform_account_action_emails, account_email_outbox, account_action_tokens,
+            CREATE TABLE IF NOT EXISTS usage_events (
+              id serial PRIMARY KEY, account_id integer REFERENCES accounts(id), candidate_id integer,
+              session_id text, root_request_id text, call_id text, provider text DEFAULT 'provider', model text DEFAULT 'model',
+              operation text DEFAULT 'chat', input_tokens bigint DEFAULT 8, output_tokens bigint DEFAULT 2,
+              total_tokens bigint DEFAULT 10, usage_source text DEFAULT 'provider', status text DEFAULT 'succeeded',
+              attempt integer DEFAULT 1, provider_request_id text, raw_usage_json jsonb DEFAULT '{}',
+              created_at timestamptz DEFAULT CURRENT_TIMESTAMP, billable boolean DEFAULT TRUE, pricing_version text)
+            """);
+        jdbc.execute("""
+            CREATE TABLE IF NOT EXISTS tool_call_traces (id serial PRIMARY KEY, account_id integer REFERENCES accounts(id),
+              status text, updated_at timestamptz DEFAULT CURRENT_TIMESTAMP)
+            """);
+        jdbc.execute("""
+            CREATE TABLE IF NOT EXISTS account_balance_ledger (id serial PRIMARY KEY, account_id integer REFERENCES accounts(id))
+            """);
+        jdbc.execute("""
+            TRUNCATE usage_events, tool_call_traces, account_balance_ledger,
+                     platform_account_action_emails, account_email_outbox, account_action_tokens,
                      admin_audit_events, auth_sessions, account_consents, account_balances, accounts
                      RESTART IDENTITY CASCADE
             """);
@@ -241,6 +262,62 @@ class AccountAdministrationIntegrationTest {
         assertThat(sessions.resolve(user)).isEqualTo(2L);
         assertThat(jdbc.queryForObject("SELECT status FROM accounts WHERE id=2", String.class)).isEqualTo("active");
         assertThat(audit.page(admin, 50, 0).events()).isEmpty();
+    }
+
+    @Test void usageReadsUsePerAccountWindowsBeforeFiltersAndKeepFinancialFacts() {
+        String admin = sessions.login("admin@example.com", "password-123", false, null, null).session_token();
+        jdbc.execute("INSERT INTO usage_events(account_id, candidate_id, call_id) SELECT 2, CASE WHEN n=1 THEN 7 ELSE 8 END, 'call-' || n FROM generate_series(1,501) n");
+        jdbc.execute("INSERT INTO usage_events(account_id, call_id, raw_usage_json, billable) VALUES (1, 'admin-call', '{\"tokens\":10}', FALSE)");
+        jdbc.execute("INSERT INTO tool_call_traces(account_id,status) SELECT 2, CASE WHEN n=1 THEN 'failed' ELSE 'completed' END FROM generate_series(1,501) n");
+        jdbc.execute("INSERT INTO account_balance_ledger(account_id) SELECT 2 FROM generate_series(1,510)");
+        var page = usage.events(admin, 2L, null, null, 100, 400);
+        assertThat(page.total()).isEqualTo(500);
+        assertThat(page.events()).hasSize(100);
+        assertThat(page.events().getLast().call_id()).isEqualTo("call-2");
+        assertThat(page.events().getFirst().candidate_id()).isEqualTo(8L);
+        assertThat(usage.events(admin, 2L, 7L, null, 100, 0).events()).isEmpty();
+        assertThat(usage.events(admin, 2L, null, "x' OR 1=1 --", 100, 0).total()).isZero();
+        assertThat(usage.events(admin, 2L, null, null, 100, 500).events()).isEmpty();
+        var summary = usage.summary(admin);
+        var totals = (java.util.Map<?, ?>) summary.get("summary");
+        assertThat(((Number) totals.get("event_count")).longValue()).isEqualTo(501);
+        assertThat(((Number) totals.get("total_tokens")).longValue()).isEqualTo(5010);
+        assertThat(((Number) totals.get("billable_tokens")).longValue()).isEqualTo(5000);
+        var tools = (java.util.List<?>) summary.get("tool_calls_by_account");
+        assertThat(((Number) ((java.util.Map<?, ?>) tools.getFirst()).get("failed_trace_count")).longValue()).isZero();
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM usage_events", Long.class)).isEqualTo(502);
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM account_balance_ledger", Long.class)).isEqualTo(510);
+    }
+
+    @Test void usageSummaryReflectsNewWritesStatusThresholdAndDeletedAccountsWithoutCache() {
+        String admin = sessions.login("admin@example.com", "password-123", false, null, null).session_token();
+        jdbc.execute("UPDATE account_balances SET balance_micro_yuan=20000000 WHERE account_id=1");
+        jdbc.execute("UPDATE account_balances SET balance_micro_yuan=5000000, low_balance_threshold_micro_yuan=6000000 WHERE account_id=2");
+        var billing = (java.util.Map<?, ?>) usage.summary(admin).get("billing");
+        var totals = (java.util.Map<?, ?>) billing.get("summary");
+        assertThat(((Number) totals.get("healthy_account_count")).longValue()).isEqualTo(1);
+        assertThat(((Number) totals.get("low_balance_account_count")).longValue()).isEqualTo(1);
+        jdbc.execute("UPDATE accounts SET status='disabled' WHERE id=2");
+        jdbc.execute("UPDATE account_balances SET total_consumed_micro_yuan=123 WHERE account_id=2");
+        var fresh = (java.util.Map<?, ?>) ((java.util.Map<?, ?>) usage.summary(admin).get("billing")).get("summary");
+        assertThat(((Number) fresh.get("suspended_account_count")).longValue()).isEqualTo(1);
+        assertThat(((Number) fresh.get("total_consumed_micro_yuan")).longValue()).isEqualTo(123);
+        jdbc.execute("UPDATE accounts SET deleted_at=CURRENT_TIMESTAMP WHERE id=2");
+        var deleted = (java.util.Map<?, ?>) ((java.util.Map<?, ?>) usage.summary(admin).get("billing")).get("summary");
+        assertThat(((Number) deleted.get("account_count")).longValue()).isEqualTo(1);
+        jdbc.execute("DELETE FROM account_balances WHERE account_id=1");
+        var missing = (java.util.Map<?, ?>) ((java.util.Map<?, ?>) usage.summary(admin).get("billing")).get("summary");
+        assertThat(((Number) missing.get("total_balance_micro_yuan")).longValue()).isZero();
+    }
+
+    @Test void usageRejectsOrdinaryAndRevokedSessionsAndInvalidPages() {
+        String user = sessions.login("user@example.com", "password-123", false, null, null).session_token();
+        assertThatThrownBy(() -> usage.summary(user)).isInstanceOf(AuthException.class).extracting("code").isEqualTo("ADMIN_REQUIRED");
+        String admin = sessions.login("admin@example.com", "password-123", false, null, null).session_token();
+        assertThatThrownBy(() -> usage.events(admin, null, null, null, 101, 0)).isInstanceOf(AuthException.class);
+        assertThatThrownBy(() -> usageQueries.events(null, null, null, 1, -1)).isInstanceOf(AuthException.class);
+        sessions.logout(admin);
+        assertThatThrownBy(() -> usage.summary(admin)).isInstanceOf(AuthException.class).extracting("code").isEqualTo("SESSION_EXPIRED");
     }
 
     private void insertAccount(int id, String email, String role, String status) {

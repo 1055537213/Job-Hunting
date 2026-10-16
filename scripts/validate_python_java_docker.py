@@ -26,13 +26,15 @@ from validate_python_java_local import (
 
 
 def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
-                             web_container: str, admin_credentials: tuple[str, str]) -> None:
+                             web_container: str, admin_credentials: tuple[str, str], database_url: str) -> None:
     """Verify that the same browser session crosses the Java/Python proxy boundary."""
     from urllib.parse import parse_qs, urlsplit
 
     from job_hunting_agent.config import PlatformAuthSettings
     from job_hunting_agent.platform_auth import PlatformAuthClient
     from job_hunting_agent.platform_email import deliver_platform_verification
+    from job_hunting_agent.models import UsageEventRecord
+    from job_hunting_agent.storage import SQLAlchemyStore
 
     auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
     email = f"gateway-{os.urandom(12).hex()}@example.com"
@@ -60,6 +62,18 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
         })
         assert registered.status_code == 200, registered.text[:300]
         assert registered.json()["verification_required"] is True
+        store = SQLAlchemyStore(database_url)
+        try:
+            from datetime import UTC, datetime
+            for index in range(2):
+                store.record_usage_event(UsageEventRecord(
+                    id=0, account_id=registered.json()["account"]["id"], candidate_id=None, session_id="gateway-usage",
+                    root_request_id=None, call_id=f"gateway-usage-{email}-{index}", provider="contract", model="contract",
+                    operation="chat", input_tokens=8, output_tokens=2, total_tokens=10, usage_source="estimated",
+                    status="succeeded", attempt=1, provider_request_id=None, raw_usage={"total_tokens": 10},
+                    created_at=datetime.now(UTC).isoformat(timespec="seconds"), billable=False, pricing_version=None))
+        finally:
+            store.close()
         assert browser.post("/api/auth/login", json={"email": email, "password": password}).status_code == 403
         pending = auth.email_verification("due")["records"]
         assert len(pending) == 1
@@ -140,7 +154,7 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
                                    account_id: int, order_id: int, user_credentials: tuple[str, str]) -> None:
     """Runs while the isolated Python Web is stopped; every tested route must reach Java."""
     paths = ["/api/admin/balance/events", "/api/admin/recharge/orders", f"/api/admin/recharge/orders/{order_id}/events",
-             "/api/admin/accounts", "/api/admin/audit/events"]
+             "/api/admin/accounts", "/api/admin/audit/events", "/api/admin/usage/summary", "/api/admin/usage/events"]
     for path in paths:
         assert user.get(path).status_code == 403
     path = f"/api/admin/accounts/{account_id}/balance/credit"
@@ -182,6 +196,22 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
                        "email_verified_at", "deleted_at", "created_at", "updated_at"}
         assert all(set(row) == safe_fields for row in listed.json()["accounts"])
         assert account_id in {row["id"] for row in listed.json()["accounts"]}
+        usage = admin.get("/api/admin/usage/summary")
+        assert usage.status_code == 200 and usage.headers["cache-control"] == "no-store", usage.text[:300]
+        assert usage.json()["page_size"] == 100 and usage.json()["max_pages"] == 5
+        balance = next(row for row in usage.json()["billing"]["by_account"] if row["account_id"] == account_id)
+        assert balance["balance_micro_yuan"] == credited.json()["summary"]["balance_micro_yuan"]
+        token_page = admin.get(f"/api/admin/usage/events?account_id={account_id}&limit=1&offset=0")
+        assert token_page.status_code == 200 and token_page.json()["max_pages"] == 5
+        assert token_page.json()["total"] == 2 and len(token_page.json()["events"]) == 1
+        assert token_page.json()["events"][0]["raw_usage"] == {"total_tokens": 10}
+        next_token = admin.get(f"/api/admin/usage/events?account_id={account_id}&session_id=gateway-usage&limit=1&offset=1").json()
+        assert next_token["total"] == 2 and next_token["events"][0]["id"] != token_page.json()["events"][0]["id"]
+        usage_account = next(row for row in usage.json()["by_account"] if row["account_id"] == account_id)
+        assert usage_account["total_tokens"] == 20 and usage_account["billable_tokens"] == 0
+        assert all(row["account_id"] == account_id for row in token_page.json()["events"])
+        assert admin.get("/api/admin/usage/events?limit=101").status_code == 422
+        assert admin.get("/api/admin/usage/events?offset=-1").status_code == 422
         status_path = f"/api/admin/accounts/{account_id}/status"
         assert user.patch(status_path, json={"status": "disabled"},
                           headers={"X-CSRF-Token": user.cookies["job_agent_csrf"]}).status_code == 403
@@ -191,6 +221,8 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
         disabled = admin.patch(status_path, json={"status": "disabled", "actor_account_id": 999999},
                                headers={**headers, "X-Request-ID": "gateway-account-disable-trace"})
         assert disabled.status_code == 200 and disabled.json()["account"]["status"] == "disabled"
+        suspended = admin.get("/api/admin/usage/summary").json()["billing"]["by_account"]
+        assert next(row for row in suspended if row["account_id"] == account_id)["state"] == "suspended"
         old_user_cookies = dict(user.cookies)
         assert user.get("/api/me/balance").status_code == 401
         restored = admin.patch(status_path, json={"status": "active"}, headers=headers)
@@ -215,9 +247,12 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
             assert revoked.get(paths[0]).status_code == 401
             assert revoked.get("/api/admin/accounts").status_code == 401
             assert revoked.get("/api/admin/audit/events").status_code == 401
+            assert revoked.get("/api/admin/usage/summary").status_code == 401
+            assert revoked.get("/api/admin/usage/events").status_code == 401
             assert revoked.post(path, json=body, headers=headers).status_code == 401
     print("==> Java admin billing -> RBAC/CSRF/pagination/events/self-credit/replay/revocation with Python stopped: PASS")
     print("==> Java admin account list/status/audit -> safe fields/CSRF/session revocation/pagination with Python stopped: PASS")
+    print("==> Java usage summary/events -> RBAC/pagination/current balance/status without Python or summary cache: PASS")
 
 
 def docker(*args: str) -> str:
@@ -404,7 +439,7 @@ def main() -> None:
         wait(f"http://127.0.0.1:{args.port + 2}/api/health")
         run_browser_gateway_flow(f"http://127.0.0.1:{args.port + 2}",
                                  f"http://127.0.0.1:{args.port + 1}",
-                                 f"http://127.0.0.1:{args.port}", token, web, admin_credentials)
+                                 f"http://127.0.0.1:{args.port}", token, web, admin_credentials, isolated_url)
         run_java_security_flow(f"http://127.0.0.1:{args.port}", token, admin_credentials, redis_name)
         run_java_ingress_flow(f"http://127.0.0.1:{args.port}", metrics_token, token)
         with tempfile.TemporaryDirectory(prefix="job-agent-prometheus-") as scratch:

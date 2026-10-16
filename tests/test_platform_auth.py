@@ -13,6 +13,65 @@ from job_hunting_agent.platform_auth import (
 from job_hunting_agent.web import create_web_app
 
 
+@pytest.mark.parametrize("resource", ["summary", "events"])
+@pytest.mark.parametrize("status", [200, 403, 503])
+def test_usage_adapter_bypasses_cache_local_reads_and_cleanup(tmp_path, monkeypatch, resource, status):
+    app = create_web_app(env_file=tmp_path / "missing.env")
+    with TestClient(app) as browser:
+        credentials = {"email": "usage-adapter@example.com", "password": "password-123"}
+        assert browser.post("/api/auth/register", json=credentials).status_code == 200
+        assert browser.post("/api/auth/login", json=credentials).status_code == 200
+        payload = {"page_size": 100, "max_pages": 5}
+        if resource == "summary":
+            payload.update(summary={}, by_account=[], tool_calls_by_account=[], billing={"summary": {}, "settings": {}, "by_account": []})
+        else:
+            payload.update(events=[], total=0, limit=2, offset=4)
+
+        def request(url, **kwargs):
+            if url.endswith("/internal/v1/auth/accounts/me"):
+                return httpx.Response(401, json={"code": "SESSION_EXPIRED", "message": "expired"})
+            assert url.endswith(f"/internal/v1/admin/usage/{resource}")
+            assert kwargs["json"]["session_token"]
+            assert kwargs["headers"]["X-Trace-Id"] == "usage-adapter-trace"
+            if resource == "events":
+                assert kwargs["json"]["account_id"] == 3 and kwargs["json"]["candidate_id"] == 7
+                assert kwargs["json"]["session_id"] == "a'b"
+            return httpx.Response(status, json=payload if status == 200 else {"code": "ADMIN_REQUIRED", "message": "not allowed"})
+
+        monkeypatch.setattr(httpx, "post", request)
+        app.state.backend.platform_auth_client = PlatformAuthClient(PlatformAuthSettings(True, "http://java", "secret", 5))
+        for method in ("summarize_usage", "list_usage_events", "prune_usage_events_to_limit", "prune_tool_call_traces_to_limit"):
+            monkeypatch.setattr(app.state.backend.store, method, lambda *a, **k: pytest.fail("Local usage fallback"))
+        monkeypatch.setattr(app.state.backend, "cached_admin_usage_summary", lambda *a: pytest.fail("Stale cache"))
+        query = "?account_id=3&candidate_id=7&session_id=a%27b&limit=2&offset=4" if resource == "events" else ""
+        response = browser.get(f"/api/admin/usage/{resource}{query}", headers={"X-Request-ID": "usage-adapter-trace"})
+        assert response.status_code == status, response.text
+        if status == 200:
+            assert response.json() == payload
+
+
+@pytest.mark.parametrize("response", [httpx.Response(200, text="html"), httpx.Response(200, json={}),
+                                     httpx.Response(200, json={"events": [], "total": True, "limit": 1, "offset": 0, "page_size": 100, "max_pages": 5})])
+def test_usage_client_rejects_malformed_success(monkeypatch, response):
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: response)
+    client = PlatformAuthClient(PlatformAuthSettings(True, "http://java", "secret", 5))
+    with pytest.raises(PlatformAuthError) as error:
+        client.admin_usage("events", session_token="opaque", limit=1, offset=0)
+    assert error.value.status_code == 502
+
+
+def test_usage_client_rejects_missing_session_and_network_failure(monkeypatch):
+    client = PlatformAuthClient(PlatformAuthSettings(True, "http://java", "secret", 5))
+    with pytest.raises(PlatformAuthError) as error:
+        client.admin_usage("summary", session_token=None)
+    assert error.value.status_code == 401
+    def request(*a, **k):
+        raise httpx.ConnectError("offline")
+    monkeypatch.setattr(httpx, "post", request)
+    with pytest.raises(PlatformAuthUnavailableError):
+        client.admin_usage("summary", session_token="opaque")
+
+
 def test_audit_client_forwards_real_session_and_trace_and_validates_page(monkeypatch):
     captured = {}
     result = {"events": [{"id": 1, "details": {}, "created_at": "2026-10-16T00:00:00+00:00"}], "limit": 2, "offset": 4}
