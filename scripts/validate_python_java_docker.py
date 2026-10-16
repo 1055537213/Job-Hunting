@@ -120,6 +120,18 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
         assert older_page["orders"][0]["amount_micro_yuan"] == 1_000_000
         assert order_page["orders"][0]["account_id"] == registered.json()["account"]["id"]
         assert browser.get("/api/me/balance?limit=101").status_code == 422
+        with httpx.Client(base_url=web_url, timeout=10) as adapter:
+            authenticated = adapter.post("/api/auth/login", json={"email": admin_credentials[0], "password": admin_credentials[1]})
+            assert authenticated.status_code == 200, authenticated.text[:300]
+            account_id = registered.json()["account"]["id"]
+            for endpoint in (f"/api/admin/tools/traces?account_id={account_id}&limit=1&offset=0",
+                             f"/api/admin/tools/traces/gateway-tool-{account_id}-1"):
+                forwarded = adapter.get(endpoint)
+                direct = httpx.get(gateway_url + endpoint, cookies=adapter.cookies, timeout=10)
+                assert forwarded.status_code == direct.status_code == 200, forwarded.text[:300]
+                assert forwarded.json() == direct.json()
+            assert adapter.post("/api/auth/logout").status_code == 200
+        print("==> Python compatibility -> Java tool list/detail matches direct gateway response: PASS")
         docker("stop", "--time", "1", web_container)
         try:
             key = f"gateway-java-only-{os.urandom(12).hex()}"
@@ -225,6 +237,8 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
         assert next_token["total"] == 2 and next_token["events"][0]["id"] != token_page.json()["events"][0]["id"]
         usage_account = next(row for row in usage.json()["by_account"] if row["account_id"] == account_id)
         assert usage_account["total_tokens"] == 20 and usage_account["billable_tokens"] == 0
+        tool_counts = next(row for row in usage.json()["tool_calls_by_account"] if row["account_id"] == account_id)
+        assert tool_counts["trace_count"] == 2 and tool_counts["failed_trace_count"] == 1
         assert all(row["account_id"] == account_id for row in token_page.json()["events"])
         assert admin.get("/api/admin/usage/events?limit=101").status_code == 422
         assert admin.get("/api/admin/usage/events?offset=-1").status_code == 422
