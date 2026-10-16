@@ -125,6 +125,20 @@ class WebSecurityFilterTest {
         assertThat(called).isFalse();
     }
 
+    @Test void adminAccountAndAuditRoutesRequireRoleCsrfAndAdminRateLimit() throws Exception {
+        account("user");
+        assertThat(request("/api/admin/accounts", "GET", true, false).getStatus()).isEqualTo(403);
+        assertThat(request("/api/admin/audit/events", "GET", true, false).getStatus()).isEqualTo(403);
+        account("admin");
+        assertThat(request("/api/admin/accounts/2/status", "PATCH", true, false).getStatus()).isEqualTo(403);
+        assertThat(called).isFalse();
+        assertThat(request("/api/admin/accounts/2/status", "PATCH", true, true).getStatus()).isEqualTo(200);
+        called = false;
+        when(limiter.check("account:2", "admin")).thenReturn(13L);
+        assertThat(request("/api/admin/audit/events", "GET", true, false).getStatus()).isEqualTo(429);
+        assertThat(called).isFalse();
+    }
+
     @Test void anonymousLogoutIsIdempotentButOtherPathsRemainProtected() throws Exception {
         assertThat(request("/api/auth/logout", "POST", false, false).getStatus()).isEqualTo(200);
         called = false;

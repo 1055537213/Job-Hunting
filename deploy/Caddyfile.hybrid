@@ -33,6 +33,16 @@
 			path_regexp adminCredit ^/api/admin/accounts/[0-9]+/balance/credit$
 		}
 		reverse_proxy @admin_credit platform-service:8081
+		@admin_accounts_read {
+			method GET
+			path /api/admin/accounts /api/admin/audit/events
+		}
+		reverse_proxy @admin_accounts_read platform-service:8081
+		@admin_account_status {
+			method PATCH
+			path_regexp adminAccountStatus ^/api/admin/accounts/[0-9]+/status$
+		}
+		reverse_proxy @admin_account_status platform-service:8081
 
 		reverse_proxy {
 			dynamic a web 8000 {

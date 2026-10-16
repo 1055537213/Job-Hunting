@@ -35,6 +35,7 @@ class AccountAdministrationIntegrationTest {
     @Autowired JdbcTemplate jdbc;
     @Autowired PasswordHasher hasher;
     @Autowired SessionService sessions;
+    @Autowired AdminAuditService audit;
 
     @BeforeEach
     void reset() {
@@ -186,6 +187,60 @@ class AccountAdministrationIntegrationTest {
             .isEqualTo("admin");
         assertThat(jdbc.queryForObject("SELECT balance_micro_yuan FROM account_balances", Long.class)).isZero();
         assertThat(jdbc.queryForObject("SELECT count(*) FROM accounts", Integer.class)).isEqualTo(1);
+    }
+
+    @Test
+    void auditReadsAllWritersWithStablePagesAndNullableLegacyFields() {
+        String admin = sessions.login("admin@example.com", "password-123", false, null, null).session_token();
+        accounts.updateStatus(admin, 2, "disabled", "status-trace");
+        accounts.updateStatus(admin, 2, "active", "reactivate-trace");
+        jdbc.update("""
+            INSERT INTO admin_audit_events (action, target_type, outcome, summary, details_json, created_at)
+            VALUES ('legacy.event', 'account', 'succeeded', 'legacy', '{}'::jsonb, CURRENT_TIMESTAMP)
+            """);
+        jdbc.update("UPDATE admin_audit_events SET created_at = '2026-10-16T00:00:00.123456+00:00'");
+        var first = audit.page(admin, 2, 0);
+        var second = audit.page(admin, 2, 2);
+        assertThat(first.events()).extracting(AdminAuditService.AuditEvent::id).containsExactly(3L, 2L);
+        assertThat(first.events().getFirst().actor_account_id()).isNull();
+        assertThat(first.events().getFirst().target_account_id()).isNull();
+        assertThat(first.events().getFirst().request_id()).isNull();
+        assertThat(first.events().getFirst().created_at()).isEqualTo("2026-10-16T00:00:00.123456+00:00");
+        assertThat(first.events().getLast().details()).containsEntry("next_status", "active");
+        assertThat(second.events()).extracting(AdminAuditService.AuditEvent::request_id).containsExactly("status-trace");
+        assertThat(audit.page(admin, 200, 3).events()).isEmpty();
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM admin_audit_events", Integer.class)).isEqualTo(3);
+    }
+
+    @Test
+    void auditRejectsUsersDisabledRevokedSessionsAndInvalidPages() {
+        String admin = sessions.login("admin@example.com", "password-123", false, null, null).session_token();
+        String user = sessions.login("user@example.com", "password-123", false, null, null).session_token();
+        assertThatThrownBy(() -> audit.page(user, 50, 0)).isInstanceOf(AuthException.class)
+                .extracting("code").isEqualTo("ADMIN_REQUIRED");
+        assertThatThrownBy(() -> audit.page(admin, 201, 0)).isInstanceOf(AuthException.class)
+                .extracting("code").isEqualTo("INVALID_REQUEST");
+        jdbc.update("UPDATE accounts SET status='disabled' WHERE id=1");
+        assertThatThrownBy(() -> audit.page(admin, 50, 0)).isInstanceOf(AuthException.class)
+                .extracting("code").isEqualTo("ACCOUNT_DISABLED");
+        jdbc.update("UPDATE accounts SET status='active' WHERE id=1");
+        sessions.logout(admin);
+        assertThatThrownBy(() -> audit.page(admin, 50, 0)).isInstanceOf(AuthException.class)
+                .extracting("code").isEqualTo("SESSION_EXPIRED");
+    }
+
+    @Test
+    void auditFailureRollsBackStatusAndSessionRevocation() {
+        String admin = sessions.login("admin@example.com", "password-123", false, null, null).session_token();
+        String user = sessions.login("user@example.com", "password-123", false, null, null).session_token();
+        jdbc.execute("ALTER TABLE admin_audit_events ADD CONSTRAINT reject_status_audit_test CHECK (false) NOT VALID");
+        try {
+            assertThatThrownBy(() -> accounts.updateStatus(admin, 2, "disabled", "rollback-trace"))
+                    .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+        } finally { jdbc.execute("ALTER TABLE admin_audit_events DROP CONSTRAINT reject_status_audit_test"); }
+        assertThat(sessions.resolve(user)).isEqualTo(2L);
+        assertThat(jdbc.queryForObject("SELECT status FROM accounts WHERE id=2", String.class)).isEqualTo("active");
+        assertThat(audit.page(admin, 50, 0).events()).isEmpty();
     }
 
     private void insertAccount(int id, String email, String role, String status) {

@@ -115,11 +115,13 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
             assert independent.json()["entries"][0]["account_id"] == registered.json()["account"]["id"]
             assert browser.get("/api/me/recharge/orders").json()["total"] == 3
             run_admin_billing_gateway_flow(gateway_url, browser, admin_credentials,
-                                           registered.json()["account"]["id"], order_page["orders"][0]["id"])
+                                           registered.json()["account"]["id"], order_page["orders"][0]["id"], (email, password))
         finally:
             docker("start", web_container)
             wait(f"{web_url}/api/health")
         print("==> Java wallet read/write -> owner-scoped pagination -> recharge/replay/conflict with Python stopped: PASS")
+        login = browser.get("/api/auth/me")
+        assert login.status_code == 200 and login.json()["authenticated"]
         old_cookies = dict(browser.cookies)
         changed = browser.post("/api/account/password", json={
             "current_password": password, "new_password": "gateway-new-password-456",
@@ -135,9 +137,10 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
 
 
 def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credentials: tuple[str, str],
-                                   account_id: int, order_id: int) -> None:
+                                   account_id: int, order_id: int, user_credentials: tuple[str, str]) -> None:
     """Runs while the isolated Python Web is stopped; every tested route must reach Java."""
-    paths = ["/api/admin/balance/events", "/api/admin/recharge/orders", f"/api/admin/recharge/orders/{order_id}/events"]
+    paths = ["/api/admin/balance/events", "/api/admin/recharge/orders", f"/api/admin/recharge/orders/{order_id}/events",
+             "/api/admin/accounts", "/api/admin/audit/events"]
     for path in paths:
         assert user.get(path).status_code == 403
     path = f"/api/admin/accounts/{account_id}/balance/credit"
@@ -173,12 +176,48 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
         assert admin.get("/api/admin/balance/events?limit=101").status_code == 422
         self_path = f"/api/admin/accounts/{login.json()['account']['id']}/balance/credit"
         assert admin.post(self_path, json={**body, "amount_yuan": "0.000001", "idempotency_key": key + "-self"}, headers=headers).status_code == 200
+        listed = admin.get("/api/admin/accounts")
+        assert listed.status_code == 200, listed.text[:300]
+        safe_fields = {"id", "email", "display_name", "role", "status", "must_change_password",
+                       "email_verified_at", "deleted_at", "created_at", "updated_at"}
+        assert all(set(row) == safe_fields for row in listed.json()["accounts"])
+        assert account_id in {row["id"] for row in listed.json()["accounts"]}
+        status_path = f"/api/admin/accounts/{account_id}/status"
+        assert user.patch(status_path, json={"status": "disabled"},
+                          headers={"X-CSRF-Token": user.cookies["job_agent_csrf"]}).status_code == 403
+        assert admin.patch(status_path, json={"status": "disabled"}).status_code == 403
+        assert admin.patch(f"/api/admin/accounts/{login.json()['account']['id']}/status",
+                           json={"status": "disabled"}, headers=headers).status_code == 400
+        disabled = admin.patch(status_path, json={"status": "disabled", "actor_account_id": 999999},
+                               headers={**headers, "X-Request-ID": "gateway-account-disable-trace"})
+        assert disabled.status_code == 200 and disabled.json()["account"]["status"] == "disabled"
+        old_user_cookies = dict(user.cookies)
+        assert user.get("/api/me/balance").status_code == 401
+        restored = admin.patch(status_path, json={"status": "active"}, headers=headers)
+        assert restored.status_code == 200 and restored.json()["account"]["status"] == "active"
+        with httpx.Client(base_url=gateway_url, cookies=old_user_cookies, timeout=10) as stale_user:
+            assert stale_user.get("/api/me/balance").status_code == 401
+        relogin = user.post("/api/auth/login", json={"email": user_credentials[0], "password": user_credentials[1]})
+        assert relogin.status_code == 200
+        audit = admin.get("/api/admin/audit/events")
+        assert audit.status_code == 200 and audit.json()["limit"] == 50
+        status_event = [row for row in audit.json()["events"] if row["request_id"] == "gateway-account-disable-trace"]
+        assert len(status_event) == 1
+        assert status_event[0]["actor_account_id"] == login.json()["account"]["id"]
+        assert status_event[0]["target_account_id"] == account_id and status_event[0]["details"]["next_status"] == "disabled"
+        first = admin.get("/api/admin/audit/events?limit=1&offset=0").json()
+        second = admin.get("/api/admin/audit/events?limit=1&offset=1").json()
+        assert first["events"][0]["id"] != second["events"][0]["id"]
+        assert admin.get("/api/admin/audit/events?limit=201").status_code == 422
         old_cookies = dict(admin.cookies)
         assert admin.post("/api/auth/logout", headers=headers).status_code == 200
         with httpx.Client(base_url=gateway_url, cookies=old_cookies, timeout=10) as revoked:
             assert revoked.get(paths[0]).status_code == 401
+            assert revoked.get("/api/admin/accounts").status_code == 401
+            assert revoked.get("/api/admin/audit/events").status_code == 401
             assert revoked.post(path, json=body, headers=headers).status_code == 401
     print("==> Java admin billing -> RBAC/CSRF/pagination/events/self-credit/replay/revocation with Python stopped: PASS")
+    print("==> Java admin account list/status/audit -> safe fields/CSRF/session revocation/pagination with Python stopped: PASS")
 
 
 def docker(*args: str) -> str:

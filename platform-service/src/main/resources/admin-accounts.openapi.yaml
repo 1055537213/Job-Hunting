@@ -1,0 +1,142 @@
+openapi: 3.1.0
+info:
+  title: Administrator Accounts and Audit Contract
+  version: 1.0.0
+  description: >-
+    Public routes are served by Java behind the hybrid gateway. Active administrator
+    sessions are mandatory. Status updates also require matching CSRF cookie/header
+    and share the administrator rate limit. Existing policy locks, self/last-admin
+    protection, credential-link invalidation, session revocation and atomic audit
+    writes are reused. Reactivation never revives old sessions. Account responses
+    expose id, not account_id, and never password hashes or session tokens. Audit
+    reads include both Java and Python writers in the shared PostgreSQL table,
+    preserve nullable historical references and never prune records.
+security: [{SessionCookie: []}]
+paths:
+  /api/admin/accounts:
+    get:
+      operationId: publicAdminAccounts
+      responses:
+        '200':
+          description: Non-deleted accounts in ascending ID order; Cache-Control no-store
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accounts]
+                properties:
+                  accounts: {type: array, items: {$ref: '#/components/schemas/Account'}}
+        default: {$ref: '#/components/responses/Error'}
+  /api/admin/accounts/{accountId}/status:
+    patch:
+      operationId: publicAdminAccountStatus
+      parameters:
+        - {name: accountId, in: path, required: true, schema: {type: integer, format: int64, minimum: 1}}
+        - {name: X-CSRF-Token, in: header, required: true, schema: {type: string}}
+        - {name: X-Request-ID, in: header, schema: {type: string, maxLength: 128}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: {type: string, enum: [active, disabled]}
+      responses:
+        '200':
+          description: Safe account projection after account/session/link/audit transaction commits
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [account]
+                properties:
+                  account: {$ref: '#/components/schemas/Account'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/admin/audit/events:
+    get:
+      operationId: publicAdminAuditEvents
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 50}}
+        - {name: offset, in: query, schema: {type: integer, format: int64, minimum: 0, default: 0}}
+      responses:
+        '200': {$ref: '#/components/responses/AuditPage'}
+        default: {$ref: '#/components/responses/Error'}
+  /internal/v1/auth/admin/audit/events:
+    post:
+      operationId: internalAdminAuditEvents
+      description: Compatibility adapter requires service token and real administrator session, not a claimed actor ID.
+      security: [{InternalServiceToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_token, limit, offset]
+              properties:
+                session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+                limit: {type: integer, minimum: 1, maximum: 200}
+                offset: {type: integer, format: int64, minimum: 0}
+      responses:
+        '200': {$ref: '#/components/responses/AuditPage'}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    SessionCookie: {$ref: 'billing-personal.openapi.yaml#/components/securitySchemes/SessionCookie'}
+    InternalServiceToken: {$ref: 'billing-personal.openapi.yaml#/components/securitySchemes/InternalServiceToken'}
+  schemas:
+    Account:
+      type: object
+      required: [id, email, display_name, role, status, must_change_password, email_verified_at,
+                 deleted_at, created_at, updated_at]
+      additionalProperties: false
+      properties:
+        id: {type: integer, format: int64}
+        email: {type: string}
+        display_name: {type: [string, 'null']}
+        role: {type: string, enum: [user, admin]}
+        status: {type: string, enum: [active, disabled]}
+        must_change_password: {type: boolean}
+        email_verified_at: {type: [string, 'null'], format: date-time}
+        deleted_at: {type: [string, 'null'], format: date-time}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    AuditEvent:
+      type: object
+      required: [id, actor_account_id, target_account_id, action, target_type, target_id,
+                 outcome, summary, details, request_id, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        actor_account_id: {type: [integer, 'null'], format: int64}
+        target_account_id: {type: [integer, 'null'], format: int64}
+        action: {type: string}
+        target_type: {type: string}
+        target_id: {type: [string, 'null']}
+        outcome: {type: string}
+        summary: {type: string}
+        details: {type: object, additionalProperties: true}
+        request_id: {type: [string, 'null']}
+        created_at: {type: string, format: date-time}
+    AuditPage:
+      type: object
+      required: [events, limit, offset]
+      properties:
+        events: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/AuditEvent'}}
+        limit: {type: integer, minimum: 1, maximum: 200}
+        offset: {type: integer, format: int64, minimum: 0}
+  responses:
+    AuditPage:
+      description: Existing events/limit/offset contract, descending created_at then ID, Cache-Control no-store
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/AuditPage'}
+    Error:
+      description: >-
+        400 invalid status or forbidden self/last-admin action; 401 expired session
+        or internal token; 403 non-admin/disabled/CSRF; 404 missing target; 422 invalid
+        body/path/page; 429 rate limit; 503 dependency failure. No local auth/audit fallback.
+      content:
+        application/json:
+          schema: {$ref: 'billing-personal.openapi.yaml#/components/schemas/Error'}

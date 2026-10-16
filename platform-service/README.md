@@ -190,7 +190,15 @@ Java 用真实 Session 校验管理员权限，补款不信任请求中的操作
 停用账号收到补款后仍保持停用。查询每页最多 100 条，不自动淘汰资金事实；
 契约见 [`billing-admin.openapi.yaml`](src/main/resources/billing-admin.openapi.yaml)。
 Python 在 Java 模式下仅转发这四类请求，不能回读旧数据或回退本地补款。
-后台账号/用量聚合、Token/工具明细及审计查询入口仍在 Python，不属于本轮迁移。
+后台账号/用量聚合及 Token/工具明细仍在 Python。
+
+`GET /api/admin/accounts`、`PATCH /api/admin/accounts/{account_id}/status` 和
+`GET /api/admin/audit/events` 也由混合网关直达 Java，启用/停用复用原有策略锁和账号事务。
+禁止自停用或移除最后可用管理员；停用会原子撤销会话、作废操作链接并保存审计，启用后不恢复旧会话。
+公开账号投影保持 `id` 等原有安全字段，不暴露密码哈希或 Session。审计按时间/ID 倒序，
+默认 50 条、最多 200 条，保留空历史引用及请求 ID，读取同表中的 Python/Java 事件且不删除历史。
+Python Java 模式只转发这些请求，状态更新会透传规范化请求 ID；Java 故障不回读本地审计。
+契约见 [`admin-accounts.openapi.yaml`](src/main/resources/admin-accounts.openapi.yaml)。
 
 - Java 服务和 Python 服务不能同时写同一组账务表。
 - Java 账务开关关闭时，`account_balances`、`recharge_orders`、`account_balance_ledger` 仍由 Python 独占写入；开关打开后，余额、模拟充值和模型扣费由 Java 独占写入。

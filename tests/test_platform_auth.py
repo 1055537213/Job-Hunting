@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from job_hunting_agent.config import PlatformAuthSettings, load_platform_auth_settings
 from job_hunting_agent.platform_auth import (
@@ -9,6 +10,63 @@ from job_hunting_agent.platform_auth import (
     PlatformAuthError,
     PlatformAuthUnavailableError,
 )
+from job_hunting_agent.web import create_web_app
+
+
+def test_audit_client_forwards_real_session_and_trace_and_validates_page(monkeypatch):
+    captured = {}
+    result = {"events": [{"id": 1, "details": {}, "created_at": "2026-10-16T00:00:00+00:00"}], "limit": 2, "offset": 4}
+
+    def request(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        return httpx.Response(200, json=result)
+
+    monkeypatch.setattr(httpx, "post", request)
+    client = PlatformAuthClient(PlatformAuthSettings(True, "http://platform-service:8081", "secret", 5))
+    assert client.audit_events(session_token="session", limit=2, offset=4, trace_id="audit-trace") == result
+    assert captured["url"].endswith("/internal/v1/auth/admin/audit/events")
+    assert captured["json"] == {"session_token": "session", "limit": 2, "offset": 4}
+    assert captured["headers"]["X-Trace-Id"] == "audit-trace"
+    for field, invalid in (("events", None), ("events", [{"id": True, "details": {}, "created_at": "date"}]), ("limit", 3)):
+        previous = result[field]
+        result[field] = invalid
+        with pytest.raises(PlatformAuthError) as error:
+            client.audit_events(session_token="session", limit=2, offset=4)
+        assert error.value.status_code == 502
+        result[field] = previous
+
+
+@pytest.mark.parametrize("status", [200, 403, 503])
+def test_java_audit_web_adapter_never_reads_local_audit(tmp_path, monkeypatch, status):
+    app = create_web_app(env_file=tmp_path / "missing.env")
+    with TestClient(app) as browser:
+        credentials = {"email": "audit-adapter@example.com", "password": "password-123"}
+        assert browser.post("/api/auth/register", json=credentials).status_code == 200
+        assert browser.post("/api/auth/login", json=credentials).status_code == 200
+
+        def request(url, **kwargs):
+            assert kwargs["json"]["session_token"]
+            assert kwargs["headers"]["X-Trace-Id"] == "audit-adapter-trace"
+            return httpx.Response(status, json={"events": [], "limit": 2, "offset": 4,
+                                                "code": "ADMIN_REQUIRED", "message": "not allowed"})
+
+        monkeypatch.setattr(httpx, "post", request)
+        app.state.backend.platform_auth_client = PlatformAuthClient(
+            PlatformAuthSettings(True, "http://platform-service:8081", "secret", 5))
+        monkeypatch.setattr(app.state.backend.store, "list_admin_audit_events", lambda *args, **kwargs: pytest.fail("Local audit fallback"))
+        response = browser.get("/api/admin/audit/events?limit=2&offset=4", headers={"X-Request-ID": "audit-adapter-trace"})
+        assert response.status_code == status, response.text
+
+
+def test_audit_client_maps_html_outage_and_malformed_success(monkeypatch):
+    client = PlatformAuthClient(PlatformAuthSettings(True, "http://platform-service:8081", "secret", 5))
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: httpx.Response(503, text="<html>Error</html>"))
+    with pytest.raises(PlatformAuthUnavailableError):
+        client.audit_events(session_token="session", limit=50, offset=0)
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: httpx.Response(200, text="<html>Error</html>"))
+    with pytest.raises(PlatformAuthError) as error:
+        client.audit_events(session_token="session", limit=50, offset=0)
+    assert error.value.status_code == 502
 
 
 def test_platform_auth_settings_are_disabled_and_validated_by_default(tmp_path):

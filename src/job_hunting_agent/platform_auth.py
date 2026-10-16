@@ -166,6 +166,39 @@ class PlatformAuthClient:
             raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502)
         return payload
 
+    def audit_events(self, *, session_token: str | None, limit: int, offset: int,
+                    trace_id: str | None = None) -> dict[str, Any]:
+        if not session_token:
+            raise PlatformAuthError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
+        try:
+            response = httpx.post(f"{self.base_url}/internal/v1/auth/admin/audit/events", headers={
+                "X-Internal-Service-Token": self.internal_token,
+                "X-Trace-Id": trace_id or f"platform-audit-{uuid4().hex}",
+            }, json={"session_token": session_token, "limit": limit, "offset": offset}, timeout=self.timeout_seconds)
+        except httpx.HTTPError as error:
+            raise PlatformAuthUnavailableError() from error
+        if response.status_code >= 500:
+            raise PlatformAuthUnavailableError()
+        try:
+            result = response.json()
+        except ValueError as error:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台审计服务响应无效。", _platform_response_error_status(response)) from error
+        if not isinstance(result, dict):
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台审计服务响应无效。", _platform_response_error_status(response))
+        if response.is_error:
+            raise PlatformAuthError(str(result.get("code") or "PLATFORM_AUTH_ERROR"),
+                                    str(result.get("message") or "平台审计查询失败。"), response.status_code)
+        try:
+            if (not isinstance(result["events"], list) or len(result["events"]) > limit
+                    or result["limit"] != limit or result["offset"] != offset
+                    or any(not isinstance(row, dict) or type(row["id"]) is not int or row["id"] <= 0
+                           or not isinstance(row["details"], dict) or not isinstance(row["created_at"], str)
+                           for row in result["events"])):
+                raise ValueError("Invalid audit page")
+        except (KeyError, TypeError, ValueError) as error:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台审计服务响应无效。", 502) from error
+        return result
+
     def account(self, operation: str, *, trace_id: str | None = None, **data: Any) -> dict[str, Any]:
         """Call Java-owned current-account and administrator operations.
 

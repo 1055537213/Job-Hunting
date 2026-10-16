@@ -2721,7 +2721,7 @@ def create_web_app(
                 result = backend.platform_auth_client.account(
                     "list",
                     session_token=token,
-                    trace_id=request.headers.get("x-trace-id"),
+                    trace_id=getattr(request.state, "request_id", None),
                 )
                 return {"accounts": [platform_account_view(account) for account in result["accounts"]]}
             except PlatformAuthError as error:
@@ -2747,7 +2747,7 @@ def create_web_app(
                     session_token=token,
                     account_id=account_id,
                     status=payload.status,
-                    trace_id=request.headers.get("x-trace-id"),
+                    trace_id=getattr(request.state, "request_id", None),
                 )
                 return {"account": platform_account_view(result["account"])}
             except PlatformAuthError as error:
@@ -3121,6 +3121,12 @@ def create_web_app(
     ) -> dict[str, object]:
         """管理员查看最近的低敏管理操作审计事件。"""
 
+        if backend.platform_auth_client is not None:
+            try:
+                return backend.platform_auth_client.audit_events(session_token=request.cookies.get(SESSION_COOKIE_NAME),
+                    limit=limit, offset=offset, trace_id=getattr(request.state, "request_id", None))
+            except PlatformAuthError as error:
+                raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
         require_admin(request)
         events = backend.store.list_admin_audit_events(limit=limit, offset=offset)
         return {
