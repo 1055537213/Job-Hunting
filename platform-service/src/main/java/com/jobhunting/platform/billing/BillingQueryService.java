@@ -34,6 +34,10 @@ public class BillingQueryService {
 
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public Map<String, Object> summary(AccountAdministrationService.AccountView account) {
+        return summary(account.account_id(), account.status());
+    }
+
+    private Map<String, Object> summary(long accountId, String accountStatus) {
         var rows = jdbc.query("""
                 SELECT b.account_id, b.balance_micro_yuan, b.total_recharge_micro_yuan, b.total_consumed_micro_yuan,
                     (SELECT COUNT(*) FROM account_balance_ledger WHERE account_id = b.account_id) AS ledger_entry_count
@@ -41,7 +45,7 @@ public class BillingQueryService {
                 """, (row, index) -> {
             long amount = row.getLong("balance_micro_yuan");
             long threshold = settings.thresholdMicroYuan();
-            String state = !"active".equals(account.status()) || amount <= 0 ? "suspended"
+            String state = !"active".equals(accountStatus) || amount <= 0 ? "suspended"
                     : amount <= threshold ? "low_balance" : "balance";
             return Map.<String, Object>of("account_id", row.getLong("account_id"), "balance_micro_yuan", amount,
                     "total_recharge_micro_yuan", row.getLong("total_recharge_micro_yuan"),
@@ -52,9 +56,62 @@ public class BillingQueryService {
                         case "low_balance" -> "低余额";
                         default -> "停用";
                     });
-        }, account.account_id());
+        }, accountId);
         if (rows.isEmpty()) throw new BillingException("ACCOUNT_NOT_FOUND", "账号余额不存在。", HttpStatus.NOT_FOUND);
         return rows.getFirst();
+    }
+
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public LedgerPage adminLedger(Long accountId, int limit, long offset) {
+        validatePage(limit, offset);
+        String where = accountId == null ? "" : " WHERE account_id = ?";
+        Object[] filter = accountId == null ? new Object[]{} : new Object[]{accountId};
+        long total = jdbc.queryForObject("SELECT count(*) FROM account_balance_ledger" + where, Long.class, filter);
+        var entries = jdbc.query("SELECT * FROM account_balance_ledger" + where + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (row, index) -> ledger(row), pageArgs(accountId, limit, offset));
+        return new LedgerPage(entries, total, limit, offset, PAGE_SIZE, null);
+    }
+
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public AdminOrdersPage adminOrders(Long accountId, int limit, long offset) {
+        validatePage(limit, offset);
+        if (accountId != null) accountStatus(accountId);
+        String where = accountId == null ? "" : " WHERE account_id = ?";
+        Object[] filter = accountId == null ? new Object[]{} : new Object[]{accountId};
+        long total = jdbc.queryForObject("SELECT count(*) FROM recharge_orders" + where, Long.class, filter);
+        var orders = jdbc.query("SELECT * FROM recharge_orders" + where + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (row, index) -> order(row), pageArgs(accountId, limit, offset));
+        return new AdminOrdersPage(orders, total, limit, offset, PAGE_SIZE, null);
+    }
+
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public OrderEvents orderEvents(long orderId) {
+        var orders = jdbc.query("SELECT * FROM recharge_orders WHERE id = ?", (row, index) -> order(row), orderId);
+        if (orders.isEmpty()) throw new BillingException("ORDER_NOT_FOUND", "充值订单不存在。", HttpStatus.NOT_FOUND);
+        var events = jdbc.query("SELECT * FROM payment_events WHERE recharge_order_id = ? ORDER BY received_at, id",
+                (row, index) -> new PaymentEvent(row.getLong("id"), row.getLong("recharge_order_id"), row.getString("payment_provider"),
+                    row.getString("provider_event_id"), row.getString("event_type"), row.getString("processing_status"),
+                    row.getBoolean("signature_valid"), row.getString("payload_sha256"), row.getString("error_summary"),
+                    details(row), timestamp(row, "received_at"), timestamp(row, "processed_at")), orderId);
+        return new OrderEvents(orders.getFirst(), events);
+    }
+
+    @Transactional(readOnly = true)
+    public CreditResult creditResult(long accountId, long ledgerId) {
+        var entries = jdbc.query("SELECT * FROM account_balance_ledger WHERE id = ? AND account_id = ? AND entry_kind = 'adjustment'",
+                (row, index) -> ledger(row), ledgerId, accountId);
+        if (entries.size() != 1) throw new BillingException("CREDIT_INCOMPLETE", "平台补款流水尚未完成。", HttpStatus.SERVICE_UNAVAILABLE);
+        return new CreditResult(entries.getFirst(), summary(accountId, accountStatus(accountId)));
+    }
+
+    private String accountStatus(long accountId) {
+        var rows = jdbc.query("SELECT status FROM accounts WHERE id = ?", (row, index) -> row.getString(1), accountId);
+        if (rows.isEmpty()) throw new BillingException("ACCOUNT_NOT_FOUND", "账号不存在。", HttpStatus.NOT_FOUND);
+        return rows.getFirst();
+    }
+
+    private static Object[] pageArgs(Long accountId, int limit, long offset) {
+        return accountId == null ? new Object[]{limit, offset} : new Object[]{accountId, limit, offset};
     }
 
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
@@ -148,4 +205,11 @@ public class BillingQueryService {
             long offset, int page_size, Integer max_pages, Map<String, Object> settings) { }
     public record OrdersPage(List<RechargeOrder> orders, long total, int limit, long offset) { }
     public record RechargeResult(RechargeOrder order, LedgerEntry entry, Map<String, Object> summary) { }
+    public record LedgerPage(List<LedgerEntry> entries, long total, int limit, long offset, int page_size, Integer max_pages) { }
+    public record AdminOrdersPage(List<RechargeOrder> orders, long total, int limit, long offset, int page_size, Integer max_pages) { }
+    public record PaymentEvent(long id, long recharge_order_id, String payment_provider, String provider_event_id,
+            String event_type, String processing_status, boolean signature_valid, String payload_sha256,
+            String error_summary, Map<String, Object> details, String received_at, String processed_at) { }
+    public record OrderEvents(RechargeOrder order, List<PaymentEvent> events) { }
+    public record CreditResult(LedgerEntry entry, Map<String, Object> summary) { }
 }

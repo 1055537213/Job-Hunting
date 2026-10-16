@@ -2842,6 +2842,8 @@ def create_web_app(
         """管理员分页查看账号余额与消费流水。"""
 
         require_admin(request)
+        if backend.platform_billing_client is not None:
+            return platform_admin_billing(request, "ledger", account_id=account_id, limit=limit, offset=offset)
         entries = backend.store.list_account_balance_ledger(
             account_id,
             limit=limit,
@@ -2866,6 +2868,9 @@ def create_web_app(
         """管理员不经过支付渠道为自己或任意账号补款。"""
 
         actor = require_admin(request)
+        if backend.platform_billing_client is not None:
+            return platform_admin_billing(request, "credit", account_id=account_id, actor_account_id=actor.id,
+                payload={"amount_yuan": str(payload.amount_yuan), "reason": payload.reason, "idempotency_key": payload.idempotency_key})
         try:
             target = backend.store.get_account(account_id)
         except KeyError as error:
@@ -2916,6 +2921,8 @@ def create_web_app(
         """管理员分页查看充值订单，便于排查用户充值问题。"""
 
         require_admin(request)
+        if backend.platform_billing_client is not None:
+            return platform_admin_billing(request, "orders", account_id=account_id, limit=limit, offset=offset)
         if account_id is not None:
             try:
                 backend.store.get_account(account_id)
@@ -2936,6 +2943,8 @@ def create_web_app(
         """管理员查看充值订单对应的低敏支付事件。"""
 
         require_admin(request)
+        if backend.platform_billing_client is not None:
+            return platform_admin_billing(request, "events", order_id=order_id)
         try:
             order = backend.store.get_recharge_order(order_id)
         except KeyError as error:
@@ -2944,6 +2953,19 @@ def create_web_app(
             "order": asdict(order),
             "events": [asdict(event) for event in backend.store.list_payment_events(order_id)],
         }
+
+    def platform_admin_billing(request: Request, resource: str, **kwargs) -> dict[str, object]:
+        if backend.platform_billing_client is None:
+            raise HTTPException(status_code=503, detail="平台账务服务未配置。")
+        try:
+            return backend.platform_billing_client.admin_request(resource,
+                session_token=request.cookies.get(SESSION_COOKIE_NAME),
+                trace_id=getattr(request.state, "request_id", None), **kwargs)
+        except PlatformBillingUnavailableError:
+            raise
+        except PlatformBillingError as error:
+            status = error.status_code if error.status_code is not None and 400 <= error.status_code < 500 else 503
+            raise HTTPException(status_code=status, detail=str(error)) from error
 
     @web_app.get("/api/me/balance")
     def my_balance(

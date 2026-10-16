@@ -4,6 +4,7 @@ import java.util.Map;
 import com.jobhunting.platform.billing.BillingException;
 import com.jobhunting.platform.billing.BillingQueryController;
 import com.jobhunting.platform.billing.PersonalRechargeController;
+import com.jobhunting.platform.billing.AdminBillingController;
 import com.jobhunting.platform.security.WebSecurityFilter;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.core.Ordered;
@@ -18,7 +19,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 /** Browser-compatible validation contract; billing writes keep their existing advice. */
 @Order(Ordered.HIGHEST_PRECEDENCE)
-@RestControllerAdvice(assignableTypes = {PublicAuthController.class, PublicAuthLifecycleController.class, BillingQueryController.class, PersonalRechargeController.class})
+@RestControllerAdvice(assignableTypes = {PublicAuthController.class, PublicAuthLifecycleController.class, BillingQueryController.class, PersonalRechargeController.class, AdminBillingController.class})
 public class PublicAuthErrorHandler {
     @ExceptionHandler(AuthException.class)
     public ResponseEntity<Map<String, Object>> auth(AuthException error, HttpServletRequest request) {

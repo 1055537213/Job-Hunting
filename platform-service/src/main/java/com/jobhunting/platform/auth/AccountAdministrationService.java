@@ -71,6 +71,15 @@ public class AccountAdministrationService {
     }
 
     @Transactional
+    public AccountView authorizeAdministrator(String sessionToken) {
+        if (sessionToken == null || sessionToken.isBlank() || sessionToken.length() > 128) {
+            throw new AuthException("SESSION_EXPIRED", "登录状态已过期，请重新登录。", HttpStatus.UNAUTHORIZED);
+        }
+        lockPolicy();
+        return accountById(requireAdmin(sessionToken));
+    }
+
+    @Transactional
     public AccountResponse updateProfile(String sessionToken, String displayName, String requestId) {
         Long accountId = sessions.resolve(sessionToken);
         if (accountId == null) {

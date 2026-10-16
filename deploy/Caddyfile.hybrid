@@ -23,6 +23,16 @@
 			path /api/me/balance/recharge
 		}
 		reverse_proxy @personal_recharge platform-service:8081
+		@admin_billing_reads {
+			method GET
+			path_regexp adminBillingReads ^/api/admin/(balance/events|recharge/orders|recharge/orders/[0-9]+/events)$
+		}
+		reverse_proxy @admin_billing_reads platform-service:8081
+		@admin_credit {
+			method POST
+			path_regexp adminCredit ^/api/admin/accounts/[0-9]+/balance/credit$
+		}
+		reverse_proxy @admin_credit platform-service:8081
 
 		reverse_proxy {
 			dynamic a web 8000 {

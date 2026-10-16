@@ -25,7 +25,8 @@ from validate_python_java_local import (
 )
 
 
-def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str, web_container: str) -> None:
+def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
+                             web_container: str, admin_credentials: tuple[str, str]) -> None:
     """Verify that the same browser session crosses the Java/Python proxy boundary."""
     from urllib.parse import parse_qs, urlsplit
 
@@ -113,6 +114,8 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
             assert independent.json()["total"] == 3 and len(independent.json()["entries"]) == 1
             assert independent.json()["entries"][0]["account_id"] == registered.json()["account"]["id"]
             assert browser.get("/api/me/recharge/orders").json()["total"] == 3
+            run_admin_billing_gateway_flow(gateway_url, browser, admin_credentials,
+                                           registered.json()["account"]["id"], order_page["orders"][0]["id"])
         finally:
             docker("start", web_container)
             wait(f"{web_url}/api/health")
@@ -129,6 +132,53 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
         assert browser.get("/api/me/recharge/orders").status_code == 401
         assert browser.post("/api/me/balance/recharge", json={"amount_yuan": 1}).status_code == 401
         print("==> Java browser auth gateway -> Python account route -> password revocation: PASS")
+
+
+def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credentials: tuple[str, str],
+                                   account_id: int, order_id: int) -> None:
+    """Runs while the isolated Python Web is stopped; every tested route must reach Java."""
+    paths = ["/api/admin/balance/events", "/api/admin/recharge/orders", f"/api/admin/recharge/orders/{order_id}/events"]
+    for path in paths:
+        assert user.get(path).status_code == 403
+    path = f"/api/admin/accounts/{account_id}/balance/credit"
+    key = f"gateway-admin-credit-{os.urandom(12).hex()}"
+    body = {"amount_yuan": 2, "reason": "gateway correction", "idempotency_key": key, "actor_account_id": 999999}
+    assert user.post(path, json=body, headers={"X-CSRF-Token": user.cookies["job_agent_csrf"]}).status_code == 403
+    with httpx.Client(base_url=gateway_url, timeout=10) as admin:
+        login = admin.post("/api/auth/login", json={"email": credentials[0], "password": credentials[1]})
+        assert login.status_code == 200, login.text[:300]
+        headers = {"X-CSRF-Token": login.json()["csrf_token"], "X-Request-ID": "gateway-admin-credit-trace"}
+        assert admin.post(path, json=body).status_code == 403
+        credited = admin.post(path, json=body, headers=headers)
+        assert credited.status_code == 200, credited.text[:300]
+        assert credited.json()["entry"]["operator_account_id"] == login.json()["account"]["id"]
+        assert credited.json()["summary"]["balance_micro_yuan"] == 5_000_001
+        assert credited.json()["summary"]["total_recharge_micro_yuan"] == 3_000_001
+        replay = admin.post(path, json=body, headers=headers)
+        assert replay.status_code == 200 and replay.json()["entry"]["id"] == credited.json()["entry"]["id"]
+        assert replay.json()["summary"]["balance_micro_yuan"] == 5_000_001
+        assert admin.post(path, json={**body, "amount_yuan": 3}, headers=headers).status_code == 409
+        page = admin.get(f"/api/admin/balance/events?account_id={account_id}&limit=1&offset=0")
+        assert page.status_code == 200 and page.json()["total"] == 4
+        assert page.json()["entries"][0]["id"] == credited.json()["entry"]["id"]
+        assert page.json()["max_pages"] is None and page.headers["cache-control"] == "no-store"
+        assert len(admin.get(f"/api/admin/balance/events?account_id={account_id}&limit=1&offset=1").json()["entries"]) == 1
+        orders = admin.get(f"/api/admin/recharge/orders?account_id={account_id}&limit=1&offset=1")
+        assert orders.status_code == 200 and orders.json()["total"] == 3
+        assert all(row["account_id"] == account_id for row in orders.json()["orders"])
+        events = admin.get(f"/api/admin/recharge/orders/{order_id}/events")
+        assert events.status_code == 200 and len(events.json()["events"]) == 1
+        assert events.json()["events"][0]["recharge_order_id"] == order_id
+        assert admin.get("/api/admin/recharge/orders/999999999/events").status_code == 404
+        assert admin.get("/api/admin/balance/events?limit=101").status_code == 422
+        self_path = f"/api/admin/accounts/{login.json()['account']['id']}/balance/credit"
+        assert admin.post(self_path, json={**body, "amount_yuan": "0.000001", "idempotency_key": key + "-self"}, headers=headers).status_code == 200
+        old_cookies = dict(admin.cookies)
+        assert admin.post("/api/auth/logout", headers=headers).status_code == 200
+        with httpx.Client(base_url=gateway_url, cookies=old_cookies, timeout=10) as revoked:
+            assert revoked.get(paths[0]).status_code == 401
+            assert revoked.post(path, json=body, headers=headers).status_code == 401
+    print("==> Java admin billing -> RBAC/CSRF/pagination/events/self-credit/replay/revocation with Python stopped: PASS")
 
 
 def docker(*args: str) -> str:
@@ -315,7 +365,7 @@ def main() -> None:
         wait(f"http://127.0.0.1:{args.port + 2}/api/health")
         run_browser_gateway_flow(f"http://127.0.0.1:{args.port + 2}",
                                  f"http://127.0.0.1:{args.port + 1}",
-                                 f"http://127.0.0.1:{args.port}", token, web)
+                                 f"http://127.0.0.1:{args.port}", token, web, admin_credentials)
         run_java_security_flow(f"http://127.0.0.1:{args.port}", token, admin_credentials, redis_name)
         run_java_ingress_flow(f"http://127.0.0.1:{args.port}", metrics_token, token)
         with tempfile.TemporaryDirectory(prefix="job-agent-prometheus-") as scratch:

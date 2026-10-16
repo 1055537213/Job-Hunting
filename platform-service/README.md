@@ -175,7 +175,7 @@ Java 模式下不派发旧 Python 邮件任务；关闭迁移开关时仍保留�
 [`billing-personal.openapi.yaml`](src/main/resources/billing-personal.openapi.yaml)。
 Python 在 Java 账务模式下只转发这两项查询，Java 故障返回 503，不回读本地账务表。
 价格、低余额阈值和演示充值配置沿用同一组 `JOB_AGENT_BILLING_*` / `JOB_AGENT_DEMO_RECHARGE_*`
-环境参数；生产默认关闭演示充值。管理员账务查询暂仍由 Python 适配。
+环境参数；生产默认关闭演示充值。
 
 `POST /api/me/balance/recharge` 也经网关直达 Java，要求认证和账务模块同时开启。
 Java 在事务中重新校验 Session，按服务端配置控制演示充值开关及单笔/累计额度，不接受用户指定账号或额度。
@@ -183,6 +183,14 @@ Java 在事务中重新校验 Session，按服务端配置控制演示充值开�
 幂等键在 JSON 的 `idempotency_key` 字段传入，缺省生成新操作；重试必须复用该键。
 Python Java 模式只转发原会话和表单，失败不执行本地充值；关闭 Java 模式保留原有兼容路径。
 本阶段不接入真实支付，不改变管理员人工补款规则。
+
+管理员余额流水、充值订单、支付事件和人工补款公开路径也由混合网关直达 Java。
+Java 用真实 Session 校验管理员权限，补款不信任请求中的操作者 ID，余额/流水/审计同事务提交。
+补款返回原流水与当前余额；重试仍校验权限且不新增审计。管理员可为自己及其他账号补款，
+停用账号收到补款后仍保持停用。查询每页最多 100 条，不自动淘汰资金事实；
+契约见 [`billing-admin.openapi.yaml`](src/main/resources/billing-admin.openapi.yaml)。
+Python 在 Java 模式下仅转发这四类请求，不能回读旧数据或回退本地补款。
+后台账号/用量聚合、Token/工具明细及审计查询入口仍在 Python，不属于本轮迁移。
 
 - Java 服务和 Python 服务不能同时写同一组账务表。
 - Java 账务开关关闭时，`account_balances`、`recharge_orders`、`account_balance_ledger` 仍由 Python 独占写入；开关打开后，余额、模拟充值和模型扣费由 Java 独占写入。

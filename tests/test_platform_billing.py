@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from job_hunting_agent.auth import hash_password
 
 from job_hunting_agent.config import (
     BillingSettings,
@@ -19,6 +20,74 @@ from job_hunting_agent.platform_billing import (
 from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
 from job_hunting_agent.storage import IdempotencyConflictError, InsufficientBalanceError
 from job_hunting_agent.web import create_web_app
+
+
+@pytest.mark.parametrize("resource", ["ledger", "orders", "events", "credit"])
+def test_admin_client_uses_real_session_and_validates_financial_result(monkeypatch, resource):
+    captured = {}
+    result = {"entries": [{"account_id": 42}], "orders": [{"account_id": 42}],
+              "total": 1, "limit": 2, "offset": 0, "page_size": 100, "max_pages": None,
+              "order": {"id": 9}, "events": [{"recharge_order_id": 9}],
+              "entry": {"account_id": 42, "operator_account_id": 1, "entry_kind": "adjustment"},
+              "summary": {"account_id": 42}}
+
+    def request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return httpx.Response(200, json=result)
+
+    monkeypatch.setattr(httpx, "request", request)
+    client = PlatformBillingClient(PlatformBillingSettings(True, "http://platform-service:8081", "secret", 5))
+    args = dict(session_token="session", account_id=42, order_id=9, actor_account_id=1,
+                payload={"amount_yuan": "1.000001", "reason": "reason", "idempotency_key": "admin-credit-client-0001"},
+                limit=2, offset=0, trace_id="admin-trace")
+    assert client.admin_request(resource, **args) == result
+    assert captured["method"] == "POST"
+    assert captured["json"]["session_token"] == "session"
+    assert "actor_account_id" not in captured["json"]
+    assert captured["headers"]["X-Trace-Id"] == "admin-trace"
+    if resource == "ledger":
+        result["entries"][0]["account_id"] = 99
+    elif resource == "orders":
+        result["orders"][0]["account_id"] = 99
+    elif resource == "events":
+        result["events"][0]["recharge_order_id"] = 99
+    else:
+        result["entry"]["operator_account_id"] = 99
+    with pytest.raises(PlatformBillingError, match="无效管理员账务数据"):
+        client.admin_request(resource, **args)
+
+
+@pytest.mark.parametrize("resource", ["ledger", "orders", "events", "credit"])
+@pytest.mark.parametrize("available", [True, False])
+def test_python_admin_billing_has_no_local_query_or_credit_fallback(tmp_path, monkeypatch, resource, available):
+    app = create_web_app(env_file=tmp_path / "missing.env")
+    actor = app.state.backend.store.create_account("adapter-admin@example.com", hash_password("password-123"), role="admin")
+    with TestClient(app) as browser:
+        assert browser.post("/api/auth/login", json={"email": actor.email, "password": "password-123"}).status_code == 200
+
+        def request(method, url, **kwargs):
+            assert kwargs["json"]["session_token"]
+            assert "actor_account_id" not in kwargs["json"]
+            if not available:
+                return httpx.Response(503, text="temporarily unavailable")
+            return httpx.Response(200, json={
+                "entries": [], "orders": [], "total": 0, "limit": 100, "offset": 0, "page_size": 100, "max_pages": None,
+                "order": {"id": 9}, "events": [],
+                "entry": {"account_id": 42, "operator_account_id": actor.id, "entry_kind": "adjustment"},
+                "summary": {"account_id": 42}})
+
+        monkeypatch.setattr(httpx, "request", request)
+        app.state.backend.platform_billing_client = PlatformBillingClient(
+            PlatformBillingSettings(True, "http://platform-service:8081", "secret", 5))
+        for name in ("list_account_balance_ledger", "count_account_balance_ledger", "list_recharge_orders",
+                     "count_recharge_orders", "get_recharge_order", "list_payment_events",
+                     "credit_account_balance_with_audit", "get_account_balance_summary"):
+            monkeypatch.setattr(app.state.backend.store, name, lambda *args, **kwargs: pytest.fail("Local admin billing fallback"))
+        paths = {"ledger": "/api/admin/balance/events?account_id=42", "orders": "/api/admin/recharge/orders?account_id=42",
+                 "events": "/api/admin/recharge/orders/9/events", "credit": "/api/admin/accounts/42/balance/credit"}
+        response = (browser.post(paths[resource], json={"amount_yuan": "1.000001", "reason": "reason", "idempotency_key": "admin-adapter-0001"})
+                    if resource == "credit" else browser.get(paths[resource]))
+        assert response.status_code == (200 if available else 503), response.text
 
 
 @pytest.mark.parametrize("resource", ["balance", "recharge/orders"])

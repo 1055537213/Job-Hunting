@@ -57,6 +57,7 @@ class BillingServiceIntegrationTest {
     @Autowired private PasswordHasher passwords;
     @Autowired private BillingQueryService queries;
     @Autowired private PersonalRechargeService personalRecharges;
+    @Autowired private AdminBillingService adminBilling;
 
     @BeforeEach
     void resetDatabase() {
@@ -505,6 +506,95 @@ class BillingServiceIntegrationTest {
         assertThatThrownBy(() -> personalRecharges.recharge(session, java.math.BigDecimal.ONE, null, "personal-disabled-0001"))
                 .isInstanceOf(AuthException.class).extracting("code").isEqualTo("ACCOUNT_DISABLED");
         assertThat(jdbc.queryForObject("SELECT count(*) FROM recharge_orders", Integer.class)).isZero();
+    }
+
+    @Test
+    void administratorPagesPreserveAllFinancialFactsAndStableOrdering() {
+        String admin = login(42);
+        jdbc.update("""
+                INSERT INTO account_balance_ledger (account_id, entry_kind, amount_micro_yuan, balance_before_micro_yuan,
+                    balance_after_micro_yuan, source_reference, summary, details_json, created_at)
+                SELECT 43, 'adjustment', 1, n - 1, n, 'admin-page-test:' || n, 'fixture', '{}'::jsonb, CURRENT_TIMESTAMP
+                FROM generate_series(1, 510) n
+                """);
+        var first = adminBilling.ledger(admin, 43L, 100, 0);
+        var sixth = adminBilling.ledger(admin, 43L, 100, 500);
+        assertThat(first.total()).isEqualTo(510);
+        assertThat(first.max_pages()).isNull();
+        assertThat(first.entries().getFirst().id()).isEqualTo(510);
+        assertThat(sixth.entries()).hasSize(10);
+        assertThat(adminBilling.ledger(admin, null, 1, 509).entries().getFirst().id()).isEqualTo(1);
+        assertThat(adminBilling.ledger(admin, 999L, 100, 0).entries()).isEmpty();
+        billing.recharge(rechargeRequest(43, 1_000_000, "admin-orders-owner-0001"), "admin-orders-owner-0001");
+        billing.recharge(rechargeRequest(42, 1_000_000, "admin-orders-other-0001"), "admin-orders-other-0001");
+        var orders = adminBilling.orders(admin, 43L, 1, 0);
+        assertThat(orders.total()).isEqualTo(1);
+        assertThat(adminBilling.orders(admin, null, 1, 0).total()).isEqualTo(2);
+        var events = adminBilling.events(admin, orders.orders().getFirst().id());
+        assertThat(events.events()).hasSize(1);
+        assertThat(events.events().getFirst().recharge_order_id()).isEqualTo(events.order().id());
+        assertThat(events.events().getFirst().signature_valid()).isTrue();
+        assertThat(events.events().getFirst().error_summary()).isNull();
+        assertThatThrownBy(() -> adminBilling.orders(admin, 999L, 100, 0)).isInstanceOf(BillingException.class)
+                .extracting("code").isEqualTo("ACCOUNT_NOT_FOUND");
+        assertThatThrownBy(() -> adminBilling.events(admin, 999L)).isInstanceOf(BillingException.class)
+                .extracting("code").isEqualTo("ORDER_NOT_FOUND");
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM account_balance_ledger", Integer.class)).isEqualTo(512);
+    }
+
+    @Test
+    void administratorEntryRejectsOrdinaryDisabledAndRevokedSessions() {
+        String user = login(43);
+        assertThatThrownBy(() -> adminBilling.ledger(user, null, 100, 0)).isInstanceOf(AuthException.class)
+                .extracting("code").isEqualTo("ADMIN_REQUIRED");
+        assertThatThrownBy(() -> adminBilling.credit(user, 42, java.math.BigDecimal.ONE, "reason", "admin-web-denied-0001", "trace"))
+                .isInstanceOf(AuthException.class).extracting("code").isEqualTo("ADMIN_REQUIRED");
+        String admin = login(42);
+        jdbc.update("UPDATE accounts SET status = 'disabled' WHERE id = 42");
+        assertThatThrownBy(() -> adminBilling.orders(admin, null, 100, 0)).isInstanceOf(AuthException.class)
+                .extracting("code").isEqualTo("ACCOUNT_DISABLED");
+        jdbc.update("UPDATE accounts SET status = 'active' WHERE id = 42");
+        sessions.logout(admin);
+        assertThatThrownBy(() -> adminBilling.events(admin, 999)).isInstanceOf(AuthException.class)
+                .extracting("code").isEqualTo("SESSION_EXPIRED");
+    }
+
+    @Test
+    void publicCreditReturnsOriginalLedgerCurrentBalanceAndOneAudit() {
+        String admin = login(42);
+        var first = adminBilling.credit(admin, 43, new java.math.BigDecimal("1.000001"), " reason ", "admin-web-credit-0001", "web-trace");
+        billing.consume(request(43, 1, "admin-web-after-credit"), "admin-web-after-credit");
+        var replay = adminBilling.credit(admin, 43, new java.math.BigDecimal("1.000001"), "reason", "admin-web-credit-0001", "replay-trace");
+        assertThat(replay.entry().id()).isEqualTo(first.entry().id());
+        assertThat(replay.entry().balance_after_micro_yuan()).isEqualTo(11_000_001);
+        assertThat(replay.summary().get("balance_micro_yuan")).isEqualTo(11_000_000L);
+        assertThat(replay.summary().get("total_recharge_micro_yuan")).isEqualTo(10_000_000L);
+        assertThat(replay.entry().operator_account_id()).isEqualTo(42L);
+        assertThat(replay.entry().recharge_order_id()).isNull();
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM admin_audit_events", Integer.class)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("SELECT request_id FROM admin_audit_events", String.class)).isEqualTo("web-trace");
+        assertThatThrownBy(() -> adminBilling.credit(admin, 44, java.math.BigDecimal.ONE, "reason", "admin-web-credit-0001", "trace"))
+                .isInstanceOf(BillingException.class).extracting("code").isEqualTo("IDEMPOTENCY_CONFLICT");
+        sessions.logout(admin);
+        assertThatThrownBy(() -> adminBilling.credit(admin, 43, new java.math.BigDecimal("1.000001"), "reason", "admin-web-credit-0001", "trace"))
+                .isInstanceOf(AuthException.class).extracting("code").isEqualTo("SESSION_EXPIRED");
+    }
+
+    @Test
+    void publicCreditsKeepLockOrderAndRollBackOnAuditFailure() throws Exception {
+        String a = login(42), b = login(44);
+        var results = runTogether(
+                () -> adminBilling.credit(a, 44, java.math.BigDecimal.ONE, "reason", "admin-web-cross-a-0001", "trace"),
+                () -> adminBilling.credit(b, 42, java.math.BigDecimal.ONE, "reason", "admin-web-cross-b-0001", "trace"));
+        assertThat(results).hasSize(2);
+        jdbc.execute("ALTER TABLE admin_audit_events ADD CONSTRAINT reject_admin_web_test CHECK (false) NOT VALID");
+        try {
+            assertThatThrownBy(() -> adminBilling.credit(a, 43, java.math.BigDecimal.ONE, "reason", "admin-web-rollback-0001", "trace"))
+                    .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+        } finally { jdbc.execute("ALTER TABLE admin_audit_events DROP CONSTRAINT reject_admin_web_test"); }
+        assertThat(billing.getBalance(43).balance_micro_yuan()).isEqualTo(10_000_000);
+        assertThat(adminBilling.ledger(a, 43L, 100, 0).entries()).isEmpty();
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM admin_audit_events", Integer.class)).isEqualTo(2);
     }
 
     private String login(int id) {

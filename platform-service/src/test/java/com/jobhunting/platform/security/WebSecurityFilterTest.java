@@ -111,6 +111,20 @@ class WebSecurityFilterTest {
         assertThat(called).isFalse();
     }
 
+    @Test void adminCreditAndQueriesRequireAdminCsrfAndAdminRateLimit() throws Exception {
+        account("user");
+        assertThat(request("/api/admin/balance/events", "GET", true, false).getStatus()).isEqualTo(403);
+        assertThat(called).isFalse();
+        account("admin");
+        assertThat(request("/api/admin/accounts/42/balance/credit", "POST", true, false).getStatus()).isEqualTo(403);
+        assertThat(called).isFalse();
+        assertThat(request("/api/admin/accounts/42/balance/credit", "POST", true, true).getStatus()).isEqualTo(200);
+        called = false;
+        when(limiter.check("account:2", "admin")).thenReturn(13L);
+        assertThat(request("/api/admin/recharge/orders", "GET", true, false).getStatus()).isEqualTo(429);
+        assertThat(called).isFalse();
+    }
+
     @Test void anonymousLogoutIsIdempotentButOtherPathsRemainProtected() throws Exception {
         assertThat(request("/api/auth/logout", "POST", false, false).getStatus()).isEqualTo(200);
         called = false;

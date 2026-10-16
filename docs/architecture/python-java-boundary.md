@@ -123,7 +123,7 @@ Java 从 Web 安全过滤器校验后的 Session 获取账号，内部适配接�
 时间相同的记录按 ID 倒序，保留空字段及 UTC 来源时间。`/api/auth/me` 复用同一余额查询服务。
 Java 模式的 Python 个人查询不再直接读取本地流水或订单；故障失败关闭，不返回旧余额。
 价格、低余额阈值及演示充值开关由 Compose 将同一环境参数注入两端；生产默认关闭演示充值。
-资金事实不自动淘汰。管理员查询、支付/退款仍是后续迁移范围。
+资金事实不自动淘汰。支付/退款仍是后续迁移范围。
 验收在隔离数据下暂停 Python Web，验证网关余额及订单查询仍由 Java 正常响应；不会暂停开发或生产服务。
 
 ## 个人演示充值入口直达 Java
@@ -136,6 +136,23 @@ Java Web 安全层负责 Session、CSRF、Redis 写请求限流；资金事务�
 Python 在 Java 模式下只调用新的内部适配接口，不再读取本地充值结果或执行额度规则，故障不回退。
 关闭 Java 开关的纯 Python 兼容路径仍保留；管理员补款和真实支付不属于本次公开入口迁移。
 隔离 Docker 验收会暂停 Python Web 后实际充值，验证 Java 独立到账、重复请求及额度限制。
+
+## 管理员账务公开入口直达 Java
+
+混合网关仅将以下公开路径分流到 Java，不使用笼统的 `/api/admin/*` 转发：
+
+- `GET /api/admin/balance/events`
+- `GET /api/admin/recharge/orders`
+- `GET /api/admin/recharge/orders/{order_id}/events`
+- `POST /api/admin/accounts/{account_id}/balance/credit`
+
+前端及原有 JSON 不变。Java 直接用 Session 校验管理员权限，补款以“策略锁 → 操作者 →
+目标账号 → 余额”顺序在同一事务中校验权限、写入账务与审计并组装响应，避免交叉补款死锁。
+查询在独立只读 Repeatable Read 快照中统计总数与读取分页；资金记录不按五页规则删除。
+相同操作者、幂等键、目标、金额和去空白原因重试，只返回原流水及当前余额，不重复补款或审计。
+Python Java 模式只转发会话及表单，不构造补款审计、不读取充值/流水结果，故障失败关闭。
+后台账号/用量聚合、Token/工具明细和审计查询仍属 Python；本轮不代表整个管理后台已迁完。
+本地 Docker 验收暂停隔离 Python Web，验证管理员查询、自补款/他人补款、越权拒绝、CSRF 和撤销后的重放拒绝。
 
 ## Java 安全入口准备阶段
 

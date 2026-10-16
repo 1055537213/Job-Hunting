@@ -574,6 +574,10 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
         assert "method POST" in edge
         assert "path /api/me/balance/recharge" in edge
         assert "reverse_proxy @personal_recharge platform-service:8081" in edge
+        assert "reverse_proxy @admin_billing_reads platform-service:8081" in edge
+        assert "reverse_proxy @admin_credit platform-service:8081" in edge
+        assert "path_regexp adminBillingReads ^/api/admin/(balance/events|recharge/orders|recharge/orders/[0-9]+/events)$" in edge
+        assert "path_regexp adminCredit ^/api/admin/accounts/[0-9]+/balance/credit$" in edge
         assert "respond @internal 404" in edge
     nginx = (ROOT / "deploy/nginx/coexist-hybrid-ip-https.conf.template").read_text(encoding="utf-8")
     assert "proxy_pass http://platform-service:8081" in nginx
@@ -582,6 +586,7 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
     assert "location = /api/me/balance" in nginx
     assert "location = /api/me/recharge/orders" in nginx
     assert "location = /api/me/balance/recharge" in nginx
+    assert "location ~ ^/api/admin/(balance/events|recharge/orders|recharge/orders/[0-9]+/events|accounts/[0-9]+/balance/credit)$" in nginx
     assert "location ^~ /internal/" in nginx
     workflow = (ROOT / ".github/workflows/deploy-hybrid.yml").read_text(encoding="utf-8")
     assert "compose.hybrid.coexist.yaml deploy scripts" in workflow

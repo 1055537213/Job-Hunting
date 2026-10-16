@@ -1,0 +1,228 @@
+openapi: 3.1.0
+info:
+  title: Administrator Billing Contract
+  version: 1.0.0
+  description: >-
+    Requires an active administrator session, never a supplied actor ID. Reads use
+    repeatable-read snapshots, stable time/ID ordering, at most 100 records per page
+    and no financial retention cap. Ledger filtering for an unknown account returns
+    an empty page; order filtering for an unknown account returns 404, preserving
+    the Python contract. Credit is not a payment and does not increase recharge
+    revenue. Policy lock precedes actor, target and balance locks; balance, ledger,
+    audit and response are built in one transaction. Replays reauthorize the actor,
+    return the original ledger and current balance, and add no audit event.
+security: [{SessionCookie: []}]
+paths:
+  /api/admin/balance/events:
+    get:
+      operationId: adminBalanceEvents
+      parameters:
+        - {$ref: '#/components/parameters/AccountFilter'}
+        - {$ref: 'billing-personal.openapi.yaml#/components/parameters/Limit'}
+        - {$ref: 'billing-personal.openapi.yaml#/components/parameters/Offset'}
+      responses:
+        '200': {$ref: '#/components/responses/LedgerPage'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/admin/recharge/orders:
+    get:
+      operationId: adminRechargeOrders
+      parameters:
+        - {$ref: '#/components/parameters/AccountFilter'}
+        - {$ref: 'billing-personal.openapi.yaml#/components/parameters/Limit'}
+        - {$ref: 'billing-personal.openapi.yaml#/components/parameters/Offset'}
+      responses:
+        '200': {$ref: '#/components/responses/OrdersPage'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/admin/recharge/orders/{orderId}/events:
+    get:
+      operationId: adminPaymentEvents
+      parameters: [{$ref: '#/components/parameters/OrderId'}]
+      responses:
+        '200': {$ref: '#/components/responses/OrderEvents'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/admin/accounts/{accountId}/balance/credit:
+    post:
+      operationId: adminCredit
+      description: >-
+        Matching CSRF cookie/header and admin rate limits are enforced. Same actor,
+        key, target, amount and trimmed reason replay; changing the request returns
+        409. Auth or billing failures never fall back to Python money writes.
+        Disabled target accounts may receive credit but remain disabled.
+      parameters:
+        - {$ref: '#/components/parameters/AccountId'}
+        - {name: X-CSRF-Token, in: header, required: true, schema: {type: string}}
+        - {name: X-Request-ID, in: header, schema: {type: string, maxLength: 128}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreditRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/CreditResult'}
+        default: {$ref: '#/components/responses/Error'}
+  /internal/v1/billing/admin/ledger:
+    post:
+      operationId: internalAdminLedger
+      security: [{InternalServiceToken: []}]
+      requestBody: {$ref: '#/components/requestBodies/SessionPage'}
+      responses:
+        '200': {$ref: '#/components/responses/LedgerPage'}
+        default: {$ref: '#/components/responses/Error'}
+  /internal/v1/billing/admin/orders:
+    post:
+      operationId: internalAdminOrders
+      security: [{InternalServiceToken: []}]
+      requestBody: {$ref: '#/components/requestBodies/SessionPage'}
+      responses:
+        '200': {$ref: '#/components/responses/OrdersPage'}
+        default: {$ref: '#/components/responses/Error'}
+  /internal/v1/billing/admin/orders/{orderId}/events:
+    post:
+      operationId: internalAdminPaymentEvents
+      security: [{InternalServiceToken: []}]
+      parameters: [{$ref: '#/components/parameters/OrderId'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Session'}
+      responses:
+        '200': {$ref: '#/components/responses/OrderEvents'}
+        default: {$ref: '#/components/responses/Error'}
+  /internal/v1/billing/admin/accounts/{accountId}/credit:
+    post:
+      operationId: internalAdminCredit
+      security: [{InternalServiceToken: []}]
+      parameters:
+        - {$ref: '#/components/parameters/AccountId'}
+        - {name: X-Trace-Id, in: header, schema: {type: string, maxLength: 128}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - {$ref: '#/components/schemas/Session'}
+                - type: object
+                  required: [payload]
+                  properties:
+                    payload: {$ref: '#/components/schemas/CreditRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/CreditResult'}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    SessionCookie: {$ref: 'billing-personal.openapi.yaml#/components/securitySchemes/SessionCookie'}
+    InternalServiceToken: {$ref: 'billing-personal.openapi.yaml#/components/securitySchemes/InternalServiceToken'}
+  parameters:
+    AccountFilter: {name: account_id, in: query, schema: {type: integer, format: int64}}
+    AccountId: {name: accountId, in: path, required: true, schema: {type: integer, format: int64}}
+    OrderId: {name: orderId, in: path, required: true, schema: {type: integer, format: int64}}
+  requestBodies:
+    SessionPage:
+      required: true
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: '#/components/schemas/Session'}
+              - type: object
+                required: [limit, offset]
+                properties:
+                  account_id: {type: [integer, 'null'], format: int64}
+                  limit: {type: integer, minimum: 1, maximum: 100}
+                  offset: {type: integer, format: int64, minimum: 0}
+  schemas:
+    Session:
+      type: object
+      required: [session_token]
+      properties:
+        session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+    CreditRequest:
+      type: object
+      required: [amount_yuan, reason, idempotency_key]
+      properties:
+        amount_yuan: {type: number, exclusiveMinimum: 0, maximum: 1000000, multipleOf: 0.000001}
+        reason: {type: string, minLength: 2, maxLength: 500}
+        idempotency_key: {type: string, minLength: 16, maxLength: 128}
+    CreditResult:
+      type: object
+      required: [entry, summary]
+      properties:
+        entry: {$ref: 'billing-personal.openapi.yaml#/components/schemas/LedgerEntry'}
+        summary: {$ref: 'billing-personal.openapi.yaml#/components/schemas/Summary'}
+    FinancialPage:
+      type: object
+      required: [total, limit, offset, page_size, max_pages]
+      properties:
+        total: {type: integer, format: int64, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 100}
+        offset: {type: integer, format: int64, minimum: 0}
+        page_size: {type: integer, const: 100}
+        max_pages: {type: 'null'}
+    LedgerPage:
+      allOf:
+        - {$ref: '#/components/schemas/FinancialPage'}
+        - type: object
+          required: [entries]
+          properties:
+            entries: {type: array, maxItems: 100, items: {$ref: 'billing-personal.openapi.yaml#/components/schemas/LedgerEntry'}}
+    OrdersPage:
+      allOf:
+        - {$ref: '#/components/schemas/FinancialPage'}
+        - type: object
+          required: [orders]
+          properties:
+            orders: {type: array, maxItems: 100, items: {$ref: 'billing-personal.openapi.yaml#/components/schemas/RechargeOrder'}}
+    OrderEvents:
+      type: object
+      required: [order, events]
+      properties:
+        order: {$ref: 'billing-personal.openapi.yaml#/components/schemas/RechargeOrder'}
+        events: {type: array, items: {$ref: '#/components/schemas/PaymentEvent'}}
+    PaymentEvent:
+      type: object
+      required: [id, recharge_order_id, payment_provider, provider_event_id, event_type, processing_status,
+                 signature_valid, payload_sha256, error_summary, details, received_at, processed_at]
+      properties:
+        id: {type: integer, format: int64}
+        recharge_order_id: {type: integer, format: int64}
+        payment_provider: {type: string}
+        provider_event_id: {type: string}
+        event_type: {type: string}
+        processing_status: {type: string}
+        signature_valid: {type: boolean}
+        payload_sha256: {type: string}
+        error_summary: {type: [string, 'null']}
+        details: {type: object, additionalProperties: true}
+        received_at: {type: string, format: date-time}
+        processed_at: {type: [string, 'null'], format: date-time}
+  responses:
+    LedgerPage:
+      description: Financial ledger, Cache-Control no-store
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/LedgerPage'}
+    OrdersPage:
+      description: Recharge orders, Cache-Control no-store
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/OrdersPage'}
+    OrderEvents:
+      description: Low-sensitivity payment events, ascending by received_at and ID
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/OrderEvents'}
+    CreditResult:
+      description: Adjustment and current balance; no payment order or recharge revenue
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/CreditResult'}
+    Error:
+      description: >-
+        400 invalid normalized credit input; 401 expired session or internal token;
+        403 not admin/disabled/CSRF; 404 missing account/order; 409 idempotency conflict;
+        422 body/page validation; 429 rate limit; 503 dependency failure. No fallback.
+      content:
+        application/json:
+          schema: {$ref: 'billing-personal.openapi.yaml#/components/schemas/Error'}

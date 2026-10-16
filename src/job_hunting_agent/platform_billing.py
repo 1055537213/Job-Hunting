@@ -112,6 +112,46 @@ class PlatformBillingClient:
             raise PlatformBillingError("INVALID_PLATFORM_RESPONSE", "平台账务服务返回了无效分页数据。") from error
         return payload
 
+    def admin_request(
+        self, resource: str, *, session_token: str | None, account_id: int | None = None,
+        order_id: int | None = None, actor_account_id: int | None = None, payload: dict[str, Any] | None = None,
+        limit: int = 100, offset: int = 0, trace_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not session_token:
+            raise PlatformBillingError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
+        body: dict[str, Any] = {"session_token": session_token}
+        if resource in {"ledger", "orders"}:
+            path = f"/internal/v1/billing/admin/{resource}"
+            body.update(account_id=account_id, limit=limit, offset=offset)
+        elif resource == "events" and order_id is not None:
+            path = f"/internal/v1/billing/admin/orders/{int(order_id)}/events"
+        elif resource == "credit" and account_id is not None and payload is not None:
+            path = f"/internal/v1/billing/admin/accounts/{int(account_id)}/credit"
+            body["payload"] = payload
+        else:
+            raise ValueError("Unsupported administrator billing resource")
+        result = self._request("POST", path, trace_id=trace_id, json=body)
+        try:
+            if resource in {"ledger", "orders"}:
+                rows = result["entries" if resource == "ledger" else "orders"]
+                if (not isinstance(rows, list) or len(rows) > limit
+                        or any(not isinstance(row, dict) or account_id is not None and row["account_id"] != account_id for row in rows)
+                        or type(result["total"]) is not int or result["total"] < 0
+                        or result["limit"] != limit or result["offset"] != offset
+                        or result["page_size"] != 100 or result["max_pages"] is not None):
+                    raise ValueError("Invalid page")
+            elif resource == "events":
+                if (result["order"]["id"] != order_id or not isinstance(result["events"], list)
+                        or any(row["recharge_order_id"] != order_id for row in result["events"])):
+                    raise ValueError("Invalid order events")
+            elif (result["entry"]["account_id"] != account_id or result["summary"]["account_id"] != account_id
+                    or result["entry"]["operator_account_id"] != actor_account_id
+                    or result["entry"]["entry_kind"] != "adjustment"):
+                raise ValueError("Invalid credit identity")
+        except (KeyError, TypeError, ValueError) as error:
+            raise PlatformBillingError("INVALID_PLATFORM_RESPONSE", "平台账务服务返回了无效管理员账务数据。") from error
+        return result
+
     def recharge(
         self,
         *,
