@@ -588,6 +588,8 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
         assert "reverse_proxy @browser_auth platform-service:8081" in edge
         assert "path /api/account/profile /api/account/email" in edge
         assert "reverse_proxy @account_profile platform-service:8081" in edge
+        assert "path /api/account/export" in edge
+        assert "reverse_proxy @account_export platform-service:8081" in edge
         assert "method GET" in edge
         assert "path /api/me/balance /api/me/recharge/orders" in edge
         assert "reverse_proxy @billing_reads platform-service:8081" in edge
@@ -619,6 +621,7 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
     assert "location ^~ /api/auth/" in nginx
     assert "location = /api/account/password" in nginx
     assert "location ~ ^/api/account/(profile|email)$" in nginx
+    assert "location = /api/account/export" in nginx
     assert 'if ($request_method != PATCH) { return 418; }' in nginx
     assert "location = /api/me/balance" in nginx
     assert "location = /api/me/recharge/orders" in nginx

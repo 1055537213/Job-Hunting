@@ -1053,10 +1053,12 @@ class RepositoryStore:
             )
         return self.get_account(account_id)
 
-    def export_account_data(self, account_id: int) -> dict[str, object]:
+    def export_account_data(self, account_id: int, *, account: AccountRecord | None = None) -> dict[str, object]:
         """Return a structured account export without password, session, or token secrets."""
 
-        account = self.get_account(account_id)
+        account = account if account is not None else self.get_account(account_id)
+        if account.id != account_id:
+            raise ValueError("账号与导出数据不匹配。")
         if account.deleted_at is not None:
             raise ValueError("已注销账号不能再次导出数据。")
         direct_tables = (

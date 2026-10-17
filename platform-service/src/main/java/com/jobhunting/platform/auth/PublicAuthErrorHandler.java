@@ -27,13 +27,14 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 @RestControllerAdvice(assignableTypes = {PublicAuthController.class, PublicAuthLifecycleController.class,
         PublicAdminAccountController.class, BillingQueryController.class, PersonalRechargeController.class, AdminBillingController.class,
         AdminUsageController.class, AdminToolTraceController.class, TaskReadController.class, TaskCommandController.class,
-        AdminObservabilityController.class, PublicAccountProfileController.class})
+        AdminObservabilityController.class, PublicAccountProfileController.class, PublicAccountExportController.class,
+        InternalAccountExportController.class})
 public class PublicAuthErrorHandler {
     @ExceptionHandler(AuthException.class)
     public ResponseEntity<Map<String, Object>> auth(AuthException error, HttpServletRequest request) {
         String id = WebSecurityFilter.requestId(request.getHeader("X-Request-ID"), request.getHeader("X-Trace-Id"));
         var response = ResponseEntity.status(error.status());
-        if ("TASK_COMMAND_UNAVAILABLE".equals(error.code())) response.header("Retry-After", "3");
+        if ("TASK_COMMAND_UNAVAILABLE".equals(error.code()) || "EXPORT_UNAVAILABLE".equals(error.code())) response.header("Retry-After", "3");
         return response.body(Map.of("code", error.code(), "detail", error.getMessage(),
                 "message", error.getMessage(), "request_id", id, "trace_id", id));
     }

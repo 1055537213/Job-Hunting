@@ -545,6 +545,71 @@ def run_account_profile_gateway_flow(gateway_url: str, web_url: str, java_url: s
     print("==> Java profile/email entry -> Python-stop writes/normalization/CSRF -> outbox/SMTP callback -> revocation/replay: PASS")
 
 
+def run_account_export_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
+                                    web_container: str, database_url: str) -> None:
+    from job_hunting_agent.account_export import validate_export
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+    from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
+
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
+    password = "export-acceptance-password"
+    emails = [f"export-{os.urandom(10).hex()}@example.com" for _ in range(2)]
+    ids = [auth.register_account(email=email, password=password, display_name="Export acceptance",
+                                 email_verified=True, consents=[]).account_id for email in emails]
+    store = SQLAlchemyStore(database_url)
+    try:
+        tasks = [store.create_background_task(account_id=owner, task_type="system_probe", payload={"note": f"private-to-{owner}"})
+                 for owner in ids]
+        assets = [store.register_knowledge_asset(account_id=owner, candidate_id=None, asset_kind="document",
+                                                title=f"Export fixture {owner}", original_filename="fixture.txt",
+                                                storage_key=f"export-fixture/{owner}/fixture.txt", media_type="text/plain",
+                                                file_size=1, sha256="0" * 64) for owner in ids]
+        with httpx.Client(base_url=gateway_url, timeout=40) as browser:
+            assert browser.get("/api/account/export").status_code == 401
+            login = browser.post("/api/auth/login", json={"email": emails[0], "password": password})
+            assert login.status_code == 200, login.text[:300]
+            headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+            session = browser.cookies["job_agent_session"]
+            exported = browser.get(f"/api/account/export?account_id={ids[1]}")
+            assert exported.status_code == 200, exported.text[:300]
+            validate_export(exported.json(), ids[0])
+            assert exported.headers["cache-control"] == "no-store"
+            assert exported.headers["content-disposition"] == f'attachment; filename="job-agent-account-{ids[0]}-export.json"'
+            assert {row["task_key"] for row in exported.json()["background_tasks"]} == {tasks[0].task_key}
+            assert {row["id"] for row in exported.json()["knowledge_assets"]} == {assets[0][0].id}
+            assert {row["id"] for row in exported.json()["knowledge_asset_versions"]} == {assets[0][1].id}
+            assert tasks[1].task_key not in exported.text
+            assert "password_hash" not in exported.text and "token_hash" not in exported.text
+            forwarded = httpx.get(web_url + "/api/account/export", cookies=browser.cookies, timeout=40)
+            assert forwarded.status_code == 200, forwarded.text[:300]
+            validate_export(forwarded.json(), ids[0])
+            assert forwarded.json()["background_tasks"] == exported.json()["background_tasks"]
+            private_url = web_url + "/internal/v1/accounts/export"
+            private_headers = {"X-Internal-Service-Token": internal_token}
+            assert browser.post("/internal/v1/accounts/export", json={"session_token": session}).status_code == 404
+            assert httpx.post(private_url, json={"session_token": session}).status_code == 401
+            assert httpx.post(private_url, headers=private_headers, json={"session_token": "revoked"}).status_code == 401
+            assert httpx.post(private_url, headers=private_headers, json={"session_token": session, "account_id": ids[1]}).status_code == 422
+            docker("stop", "--time", "1", web_container)
+            try:
+                failed = browser.get("/api/account/export")
+                assert failed.status_code == 503, failed.text[:300]
+                assert failed.json()["code"] == "EXPORT_UNAVAILABLE"
+                assert "Content-Disposition" not in failed.headers and "private-to-" not in failed.text
+                assert browser.get("/api/auth/me").status_code == 200
+            finally:
+                docker("start", web_container)
+                wait(web_url + "/api/health")
+            assert browser.get("/api/account/export").status_code == 200
+            assert browser.post("/api/auth/logout", headers=headers).status_code == 200
+            assert httpx.get(gateway_url + "/api/account/export", cookies={"job_agent_session": session}).status_code == 401
+            assert httpx.post(private_url, headers=private_headers, json={"session_token": session}).status_code == 401
+    finally:
+        store.close()
+    print("==> Java export -> real-session Python callback -> tenant isolation/no secrets -> outage/recovery/revocation: PASS")
+
+
 def run_observability_gateway_flow(gateway_url: str, web_url: str, internal_token: str,
                                     credentials: tuple[str, str]) -> None:
     """Check real aggregation after Python recovery, without mocks or application data."""
@@ -778,6 +843,9 @@ def main() -> None:
         docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
         run_account_profile_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                          f"http://127.0.0.1:{args.port}", token, web, isolated_url, admin_credentials[0])
+        docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
+        run_account_export_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                                        f"http://127.0.0.1:{args.port}", token, web, isolated_url)
         docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
         run_observability_gateway_flow(f"http://127.0.0.1:{args.port + 2}",
                                       f"http://127.0.0.1:{args.port + 1}", token, admin_credentials)

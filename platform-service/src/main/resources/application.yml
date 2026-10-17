@@ -46,6 +46,10 @@ platform:
     token: ${PLATFORM_METRICS_TOKEN:}
     token-file: ${PLATFORM_METRICS_TOKEN_FILE:}
   internal-token: ${PLATFORM_INTERNAL_TOKEN:}
+  account-export:
+    python-base-url: ${PLATFORM_ACCOUNT_EXPORT_PYTHON_BASE_URL:http://web:8000}
+    connect-timeout-ms: ${PLATFORM_ACCOUNT_EXPORT_CONNECT_TIMEOUT_MS:1000}
+    read-timeout-ms: ${PLATFORM_ACCOUNT_EXPORT_READ_TIMEOUT_MS:30000}
   observability:
     python-base-url: ${PLATFORM_OBSERVABILITY_PYTHON_BASE_URL:http://web:8000}
     connect-timeout-ms: ${PLATFORM_OBSERVABILITY_CONNECT_TIMEOUT_MS:1000}

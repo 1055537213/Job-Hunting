@@ -25,6 +25,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from threading import BoundedSemaphore
 from urllib.parse import quote
 
 from fastapi import (
@@ -38,12 +39,15 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
 from starlette.concurrency import run_in_threadpool
 
 from .account_email_outbox import AccountEmailOutboxService, redact_email
+from .account_export import encode_export
 from .account_lifecycle import (
     AccountEmailSender,
     action_token_hash,
@@ -369,6 +373,11 @@ class AccountDeletePayload(BaseModel):
 
     current_password: str = Field(min_length=1, max_length=1024)
     confirmation: str = Field(min_length=1, max_length=32)
+
+
+class InternalAccountExportPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_token: str = Field(min_length=1, max_length=128, repr=False)
 
 
 class AccountStatusPayload(BaseModel):
@@ -1179,6 +1188,18 @@ def create_web_app(
     def export_account_data(request: Request, response: Response) -> dict[str, object]:
         """Download the current account's structured portable data export."""
 
+        if backend.platform_auth_client is not None:
+            token = request.cookies.get(SESSION_COOKIE_NAME)
+            if not token:
+                raise HTTPException(401, "登录状态已过期，请重新登录。")
+            try:
+                result = backend.platform_auth_client.export_account(token)
+            except PlatformAuthError as error:
+                raise HTTPException(error.status_code or 503, str(error)) from None
+            account_id = result["account"]["id"]
+            response.headers["Content-Disposition"] = f'attachment; filename="job-agent-account-{account_id}-export.json"'
+            response.headers["Cache-Control"] = "no-store"
+            return result
         account = current_account(request)
         assert account is not None
         response.headers["Content-Disposition"] = (
@@ -1186,6 +1207,46 @@ def create_web_app(
         )
         response.headers["Cache-Control"] = "no-store"
         return backend.store.export_account_data(account.id)
+
+    @web_app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, error: RequestValidationError):
+        if request.url.path == "/internal/v1/accounts/export":
+            return JSONResponse({"detail": "无效的导出请求。"}, status_code=422, headers={"Cache-Control": "no-store"})
+        return await request_validation_exception_handler(request, error)
+
+    account_exports = BoundedSemaphore(2)
+
+    def build_internal_account_export(payload: InternalAccountExportPayload) -> bytes:
+        if not account_exports.acquire(blocking=False):
+            raise HTTPException(503, "账号导出暂时不可用，请稍后重试。", headers={"Retry-After": "3"})
+        try:
+            try:
+                result = backend.platform_auth_client.account("me", session_token=payload.session_token)
+            except PlatformAuthError as error:
+                raise HTTPException(401 if error.status_code == 401 else 503, "账号导出认证失败。") from None
+            account = platform_account_record(result["account"])
+            return encode_export(backend.store.export_account_data(account.id, account=account), account.id)
+        except OverflowError:
+            raise HTTPException(413, "数据量超过同步导出限制，请联系管理员。") from None
+        finally:
+            account_exports.release()
+
+    @web_app.post("/internal/v1/accounts/export", include_in_schema=False)
+    async def internal_account_export(payload: InternalAccountExportPayload, request: Request):
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            raise HTTPException(401, "内部服务认证失败。")
+        # Compatibility downloads wait on Java in the regular sync pool.
+        try:
+            body = await asyncio.to_thread(build_internal_account_export, payload)
+            return Response(body, media_type="application/json", headers={"Cache-Control": "no-store"})
+        except HTTPException:
+            raise
+        except Exception:  # noqa: BLE001 - never reflect personal data or upstream exception text.
+            raise HTTPException(503, "账号导出暂时不可用，请稍后重试。") from None
 
     @web_app.post("/api/account/delete")
     def delete_account(

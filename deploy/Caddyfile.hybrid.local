@@ -9,6 +9,11 @@
 			path /api/account/profile /api/account/email
 		}
 		reverse_proxy @account_profile platform-service:8081
+		@account_export {
+			method GET
+			path /api/account/export
+		}
+		reverse_proxy @account_export platform-service:8081
 		@billing_reads {
 			method GET
 			path /api/me/balance /api/me/recharge/orders

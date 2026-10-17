@@ -10,6 +10,7 @@ from uuid import uuid4
 import httpx
 
 from .config import PlatformAuthSettings
+from .account_export import MAX_EXPORT_BYTES, decode_export
 
 
 def _platform_response_error_status(response: httpx.Response) -> int:
@@ -393,6 +394,30 @@ class PlatformAuthClient:
         except (KeyError, TypeError, ValueError) as error:
             raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台审计服务响应无效。", 502) from error
         return result
+
+    def export_account(self, session_token: str) -> dict[str, Any]:
+        """Forward the real session; never select an owner or fall back to local SQL."""
+        try:
+            with httpx.Client(trust_env=False, follow_redirects=False, timeout=35) as client:
+                with client.stream("POST", f"{self.base_url}/internal/v1/accounts/export",
+                                   headers={"X-Internal-Service-Token": self.internal_token},
+                                   json={"session_token": session_token}) as response:
+                    if response.status_code != 200:
+                        status, code, message = {
+                            401: (401, "SESSION_EXPIRED", "登录状态已过期，请重新登录。"),
+                            413: (413, "EXPORT_TOO_LARGE", "数据量超过同步导出限制，请联系管理员。"),
+                        }.get(response.status_code, (503, "EXPORT_UNAVAILABLE", "账号导出暂时不可用，请稍后重试。"))
+                        raise PlatformAuthError(code, message, status)
+                    if response.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                        raise ValueError("Invalid export content type")
+                    body = bytearray()
+                    for chunk in response.iter_bytes(chunk_size=65536):
+                        if len(body) + len(chunk) > MAX_EXPORT_BYTES:
+                            raise ValueError("Oversized export")
+                        body.extend(chunk)
+                    return decode_export(bytes(body))
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, RecursionError):
+            raise PlatformAuthError("EXPORT_UNAVAILABLE", "账号导出暂时不可用，请稍后重试。", 503) from None
 
     def account(self, operation: str, *, trace_id: str | None = None, **data: Any) -> dict[str, Any]:
         """Call Java-owned current-account and administrator operations.

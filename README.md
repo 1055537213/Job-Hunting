@@ -46,6 +46,7 @@
 - 混合模式下，个人中心显示名修改和邮箱变更申请直接进入 Java；Python 不重复写账号或登记邮件，SMTP 投递仍由 Python Worker 负责。
 - Argon2id 密码哈希，Java 兼容现有 Python 哈希格式。
 - 账号导出、可恢复删除任务和管理员启用/停用账号。
+- 混合模式下账号导出从 Java 进入，Python 按真实会话整理业务数据；仅能导出本人数据，下载禁用缓存，单次同步下载上限 16 MiB。
 
 ### 候选人档案与 Agent
 
@@ -302,6 +303,7 @@ PR 和 `master` 推送仍运行完整验收。部署门禁要求目标 SHA 的�
 | 账号 | GET /api/auth/me | 当前账号与余额摘要 |
 | 账号 | PATCH /api/account/email | 发起邮箱变更确认邮件 |
 | 账号 | PATCH /api/account/profile | 修改当前账号显示名称 |
+| 账号 | GET /api/account/export | 导出本人结构化数据，不包含密码哈希、会话凭据和向量 |
 | 账号 | GET /api/account/export | 导出本人数据 |
 | 档案 | GET/POST /api/profiles | 查询或创建候选人档案 |
 | 对话 | POST /api/chat/stream | SSE Agent 对话 |
@@ -323,6 +325,7 @@ PR 和 `master` 推送仍运行完整验收。部署门禁要求目标 SHA 的�
 Java 内部接口不面向浏览器开放，使用 X-Internal-Service-Token 和 X-Trace-Id。账号资料读取契约位于 platform-service/src/main/resources/auth-internal.openapi.yaml 的 POST /internal/v1/auth/accounts/me。
 请求观测的两端快照、不可用状态和邮件投递字段见 [观测接口契约](platform-service/src/main/resources/observability.openapi.yaml)。
 个人中心账号资料与邮箱变更入口见 [账号资料接口契约](platform-service/src/main/resources/account-profile.openapi.yaml)。
+账号导出边界、错误码和同步下载限制见 [账号导出接口契约](platform-service/src/main/resources/account-export.openapi.yaml)。
 
 ## 9. 常见问题（FAQ）
 

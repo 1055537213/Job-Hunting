@@ -1,0 +1,42 @@
+openapi: 3.1.0
+info:
+  title: Account data export
+  version: 1.0.0
+paths:
+  /api/account/export:
+    get:
+      summary: Download the authenticated account's portable structured data
+      description: >-
+        Java authenticates the real session and calls the private Python export service.
+        No owner selector is accepted. Contains account, consents, account_balance and
+        account-scoped business collections; excludes password/session/token hashes and embeddings.
+        Maximum synchronous JSON payload is 16 MiB; no truncation or local fallback.
+        Decimal database fields are emitted as exact decimal strings (not rounded floats).
+        Not a point-in-time database backup. Both services must be available.
+      security:
+        - session: []
+      responses:
+        '200':
+          description: Complete portable JSON export
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+            Content-Disposition:
+              schema: {type: string, example: 'attachment; filename="job-agent-account-42-export.json"'}
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [exported_at, account, consents, account_balance]
+                properties:
+                  exported_at: {type: string}
+                  account: {type: object}
+                  consents: {type: array, items: {type: object}}
+                  account_balance: {type: object}
+        '401': {description: Missing or revoked session}
+        '413': {description: EXPORT_TOO_LARGE - synchronous limit exceeded}
+        '429': {description: Rate limited - Retry-After in seconds}
+        '503': {description: EXPORT_UNAVAILABLE - busy, upstream outage or invalid response; retry later}
+components:
+  securitySchemes:
+    session: {type: apiKey, in: cookie, name: job_agent_session}

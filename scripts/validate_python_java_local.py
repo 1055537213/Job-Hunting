@@ -608,6 +608,7 @@ def main() -> int:
                 "PLATFORM_INTERNAL_TOKEN": internal_token,
                 "PLATFORM_TASKS_PYTHON_BASE_URL": f"http://127.0.0.1:{args.port + 1}",
                 "PLATFORM_OBSERVABILITY_PYTHON_BASE_URL": f"http://127.0.0.1:{args.port + 1}",
+                "PLATFORM_ACCOUNT_EXPORT_PYTHON_BASE_URL": f"http://127.0.0.1:{args.port + 1}",
                 "SPRING_DATASOURCE_URL": jdbc_url,
                 "SPRING_DATASOURCE_USERNAME": jdbc_username,
                 "SPRING_DATASOURCE_PASSWORD": jdbc_password,
