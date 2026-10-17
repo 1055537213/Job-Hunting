@@ -4,6 +4,11 @@
 		respond @internal 404
 		@browser_auth path /api/auth/* /api/account/password
 		reverse_proxy @browser_auth platform-service:8081
+		@account_profile {
+			method PATCH
+			path /api/account/profile /api/account/email
+		}
+		reverse_proxy @account_profile platform-service:8081
 		@billing_reads {
 			method GET
 			path /api/me/balance /api/me/recharge/orders

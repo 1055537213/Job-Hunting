@@ -229,6 +229,14 @@ Java 不写任务表，通过带服务 Token/真实会话的内部命令调用 P
 Python 继续独占状态写入及执行，并由 Beat 补投 pending 命令；没有引入第二套任务状态机或 Java Celery 客户端。
 契约见 [`task-commands.openapi.yaml`](src/main/resources/task-commands.openapi.yaml)。
 
+个人中心 `PATCH /api/account/profile` 和 `PATCH /api/account/email` 已由网关直达 Java。
+复用真实 Session/CSRF/限流和既有事务服务，不信任 JSON 中的账号 ID、角色或来源地址。
+显示名称去除首尾空格，空值可清除；邮箱统一大小写与首尾空格，重复邮箱 409、同邮箱 400、无效字段 422。
+邮箱申请只登记 Java outbox，原邮箱在确认前不变；确认后原子变更邮箱并撤销旧会话。冷却期重复申请不新增投递任务。
+SMTP 仍由 Python Worker 领取与回报，Python Web 暂停不影响这两个 Java 入口；不代表所有 Python 进程停止后仍能发送邮件。
+混合模式下 Python 只转发，Java 故障返回 503，不读旧账号或回退写旧 outbox；无需新增环境变量或数据库迁移。
+契约见 [`account-profile.openapi.yaml`](src/main/resources/account-profile.openapi.yaml)。
+
 `GET /api/admin/observability/requests` 由 Java 校验管理员会话并汇总两端进程快照。
 只有 `/api/*` 参与 API 合计，`/internal/*` 单独列出；HTML、静态资源、Actuator 不参与该合计。
 平均耗时使用总耗时/总请求数，不平均两个服务的平均值。缺失端以 null/不可用表示，不伪造 0。

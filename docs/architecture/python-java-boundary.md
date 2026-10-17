@@ -234,6 +234,15 @@ Worker 继续使用原子认领和既有业务幂等机制防止重复副作用�
 本地/生产网关同步具体 POST 路径，内部接口不对公网开放。隔离 Docker 验收使用独立 Redis broker 和真实 Worker，
 验证鉴权、CSRF、命令重放、改意图冲突、Python 兼容回调、队列故障和恢复，不接触服务器或日常容器。
 
+## 个人中心资料与邮箱申请入口
+
+`PATCH /api/account/profile` 和 `PATCH /api/account/email` 经混合网关直达 Java，保留前端地址与响应字段。
+Java 复用既有显示名事务和邮箱变更 outbox 服务，校验当前 Session、CSRF、参数与限流；身份只来自真实会话，来源使用可信代理解析结果。
+Python 的兼容 API 仅转发原始字段与真实 Session；混合模式不再读取本地账号、不重复判断邮箱归属或写旧投递表，Java 故障失败关闭。
+纯 Python 模式维持原逻辑。本次不修改数据库结构、不新增配置项，三个本地/生产网关文件同步分流。
+邮箱确认和旧会话撤销沿用 Java 事务；SMTP/Celery 投递仍属 Python，两个 HTTP 入口独立于 Python Web 不等于邮件脱离 Python Worker。
+本地隔离 Docker 验收覆盖兼容转发、Python Web 暂停时的修改与申请、邮箱冲突、CSRF、空显示名、冷却去重、邮件处理回报与确认后旧会话撤销。
+
 ## 请求观测统一入口
 
 `GET /api/admin/observability/requests` 经本地和生产混合网关直达 Java，复用真实管理员 Session/RBAC、限流、请求 ID 和 no-store。

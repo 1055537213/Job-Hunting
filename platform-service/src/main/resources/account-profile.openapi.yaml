@@ -1,0 +1,84 @@
+openapi: 3.1.0
+info:
+  title: Personal Account Profile and Email
+  version: 1.0.0
+  description: Java owns profile writes and email-change admission. Python retains SMTP delivery and compatibility forwarding.
+security:
+  - SessionCookie: []
+paths:
+  /api/account/profile:
+    patch:
+      operationId: updateOwnAccountProfile
+      parameters:
+        - {$ref: '#/components/parameters/Csrf'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name:
+                  type: [string, 'null']
+                  maxLength: 128
+                  description: Trimmed by the account service. Missing, null or blank clears the display name.
+      responses:
+        '200':
+          description: Updated current account. Never accepts a claimed account ID or role.
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [account]
+                properties:
+                  account: {$ref: 'admin-accounts.openapi.yaml#/components/schemas/Account'}
+        '401': {description: Missing, disabled or revoked session}
+        '403': {description: CSRF rejected}
+        '422': {description: Invalid display name}
+        '429': {description: Rate limited}
+        '503': {description: Account or request protection unavailable. No Python write fallback.}
+  /api/account/email:
+    patch:
+      operationId: requestOwnEmailChange
+      parameters:
+        - {$ref: '#/components/parameters/Csrf'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_email]
+              properties:
+                new_email: {type: string, format: email, minLength: 3, maxLength: 254}
+      responses:
+        '200':
+          description: Admitted to the Java email outbox or suppressed by existing cooldown. Does not change the current email yet.
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message: {type: string}
+        '400': {description: New email equals current email}
+        '401': {description: Missing, disabled or revoked session}
+        '403': {description: CSRF rejected}
+        '409': {description: Email already registered}
+        '422': {description: Invalid target email}
+        '429': {description: Rate limited}
+        '503': {description: Account or request protection unavailable. No Python outbox fallback.}
+components:
+  securitySchemes:
+    SessionCookie: {type: apiKey, in: cookie, name: job_agent_session}
+  parameters:
+    Csrf:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      schema: {type: string}

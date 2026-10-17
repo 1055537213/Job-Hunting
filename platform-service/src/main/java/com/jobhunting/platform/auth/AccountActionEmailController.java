@@ -78,7 +78,12 @@ public class AccountActionEmailController {
         return service.observations(purpose(action));
     }
     public record EmailRequest(@NotBlank @Email @Size(max = 254) String email,
-            @Size(max = 64) String source, @Size(max = 128) String session_token) { }
+            @Size(max = 64) String source, @Size(max = 128) String session_token) {
+        public EmailRequest {
+            if (email != null) email = email.strip().toLowerCase(java.util.Locale.ROOT);
+        }
+        @Override public String toString() { return "EmailRequest[redacted]"; }
+    }
     public record TokenRequest(@NotBlank @Size(max = 128) String token,
             @Size(min = 8, max = 1024) String new_password) {
         @Override public String toString() { return "TokenRequest[redacted]"; }

@@ -458,6 +458,93 @@ def run_task_command_flow(gateway_url, web_url, java_url, token, credentials, da
     print("==> Java commands -> Python durable intent/audit -> Redis/real Worker -> replay/conflict/CSRF/queue outage recovery: PASS")
 
 
+def run_account_profile_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
+                                     web_container: str, database_url: str, occupied_email: str) -> None:
+    from urllib.parse import parse_qs, urlsplit
+
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+    from job_hunting_agent.platform_email import deliver_platform_account_email
+
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
+    email = f"profile-{os.urandom(10).hex()}@example.com"
+    target = f"changed-{os.urandom(10).hex()}@example.com"
+    password = "profile-acceptance-password"
+    engine = sa.create_engine(database_url)
+
+    class Sender:
+        recipient = ""
+        url = ""
+
+        def send_verification(self, recipient, url):
+            self.recipient, self.url = recipient, url
+
+        def send_email_change(self, recipient, url):
+            self.recipient, self.url = recipient, url
+
+    sender = Sender()
+
+    def email_job(account_id, purpose):
+        with engine.connect() as conn:
+            return conn.execute(sa.text("SELECT id FROM platform_account_action_emails WHERE account_id=:id AND purpose=:purpose ORDER BY id DESC LIMIT 1"),
+                                {"id": account_id, "purpose": purpose}).scalar_one()
+
+    try:
+        with httpx.Client(base_url=gateway_url, timeout=10) as browser:
+            registered = browser.post("/api/auth/register", json={"email": email, "password": password})
+            assert registered.status_code == 200, registered.text[:300]
+            account_id = registered.json()["account"]["id"]
+            assert deliver_platform_account_email(auth, sender, email_job(account_id, "verify_email"), "verify_email")["accepted"]
+            token = parse_qs(urlsplit(sender.url).query)["verify_email_token"][0]
+            assert browser.post("/api/auth/verify-email", json={"token": token}).status_code == 200
+            login = browser.post("/api/auth/login", json={"email": email, "password": password})
+            assert login.status_code == 200, login.text[:300]
+            headers = {"X-CSRF-Token": login.json()["csrf_token"], "X-Request-ID": "profile-gateway-trace"}
+            forwarded = httpx.patch(web_url + "/api/account/profile", cookies=browser.cookies,
+                                   headers=headers, json={"display_name": " Compatibility "}, timeout=10)
+            assert forwarded.status_code == 200 and forwarded.json()["account"]["display_name"] == "Compatibility"
+            duplicate = httpx.patch(web_url + "/api/account/email", cookies=browser.cookies, headers=headers,
+                                   json={"new_email": occupied_email}, timeout=10)
+            assert duplicate.status_code == 409, duplicate.text[:300]
+            docker("stop", "--time", "1", web_container)
+            try:
+                assert browser.patch("/api/account/profile", json={"display_name": "Denied"}).status_code == 403
+                for display_name in ("  Java Profile  ", "", None):
+                    result = browser.patch("/api/account/profile", json={"display_name": display_name, "account_id": 999999}, headers=headers)
+                    assert result.status_code == 200, result.text[:300]
+                    assert result.json()["account"]["id"] == account_id
+                    assert result.json()["account"]["display_name"] == ("Java Profile" if display_name else None)
+                    assert result.headers["cache-control"] == "no-store"
+                assert browser.patch("/api/account/profile", json={"display_name": "x" * 129}, headers=headers).status_code == 422
+                assert browser.patch("/api/account/email", json={"new_email": occupied_email}, headers=headers).status_code == 409
+                assert browser.patch("/api/account/email", json={"new_email": email.upper()}, headers=headers).status_code == 400
+                assert browser.patch("/api/account/email", json={"new_email": "not-email"}, headers=headers).status_code == 422
+                for _ in range(2):
+                    requested = browser.patch("/api/account/email", json={"new_email": f" {target.upper()} ", "account_id": 999999}, headers=headers)
+                    assert requested.status_code == 200, requested.text[:300]
+                assert browser.get("/api/auth/me").json()["account"]["email"] == email
+                with engine.connect() as conn:
+                    assert conn.execute(sa.text("SELECT count(*) FROM platform_account_action_emails WHERE account_id=:id AND purpose='change_email'"), {"id": account_id}).scalar_one() == 1
+                    assert conn.execute(sa.text("SELECT count(*) FROM account_email_outbox WHERE account_id=:id"), {"id": account_id}).scalar_one() == 0
+                assert deliver_platform_account_email(auth, sender, email_job(account_id, "change_email"), "change_email")["accepted"]
+                assert sender.recipient == target
+                token = parse_qs(urlsplit(sender.url).query)["change_email_token"][0]
+                confirmed = browser.post("/api/auth/change-email/confirm", json={"token": token}, headers=headers)
+                assert confirmed.status_code == 200 and confirmed.json()["account"]["email"] == target
+                assert browser.patch("/api/account/profile", json={}, headers=headers).status_code == 401
+                assert browser.patch("/api/account/email", json={"new_email": email}, headers=headers).status_code == 401
+                assert browser.post("/api/auth/login", json={"email": target, "password": password}).status_code == 200
+                assert browser.post("/api/auth/login", json={"email": email, "password": password}).status_code == 401
+                assert browser.post("/api/auth/change-email/confirm", json={"token": token},
+                                    headers={"X-CSRF-Token": browser.cookies["job_agent_csrf"]}).status_code == 400
+            finally:
+                docker("start", web_container)
+                wait(web_url + "/api/health")
+    finally:
+        engine.dispose()
+    print("==> Java profile/email entry -> Python-stop writes/normalization/CSRF -> outbox/SMTP callback -> revocation/replay: PASS")
+
+
 def run_observability_gateway_flow(gateway_url: str, web_url: str, internal_token: str,
                                     credentials: tuple[str, str]) -> None:
     """Check real aggregation after Python recovery, without mocks or application data."""
@@ -688,6 +775,9 @@ def main() -> None:
                               f"http://127.0.0.1:{args.port}", token, admin_credentials, isolated_url, worker, broker)
         # This randomly named Redis belongs only to this test. Give the limiter stage
         # its own empty window, independent of preceding browser/Worker acceptance traffic.
+        docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
+        run_account_profile_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                                         f"http://127.0.0.1:{args.port}", token, web, isolated_url, admin_credentials[0])
         docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
         run_observability_gateway_flow(f"http://127.0.0.1:{args.port + 2}",
                                       f"http://127.0.0.1:{args.port + 1}", token, admin_credentials)

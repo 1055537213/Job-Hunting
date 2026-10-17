@@ -1096,9 +1096,6 @@ def create_web_app(
     ) -> dict[str, object]:
         """更新当前账号显示名称，混合模式不直接写 Python 账号表。"""
 
-        account = current_account(request)
-        assert account is not None
-        display_name = normalize_display_name(payload.display_name, "")
         if backend.platform_auth_client is not None:
             token = request.cookies.get(SESSION_COOKIE_NAME)
             if not token:
@@ -1107,13 +1104,16 @@ def create_web_app(
                 result = backend.platform_auth_client.account(
                     "profile",
                     session_token=token,
-                    display_name=display_name,
-                    trace_id=request.headers.get("x-trace-id"),
+                    display_name=payload.display_name,
+                    trace_id=getattr(request.state, "request_id", None),
                 )
                 updated = platform_account_record(result["account"])
             except PlatformAuthError as error:
                 raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
         else:
+            account = current_account(request)
+            assert account is not None
+            display_name = normalize_display_name(payload.display_name, "")
             try:
                 updated = backend.store.update_account_display_name(account.id, display_name)
             except KeyError as error:
@@ -1128,14 +1128,6 @@ def create_web_app(
     ) -> dict[str, str]:
         """Send a confirmation link before replacing the account email."""
 
-        account = current_account(request)
-        assert account is not None
-        try:
-            new_email = backend.auth.normalize_email(payload.new_email)
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-        if new_email == account.email:
-            raise HTTPException(status_code=400, detail="新邮箱不能与当前邮箱相同。")
         token = request.cookies.get(SESSION_COOKIE_NAME)
         if backend.platform_auth_client is not None:
             if not token:
@@ -1143,13 +1135,21 @@ def create_web_app(
             try:
                 backend.platform_auth_client.email_change(
                     "request",
-                    email=new_email,
+                    email=payload.new_email,
                     session_token=token,
                     source=request.client.host if request.client else None,
                 )
             except PlatformAuthError as error:
                 raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
         else:
+            account = current_account(request)
+            assert account is not None
+            try:
+                new_email = backend.auth.normalize_email(payload.new_email)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+            if new_email == account.email:
+                raise HTTPException(status_code=400, detail="新邮箱不能与当前邮箱相同。")
             existing = backend.store.get_account_by_email(new_email)
             if existing is not None and existing[0].id != account.id:
                 raise HTTPException(status_code=409, detail="该邮箱已经注册。")

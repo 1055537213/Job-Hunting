@@ -5,6 +5,7 @@
 混合部署通过 Caddy/Nginx 分流：`/api/auth/*`、`/api/account/password`，以及
 `GET /api/me/balance`、`GET /api/me/recharge/orders` 直达 Java；
 `POST /api/me/balance/recharge` 也直达 Java，要求 `JOB_AGENT_JAVA_BILLING_ENABLED=true`。
+`PATCH /api/account/profile` 与 `PATCH /api/account/email` 同样直达 Java，邮箱 SMTP 投递仍由 Python Worker 处理。
 管理员余额流水、充值订单、支付事件查询及人工补款公开入口同样直达 Java。
 管理员账号列表、启用/停用及审计查询公开入口也直达 Java，仍使用同一 Session、CSRF 和管理员限流。
 管理员用量汇总及 Token 明细查询同样直达 Java，Python 保留用量写入与定期清理。

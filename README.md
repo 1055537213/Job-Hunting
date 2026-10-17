@@ -43,6 +43,7 @@
 - 多账号隔离、HttpOnly Session Cookie、CSRF、防重放、限流和安全响应头。
 - 注册、登录、邮箱验证、密码重置、修改密码、全部设备退出和账号注销。
 - 登录后可发起邮箱变更；新邮箱确认成功后会撤销旧登录会话，并要求重新登录。
+- 混合模式下，个人中心显示名修改和邮箱变更申请直接进入 Java；Python 不重复写账号或登记邮件，SMTP 投递仍由 Python Worker 负责。
 - Argon2id 密码哈希，Java 兼容现有 Python 哈希格式。
 - 账号导出、可恢复删除任务和管理员启用/停用账号。
 
@@ -300,6 +301,7 @@ PR 和 `master` 推送仍运行完整验收。部署门禁要求目标 SHA 的�
 | 认证 | POST /api/auth/change-email/confirm | 消费邮箱变更令牌并撤销旧会话 |
 | 账号 | GET /api/auth/me | 当前账号与余额摘要 |
 | 账号 | PATCH /api/account/email | 发起邮箱变更确认邮件 |
+| 账号 | PATCH /api/account/profile | 修改当前账号显示名称 |
 | 账号 | GET /api/account/export | 导出本人数据 |
 | 档案 | GET/POST /api/profiles | 查询或创建候选人档案 |
 | 对话 | POST /api/chat/stream | SSE Agent 对话 |
@@ -320,6 +322,7 @@ PR 和 `master` 推送仍运行完整验收。部署门禁要求目标 SHA 的�
 
 Java 内部接口不面向浏览器开放，使用 X-Internal-Service-Token 和 X-Trace-Id。账号资料读取契约位于 platform-service/src/main/resources/auth-internal.openapi.yaml 的 POST /internal/v1/auth/accounts/me。
 请求观测的两端快照、不可用状态和邮件投递字段见 [观测接口契约](platform-service/src/main/resources/observability.openapi.yaml)。
+个人中心账号资料与邮箱变更入口见 [账号资料接口契约](platform-service/src/main/resources/account-profile.openapi.yaml)。
 
 ## 9. 常见问题（FAQ）
 

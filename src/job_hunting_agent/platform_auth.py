@@ -418,6 +418,8 @@ class PlatformAuthClient:
             )
         except httpx.HTTPError as error:
             raise PlatformAuthUnavailableError() from error
+        if response.status_code >= 500:
+            raise PlatformAuthUnavailableError()
         try:
             payload = response.json()
         except ValueError as error:
@@ -480,6 +482,8 @@ class PlatformAuthClient:
             )
         except httpx.HTTPError as error:
             raise PlatformAuthUnavailableError() from error
+        if response.status_code >= 500:
+            raise PlatformAuthUnavailableError()
         try:
             payload = response.json()
         except ValueError as error:

@@ -67,6 +67,7 @@ jobs:
           python -m pytest -q
           tests/test_cd_workflows.py
           tests/test_platform_auth.py
+          tests/test_platform_profile.py
           tests/test_platform_billing.py
           tests/test_platform_email.py
           tests/test_platform_password_reset.py

@@ -27,7 +27,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 @RestControllerAdvice(assignableTypes = {PublicAuthController.class, PublicAuthLifecycleController.class,
         PublicAdminAccountController.class, BillingQueryController.class, PersonalRechargeController.class, AdminBillingController.class,
         AdminUsageController.class, AdminToolTraceController.class, TaskReadController.class, TaskCommandController.class,
-        AdminObservabilityController.class})
+        AdminObservabilityController.class, PublicAccountProfileController.class})
 public class PublicAuthErrorHandler {
     @ExceptionHandler(AuthException.class)
     public ResponseEntity<Map<String, Object>> auth(AuthException error, HttpServletRequest request) {
