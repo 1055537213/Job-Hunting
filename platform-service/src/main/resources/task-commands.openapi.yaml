@@ -1,0 +1,99 @@
+openapi: 3.1.0
+info:
+  title: Administrator Task Commands
+  version: 1.0.0
+  description: >-
+    Java authenticates and forwards commands; Python exclusively owns task writes,
+    transactional intent/audit and queue dispatch. Optional Idempotency-Key must be
+    reused after timeout or 503. Without it each request is a new intent. Same actor/key
+    with changed operation or target returns 409. Replay returns current task state,
+    never resets it. A successful response confirms dispatch (or prior execution),
+    not task completion. Pending publish returns 503 and is recoverable by maintenance.
+    Queue delivery is at least once; Worker claims and domain idempotency remain required.
+security: [{SessionCookie: [], CsrfHeader: []}]
+paths:
+  /api/admin/tasks/probe:
+    post:
+      operationId: adminTaskProbe
+      parameters: [{$ref: '#/components/parameters/Key'}]
+      responses:
+        '200': {$ref: 'task-reads.openapi.yaml#/components/responses/Detail'}
+        default: {$ref: 'task-reads.openapi.yaml#/components/responses/Error'}
+  /api/admin/tasks/{task_key}/retry:
+    post:
+      operationId: adminTaskRetry
+      parameters:
+        - {$ref: '#/components/parameters/Key'}
+        - {name: task_key, in: path, required: true, schema: {type: string, minLength: 1, maxLength: 64}}
+      responses:
+        '200':
+          description: Current state of the retried task
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [task]
+                properties:
+                  task: {$ref: 'task-reads.openapi.yaml#/components/schemas/AdminTask'}
+        default: {$ref: 'task-reads.openapi.yaml#/components/responses/Error'}
+  /internal/v1/tasks/admin/command:
+    post:
+      operationId: compatibilityTaskCommand
+      security: [{InternalServiceToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_token, operation]
+              properties:
+                session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+                operation: {type: string, enum: [probe, retry]}
+                task_key: {type: [string, 'null'], maxLength: 64}
+                idempotency_key: {type: [string, 'null'], pattern: '^[A-Za-z0-9._-]{8,128}$'}
+      responses:
+        '200': {description: Same operation-specific task projection as public endpoint}
+        default: {$ref: 'task-reads.openapi.yaml#/components/responses/Error'}
+  /internal/v1/task-commands:
+    post:
+      operationId: pythonExecuteTaskCommand
+      description: Python callback; private service network only; validates the actual Java session again.
+      security: [{InternalServiceToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [command_id, operation, session_token, request_id]
+              properties:
+                command_id: {type: string, pattern: '^[a-f0-9]{64}$'}
+                operation: {type: string, enum: [probe, retry]}
+                task_key: {type: [string, 'null'], minLength: 1, maxLength: 64}
+                session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+                request_id: {type: string, pattern: '^[A-Za-z0-9._-]{8,128}$'}
+      responses:
+        '200': {description: Same operation-specific task projection as public endpoint}
+        default:
+          description: Safe business error; unavailable queue returns 503 with Retry-After 3
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, detail]
+                properties:
+                  code: {type: string}
+                  detail: {type: string}
+components:
+  parameters:
+    Key:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: {type: string, pattern: '^[A-Za-z0-9._-]{8,128}$'}
+  securitySchemes:
+    SessionCookie: {$ref: 'billing-personal.openapi.yaml#/components/securitySchemes/SessionCookie'}
+    InternalServiceToken: {$ref: 'billing-personal.openapi.yaml#/components/securitySchemes/InternalServiceToken'}
+    CsrfHeader: {type: apiKey, in: header, name: X-CSRF-Token}

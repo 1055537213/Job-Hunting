@@ -222,6 +222,13 @@ Python 仍独占任务投递、重试、认领、进度更新、完成及失败�
 Java 模式的 Python 查询入口只转发真实会话，故障不回退本地查询。
 契约见 [`task-reads.openapi.yaml`](src/main/resources/task-reads.openapi.yaml)。
 
+管理员重试/探针的公开 POST 入口现也由 Java 接管，校验会话、权限、CSRF、限流及可选 `Idempotency-Key`。
+`PLATFORM_TASKS_PYTHON_BASE_URL` 默认 `http://web:8000`，Compose 使用内部服务名；生产拒绝公网目标和携带凭据的 URL。
+Java 不写任务表，通过带服务 Token/真实会话的内部命令调用 Python。Python 用命令 ID 实现任务/审计事务和重放保护，
+队列未确认返回 503，重试必须复用原幂等键。内部调用不自动重试或跟随重定向，连接/读取超时及响应大小有界。
+Python 继续独占状态写入及执行，并由 Beat 补投 pending 命令；没有引入第二套任务状态机或 Java Celery 客户端。
+契约见 [`task-commands.openapi.yaml`](src/main/resources/task-commands.openapi.yaml)。
+
 - Java 服务和 Python 服务不能同时写同一组账务表。
 - Java 账务开关关闭时，`account_balances`、`recharge_orders`、`account_balance_ledger` 仍由 Python 独占写入；开关打开后，余额、模拟充值和模型扣费由 Java 独占写入。
 - 跨服务请求必须带幂等键和 trace id。

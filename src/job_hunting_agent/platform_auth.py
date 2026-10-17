@@ -166,6 +166,32 @@ class PlatformAuthClient:
             raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502)
         return payload
 
+    def task_command(self, *, session_token: str | None, operation: str, task_key: str | None,
+                     idempotency_key: str | None, trace_id: str | None = None) -> dict[str, Any]:
+        if not session_token:
+            raise PlatformAuthError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
+        try:
+            response = httpx.post(f"{self.base_url}/internal/v1/tasks/admin/command", headers={
+                "X-Internal-Service-Token": self.internal_token, "X-Trace-Id": trace_id or uuid4().hex,
+            }, json={"session_token": session_token, "operation": operation, "task_key": task_key,
+                     "idempotency_key": idempotency_key}, timeout=self.timeout_seconds)
+        except httpx.HTTPError as error:
+            raise PlatformAuthUnavailableError() from error
+        if response.status_code >= 500:
+            raise PlatformAuthUnavailableError()
+        try:
+            result = response.json()
+        except ValueError as error:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台任务服务响应无效。", 502) from error
+        if response.is_error:
+            detail = result.get("message") or result.get("detail") if isinstance(result, dict) else None
+            raise PlatformAuthError("TASK_COMMAND_ERROR", str(detail or "任务操作失败。"), response.status_code)
+        if not isinstance(result, dict) or set(result) != {"task"} or not _valid_task_projection(result["task"], admin=operation == "retry"):
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台任务服务响应无效。", 502)
+        if operation == "retry" and result["task"]["task_key"] != task_key:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台任务服务响应无效。", 502)
+        return result
+
     def task_query(self, resource: str, *, session_token: str | None, trace_id: str | None = None,
                    **filters: Any) -> dict[str, Any]:
         """Task reads require real sessions; Java failures never query Python's repository."""

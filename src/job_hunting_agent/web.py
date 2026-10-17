@@ -12,11 +12,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import time
 import uuid
 from dataclasses import asdict
@@ -373,6 +375,15 @@ class AccountStatusPayload(BaseModel):
     """管理员启用或禁用账号时提交的状态。"""
 
     status: str
+
+
+class InternalTaskCommandPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    operation: str = Field(pattern=r"^(probe|retry)$")
+    task_key: str | None = Field(default=None, min_length=1, max_length=64)
+    session_token: str = Field(min_length=1, max_length=128, repr=False)
+    request_id: str = Field(pattern=r"^[A-Za-z0-9._-]{8,128}$")
 
 
 class ChatSessionPayload(BaseModel):
@@ -3198,6 +3209,8 @@ def create_web_app(
     def admin_retry_background_task(task_key: str, request: Request) -> dict[str, object]:
         """管理员重试失败任务；重试动作写入审计并重新投递队列。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_task_command(request, "retry", task_key)
         actor = require_admin(request)
         try:
             task = backend.store.get_background_task(task_key)
@@ -3233,6 +3246,8 @@ def create_web_app(
     def admin_task_queue_probe(request: Request) -> dict[str, object]:
         """管理员登记一个无业务数据的 Worker 探针，用于运维验证。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_task_command(request, "probe", None)
         actor = require_admin(request)
         task: BackgroundTaskRecord | None = None
         try:
@@ -3255,6 +3270,53 @@ def create_web_app(
             raise HTTPException(status_code=503, detail=str(error)) from error
         assert task is not None
         return {"task": serialize_background_task(task)}
+
+    def platform_task_command(request: Request, operation: str, task_key: str | None):
+        try:
+            return backend.platform_auth_client.task_command(
+                session_token=request.cookies.get(SESSION_COOKIE_NAME), operation=operation, task_key=task_key,
+                idempotency_key=request.headers.get("Idempotency-Key"), trace_id=getattr(request.state, "request_id", None))
+        except PlatformAuthError as error:
+            raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
+
+    def execute_internal_task_command(payload: InternalTaskCommandPayload):
+        from .task_commands import TaskCommands, TaskCommandConflict
+        try:
+            account = backend.platform_auth_client.account("me", session_token=payload.session_token,
+                                                          trace_id=payload.request_id)["account"]
+            if account["role"] != "admin" or account["status"] != "active":
+                raise HTTPException(403, "需要管理员权限。")
+            task = TaskCommands(backend.store, backend.task_queue).submit(
+                account["account_id"], payload.command_id, payload.operation, payload.task_key, payload.request_id)
+            return {"task": serialize_admin_background_task(task) if payload.operation == "retry" else serialize_background_task(task)}
+        except PlatformAuthError as error:
+            raise HTTPException(error.status_code or 503, str(error)) from error
+        except PermissionError as error:
+            raise HTTPException(403, "需要有效的管理员账号。") from error
+        except KeyError as error:
+            raise HTTPException(404, "后台任务不存在。") from error
+        except TaskCommandConflict as error:
+            raise HTTPException(409, str(error)) from error
+        except ValueError as error:
+            raise HTTPException(422, "无效的任务操作。") from error
+        except TaskQueueError as error:
+            raise HTTPException(503, "后台任务投递尚未确认，请稍后使用相同请求重试。", headers={"Retry-After": "3"}) from error
+
+    @web_app.post("/internal/v1/task-commands", include_in_schema=False)
+    async def internal_task_command(payload: InternalTaskCommandPayload, request: Request):
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            raise HTTPException(401, "内部服务认证失败。")
+        # Separate executor avoids exhausting the public sync-handler pool on compatibility callbacks.
+        try:
+            return await asyncio.to_thread(execute_internal_task_command, payload)
+        except HTTPException as error:
+            code = {401: "SESSION_EXPIRED", 403: "ADMIN_REQUIRED", 404: "TASK_NOT_FOUND",
+                    409: "TASK_COMMAND_CONFLICT", 422: "INVALID_REQUEST", 503: "TASK_COMMAND_UNAVAILABLE"}.get(error.status_code, "TASK_COMMAND_ERROR")
+            return JSONResponse({"code": code, "detail": error.detail}, status_code=error.status_code, headers=error.headers)
 
     @web_app.get("/api/admin/usage/events")
     def admin_usage_events(

@@ -83,6 +83,10 @@ CI 还构建两份镜像，运行 `scripts/validate_python_java_docker.py` 验�
 任务验收由 Python 创建任务并推进 queued/running/succeeded 状态，Java 下一次查询即读取已提交进度。
 同时验证个人归属、管理员筛选分页、低敏字段和撤销会话；暂停隔离 Python Web 后任务查询仍可用，
 而任务投递/重试写请求仍路由到 Python。任务不采用 Token/工具记录的 500 条保留窗口。
+管理员重试/探针的 POST 入口已改为 Java，经内部命令回调 Python 执行；Java 不直接写任务状态。
+最新迁移新增命令 Outbox 表，发布脚本会先执行 Alembic；不需要修改生产源码。
+Docker 验收另启独立 Redis broker 和真实 Worker，验证重复请求、队列故障、持久化补投和跨服务权限。
+普通 API 调用方应提供并复用 `Idempotency-Key`；前端重试按钮已自动保存失败请求的键。
 价格、低余额阈值和演示充值限额共用 `.env` 参数，生产默认关闭演示充值，无需修改业务代码。
 Docker 验收还运行真实 Prometheus，验证独立凭据和 Java target UP；本地 Prometheus 默认在
 `http://127.0.0.1:9090`，可查询 `up{job="job-hunting-platform"}`。不要把监控令牌提交到 Git。
@@ -138,6 +142,8 @@ bash <release-dir>/scripts/deploy_production.sh \
 独立拓扑使用 `deploy/Caddyfile.hybrid`，共存拓扑使用
 `deploy/nginx/coexist-hybrid-ip-https.conf.template`；两者均将已迁移的认证、个人账务、管理员账务、
 账号管理、审计、用量、工具轨迹和任务查询路径转至 Java，拒绝公网 `/internal/*`。
-任务查询按 GET 方法和精确路径分流，投递/重试及其他流量仍转至 Python。Java 端口只在容器网络内暴露。
+任务查询按 GET 方法和精确路径分流，管理员重试/探针按具体 POST 路径分流至 Java，其他任务流量仍转至 Python。
+Java 通过 `PLATFORM_TASKS_PYTHON_BASE_URL=http://web:8000` 回调 Python；启动时不探测 Web，避免相互依赖。
+Java 端口只在容器网络内暴露。
 
 这些步骤只建立可部署能力，不代表已经做过真实服务器演练；本分支暂不部署。

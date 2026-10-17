@@ -49,6 +49,11 @@
 			path_regexp taskReads ^/api/(admin/tasks|tasks/[^/]+)$
 		}
 		reverse_proxy @task_reads platform-service:8081
+		@task_commands {
+			method POST
+			path_regexp taskCommands ^/api/admin/tasks/(probe|[^/]+/retry)$
+		}
+		reverse_proxy @task_commands platform-service:8081
 		reverse_proxy web:8000
 	}
 }

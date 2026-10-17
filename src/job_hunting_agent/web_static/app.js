@@ -171,6 +171,8 @@ if (!window.Vue) {
           backgroundTaskPage: 1,
           backgroundTaskLoading: false,
           backgroundTaskError: "",
+          backgroundTaskCommandKeys: {},
+          backgroundTaskBusy: {},
           backgroundTaskRequestVersion: 0,
           activeDetailTab: "tokens",
           selectedAccountId: 0,
@@ -1386,18 +1388,30 @@ if (!window.Vue) {
 
       /** 管理员重新投递一个失败后台任务，并立即刷新任务与审计记录。 */
       async retryAdminBackgroundTask(taskKey) {
-        if (!taskKey) return;
+        if (!taskKey || this.admin.backgroundTaskBusy[taskKey]) return;
+        this.admin.backgroundTaskBusy[taskKey] = true;
+        const key = this.admin.backgroundTaskCommandKeys[taskKey] || this.newIdempotencyKey("task-retry");
+        this.admin.backgroundTaskCommandKeys[taskKey] = key;
+        let applied = false;
         try {
           await this.requestJson(`/api/admin/tasks/${encodeURIComponent(taskKey)}/retry`, {
             method: "POST",
+            headers: { "Idempotency-Key": key },
           });
+          applied = true;
+          delete this.admin.backgroundTaskCommandKeys[taskKey];
           this.showAccountAction("后台任务已重新排队。", true);
           await Promise.all([
             this.loadAdminBackgroundTasks(this.admin.backgroundTaskPage),
             this.loadAdminAuditEvents(),
           ]);
         } catch (error) {
-          this.showAccountAction(error.message || "后台任务重试失败。", false);
+          if (error.status >= 400 && error.status < 500 && error.status !== 429) {
+            delete this.admin.backgroundTaskCommandKeys[taskKey];
+          }
+          this.showAccountAction(applied ? "后台任务已重新排队，但列表刷新失败，请刷新列表查看。" : (error.message || "后台任务重试失败。"), applied);
+        } finally {
+          this.admin.backgroundTaskBusy[taskKey] = false;
         }
       },
 

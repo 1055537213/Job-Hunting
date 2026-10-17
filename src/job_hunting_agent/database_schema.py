@@ -1291,6 +1291,24 @@ sa.Index(
 sa.Index("idx_background_tasks_candidate", background_tasks.c.candidate_id, background_tasks.c.updated_at.desc())
 
 
+task_commands = sa.Table(
+    "task_commands", metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column("command_id", sa.String(64), nullable=False, unique=True),
+    sa.Column("actor_account_id", sa.Integer, sa.ForeignKey("accounts.id", ondelete="SET NULL")),
+    sa.Column("operation", sa.String(16), nullable=False),
+    sa.Column("task_key", sa.String(64), sa.ForeignKey("background_tasks.task_key", ondelete="CASCADE"), nullable=False),
+    sa.Column("request_id", sa.String(128), nullable=False),
+    sa.Column("status", sa.String(16), nullable=False, server_default=sa.text("'pending'")),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.Column("updated_at", timestamp_type, nullable=False),
+    sa.CheckConstraint("operation IN ('probe','retry')", name="task_command_operation"),
+    sa.CheckConstraint("status IN ('pending','dispatched','superseded')", name="task_command_status"),
+)
+sa.Index("idx_task_commands_pending", task_commands.c.status, task_commands.c.id)
+sa.Index("idx_task_commands_task", task_commands.c.task_key, task_commands.c.id)
+
+
 # RAG 分块是 long_texts 的派生索引。2560 维正式模型使用迁移维护的
 # halfvec 表达式 HNSW 索引；这里保留无 typmod 的原始 vector 列，以便重建期间兼容旧模型空间。
 rag_chunks = sa.Table(

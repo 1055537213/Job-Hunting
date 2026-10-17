@@ -1963,7 +1963,7 @@
                     </div>
                     <div class="admin-task-actions">
                       <span class="admin-task-status" :data-state="task.status">{{ task.status }}</span>
-                      <button v-if="task.status === 'failed'" class="admin-ledger-page-button" type="button" @click="retryAdminBackgroundTask(task.task_key)">重新排队</button>
+                      <button v-if="task.status === 'failed'" class="admin-ledger-page-button" type="button" :disabled="admin.backgroundTaskBusy[task.task_key]" @click="retryAdminBackgroundTask(task.task_key)">重新排队</button>
                     </div>
                   </article>
                 </div>

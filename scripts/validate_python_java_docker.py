@@ -305,8 +305,8 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
         assert admin.get(f"/api/tasks/{task_key}").status_code == 404
         assert admin.get("/api/admin/tasks?status=unknown").status_code == 400
         assert admin.get("/api/admin/tasks?limit=101").status_code == 422
-        # Write requests must still reach the stopped Python service, not Java.
-        assert admin.post("/api/admin/tasks/probe", json={}, headers=headers).status_code == 502
+        # Java must report dependency failure, never success, when Python is stopped.
+        assert admin.post("/api/admin/tasks/probe", json={}, headers=headers).status_code == 503
         assert admin.post("/api/admin/tasks", json={}, headers=headers).status_code == 502
         status_path = f"/api/admin/accounts/{account_id}/status"
         assert user.patch(status_path, json={"status": "disabled"},
@@ -365,6 +365,87 @@ def docker(*args: str) -> str:
     return result.stdout.strip()
 
 
+def run_task_command_flow(gateway_url, web_url, java_url, token, credentials, database_url, worker, broker):
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+    from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, token, 10))
+    email = f"task-command-user-{os.urandom(8).hex()}@example.com"
+    auth.register_account(email=email, password="task-password-123", display_name=None, email_verified=True, consents=[])
+    with httpx.Client(base_url=gateway_url, timeout=15) as admin, httpx.Client(base_url=gateway_url, timeout=15) as user:
+        user.post("/api/auth/login", json={"email": email, "password": "task-password-123"}).raise_for_status()
+        assert user.post("/api/admin/tasks/probe", headers={"X-CSRF-Token": user.cookies["job_agent_csrf"]}).status_code == 403
+        login = admin.post("/api/auth/login", json={"email": credentials[0], "password": credentials[1]})
+        login.raise_for_status()
+        actor = login.json()["account"]["id"]
+        key = "task-command-" + os.urandom(16).hex()
+        headers = {"Idempotency-Key": key, "X-CSRF-Token": login.json()["csrf_token"], "X-Request-ID": "gateway-task-command-trace"}
+        assert admin.post("/api/admin/tasks/probe").status_code == 403
+        assert admin.post("/api/admin/tasks/probe", headers={**headers, "Idempotency-Key": "bad"}).status_code == 422
+        assert admin.post("/internal/v1/task-commands", json={}).status_code == 404
+        store = SQLAlchemyStore(database_url)
+        try:
+            def finished(task_key):
+                deadline = time.monotonic() + 45
+                while time.monotonic() < deadline:
+                    result = admin.get(f"/api/tasks/{task_key}")
+                    result.raise_for_status()
+                    task = result.json()["task"]
+                    if task["status"] == "succeeded":
+                        assert task["attempt"] == 1 and task["progress"] == 100
+                        return task
+                    assert task["status"] != "failed", task
+                    time.sleep(0.5)
+                raise AssertionError("Isolated Worker did not finish task: " + task_key)
+            probe = admin.post("/api/admin/tasks/probe", headers=headers)
+            assert probe.status_code == 200, probe.text[:500]
+            task_key = probe.json()["task"]["task_key"]
+            finished(task_key)
+            replay = admin.post("/api/admin/tasks/probe", headers=headers)
+            assert replay.status_code == 200 and replay.json()["task"]["task_key"] == task_key
+            assert replay.json()["task"]["status"] == "succeeded"
+            failed = store.create_background_task(account_id=actor, task_type="system_probe")
+            store.fail_queued_background_task(failed.task_key, "acceptance failure")
+            retry_path = f"/api/admin/tasks/{failed.task_key}/retry"
+            assert admin.post(retry_path, headers=headers).status_code == 409
+            retry_headers = {**headers, "Idempotency-Key": key + "-retry"}
+            retried = admin.post(retry_path, headers=retry_headers)
+            assert retried.status_code == 200 and len(retried.json()["task"]) == 14, retried.text[:500]
+            finished(failed.task_key)
+            assert admin.post(retry_path, headers=retry_headers).json()["task"]["status"] == "succeeded"
+            compat_headers = {**headers, "Idempotency-Key": key + "-compat"}
+            forwarded = httpx.post(web_url + "/api/admin/tasks/probe", headers=compat_headers, cookies=admin.cookies, timeout=15)
+            assert forwarded.status_code == 200, forwarded.text[:500]
+            compat_key = forwarded.json()["task"]["task_key"]
+            assert admin.post("/api/admin/tasks/probe", headers=compat_headers).json()["task"]["task_key"] == compat_key
+            finished(compat_key)
+            offline_headers = {**headers, "Idempotency-Key": key + "-offline"}
+            docker("stop", "--time", "1", broker)
+            try:
+                unavailable = admin.post("/api/admin/tasks/probe", headers=offline_headers)
+                assert unavailable.status_code == 503, unavailable.text[:500]
+                with store.connect() as conn:
+                    pending = conn.execute("SELECT task_key FROM task_commands WHERE actor_account_id=? AND status='pending'", (actor,)).fetchall()
+                assert len(pending) == 1
+                pending_key = pending[0]["task_key"]
+            finally:
+                docker("start", broker)
+            # Exercise the same durable recovery dispatcher used by the Beat maintenance task.
+            docker("exec", worker, "python", "-c", "from job_hunting_agent.app import JobHuntingApp; from job_hunting_agent.task_commands import TaskCommands; a=JobHuntingApp(); a.initialize(); print(TaskCommands(a.store,a.task_queue).dispatch_pending()); a.store.close()")
+            finished(pending_key)
+            recovered = admin.post("/api/admin/tasks/probe", headers=offline_headers)
+            assert recovered.status_code == 200 and recovered.json()["task"]["task_key"] == pending_key
+            audits = [row for row in store.list_admin_audit_events(limit=100) if row.request_id == "gateway-task-command-trace"]
+            assert len(audits) == 4
+            for audit in audits:
+                assert audit.actor_account_id == actor and "command_id" in audit.details
+            assert admin.post("/api/auth/logout", headers=headers).status_code == 200
+            assert admin.post("/api/admin/tasks/probe", headers=headers).status_code == 401
+        finally:
+            store.close()
+    print("==> Java commands -> Python durable intent/audit -> Redis/real Worker -> replay/conflict/CSRF/queue outage recovery: PASS")
+
+
 def wait(url: str) -> None:
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
@@ -406,6 +487,8 @@ def main() -> None:
     gateway = f"{prefix}-gateway"
     prometheus = f"{prefix}-prometheus"
     redis_name = f"{prefix}-redis"
+    broker = f"{prefix}-broker"
+    worker = f"{prefix}-worker"
     redis_password = os.urandom(24).hex()
     base_url = os.environ.get("JOB_AGENT_TEST_DATABASE_URL", DEFAULT_DATABASE_URL)
     isolated_url = schema_database_url(base_url, schema)
@@ -436,6 +519,9 @@ def main() -> None:
         ]
         docker("run", "-d", "--name", redis_name, "--network", prefix,
                "--network-alias", "security-redis", "redis:7.4-alpine",
+               "redis-server", "--requirepass", redis_password)
+        docker("run", "-d", "--name", broker, "--network", prefix,
+               "--network-alias", "task-broker", "redis:7.4-alpine",
                "redis-server", "--requirepass", redis_password)
         docker(
             "run",
@@ -502,7 +588,9 @@ def main() -> None:
             "JOB_AGENT_CONSENT_REQUIRED": "false",
             "JOB_AGENT_EMAIL_VERIFICATION_REQUIRED": "true",
             "JOB_AGENT_DEMO_RECHARGE_ENABLED": "true",
-            "JOB_AGENT_TASK_QUEUE_ENABLED": "false",
+            "JOB_AGENT_TASK_QUEUE_ENABLED": "true",
+            "JOB_AGENT_REDIS_URL": f"redis://:{redis_password}@task-broker:6379/0",
+            "JOB_AGENT_RATE_LIMIT_ENABLED": "false",
             "JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS": "100",
             "JOB_AGENT_JAVA_AUTH_ENABLED": "true",
             "JOB_AGENT_JAVA_BILLING_ENABLED": "true",
@@ -542,6 +630,13 @@ def main() -> None:
         run_browser_gateway_flow(f"http://127.0.0.1:{args.port + 2}",
                                  f"http://127.0.0.1:{args.port + 1}",
                                  f"http://127.0.0.1:{args.port}", token, web, admin_credentials, isolated_url)
+        docker("run", "-d", "--name", worker, *common, *env_args, args.ai_image,
+               "job-agent-worker", "--concurrency", "1", "--log-level", "WARNING")
+        run_task_command_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                              f"http://127.0.0.1:{args.port}", token, admin_credentials, isolated_url, worker, broker)
+        # This randomly named Redis belongs only to this test. Give the limiter stage
+        # its own empty window, independent of preceding browser/Worker acceptance traffic.
+        docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
         run_java_security_flow(f"http://127.0.0.1:{args.port}", token, admin_credentials, redis_name)
         run_java_ingress_flow(f"http://127.0.0.1:{args.port}", metrics_token, token)
         with tempfile.TemporaryDirectory(prefix="job-agent-prometheus-") as scratch:
@@ -572,7 +667,7 @@ def main() -> None:
                 docker("rm", "-f", prometheus)
         print("Docker Python-Java account and billing acceptance: PASS")
     finally:
-        for name in (prometheus, gateway, web, java, redis_name):
+        for name in (prometheus, gateway, worker, web, java, redis_name, broker):
             subprocess.run(
                 ["docker", "rm", "-f", name], capture_output=True, check=False
             )

@@ -48,6 +48,10 @@ platform:
   internal-token: ${PLATFORM_INTERNAL_TOKEN:}
   auth:
     enabled: ${PLATFORM_AUTH_ENABLED:false}
+  tasks:
+    python-base-url: ${PLATFORM_TASKS_PYTHON_BASE_URL:http://web:8000}
+    connect-timeout-ms: ${PLATFORM_TASKS_CONNECT_TIMEOUT_MS:1000}
+    read-timeout-ms: ${PLATFORM_TASKS_READ_TIMEOUT_MS:5000}
   web-security:
     enabled: ${PLATFORM_WEB_SECURITY_ENABLED:false}
     environment: ${JOB_AGENT_ENVIRONMENT:development}

@@ -94,6 +94,8 @@ def build_celery_app(settings: TaskQueueSettings) -> Any:
         worker_hijack_root_logger=False,
         worker_redirect_stdouts=False,
         broker_connection_retry_on_startup=True,
+        broker_connection_timeout=3,
+        broker_transport_options={"socket_connect_timeout": 3, "socket_timeout": 3, "retry_on_timeout": False},
         timezone="Asia/Shanghai",
         enable_utc=True,
         task_time_limit=settings.task_time_limit_seconds,
@@ -153,6 +155,14 @@ class CeleryTaskQueue:
     def enqueue(self, task_key: str) -> None:
         """以数据库任务键作为 Celery task_id 投递消息。"""
 
+        self._publish(task_key)
+
+    def enqueue_command(self, task_key: str) -> None:
+        """Command outbox owns retries; one bounded broker attempt per dispatch."""
+        self._publish(task_key, retry=False, connection_timeout=3)
+
+    def _publish(self, task_key: str, **options) -> None:
+
         if not task_key.strip():
             raise TaskQueueError("后台任务键不能为空。")
         try:
@@ -162,6 +172,7 @@ class CeleryTaskQueue:
                 kwargs={},
                 task_id=task_key,
                 queue=self.settings.queue_name,
+                **options,
             )
         except Exception as error:
             raise TaskQueueError("后台任务投递失败。") from error
