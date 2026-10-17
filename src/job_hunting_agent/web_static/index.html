@@ -1767,34 +1767,60 @@
                   <p class="eyebrow">Request Observability</p>
                   <h2 class="panel-title">请求观测</h2>
                 </div>
+                <label class="admin-observability-scope">
+                  <span>范围</span>
+                  <select v-model="admin.observabilityScope" aria-label="请求观测范围">
+                    <option value="all">API合计</option>
+                    <option value="java">Java API</option>
+                    <option value="python">Python API</option>
+                    <option value="java_internal">Java内部调用</option>
+                    <option value="python_internal">Python内部调用</option>
+                  </select>
+                </label>
               </div>
-              <p class="admin-observability-lede">
-                仅显示进程内低基数统计、最近错误摘要和路由热度，不包含正文、查询参数或密钥。
+              <div class="admin-observability-health" role="status" aria-live="polite">
+                <span class="admin-observability-badge" :data-status="admin.observabilityStatus">{{ observabilityStatusLabel(admin.observabilityStatus) }}</span>
+                <span v-if="admin.observabilityLoading">刷新中</span>
+                <span v-if="admin.observabilityStale" class="admin-observability-warning">数据已过期 · 刷新失败</span>
+              </div>
+              <p v-if="admin.observabilityError" class="admin-observability-warning" role="alert">{{ admin.observabilityError }}</p>
+              <p v-if="admin.observabilityStatus === 'partial' && !admin.requestMetrics" class="admin-observability-warning" role="status">
+                部分服务不可用 · API 合计不可用
               </p>
+              <div v-if="adminObservabilityServices.length" class="admin-observability-services">
+                <div v-for="service in adminObservabilityServices" :key="service.service" class="admin-observability-service">
+                  <strong>{{ service.label }}</strong>
+                  <span class="admin-observability-badge" :data-status="service.status">{{ observabilityStatusLabel(service.status) }}</span>
+                  <span>API {{ adminMetricValue(service.status === 'available' ? service.api : null, 'total_requests') }}</span>
+                  <span>内部 {{ adminMetricValue(service.status === 'available' ? service.internal : null, 'total_requests') }}</span>
+                  <time v-if="service.observed_at" :datetime="service.observed_at">{{ formatDate(service.observed_at) }}</time>
+                </div>
+              </div>
+              <p v-if="!adminSelectedRequestMetrics" class="admin-observability-warning" role="status">当前范围数据不可用</p>
               <div class="admin-observability-summary" aria-label="请求观测摘要">
                 <div class="admin-observability-stat">
                   <span>当前处理中</span>
-                  <strong>{{ admin.requestMetrics.in_flight_requests || 0 }}</strong>
+                  <strong>{{ adminMetricValue(adminSelectedRequestMetrics, 'in_flight_requests') }}</strong>
                 </div>
                 <div class="admin-observability-stat">
                   <span>最大耗时</span>
-                  <strong>{{ admin.requestMetrics.max_duration_ms || 0 }}ms</strong>
+                  <strong>{{ adminMetricValue(adminSelectedRequestMetrics, 'max_duration_ms', 'ms') }}</strong>
                 </div>
                 <div class="admin-observability-stat">
                   <span>限流次数</span>
-                  <strong>{{ admin.requestMetrics.rate_limited_requests || 0 }}</strong>
+                  <strong>{{ adminMetricValue(adminSelectedRequestMetrics, 'rate_limited_requests') }}</strong>
                 </div>
                 <div class="admin-observability-stat">
                   <span>CSRF 拦截</span>
-                  <strong>{{ admin.requestMetrics.csrf_rejected_requests || 0 }}</strong>
+                  <strong>{{ adminMetricValue(adminSelectedRequestMetrics, 'csrf_rejected_requests') }}</strong>
                 </div>
                 <div class="admin-observability-stat">
                   <span>异常请求</span>
-                  <strong>{{ admin.requestMetrics.exception_requests || 0 }}</strong>
+                  <strong>{{ adminMetricValue(adminSelectedRequestMetrics, 'exception_requests') }}</strong>
                 </div>
                 <div class="admin-observability-stat">
                   <span>最近错误</span>
-                  <strong>{{ adminRecentRequestErrors.length }}</strong>
+                  <strong>{{ adminMetricSize(adminSelectedRequestMetrics, 'recent_errors') }}</strong>
                 </div>
               </div>
               <div class="admin-observability-grid">
@@ -1804,10 +1830,10 @@
                       <p class="eyebrow">Status Families</p>
                       <h3>状态分布</h3>
                     </div>
-                    <span>{{ adminRequestStatusRows.length }} 项</span>
+                    <span>{{ adminMetricSize(adminSelectedRequestMetrics, 'status_counts') }} 项</span>
                   </div>
                   <div v-if="!adminRequestStatusRows.length" class="admin-observability-empty">
-                    当前没有状态分布数据。
+                    {{ adminSelectedRequestMetrics?.status_counts == null ? '-- 数据不可用' : '暂无状态分布' }}
                   </div>
                   <div v-else class="admin-table-wrap admin-observability-table-wrap">
                     <table class="admin-table admin-observability-table">
@@ -1827,10 +1853,10 @@
                       <p class="eyebrow">Methods</p>
                       <h3>请求方法</h3>
                     </div>
-                    <span>{{ adminRequestMethodRows.length }} 项</span>
+                    <span>{{ adminMetricSize(adminSelectedRequestMetrics, 'method_counts') }} 项</span>
                   </div>
                   <div v-if="!adminRequestMethodRows.length" class="admin-observability-empty">
-                    当前没有请求方法统计。
+                    {{ adminSelectedRequestMetrics?.method_counts == null ? '-- 数据不可用' : '暂无请求方法统计' }}
                   </div>
                   <div v-else class="admin-table-wrap admin-observability-table-wrap">
                     <table class="admin-table admin-observability-table">
@@ -1851,10 +1877,10 @@
                       <p class="eyebrow">Endpoints</p>
                       <h3>Endpoint 统计</h3>
                     </div>
-                    <span>{{ adminRequestEndpointRows.length }} 项</span>
+                    <span>{{ adminMetricSize(adminSelectedRequestMetrics, 'endpoint_counts') }} 项</span>
                   </div>
                   <div v-if="!adminRequestEndpointRows.length" class="admin-observability-empty">
-                    当前没有 endpoint 统计。
+                    {{ adminSelectedRequestMetrics?.endpoint_counts == null ? '-- 数据不可用' : '暂无 endpoint 统计' }}
                   </div>
                   <div v-else class="admin-table-wrap admin-observability-table-wrap">
                     <table class="admin-table admin-observability-table">
@@ -1876,18 +1902,19 @@
                     <p class="eyebrow">Recent Errors</p>
                     <h3>最近错误摘要</h3>
                   </div>
-                  <span>{{ adminRecentRequestErrors.length }} 条</span>
+                  <span>{{ adminMetricSize(adminSelectedRequestMetrics, 'recent_errors') }} 条</span>
                 </div>
                 <div v-if="!adminRecentRequestErrors.length" class="admin-observability-empty">
-                  当前没有最近错误摘要。
+                  {{ adminSelectedRequestMetrics?.recent_errors == null ? '-- 数据不可用' : '暂无最近错误' }}
                 </div>
                 <div v-else class="admin-observability-error-list">
-                  <article v-for="error in adminRecentRequestErrors" :key="error.request_id + error.created_at" class="admin-observability-error">
+                  <article v-for="error in adminRecentRequestErrors" :key="adminRequestErrorKey(error)" class="admin-observability-error">
                     <div class="admin-observability-error-head">
                       <strong>{{ error.method }} {{ error.endpoint }}</strong>
                       <span>{{ error.status_code }} · {{ error.outcome }} · {{ error.duration_ms }}ms</span>
                     </div>
                     <div class="admin-observability-error-meta">
+                      <span v-if="error.service">{{ error.service }}</span>
                       <span>请求 ID {{ error.request_id }}</span>
                       <span>{{ formatDate(error.created_at) }}</span>
                     </div>
@@ -1900,24 +1927,26 @@
                     <p class="eyebrow">Account Email Delivery</p>
                     <h3 id="accountEmailDeliveryTitle">账号邮件投递</h3>
                   </div>
-                  <span>{{ admin.emailOutbox.records.length }} 条最近记录</span>
+                  <span class="admin-observability-badge" :data-status="admin.emailOutbox.status">{{ observabilityStatusLabel(admin.emailOutbox.status) }}</span>
                 </div>
+                <p v-if="admin.emailOutbox.status !== 'available'" class="admin-observability-warning" role="status">邮件汇总{{ observabilityStatusLabel(admin.emailOutbox.status) }}</p>
                 <div class="admin-observability-summary" aria-label="账号邮件投递摘要">
-                  <div class="admin-observability-stat"><span>待投递</span><strong>{{ admin.emailOutbox.summary.pending || 0 }}</strong></div>
-                  <div class="admin-observability-stat"><span>待重试</span><strong>{{ admin.emailOutbox.summary.retrying || 0 }}</strong></div>
-                  <div class="admin-observability-stat"><span>已发送</span><strong>{{ admin.emailOutbox.summary.sent || 0 }}</strong></div>
-                  <div class="admin-observability-stat"><span>失败</span><strong>{{ admin.emailOutbox.summary.failed || 0 }}</strong></div>
+                  <div class="admin-observability-stat"><span>待投递</span><strong>{{ adminEmailMetricValue('pending') }}</strong></div>
+                  <div class="admin-observability-stat"><span>待重试</span><strong>{{ adminEmailMetricValue('retrying') }}</strong></div>
+                  <div class="admin-observability-stat"><span>已发送</span><strong>{{ adminEmailMetricValue('sent') }}</strong></div>
+                  <div class="admin-observability-stat"><span>失败</span><strong>{{ adminEmailMetricValue('failed') }}</strong></div>
                 </div>
                 <div v-if="!admin.emailOutbox.records.length" class="admin-observability-empty">
-                  当前没有账号邮件投递记录。
+                  {{ admin.emailOutbox.status === 'available' ? '暂无账号邮件投递记录' : '-- 邮件记录不完整' }}
                 </div>
                 <div v-else class="admin-table-wrap admin-observability-table-wrap">
                   <table class="admin-table admin-observability-table">
                     <thead>
-                      <tr><th>收件账号</th><th>用途</th><th>状态</th><th>尝试</th><th>失败摘要</th><th>更新时间</th></tr>
+                      <tr><th>来源</th><th>收件账号</th><th>用途</th><th>状态</th><th>尝试</th><th>失败摘要</th><th>更新时间</th></tr>
                     </thead>
                     <tbody>
-                      <tr v-for="record in admin.emailOutbox.records" :key="record.id">
+                      <tr v-for="record in admin.emailOutbox.records" :key="adminEmailRecordKey(record)">
+                        <td>{{ record.owner || '--' }}</td>
                         <td>{{ record.recipient_email }}</td>
                         <td>{{ accountEmailPurposeLabel(record.purpose) }}</td>
                         <td>{{ accountEmailStatusLabel(record.status) }}</td>

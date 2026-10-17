@@ -45,7 +45,7 @@ public class WebSecurityConfiguration {
             WebSecuritySettings settings, ObjectMapper mapper, MeterRegistry metrics, ClientAddressResolver addresses) {
         var registration = new FilterRegistrationBean<>(new WebSecurityFilter(accounts, limiter, settings, mapper, metrics, addresses));
         registration.addUrlPatterns("/api/*");
-        registration.setOrder(Ordered.HIGHEST_PRECEDENCE);
+        registration.setOrder(Ordered.HIGHEST_PRECEDENCE + 1);
         return registration;
     }
 }

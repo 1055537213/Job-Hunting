@@ -14,7 +14,7 @@
 
 - Python 负责其余 FastAPI Web API、Agent、RAG、文件分析、简历生成和异步 AI 任务。
 - Java Spring Boot 平台服务分阶段接管账号、Session、权限和账务等平台能力。
-- 前端仍由 Python Web 提供；混合网关将浏览器认证路径分流给 Java，外部 URL 保持不变。
+- 前端仍由 Python Web 提供；混合网关将已迁移的平台 API 分流给 Java，外部 URL 保持不变。
 - master 保留纯 Python 版本；java-platform-migration 是独立的 Python+Java 版本。
 
 ### 解决的问题
@@ -88,7 +88,8 @@
 ### 运维与可观测性
 
 - Prometheus 请求指标和 Web 不可用、5xx、慢响应、安全拦截、高并发告警规则。
-- Java 支持显式可信代理、独立监控令牌和 Prometheus DNS 抓取；混合网关仅转发公开认证路径，不开放 Java 内部指标路径。
+- Java 支持显式可信代理、独立监控令牌和 Prometheus DNS 抓取；混合网关仅转发已迁移的公开 API，不开放 Java 内部指标路径。
+- 后台请求观测由 Java 汇总两端对外 API，内部调用单列；可按服务切换，缺失数据标为不可用，刷新失败保留旧快照并提示过期。
 - Alertmanager、SMTP、Loki、Alloy、Tempo、OpenTelemetry 和 Grafana 配置。
 - PostgreSQL/对象存储备份、恢复演练、Worker 恢复和 ClamAV 上传扫描验收脚本。
 
@@ -115,7 +116,7 @@
 - ClamAV：上传文件病毒扫描。
 - Prometheus/Alertmanager/Grafana/Loki/Tempo：指标、告警、日志、Trace 和可视化。
 - Docker Compose：开发、生产、混合、共存、恢复和验收拓扑。
-- Caddy 或共存 Nginx：HTTPS 入口；浏览器认证到 Java，其余页面/API 到 Python。
+- Caddy 或共存 Nginx：HTTPS 入口；已迁移的平台 API 到 Java，其余页面/API 到 Python。
 
 ### 质量与安全
 
@@ -312,11 +313,13 @@ PR 和 `master` 推送仍运行完整验收。部署门禁要求目标 SHA 的�
 | 计费 | GET /api/me/balance | 查询余额和消费摘要 |
 | RAG | GET /api/rag/search | 账号隔离检索 |
 | 运维 | GET /api/health | 应用健康检查 |
+| 运维 | GET /api/admin/observability/requests | 管理员读取两端 API/内部调用快照与邮件投递状态 |
 | 运维 | GET /internal/metrics | Prometheus 内部指标 |
 
 已登录的写操作需要同源 Cookie 和 X-CSRF-Token；管理接口需要管理员角色；资源接口校验账号归属；/internal/metrics 不应暴露到公网。
 
 Java 内部接口不面向浏览器开放，使用 X-Internal-Service-Token 和 X-Trace-Id。账号资料读取契约位于 platform-service/src/main/resources/auth-internal.openapi.yaml 的 POST /internal/v1/auth/accounts/me。
+请求观测的两端快照、不可用状态和邮件投递字段见 [观测接口契约](platform-service/src/main/resources/observability.openapi.yaml)。
 
 ## 9. 常见问题（FAQ）
 
@@ -326,11 +329,12 @@ AI、RAG、OCR 和多模态文件处理仍然依赖 Python 生态；Java 更适�
 
 ### Java 服务是否已经替代 Python 全部代码？
 
-没有。当前已迁移账号注册、Session、邮箱验证、邮箱变更、密码重置、管理员账号操作、当前账号资料读取、显示名称写入，以及余额查询、演示充值、模型扣费和管理员人工补款的可选 Java 账务路径。浏览器认证、个人中心账务、管理员账务、账号列表/启停、审计、用量、工具轨迹和后台任务进度查询经网关直达 Java；Python 仍处理工具执行与轨迹写入、任务投递/重试/状态写入、请求观测、其余 Web API、兼容适配、Agent、RAG、文件分析、简历生成和 Worker。
+没有。当前已迁移账号注册、Session、邮箱验证、邮箱变更、密码重置、管理员账号操作、当前账号资料读取、显示名称写入，以及余额查询、演示充值、模型扣费和管理员人工补款的可选 Java 账务路径。浏览器认证、个人中心账务、管理员账务、账号列表/启停、审计、用量、工具轨迹、后台任务查询/管理操作和请求观测入口经网关直达 Java；Python 仍处理工具执行与轨迹写入、任务可靠投递/重试/状态写入、进程指标采集、其余 Web API、兼容适配、Agent、RAG、文件分析、简历生成和 Worker。
 
 ### Java 服务不可用时会不会偷偷回退到 Python？
 
 不会。混合认证和 Java 账务路径会失败关闭，返回 503，避免出现双事实源、旧余额或绕过 Java 权限校验。
+请求观测在管理员鉴权成功后允许依赖服务部分不可用，缺失指标返回 null；这不是认证或业务写入回退。
 
 ### RAG 默认 Top-K 和 Top-N 是多少？
 

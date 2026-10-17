@@ -229,6 +229,15 @@ Java 不写任务表，通过带服务 Token/真实会话的内部命令调用 P
 Python 继续独占状态写入及执行，并由 Beat 补投 pending 命令；没有引入第二套任务状态机或 Java Celery 客户端。
 契约见 [`task-commands.openapi.yaml`](src/main/resources/task-commands.openapi.yaml)。
 
+`GET /api/admin/observability/requests` 由 Java 校验管理员会话并汇总两端进程快照。
+只有 `/api/*` 参与 API 合计，`/internal/*` 单独列出；HTML、静态资源、Actuator 不参与该合计。
+平均耗时使用总耗时/总请求数，不平均两个服务的平均值。缺失端以 null/不可用表示，不伪造 0。
+邮件汇总包含 Java 三类账号邮件和 Python 历史投递记录，字段显式投影、收件地址和错误脱敏。
+`PLATFORM_OBSERVABILITY_PYTHON_BASE_URL` 默认 `http://web:8000`，超时和响应体大小有界；
+回调使用服务 Token，内部兼容入口额外校验真实管理员 Session，公网不开放内部路径。
+快照不缓存、不持久化，服务重启独立清零，不是跨副本累计或历史监控；Prometheus 保持原有口径。
+无需数据库迁移，契约见 [`observability.openapi.yaml`](src/main/resources/observability.openapi.yaml)。
+
 - Java 服务和 Python 服务不能同时写同一组账务表。
 - Java 账务开关关闭时，`account_balances`、`recharge_orders`、`account_balance_ledger` 仍由 Python 独占写入；开关打开后，余额、模拟充值和模型扣费由 Java 独占写入。
 - 跨服务请求必须带幂等键和 trace id。

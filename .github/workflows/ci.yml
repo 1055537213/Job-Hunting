@@ -72,6 +72,7 @@ jobs:
           tests/test_platform_password_reset.py
           tests/test_platform_sessions.py
           tests/test_task_commands.py
+          tests/test_request_observability.py
 
       - name: Run lint
         run: ruff check src tests alembic

@@ -5,10 +5,11 @@
 混合部署通过 Caddy/Nginx 分流：`/api/auth/*`、`/api/account/password`，以及
 `GET /api/me/balance`、`GET /api/me/recharge/orders` 直达 Java；
 `POST /api/me/balance/recharge` 也直达 Java，要求 `JOB_AGENT_JAVA_BILLING_ENABLED=true`。
-管理员余额流水、充值订单、支付事件查询及人工补款公开入口同样直达 Java；其他后台聚合仍走 Python。
+管理员余额流水、充值订单、支付事件查询及人工补款公开入口同样直达 Java。
 管理员账号列表、启用/停用及审计查询公开入口也直达 Java，仍使用同一 Session、CSRF 和管理员限流。
 管理员用量汇总及 Token 明细查询同样直达 Java，Python 保留用量写入与定期清理。
 工具调用列表和详情也直达 Java，Python 保留实际执行、低敏轨迹写入和定期清理；列表不加载详情 JSON。
+任务查询、管理员重试/探针和请求观测入口也直达 Java；任务执行仍由 Python 负责，请求快照由两端分别采集。
 页面及其他 API 仍到 Python。Java 负责账号注册、密码校验、邮箱验证、密码重置、
 登录会话、退出、修改密码和可选账务。
 Java 使用 Spring Boot 4.0 / Java 21，JSON 序列化使用 Jackson 3；
@@ -145,5 +146,10 @@ bash <release-dir>/scripts/deploy_production.sh \
 任务查询按 GET 方法和精确路径分流，管理员重试/探针按具体 POST 路径分流至 Java，其他任务流量仍转至 Python。
 Java 通过 `PLATFORM_TASKS_PYTHON_BASE_URL=http://web:8000` 回调 Python；启动时不探测 Web，避免相互依赖。
 Java 端口只在容器网络内暴露。
+
+请求观测 `/api/admin/observability/requests` 也分流至 Java，后台可以分别查看两端 API 与内部调用。
+Compose 自动配置 `PLATFORM_OBSERVABILITY_PYTHON_BASE_URL=http://web:8000`；非容器本地验收脚本会配置对应回环地址。
+Java 不在启动阶段调用 Python；Python 未就绪时观测返回部分可用，合计未知而非 0，恢复后下次刷新自动恢复。
+纯 Python 模式不要求 Java 存在。本次无新数据库迁移，不需要修改已有服务凭据或开放新端口。
 
 这些步骤只建立可部署能力，不代表已经做过真实服务器演练；本分支暂不部署。

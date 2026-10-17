@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 from uuid import uuid4
 
@@ -165,6 +166,37 @@ class PlatformAuthClient:
         if not valid:
             raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502)
         return payload
+
+    def observability(self, *, session_token: str | None, trace_id: str | None = None) -> dict[str, Any]:
+        if not session_token:
+            raise PlatformAuthError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
+        try:
+            response = httpx.post(f"{self.base_url}/internal/v1/observability/requests", headers={
+                "X-Internal-Service-Token": self.internal_token, "X-Trace-Id": trace_id or uuid4().hex,
+            }, json={"session_token": session_token}, timeout=self.timeout_seconds)
+        except httpx.HTTPError as error:
+            raise PlatformAuthUnavailableError() from error
+        if response.status_code >= 500:
+            raise PlatformAuthUnavailableError()
+        try:
+            result = response.json()
+        except ValueError as error:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台观测服务响应无效。", 502) from error
+        if response.is_error:
+            message = result.get("message") or result.get("detail") if isinstance(result, dict) else None
+            raise PlatformAuthError("OBSERVABILITY_ERROR", str(message or "观测查询失败。"), response.status_code)
+        try:
+            valid = (isinstance(result, dict) and set(result) == {"status", "requests", "services", "account_email"}
+                     and result["status"] in {"available", "partial"}
+                     and (result["requests"] is None or _valid_request_metrics(result["requests"]))
+                     and isinstance(result["services"], dict) and set(result["services"]) == {"java", "python"}
+                     and all(_valid_service_snapshot(service) for service in result["services"].values())
+                     and _valid_email_snapshot(result["account_email"]))
+        except (KeyError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台观测服务响应无效。", 502)
+        return result
 
     def task_command(self, *, session_token: str | None, operation: str, task_key: str | None,
                      idempotency_key: str | None, trace_id: str | None = None) -> dict[str, Any]:
@@ -505,6 +537,52 @@ class PlatformAuthClient:
                 "INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502
             )
         return payload
+
+
+def _valid_request_metrics(value: Any) -> bool:
+    counts = ("total_requests", "in_flight_requests", "total_duration_ms", "error_requests", "max_duration_ms",
+              "rate_limited_requests", "rate_limit_backend_errors", "csrf_rejected_requests", "exception_requests")
+    fields = {*counts, "average_duration_ms", "started_at", "status_counts", "method_counts", "endpoint_counts", "outcome_counts", "recent_errors"}
+    return (isinstance(value, dict) and set(value) == fields and isinstance(value["started_at"], str)
+            and all(type(value.get(key)) in (int, float) and math.isfinite(value[key]) and value[key] >= 0 for key in (*counts, "average_duration_ms"))
+            and all(isinstance(value.get(key), dict) and len(value[key]) <= 260
+                    and all(isinstance(k, str) and len(k) <= 512 and type(v) is int and v >= 0 for k, v in value[key].items())
+                    for key in ("status_counts", "method_counts", "endpoint_counts", "outcome_counts"))
+            and isinstance(value.get("recent_errors"), list) and len(value["recent_errors"]) <= 20
+            and all(isinstance(error, dict) and set(error) in (
+                {"request_id", "method", "endpoint", "status_code", "outcome", "duration_ms", "created_at"},
+                {"request_id", "method", "endpoint", "status_code", "outcome", "duration_ms", "created_at", "service"})
+                and all(isinstance(error[k], str) and len(error[k]) <= 512 for k in ("request_id", "method", "endpoint", "outcome", "created_at"))
+                and type(error["status_code"]) is int and 100 <= error["status_code"] <= 599
+                and type(error["duration_ms"]) in (int, float) and math.isfinite(error["duration_ms"]) and error["duration_ms"] >= 0
+                and ("service" not in error or error["service"] in {"java", "python"}) for error in value["recent_errors"]))
+
+
+def _valid_service_snapshot(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {"status", "api", "internal", "observed_at"}:
+        return False
+    if value["status"] == "available":
+        return all(_valid_request_metrics(value[key]) for key in ("api", "internal")) and isinstance(value["observed_at"], str)
+    return value["status"] in {"unavailable", "not_configured"} and all(value[key] is None for key in ("api", "internal", "observed_at"))
+
+
+def _valid_email_snapshot(value: Any) -> bool:
+    fields = {"id", "account_id", "purpose", "recipient_email", "status", "attempt_count", "max_attempts",
+              "last_error_type", "last_error_summary", "created_at", "updated_at", "owner"}
+    statuses = {"pending", "sending", "retrying", "sent", "failed", "cancelled"}
+    if not isinstance(value, dict) or set(value) != {"status", "summary", "records"} or value["status"] not in {"available", "partial", "unavailable"}:
+        return False
+    summary = value["summary"]
+    if summary is not None and (not isinstance(summary, dict) or not set(summary) <= statuses
+                                or not all(type(n) is int and n >= 0 for n in summary.values())):
+        return False
+    return (isinstance(value["records"], list) and len(value["records"]) <= 20
+            and all(isinstance(row, dict) and set(row) == fields and row["owner"] in {"java", "python"}
+                    and row["purpose"] in {"verify_email", "reset_password", "change_email"} and row["status"] in statuses
+                    and all(type(row[k]) is int and row[k] >= 0 for k in ("id", "account_id", "attempt_count", "max_attempts"))
+                    and isinstance(row["recipient_email"], str) and "***" in row["recipient_email"] and len(row["recipient_email"]) <= 254
+                    and all(row[k] is None or isinstance(row[k], str) for k in ("last_error_type", "last_error_summary"))
+                    and all(isinstance(row[k], str) for k in ("created_at", "updated_at")) for row in value["records"]))
 
 
 def _valid_task_projection(value: Any, *, admin: bool) -> bool:

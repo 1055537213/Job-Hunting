@@ -215,7 +215,8 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
     """Runs while the isolated Python Web is stopped; every tested route must reach Java."""
     paths = ["/api/admin/balance/events", "/api/admin/recharge/orders", f"/api/admin/recharge/orders/{order_id}/events",
              "/api/admin/accounts", "/api/admin/audit/events", "/api/admin/usage/summary", "/api/admin/usage/events",
-             "/api/admin/tools/traces", f"/api/admin/tools/traces/gateway-tool-{account_id}-1", "/api/admin/tasks"]
+             "/api/admin/tools/traces", f"/api/admin/tools/traces/gateway-tool-{account_id}-1", "/api/admin/tasks",
+             "/api/admin/observability/requests"]
     for path in paths:
         assert user.get(path).status_code == 403
     path = f"/api/admin/accounts/{account_id}/balance/credit"
@@ -226,6 +227,16 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
         login = admin.post("/api/auth/login", json={"email": credentials[0], "password": credentials[1]})
         assert login.status_code == 200, login.text[:300]
         headers = {"X-CSRF-Token": login.json()["csrf_token"], "X-Request-ID": "gateway-admin-credit-trace"}
+        observation = admin.get("/api/admin/observability/requests")
+        assert observation.status_code == 200, observation.text[:500]
+        partial = observation.json()
+        assert partial["status"] == "partial" and partial["requests"] is None
+        assert partial["services"]["java"]["status"] == "available"
+        assert partial["services"]["java"]["api"]["total_requests"] > 0
+        assert partial["services"]["python"] == {
+            "status": "unavailable", "api": None, "internal": None, "observed_at": None}
+        assert partial["account_email"]["status"] == "partial" and partial["account_email"]["summary"] is None
+        assert observation.headers["cache-control"] == "no-store"
         assert admin.post(path, json=body).status_code == 403
         credited = admin.post(path, json=body, headers=headers)
         assert credited.status_code == 200, credited.text[:300]
@@ -348,6 +359,7 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
             assert revoked.get("/api/admin/tools/traces").status_code == 401
             assert revoked.get(f"/api/admin/tools/traces/gateway-tool-{account_id}-1").status_code == 401
             assert revoked.get("/api/admin/tasks").status_code == 401
+            assert revoked.get("/api/admin/observability/requests").status_code == 401
             assert revoked.post(path, json=body, headers=headers).status_code == 401
     print("==> Java admin billing -> RBAC/CSRF/pagination/events/self-credit/replay/revocation with Python stopped: PASS")
     print("==> Java admin account list/status/audit -> safe fields/CSRF/session revocation/pagination with Python stopped: PASS")
@@ -444,6 +456,46 @@ def run_task_command_flow(gateway_url, web_url, java_url, token, credentials, da
         finally:
             store.close()
     print("==> Java commands -> Python durable intent/audit -> Redis/real Worker -> replay/conflict/CSRF/queue outage recovery: PASS")
+
+
+def run_observability_gateway_flow(gateway_url: str, web_url: str, internal_token: str,
+                                    credentials: tuple[str, str]) -> None:
+    """Check real aggregation after Python recovery, without mocks or application data."""
+    with httpx.Client(base_url=gateway_url, timeout=10) as admin:
+        login = admin.post("/api/auth/login", json={"email": credentials[0], "password": credentials[1]})
+        assert login.status_code == 200, login.text[:300]
+        assert admin.get("/internal/v1/observability/requests").status_code == 404
+        assert httpx.get(web_url + "/internal/v1/observability/requests").status_code == 401
+        assert admin.get("/api/health").status_code == 200
+        assert admin.get("/api/auth/me").status_code == 200
+        response = admin.get("/api/admin/observability/requests?private=must-not-leak")
+        assert response.status_code == 200, response.text[:500]
+        data = response.json()
+        assert data["status"] == "available", data
+        assert response.headers["cache-control"] == "no-store"
+        snapshots = [data["services"][name]["api"] for name in ("java", "python")]
+        for name in ("java", "python"):
+            assert data["services"][name]["status"] == "available"
+            assert data["services"][name]["api"]["total_requests"] > 0
+            assert data["services"][name]["internal"]["total_requests"] > 0
+        assert data["requests"]["total_requests"] == sum(item["total_requests"] for item in snapshots)
+        assert data["requests"]["total_duration_ms"] == sum(item["total_duration_ms"] for item in snapshots)
+        expected_average = data["requests"]["total_duration_ms"] / data["requests"]["total_requests"]
+        assert abs(data["requests"]["average_duration_ms"] - expected_average) <= 0.01
+        assert all(key.startswith(("java:", "python:")) for key in data["requests"]["endpoint_counts"])
+        assert "must-not-leak" not in str(data)
+        for row in data["account_email"]["records"]:
+            assert "***" in row["recipient_email"]
+            assert row["owner"] in {"java", "python"}
+            assert "delivery_key" not in row and "action_url" not in row
+        forwarded = httpx.get(web_url + "/api/admin/observability/requests", cookies=admin.cookies, timeout=10)
+        assert forwarded.status_code == 200, forwarded.text[:500]
+        assert forwarded.json()["status"] == "available"
+        direct = httpx.get(web_url + "/internal/v1/observability/requests", headers={
+            "X-Internal-Service-Token": internal_token}, timeout=10)
+        assert direct.status_code == 200 and direct.json()["status"] == "available"
+        assert direct.headers["cache-control"] == "no-store"
+    print("==> Java/Python observability -> scoped/weighted aggregation -> private callback -> Python outage/recovery: PASS")
 
 
 def wait(url: str) -> None:
@@ -636,6 +688,9 @@ def main() -> None:
                               f"http://127.0.0.1:{args.port}", token, admin_credentials, isolated_url, worker, broker)
         # This randomly named Redis belongs only to this test. Give the limiter stage
         # its own empty window, independent of preceding browser/Worker acceptance traffic.
+        docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
+        run_observability_gateway_flow(f"http://127.0.0.1:{args.port + 2}",
+                                      f"http://127.0.0.1:{args.port + 1}", token, admin_credentials)
         docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
         run_java_security_flow(f"http://127.0.0.1:{args.port}", token, admin_credentials, redis_name)
         run_java_ingress_flow(f"http://127.0.0.1:{args.port}", metrics_token, token)

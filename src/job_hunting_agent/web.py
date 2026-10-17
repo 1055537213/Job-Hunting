@@ -22,7 +22,7 @@ import secrets
 import time
 import uuid
 from dataclasses import asdict
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import quote
@@ -3089,26 +3089,33 @@ def create_web_app(
         }
 
     @web_app.get("/api/admin/observability/requests")
-    def admin_request_metrics(request: Request) -> dict[str, object]:
-        """管理员查看当前 Web 进程的低敏请求指标。"""
+    def admin_request_metrics(request: Request, response: Response) -> dict[str, object]:
+        """管理员读取低敏快照；Java 模式不回退到 Python 汇总。"""
 
-        require_admin(request)
-        email_records = backend.store.list_account_email_outbox(limit=20)
-        platform_emails = []
+        response.headers["Cache-Control"] = "no-store"
         if backend.platform_auth_client is not None:
             try:
-                platform_emails = [
-                    backend.platform_auth_client.email_verification("observations"),
-                    backend.platform_auth_client.password_reset("observations"),
-                ]
+                return backend.platform_auth_client.observability(
+                    session_token=request.cookies.get(SESSION_COOKIE_NAME), trace_id=getattr(request.state, "request_id", None))
             except PlatformAuthError as error:
                 raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
-        result = {
-            "requests": web_app.state.request_metrics.snapshot(),
-            "account_email": {
+        require_admin(request)
+        runtime = request_observability_snapshot()
+        return {"status": "available" if runtime["account_email"]["status"] == "available" else "partial",
+                "requests": runtime["api"], "services": {
+                    "python": {key: value for key, value in runtime.items() if key != "account_email"},
+                    "java": {"status": "not_configured", "api": None, "internal": None, "observed_at": None}},
+                "account_email": runtime["account_email"]}
+
+    def request_observability_snapshot():
+        try:
+            email_records = backend.store.list_account_email_outbox(limit=20)
+            email = {
+                "status": "available",
                 "summary": backend.store.summarize_account_email_outbox(),
                 "records": [
                     {
+                        "owner": "python",
                         "id": record.id,
                         "account_id": record.account_id,
                         "purpose": record.purpose,
@@ -3116,25 +3123,32 @@ def create_web_app(
                         "status": record.status,
                         "attempt_count": record.attempt_count,
                         "max_attempts": record.max_attempts,
-                        "last_error_type": record.last_error_type,
-                        "last_error_summary": record.last_error_summary,
+                        "last_error_type": (record.last_error_type if record.last_error_type is None
+                                            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,127}", record.last_error_type) else "DeliveryError"),
+                        "last_error_summary": "邮件投递未完成。" if record.last_error_type else None,
                         "created_at": record.created_at,
                         "updated_at": record.updated_at,
                     }
                     for record in email_records
                 ],
-            },
-        }
-        for platform_email in platform_emails:
-            for status, count in platform_email["summary"].items():
-                result["account_email"]["summary"][status] += int(count)
-            for record in platform_email["records"]:
-                record["recipient_email"] = redact_email(record["recipient_email"])
-            result["account_email"]["records"] = sorted(
-                result["account_email"]["records"] + platform_email["records"],
-                key=lambda record: datetime.fromisoformat(record["created_at"]), reverse=True,
-            )[:20]
-        return result
+            }
+        except Exception:  # noqa: BLE001 - metrics remain available when the legacy email store is unavailable.
+            email = {"status": "unavailable", "summary": None, "records": []}
+        return {"status": "available", "api": web_app.state.api_request_metrics.snapshot(),
+                "internal": web_app.state.internal_request_metrics.snapshot(),
+                "observed_at": datetime.now(UTC).isoformat(), "account_email": email}
+
+    @web_app.get("/internal/v1/observability/requests", include_in_schema=False)
+    async def internal_request_observability(request: Request):
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            raise HTTPException(401, "内部服务认证失败。")
+        # Compatibility handlers may occupy FastAPI's sync pool while waiting on Java.
+        snapshot = await asyncio.to_thread(request_observability_snapshot)
+        return JSONResponse(snapshot, headers={"Cache-Control": "no-store"})
 
     @web_app.get("/api/admin/audit/events")
     def admin_audit_events(

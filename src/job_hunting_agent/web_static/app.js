@@ -161,9 +161,17 @@ if (!window.Vue) {
             summary: {},
             by_account: [],
           },
-          requestMetrics: {},
+          requestMetrics: null,
+          observabilityScope: "all",
+          observabilityServices: null,
+          observabilityStatus: "unavailable",
+          observabilityLoading: false,
+          observabilityStale: false,
+          observabilityError: "",
+          observabilityRequestVersion: 0,
           emailOutbox: {
-            summary: {},
+            status: "unavailable",
+            summary: null,
             records: [],
           },
           backgroundTasks: [],
@@ -438,24 +446,40 @@ if (!window.Vue) {
         return this.admin.toolTraceDetail || this.selectedAdminToolTrace;
       },
 
+      adminSelectedRequestMetrics() {
+        if (this.admin.observabilityScope === "all") return this.admin.requestMetrics;
+        const [service, kind] = this.admin.observabilityScope.split("_");
+        const snapshot = this.admin.observabilityServices?.[service];
+        return snapshot?.status === "available" ? snapshot[kind === "internal" ? "internal" : "api"] ?? null : null;
+      },
+
+      adminObservabilityServices() {
+        if (!this.admin.observabilityServices) return [];
+        return ["java", "python"].map((service) => ({
+          service,
+          label: service === "java" ? "Java" : "Python",
+          ...this.admin.observabilityServices[service],
+        }));
+      },
+
       /** 按管理员需要把请求指标对象转成低基数排序行。 */
       adminRequestStatusRows() {
-        return this.sortedMetricRows(this.admin.requestMetrics.status_counts, 4);
+        return this.sortedMetricRows(this.adminSelectedRequestMetrics?.status_counts, 4);
       },
 
       /** 展示请求方法分布，便于判断是 GET/POST 哪类入口占主导。 */
       adminRequestMethodRows() {
-        return this.sortedMetricRows(this.admin.requestMetrics.method_counts, 8);
+        return this.sortedMetricRows(this.adminSelectedRequestMetrics?.method_counts, 8);
       },
 
       /** 展示低基数 endpoint 统计，帮助管理员识别热点路由。 */
       adminRequestEndpointRows() {
-        return this.sortedMetricRows(this.admin.requestMetrics.endpoint_counts, 12);
+        return this.sortedMetricRows(this.adminSelectedRequestMetrics?.endpoint_counts, 12);
       },
 
       /** 最近错误按时间倒序展示。 */
       adminRecentRequestErrors() {
-        return [...(this.admin.requestMetrics.recent_errors || [])];
+        return [...(this.adminSelectedRequestMetrics?.recent_errors || [])];
       },
 
       /** 管理员审计事件按后端返回顺序展示，默认是最新在前。 */
@@ -497,8 +521,8 @@ if (!window.Vue) {
             short: "观测",
             title: "请求观测",
             description: "请求与错误概览",
-            count: this.admin.requestMetrics.total_requests || 0,
-            badge: `${this.adminRecentRequestErrors.length} 条错误`,
+            count: this.adminMetricValue(this.adminSelectedRequestMetrics, "total_requests"),
+            badge: `${this.adminSelectedRequestMetrics?.recent_errors?.length ?? "--"} 条错误`,
           },
           {
             key: "audit",
@@ -524,7 +548,7 @@ if (!window.Vue) {
       adminSectionDescription() {
         return {
           usage: "先看账号，再看余额状态、Token、余额流水和工具调用。",
-          observability: "看请求量、错误分布、限流与 CSRF 拦截。",
+          observability: "请求量 · 错误分布 · 安全拦截",
           audit: "记录状态变更、会话操作和系统探针。",
         }[this.admin.activeSection] || "后台管理";
       },
@@ -532,15 +556,17 @@ if (!window.Vue) {
       /** 当前模块顶部的 KPI 卡片。 */
       adminSectionKpis() {
         if (this.admin.activeSection === "observability") {
+          const metrics = this.adminSelectedRequestMetrics;
           return [
-            { label: "HTTP 请求", value: this.admin.requestMetrics.total_requests || 0, hint: "进程内累计" },
-            { label: "错误请求", value: this.admin.requestMetrics.error_requests || 0, hint: "4xx / 5xx" },
-            { label: "平均耗时", value: `${this.admin.requestMetrics.average_duration_ms || 0}ms`, hint: "单机快照" },
+            { label: "HTTP 请求", value: this.adminMetricValue(metrics, "total_requests"), hint: "累计" },
+            { label: "错误请求", value: this.adminMetricValue(metrics, "error_requests"), hint: "4xx / 5xx" },
+            { label: "平均耗时", value: this.adminMetricValue(metrics, "average_duration_ms", "ms"), hint: "当前快照" },
             {
               label: "安全拦截",
               value:
-                (this.admin.requestMetrics.rate_limited_requests || 0) +
-                (this.admin.requestMetrics.csrf_rejected_requests || 0),
+                metrics?.rate_limited_requests != null && metrics?.csrf_rejected_requests != null
+                  ? metrics.rate_limited_requests + metrics.csrf_rejected_requests
+                  : "--",
               hint: "限流 + CSRF",
             },
           ];
@@ -1272,6 +1298,10 @@ if (!window.Vue) {
 
       /** 按当前后台模块刷新对应数据，默认先保住“用量与账号”的首屏体验。 */
       async refreshAdminSection() {
+        if (this.admin.activeSection === "observability") {
+          await this.loadAdminObservability();
+          return;
+        }
         if (this.admin.activeSection === "audit") {
           await Promise.all([
             this.loadAdminAuditEvents(),
@@ -1282,13 +1312,80 @@ if (!window.Vue) {
         await this.loadAdminData();
       },
 
+      /** Missing observations must stay distinct from measured zeroes. */
+      adminMetricValue(metrics, key, suffix = "") {
+        return metrics?.[key] == null ? "--" : `${metrics[key]}${suffix}`;
+      },
+
+      adminMetricSize(metrics, key) {
+        const value = metrics?.[key];
+        return value == null ? "--" : Object.keys(value).length;
+      },
+
+      adminEmailMetricValue(key) {
+        return this.admin.emailOutbox.status === "available"
+          ? this.adminMetricValue(this.admin.emailOutbox.summary, key)
+          : "--";
+      },
+
+      observabilityStatusLabel(status) {
+        return {
+          available: "可用",
+          partial: "部分可用",
+          unavailable: "不可用",
+          not_configured: "未配置",
+        }[status] || "不可用";
+      },
+
+      adminEmailRecordKey(record) {
+        return JSON.stringify([record.owner || "legacy", record.id]);
+      },
+
+      adminRequestErrorKey(error) {
+        return JSON.stringify([error.service || this.admin.observabilityScope, error.request_id, error.created_at]);
+      },
+
+      /** Apply service and mail snapshots together without inventing missing counts. */
+      applyAdminObservability(data) {
+        // Older native snapshots do not include a service breakdown.
+        this.admin.observabilityServices = data.services ?? null;
+        this.admin.requestMetrics = data.requests ?? null;
+        this.admin.observabilityStatus = data.status || (data.requests ? "available" : "unavailable");
+        const email = data.account_email;
+        this.admin.emailOutbox = {
+          status: email?.status || (email?.summary ? "available" : "unavailable"),
+          summary: email?.summary ?? null,
+          records: email?.records || [],
+        };
+      },
+
+      /** Refresh independently of account data and ignore superseded requests. */
+      async loadAdminObservability() {
+        const version = (this.admin.observabilityRequestVersion || 0) + 1;
+        this.admin.observabilityRequestVersion = version;
+        this.admin.observabilityLoading = true;
+        try {
+          const data = await this.requestJson("/api/admin/observability/requests");
+          if (version !== this.admin.observabilityRequestVersion) return;
+          this.applyAdminObservability(data);
+          this.admin.observabilityStale = false;
+          this.admin.observabilityError = "";
+        } catch (error) {
+          if (version !== this.admin.observabilityRequestVersion) return;
+          this.admin.observabilityStale = true;
+          this.admin.observabilityError = error.message || "请求观测加载失败";
+        } finally {
+          if (version === this.admin.observabilityRequestVersion) this.admin.observabilityLoading = false;
+        }
+      },
+
       /** 加载账号列表和汇总；Token 明细在管理员选择账号后按账号请求。 */
       async loadAdminData() {
+        const observabilityLoad = this.loadAdminObservability();
         try {
-          const [accounts, summary, requestMetrics] = await Promise.all([
+          const [accounts, summary] = await Promise.all([
             this.requestJson("/api/admin/accounts"),
             this.requestJson("/api/admin/usage/summary"),
-            this.requestJson("/api/admin/observability/requests"),
           ]);
           this.admin.accounts = accounts.accounts || [];
           this.admin.summary = {
@@ -1303,11 +1400,6 @@ if (!window.Vue) {
           };
           this.admin.ledgerPageSize = Number(summary.page_size || ADMIN_LEDGER_PAGE_SIZE);
           this.admin.ledgerMaxPages = Number(summary.max_pages || ADMIN_LEDGER_MAX_PAGES);
-          this.admin.requestMetrics = requestMetrics.requests || {};
-          this.admin.emailOutbox = requestMetrics.account_email || {
-            summary: {},
-            records: [],
-          };
           this.admin.loadError = "";
           await this.loadAdminAuditEvents();
 
@@ -1322,6 +1414,8 @@ if (!window.Vue) {
           await this.loadAdminActiveDetail(selectedAccountId);
         } catch (error) {
           this.admin.loadError = error.message || "后台数据加载失败，请稍后重试。";
+        } finally {
+          await observabilityLoad;
         }
       },
 

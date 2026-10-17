@@ -901,11 +901,12 @@ def test_admin_can_read_low_cardinality_request_metrics(tmp_path) -> None:
     assert metrics["average_duration_ms"] >= 0
     assert "/api/auth/login" in metrics["endpoint_counts"]
     latest_error = metrics["recent_errors"][0]
-    assert latest_error["endpoint"] == "/api/missing"
+    assert latest_error["endpoint"] == "unmatched"
     assert "secret" not in str(metrics)
     email_delivery = response.json()["account_email"]
     assert email_delivery["summary"]["pending"] == 1
     assert email_delivery["records"][0] == {
+        "owner": "python",
         "id": outbox.id,
         "account_id": target.id,
         "purpose": "reset_password",

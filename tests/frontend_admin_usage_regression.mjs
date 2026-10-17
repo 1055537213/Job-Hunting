@@ -92,7 +92,7 @@ assert.match(source, /selectedAccountId:\s*0/);
 assert.match(source, /loadingEvents:\s*false/);
 assert.match(source, /toolTraces:\s*\[\]/);
 assert.match(source, /auditEvents:\s*\[\]/);
-assert.match(source, /requestMetrics:\s*\{\}/);
+assert.match(source, /requestMetrics:\s*null/);
 assert.match(source, /selectedToolTraceId:\s*""/);
 assert.match(source, /usageTotal:\s*0/);
 assert.match(source, /usagePage:\s*1/);
@@ -181,6 +181,14 @@ assert.doesNotMatch(styles, /--admin-bar\s*:\s*oklch\(/);
 const loadAdminData = extractMethod(
   "async loadAdminData() {",
   "async function loadAdminData() {",
+);
+const loadAdminObservability = extractMethod(
+  "async loadAdminObservability() {",
+  "async function loadAdminObservability() {",
+);
+const applyAdminObservability = extractMethod(
+  "applyAdminObservability(data) {",
+  "function applyAdminObservability(data) {",
 );
 const loadAdminAuditEvents = extractMethod(
   "async loadAdminAuditEvents() {",
@@ -446,6 +454,8 @@ const adminLoadContext = {
   },
 };
 
+adminLoadContext.loadAdminObservability = loadAdminObservability;
+adminLoadContext.applyAdminObservability = applyAdminObservability;
 await loadAdminData.call(adminLoadContext);
 assert.deepEqual(adminLoadUrls.sort(), [
   "/api/admin/accounts",
@@ -467,6 +477,19 @@ assert.equal(adminLoadContext.admin.emailOutbox.summary.sent, 3);
 assert.equal(adminLoadContext.admin.emailOutbox.records[0].recipient_email, "a***@example.com");
 assert.equal(adminLoadContext.admin.billing.summary.account_count, 1);
 assert.equal(adminLoadContext.admin.billing.by_account[0].state_label, "余额");
+
+const successfulAdminRequest = adminLoadContext.requestJson;
+adminLoadContext.requestJson = async (url) => {
+  if (url === "/api/admin/observability/requests") throw new Error("观测暂时不可用");
+  return successfulAdminRequest(url);
+};
+adminLoadContext.admin.accounts = [];
+await loadAdminData.call(adminLoadContext);
+assert.equal(adminLoadContext.admin.accounts[0].id, 7);
+assert.equal(adminLoadContext.admin.loadError, "");
+assert.equal(adminLoadContext.admin.observabilityStale, true);
+assert.equal(adminLoadContext.admin.requestMetrics.total_requests, 12);
+assert.equal(adminLoadContext.admin.observabilityError, "观测暂时不可用");
 
 const auditUrls = [];
 const auditContext = {

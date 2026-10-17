@@ -26,6 +26,7 @@ import tools.jackson.databind.ObjectMapper;
 
 public class WebSecurityFilter extends OncePerRequestFilter {
     public static final String ACCOUNT_ATTRIBUTE = WebSecurityFilter.class.getName() + ".account";
+    public static final String OUTCOME_ATTRIBUTE = WebSecurityFilter.class.getName() + ".outcome";
     private static final Logger LOG = LoggerFactory.getLogger(WebSecurityFilter.class);
     private static final Set<String> SAFE = Set.of("GET", "HEAD", "OPTIONS");
     private static final Set<String> ANONYMOUS = Set.of(
@@ -138,6 +139,7 @@ public class WebSecurityFilter extends OncePerRequestFilter {
             LOG.error("Platform request failed request_id={} error_type={}", id, error.getClass().getSimpleName());
             if (!response.isCommitted()) reject(response, 503, "PLATFORM_UNAVAILABLE", "平台服务暂时不可用，请稍后重试。", id, 0);
         } finally {
+            raw.setAttribute(OUTCOME_ATTRIBUTE, outcome);
             // Only finite groups/status families are tags, never raw paths, account IDs or tokens.
             String status = (response.getStatus() / 100) + "xx";
             metrics.counter("platform.web.requests", "group", group, "status", status, "outcome", outcome).increment();

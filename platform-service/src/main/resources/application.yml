@@ -46,6 +46,10 @@ platform:
     token: ${PLATFORM_METRICS_TOKEN:}
     token-file: ${PLATFORM_METRICS_TOKEN_FILE:}
   internal-token: ${PLATFORM_INTERNAL_TOKEN:}
+  observability:
+    python-base-url: ${PLATFORM_OBSERVABILITY_PYTHON_BASE_URL:http://web:8000}
+    connect-timeout-ms: ${PLATFORM_OBSERVABILITY_CONNECT_TIMEOUT_MS:1000}
+    read-timeout-ms: ${PLATFORM_OBSERVABILITY_READ_TIMEOUT_MS:2000}
   auth:
     enabled: ${PLATFORM_AUTH_ENABLED:false}
   tasks:

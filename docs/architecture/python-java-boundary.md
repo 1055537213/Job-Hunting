@@ -234,6 +234,26 @@ Worker 继续使用原子认领和既有业务幂等机制防止重复副作用�
 本地/生产网关同步具体 POST 路径，内部接口不对公网开放。隔离 Docker 验收使用独立 Redis broker 和真实 Worker，
 验证鉴权、CSRF、命令重放、改意图冲突、Python 兼容回调、队列故障和恢复，不接触服务器或日常容器。
 
+## 请求观测统一入口
+
+`GET /api/admin/observability/requests` 经本地和生产混合网关直达 Java，复用真实管理员 Session/RBAC、限流、请求 ID 和 no-store。
+Python 兼容入口仅转发真实 Session，不在 Java 故障时回读本地快照或邮件表。
+Java 向 Python 私有 `GET /internal/v1/observability/requests` 获取低敏快照，使用共享服务 Token，不携带 Cookie。
+回调采用独立于 FastAPI 同步处理池的线程执行，避免并发兼容入口等待 Java 时耗尽回调线程。
+连接最多 1 秒、完整响应最多 2 秒、响应体最多 1 MiB，不重定向；生产目标必须是内部服务地址。
+
+两端各维护 `/api/*` 和 `/internal/*` 两套线程安全快照。仅对外 API 相加，内部调用不加入总数，避免跨语言调用重复计数。
+耗时按总耗时/总请求数加权，最大耗时取最大值；聚合 endpoint 加 java/python 前缀，最近错误最多 20 条并带服务来源。
+端点只用路由模板或 unmatched/other，方法和结果有界，不保存任意 URL、查询参数、正文或 Cookie。
+Java 邮件三种用途和 Python 历史投递记录分别读取，合并最新 20 条，保留 owner，收件地址及错误显式脱敏。
+任一邮件来源不可用时邮件汇总未知，仍可显示有效请求指标；任一请求来源不可用时 API 合计为 null，仍保留另一端数据。
+
+后台允许切换 API 合计/单端 API/单端内部调用；真实 0 与不可用分开，刷新失败保留旧快照并提示过期。
+观测刷新不阻塞账号与用量展示，过期的并发响应不能覆盖较新数据。纯 Python 模式仍可使用，Java 标为未配置。
+快照随各进程独立重启清零，不缓存、不中转到 Redis、不写数据库，也不声称是跨副本全局累计。
+原有 Prometheus 采集与告警不改口径；需要历史趋势或多副本汇总时使用 Prometheus。
+无数据库结构迁移。隔离 Docker 验收覆盖网关分流、加权合计、兼容回调、Python 暂停降级及恢复和权限拒绝。
+
 ## Java 安全入口准备阶段
 
 Java `/api/*` 已增加真实 Session/RBAC、Redis 原子滑动窗口限流、CSRF、安全响应头、

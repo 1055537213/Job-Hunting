@@ -12,6 +12,16 @@ Grafana 预置 Prometheus、Loki 和 Tempo 三个数据源。JSON 日志包含�
 
 ## 隐私和基数边界
 
+管理后台的“请求观测”是另一条即时快照链路，不直接查询 Prometheus：
+
+- 混合模式：浏览器 `GET /api/admin/observability/requests` 到 Java，Java 验证管理员并读取两端进程快照。
+- 默认 API 合计仅汇总 `/api/*`，可切换 Java/Python API 或各自内部调用；页面、静态文件及内部通信不混入 API 合计。
+- 平均耗时按两端总耗时除以总请求数计算；endpoint 和最近错误带服务来源，不使用用户输入的未知 URL 作为维度。
+- 任一请求来源不可用时合计为未知，另一端仍可查看；邮件来源故障仅使邮件汇总不完整，不抹掉有效请求数据。
+- 刷新失败保留最后成功快照并标注过期；真实测得的 0 与未获取的数据分别显示为 0 和 `--`。
+- 快照不入库、不缓存，各进程重启独立清零，不是跨副本或持久累计指标；历史趋势和多副本监控仍使用 Prometheus。
+- Python 原有 Prometheus 指标与 Java Micrometer 指标保留原口径，不能直接用后台 API 合计替代既有告警表达式。
+
 - HTTP Trace 只记录方法、路由模板、状态码和 request ID，不记录查询参数、请求头或请求正文。
 - SQLAlchemy 插件记录参数化 SQL 操作，不记录绑定参数；业务代码仍不得把用户正文拼进 SQL 文本。
 - 日志格式化器会遮盖常见密码、Bearer Token、API Key 和带密码 URL。

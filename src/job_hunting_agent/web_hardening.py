@@ -73,6 +73,8 @@ def install_web_hardening(
     limiter = rate_limiter or build_rate_limiter(settings)
     metrics = RequestMetrics()
     web_app.state.request_metrics = metrics
+    web_app.state.api_request_metrics = RequestMetrics(safe_routes=True)
+    web_app.state.internal_request_metrics = RequestMetrics(safe_routes=True)
     web_app.state.rate_limiter = limiter
 
     @web_app.middleware("http")
@@ -81,6 +83,10 @@ def install_web_hardening(
         request.state.request_id = request_id
         started_at = time.monotonic()
         metrics.mark_started()
+        scoped = (web_app.state.api_request_metrics if request.url.path.startswith("/api/") else
+                  web_app.state.internal_request_metrics if request.url.path.startswith("/internal/") else None)
+        if scoped is not None:
+            scoped.mark_started()
         response: Response | None = None
         status_code = 500
         outcome = "handled"
@@ -162,13 +168,17 @@ def install_web_hardening(
                 duration_ms=duration_ms,
                 outcome=outcome,
             )
+            if scoped is not None:
+                scoped.record(request=request, request_id=request_id, status_code=status_code,
+                              duration_ms=duration_ms, outcome=outcome)
             log_access(request, status_code, duration_ms, outcome=outcome)
 
 
 class RequestMetrics:
     """进程内请求指标聚合器，不保存请求正文或查询参数。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, safe_routes: bool = False) -> None:
+        self._safe_routes = safe_routes
         self.started_at = datetime.now(UTC).isoformat(timespec="seconds")
         self._lock = threading.Lock()
         self._in_flight = 0
@@ -201,6 +211,9 @@ class RequestMetrics:
         status_family = f"{max(1, min(status_code // 100, 5))}xx"
         method = request.method.upper()
         endpoint = route_template(request)
+        if self._safe_routes:
+            method = method if method in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"} else "OTHER"
+            endpoint = getattr(request.scope.get("route"), "path", "unmatched")
         with self._lock:
             self._in_flight = max(0, self._in_flight - 1)
             self._total_requests += 1
@@ -208,6 +221,8 @@ class RequestMetrics:
             self._max_duration_ms = max(self._max_duration_ms, duration_ms)
             self._status_counts[status_family] += 1
             self._method_counts[method] += 1
+            if self._safe_routes and endpoint not in self._endpoint_counts and len(self._endpoint_counts) >= 128:
+                endpoint = "other"
             self._endpoint_counts[endpoint] += 1
             self._outcome_counts[outcome] += 1
             if status_code >= 400 or outcome in {"rate_limited", "csrf_rejected", "exception"}:

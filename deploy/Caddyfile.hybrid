@@ -48,6 +48,11 @@
 			path /api/admin/usage/summary /api/admin/usage/events
 		}
 		reverse_proxy @admin_usage platform-service:8081
+		@admin_observability {
+			method GET
+			path /api/admin/observability/requests
+		}
+		reverse_proxy @admin_observability platform-service:8081
 		@admin_tool_traces {
 			method GET
 			path_regexp adminToolTraces ^/api/admin/tools/traces(/[^/]+)?$

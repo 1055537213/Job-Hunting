@@ -1,0 +1,173 @@
+openapi: 3.1.0
+info:
+  title: Administrator Request Observability
+  version: 1.0.0
+  description: Process-local snapshots, not durable or cluster-wide totals. API and internal scopes never mix.
+paths:
+  /api/admin/observability/requests:
+    get:
+      operationId: administratorRequestObservations
+      security: [{session: []}]
+      responses:
+        '200':
+          description: Available or partial snapshot. Missing metrics are null, never synthetic zeroes.
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Observations'}
+        '401': {description: Missing or revoked session}
+        '403': {description: Active administrator required}
+        '429': {description: Rate limit reached}
+        '503': {description: Authentication or request protection unavailable}
+  /internal/v1/observability/requests:
+    post:
+      operationId: compatibleAdministratorRequestObservations
+      description: Java compatibility endpoint; requires service token AND real administrator session.
+      security: [{serviceToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [session_token]
+              properties:
+                session_token: {type: string, minLength: 1, maxLength: 128}
+      responses:
+        '200':
+          description: Same projection as the public endpoint
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Observations'}
+        '401': {description: Invalid service token or session}
+        '403': {description: Administrator required}
+        '422': {description: Invalid request}
+    get:
+      operationId: pythonPrivateRequestSnapshot
+      description: Python-only private callback. Not reachable through the public gateway. No session cookies sent.
+      security: [{serviceToken: []}]
+      responses:
+        '200':
+          description: Python runtime envelope with account_email. No Java callback from this endpoint.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, api, internal, observed_at, account_email]
+                properties:
+                  status: {const: available}
+                  api: {$ref: '#/components/schemas/Metrics'}
+                  internal: {$ref: '#/components/schemas/Metrics'}
+                  observed_at: {type: string, format: date-time}
+                  account_email: {$ref: '#/components/schemas/Email'}
+        '401': {description: Invalid service token}
+        '404': {description: Java integration disabled}
+components:
+  securitySchemes:
+    session: {type: apiKey, in: cookie, name: job_agent_session}
+    serviceToken: {type: apiKey, in: header, name: X-Internal-Service-Token}
+  schemas:
+    Observations:
+      type: object
+      additionalProperties: false
+      required: [status, requests, services, account_email]
+      properties:
+        status: {enum: [available, partial]}
+        requests:
+          description: Sum of available Java and Python API snapshots only; null if either required source is absent.
+          oneOf: [{$ref: '#/components/schemas/Metrics'}, {type: 'null'}]
+        services:
+          type: object
+          additionalProperties: false
+          required: [java, python]
+          properties:
+            java: {$ref: '#/components/schemas/Runtime'}
+            python: {$ref: '#/components/schemas/Runtime'}
+        account_email: {$ref: '#/components/schemas/Email'}
+    Runtime:
+      type: object
+      additionalProperties: false
+      required: [status, api, internal, observed_at]
+      properties:
+        status: {enum: [available, unavailable, not_configured]}
+        api:
+          oneOf: [{$ref: '#/components/schemas/Metrics'}, {type: 'null'}]
+        internal:
+          oneOf: [{$ref: '#/components/schemas/Metrics'}, {type: 'null'}]
+        observed_at: {type: [string, 'null'], format: date-time}
+    Counts:
+      type: object
+      maxProperties: 260
+      additionalProperties: {type: integer, minimum: 0}
+    Metrics:
+      type: object
+      additionalProperties: false
+      required: [started_at, in_flight_requests, total_requests, total_duration_ms, error_requests, average_duration_ms,
+        max_duration_ms, rate_limited_requests, rate_limit_backend_errors, csrf_rejected_requests,
+        exception_requests, status_counts, method_counts, endpoint_counts, outcome_counts, recent_errors]
+      properties:
+        started_at: {type: string, format: date-time}
+        in_flight_requests: {type: integer, minimum: 0}
+        total_requests: {type: integer, minimum: 0}
+        total_duration_ms: {type: number, minimum: 0}
+        error_requests: {type: integer, minimum: 0}
+        average_duration_ms: {type: number, minimum: 0, description: Total duration divided by total completed requests}
+        max_duration_ms: {type: number, minimum: 0}
+        rate_limited_requests: {type: integer, minimum: 0}
+        rate_limit_backend_errors: {type: integer, minimum: 0}
+        csrf_rejected_requests: {type: integer, minimum: 0}
+        exception_requests: {type: integer, minimum: 0}
+        status_counts: {$ref: '#/components/schemas/Counts'}
+        method_counts: {$ref: '#/components/schemas/Counts'}
+        endpoint_counts:
+          description: Route templates only. Aggregate keys have java or python prefixes; each source is bounded separately.
+          $ref: '#/components/schemas/Counts'
+        outcome_counts: {$ref: '#/components/schemas/Counts'}
+        recent_errors:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            additionalProperties: false
+            required: [request_id, method, endpoint, status_code, outcome, duration_ms, created_at]
+            properties:
+              service: {enum: [java, python]}
+              request_id: {type: string, maxLength: 128}
+              method: {type: string}
+              endpoint: {type: string}
+              status_code: {type: integer, minimum: 100, maximum: 599}
+              outcome: {type: string}
+              duration_ms: {type: number, minimum: 0}
+              created_at: {type: string, format: date-time}
+    Email:
+      type: object
+      additionalProperties: false
+      required: [status, summary, records]
+      properties:
+        status: {enum: [available, partial, unavailable]}
+        summary:
+          description: Null when any email source is unavailable, independently of request metric availability.
+          oneOf: [{$ref: '#/components/schemas/Counts'}, {type: 'null'}]
+        records:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            additionalProperties: false
+            required: [owner, id, account_id, purpose, recipient_email, status, attempt_count, max_attempts,
+              last_error_type, last_error_summary, created_at, updated_at]
+            properties:
+              owner: {enum: [java, python]}
+              id: {type: integer, minimum: 1}
+              account_id: {type: integer, minimum: 1}
+              purpose: {enum: [verify_email, reset_password, change_email]}
+              recipient_email: {type: string, description: Masked address only}
+              status: {enum: [pending, sending, retrying, sent, failed, cancelled]}
+              attempt_count: {type: integer, minimum: 0}
+              max_attempts: {type: integer, minimum: 1}
+              last_error_type: {type: [string, 'null']}
+              last_error_summary: {type: [string, 'null'], description: Fixed safe text, never raw exception messages}
+              created_at: {type: string, format: date-time}
+              updated_at: {type: string, format: date-time}

@@ -10,11 +10,13 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import Iterator
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pytest
 import sqlalchemy as sa
 
+from job_hunting_agent import config
 from job_hunting_agent.database_migrations import upgrade_database
 from job_hunting_agent.database_schema import metadata
 from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
@@ -22,6 +24,18 @@ from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
 TEST_DATABASE_URL_ENV = "JOB_AGENT_TEST_DATABASE_URL"
 # Docker Compose 仅把 PostgreSQL 端口绑定到本机，因此这个默认值不会暴露测试数据库。
 DEFAULT_TEST_DATABASE_URL = "postgresql+psycopg://job_agent@127.0.0.1:5432/job_agent"
+
+
+@pytest.fixture(autouse=True)
+def isolate_local_dotenv(monkeypatch):
+    """Do not let unit tests use developer credentials or call real model services."""
+    local_env = Path(__file__).resolve().parents[1] / ".env"
+    read_values = config.load_dotenv_values
+
+    def test_values(path):
+        return {} if Path(path).resolve() == local_env else read_values(path)
+
+    monkeypatch.setattr(config, "load_dotenv_values", test_values)
 
 
 def _schema_url(base_url: str, schema: str) -> str:
@@ -55,6 +69,7 @@ def postgres_test_schema() -> Iterator[str]:
     base_url = os.environ.get(TEST_DATABASE_URL_ENV, DEFAULT_TEST_DATABASE_URL)
     schema = f"job_agent_test_{uuid.uuid4().hex}"
     base_engine = sa.create_engine(base_url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
+    previous_test_url = os.environ.get(TEST_DATABASE_URL_ENV)
     previous_runtime_url = os.environ.get("JOB_AGENT_DATABASE_URL")
     previous_object_storage_backend = os.environ.get("JOB_AGENT_OBJECT_STORAGE_BACKEND")
     previous_csrf_enabled = os.environ.get("JOB_AGENT_CSRF_ENABLED")
@@ -74,6 +89,8 @@ def postgres_test_schema() -> Iterator[str]:
             )
 
         database_url = _schema_url(base_url, schema)
+        # Explicit test mode also disables per-App idle pools for the default local URL.
+        os.environ[TEST_DATABASE_URL_ENV] = base_url
         os.environ["JOB_AGENT_DATABASE_URL"] = database_url
         # 测试使用显式临时目录或内存替身，不要求 CI 额外启动 MinIO。
         os.environ["JOB_AGENT_OBJECT_STORAGE_BACKEND"] = "local"
@@ -91,6 +108,10 @@ def postgres_test_schema() -> Iterator[str]:
         upgrade_database(database_url)
         yield database_url
     finally:
+        if previous_test_url is None:
+            os.environ.pop(TEST_DATABASE_URL_ENV, None)
+        else:
+            os.environ[TEST_DATABASE_URL_ENV] = previous_test_url
         if previous_runtime_url is None:
             os.environ.pop("JOB_AGENT_DATABASE_URL", None)
         else:
