@@ -7,6 +7,7 @@ import com.jobhunting.platform.billing.PersonalRechargeController;
 import com.jobhunting.platform.billing.AdminBillingController;
 import com.jobhunting.platform.usage.AdminUsageController;
 import com.jobhunting.platform.usage.AdminToolTraceController;
+import com.jobhunting.platform.tasks.TaskReadController;
 import com.jobhunting.platform.security.WebSecurityFilter;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.core.Ordered;
@@ -23,7 +24,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 @Order(Ordered.HIGHEST_PRECEDENCE)
 @RestControllerAdvice(assignableTypes = {PublicAuthController.class, PublicAuthLifecycleController.class,
         PublicAdminAccountController.class, BillingQueryController.class, PersonalRechargeController.class, AdminBillingController.class,
-        AdminUsageController.class, AdminToolTraceController.class})
+        AdminUsageController.class, AdminToolTraceController.class, TaskReadController.class})
 public class PublicAuthErrorHandler {
     @ExceptionHandler(AuthException.class)
     public ResponseEntity<Map<String, Object>> auth(AuthException error, HttpServletRequest request) {

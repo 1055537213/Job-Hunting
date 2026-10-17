@@ -44,6 +44,11 @@
 			path_regexp adminToolTraces ^/api/admin/tools/traces(/[^/]+)?$
 		}
 		reverse_proxy @admin_tool_traces platform-service:8081
+		@task_reads {
+			method GET
+			path_regexp taskReads ^/api/(admin/tasks|tasks/[^/]+)$
+		}
+		reverse_proxy @task_reads platform-service:8081
 		reverse_proxy web:8000
 	}
 }

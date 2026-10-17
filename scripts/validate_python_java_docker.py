@@ -67,6 +67,12 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
         store = SQLAlchemyStore(database_url)
         try:
             from datetime import UTC, datetime
+            progress_task = store.create_background_task(
+                account_id=registered.json()["account"]["id"], task_type="system_probe",
+                payload={"private": "must-not-leak"}, session_id="private-session",
+                idempotency_key=f"private-task-{email}")
+            task_key = progress_task.task_key
+            store.create_background_task(account_id=registered.json()["account"]["id"], task_type="system_probe")
             for index in range(2):
                 store.record_usage_event(UsageEventRecord(
                     id=0, account_id=registered.json()["account"]["id"], candidate_id=None, session_id="gateway-usage",
@@ -120,20 +126,46 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
         assert older_page["orders"][0]["amount_micro_yuan"] == 1_000_000
         assert order_page["orders"][0]["account_id"] == registered.json()["account"]["id"]
         assert browser.get("/api/me/balance?limit=101").status_code == 422
+        task_path = f"/api/tasks/{task_key}"
+        assert browser.get(task_path + "?account_id=999999").json()["task"]["status"] == "queued"
+        store = SQLAlchemyStore(database_url)
+        try:
+            assert store.claim_background_task(task_key) is not None
+            store.update_background_task_progress(task_key, 60)
+            running = browser.get(task_path).json()["task"]
+            assert running["status"] == "running" and running["progress"] == 60 and running["attempt"] == 1
+            store.complete_background_task(task_key, result={"artifact_id": 7})
+        finally:
+            store.close()
+        completed = browser.get(task_path)
+        assert completed.status_code == 200 and completed.headers["cache-control"] == "no-store"
+        assert completed.json()["task"]["status"] == "succeeded"
+        assert completed.json()["task"]["result"] == {"artifact_id": 7}
+        assert len(completed.json()["task"]) == 12
+        for field in ("account_id", "candidate_id", "payload_json", "idempotency_key", "session_id"):
+            assert field not in completed.json()["task"]
+        forwarded = httpx.get(web_url + task_path, cookies=browser.cookies, timeout=10)
+        assert forwarded.status_code == 200 and forwarded.json() == completed.json()
         with httpx.Client(base_url=web_url, timeout=10) as adapter:
             authenticated = adapter.post("/api/auth/login", json={"email": admin_credentials[0], "password": admin_credentials[1]})
             assert authenticated.status_code == 200, authenticated.text[:300]
             account_id = registered.json()["account"]["id"]
             for endpoint in (f"/api/admin/tools/traces?account_id={account_id}&limit=1&offset=0",
-                             f"/api/admin/tools/traces/gateway-tool-{account_id}-1"):
+                             f"/api/admin/tools/traces/gateway-tool-{account_id}-1",
+                             f"/api/admin/tasks?account_id={account_id}&task_type=system_probe&status=succeeded&limit=1&offset=0"):
                 forwarded = adapter.get(endpoint)
                 direct = httpx.get(gateway_url + endpoint, cookies=adapter.cookies, timeout=10)
                 assert forwarded.status_code == direct.status_code == 200, forwarded.text[:300]
                 assert forwarded.json() == direct.json()
+            assert adapter.get(task_path).status_code == 404
             assert adapter.post("/api/auth/logout").status_code == 200
         print("==> Python compatibility -> Java tool list/detail matches direct gateway response: PASS")
         docker("stop", "--time", "1", web_container)
         try:
+            independent_task = browser.get(task_path)
+            assert independent_task.status_code == 200 and independent_task.json() == completed.json()
+            assert browser.get("/api/tasks/missing-task").status_code == 404
+            assert browser.get("/api/tasks/" + "a" * 65).status_code == 422
             key = f"gateway-java-only-{os.urandom(12).hex()}"
             payload = {"amount_yuan": "0.000001", "idempotency_key": key,
                        "account_id": 999999, "max_total_micro_yuan": 999999999}
@@ -156,11 +188,12 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
             assert independent.json()["entries"][0]["account_id"] == registered.json()["account"]["id"]
             assert browser.get("/api/me/recharge/orders").json()["total"] == 3
             run_admin_billing_gateway_flow(gateway_url, browser, admin_credentials,
-                                           registered.json()["account"]["id"], order_page["orders"][0]["id"], (email, password))
+                                           registered.json()["account"]["id"], order_page["orders"][0]["id"], (email, password), task_key)
         finally:
             docker("start", web_container)
             wait(f"{web_url}/api/health")
         print("==> Java wallet read/write -> owner-scoped pagination -> recharge/replay/conflict with Python stopped: PASS")
+        print("==> Python task queued/running/succeeded -> Java fresh progress/owner scope -> compatibility and Python-stop reads: PASS")
         login = browser.get("/api/auth/me")
         assert login.status_code == 200 and login.json()["authenticated"]
         old_cookies = dict(browser.cookies)
@@ -178,11 +211,11 @@ def run_browser_gateway_flow(gateway_url: str, web_url: str, java_url: str, inte
 
 
 def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credentials: tuple[str, str],
-                                   account_id: int, order_id: int, user_credentials: tuple[str, str]) -> None:
+                                   account_id: int, order_id: int, user_credentials: tuple[str, str], task_key: str) -> None:
     """Runs while the isolated Python Web is stopped; every tested route must reach Java."""
     paths = ["/api/admin/balance/events", "/api/admin/recharge/orders", f"/api/admin/recharge/orders/{order_id}/events",
              "/api/admin/accounts", "/api/admin/audit/events", "/api/admin/usage/summary", "/api/admin/usage/events",
-             "/api/admin/tools/traces", f"/api/admin/tools/traces/gateway-tool-{account_id}-1"]
+             "/api/admin/tools/traces", f"/api/admin/tools/traces/gateway-tool-{account_id}-1", "/api/admin/tasks"]
     for path in paths:
         assert user.get(path).status_code == 403
     path = f"/api/admin/accounts/{account_id}/balance/credit"
@@ -262,6 +295,19 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
         assert admin.get("/api/admin/tools/traces?limit=101").status_code == 422
         assert admin.get("/api/admin/tools/traces?offset=-1").status_code == 422
         assert admin.get("/api/admin/tools/traces/" + "a" * 129).status_code == 422
+        task_page = admin.get(f"/api/admin/tasks?account_id={account_id}&task_type=system_probe&limit=1&offset=0")
+        assert task_page.status_code == 200 and task_page.json()["total"] == 2, task_page.text[:300]
+        older_task = admin.get(f"/api/admin/tasks?account_id={account_id}&limit=1&offset=1").json()
+        assert older_task["tasks"][0]["task_key"] != task_page.json()["tasks"][0]["task_key"]
+        done = admin.get(f"/api/admin/tasks?account_id={account_id}&status=succeeded").json()
+        assert done["total"] == 1 and done["tasks"][0]["task_key"] == task_key
+        assert len(done["tasks"][0]) == 14 and done["tasks"][0]["account_id"] == account_id
+        assert admin.get(f"/api/tasks/{task_key}").status_code == 404
+        assert admin.get("/api/admin/tasks?status=unknown").status_code == 400
+        assert admin.get("/api/admin/tasks?limit=101").status_code == 422
+        # Write requests must still reach the stopped Python service, not Java.
+        assert admin.post("/api/admin/tasks/probe", json={}, headers=headers).status_code == 502
+        assert admin.post("/api/admin/tasks", json={}, headers=headers).status_code == 502
         status_path = f"/api/admin/accounts/{account_id}/status"
         assert user.patch(status_path, json={"status": "disabled"},
                           headers={"X-CSRF-Token": user.cookies["job_agent_csrf"]}).status_code == 403
@@ -301,11 +347,13 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
             assert revoked.get("/api/admin/usage/events").status_code == 401
             assert revoked.get("/api/admin/tools/traces").status_code == 401
             assert revoked.get(f"/api/admin/tools/traces/gateway-tool-{account_id}-1").status_code == 401
+            assert revoked.get("/api/admin/tasks").status_code == 401
             assert revoked.post(path, json=body, headers=headers).status_code == 401
     print("==> Java admin billing -> RBAC/CSRF/pagination/events/self-credit/replay/revocation with Python stopped: PASS")
     print("==> Java admin account list/status/audit -> safe fields/CSRF/session revocation/pagination with Python stopped: PASS")
     print("==> Java usage summary/events -> RBAC/pagination/current balance/status without Python or summary cache: PASS")
     print("==> Java tool traces -> Python persisted results/order/errors/approval -> list/detail/RBAC/revocation with Python stopped: PASS")
+    print("==> Java task list -> filters/pagination/RBAC/revocation; task writes remain on Python: PASS")
 
 
 def docker(*args: str) -> str:
@@ -430,6 +478,7 @@ def main() -> None:
             "JOB_AGENT_EMAIL_VERIFICATION_REQUIRED=true",
             "-e",
             "JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS=20",
+            "-e", "JOB_AGENT_RATE_LIMIT_ADMIN_REQUESTS=200",
             "-e",
             "PLATFORM_BILLING_ENABLED=true",
             "-e",

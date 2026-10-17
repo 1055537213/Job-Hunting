@@ -2556,6 +2556,8 @@ def create_web_app(
     def get_task(task_key: str, request: Request) -> dict[str, object]:
         """返回当前账号可见的后台任务状态，不回显任务输入正文。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_task_query(request, "me", task_key=task_key)
         account = current_account(request)
         try:
             task = backend.get_background_task(task_key, account_id=account.id if account else None)
@@ -3156,6 +3158,9 @@ def create_web_app(
     ) -> dict[str, object]:
         """管理员查看后台任务低敏状态，默认按最近更新时间倒序分页。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_task_query(request, "admin", account_id=account_id, task_type=task_type,
+                                       status=status, limit=limit, offset=offset)
         require_admin(request)
         allowed_statuses = {"queued", "running", "succeeded", "failed", "cancelled"}
         if status is not None and status not in allowed_statuses:
@@ -3180,6 +3185,14 @@ def create_web_app(
             "page_size": ADMIN_LEDGER_PAGE_SIZE,
             "max_pages": ADMIN_LEDGER_MAX_PAGES,
         }
+
+    def platform_task_query(request: Request, resource: str, **filters) -> dict[str, object]:
+        try:
+            return backend.platform_auth_client.task_query(resource,
+                session_token=request.cookies.get(SESSION_COOKIE_NAME),
+                trace_id=getattr(request.state, "request_id", None), **filters)
+        except PlatformAuthError as error:
+            raise HTTPException(status_code=error.status_code or 503, detail=str(error)) from error
 
     @web_app.post("/api/admin/tasks/{task_key}/retry")
     def admin_retry_background_task(task_key: str, request: Request) -> dict[str, object]:

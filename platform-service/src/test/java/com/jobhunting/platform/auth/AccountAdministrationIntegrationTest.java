@@ -12,6 +12,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import com.jobhunting.platform.usage.AdminUsageQueryService;
 import com.jobhunting.platform.usage.AdminUsageService;
 import com.jobhunting.platform.usage.AdminToolTraceService;
+import com.jobhunting.platform.tasks.TaskReadService;
+import com.jobhunting.platform.tasks.TaskQueryService;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -42,6 +44,8 @@ class AccountAdministrationIntegrationTest {
     @Autowired AdminUsageQueryService usageQueries;
     @Autowired AdminUsageService usage;
     @Autowired AdminToolTraceService toolTraces;
+    @Autowired TaskReadService tasks;
+    @Autowired TaskQueryService taskQueries;
 
     @BeforeEach
     void reset() {
@@ -115,7 +119,15 @@ class AccountAdministrationIntegrationTest {
             CREATE TABLE IF NOT EXISTS account_balance_ledger (id serial PRIMARY KEY, account_id integer REFERENCES accounts(id))
             """);
         jdbc.execute("""
-            TRUNCATE usage_events, tool_call_traces, account_balance_ledger,
+            CREATE TABLE IF NOT EXISTS background_tasks (id serial PRIMARY KEY, task_key varchar(64) UNIQUE,
+              account_id integer REFERENCES accounts(id), candidate_id integer, session_id text,
+              task_type text, status text DEFAULT 'queued', progress integer DEFAULT 0, attempt integer DEFAULT 0,
+              max_attempts integer DEFAULT 3, result_json jsonb DEFAULT '{}', payload_json jsonb DEFAULT '{}',
+              idempotency_key text, error_summary text, created_at timestamptz DEFAULT CURRENT_TIMESTAMP,
+              started_at timestamptz, finished_at timestamptz, updated_at timestamptz DEFAULT CURRENT_TIMESTAMP)
+            """);
+        jdbc.execute("""
+            TRUNCATE background_tasks, usage_events, tool_call_traces, account_balance_ledger,
                      platform_account_action_emails, account_email_outbox, account_action_tokens,
                      admin_audit_events, auth_sessions, account_consents, account_balances, accounts
                      RESTART IDENTITY CASCADE
@@ -391,6 +403,65 @@ class AccountAdministrationIntegrationTest {
         jdbc.execute("UPDATE accounts SET status='active' WHERE id=1");
         sessions.logout(admin);
         assertThatThrownBy(() -> toolTraces.list(admin, null, 100, 0)).isInstanceOf(AuthException.class).extracting("code").isEqualTo("SESSION_EXPIRED");
+    }
+
+    @Test void taskQueriesKeepAllTasksStablePagesAndFiltersWithoutPruning() {
+        String admin = sessions.login("admin@example.com", "password-123", false, null, null).session_token();
+        jdbc.execute("INSERT INTO background_tasks(task_key,account_id,task_type,updated_at) SELECT 'task-' || n,2,'system_probe','2026-10-17T00:00:00.123456Z' FROM generate_series(1,501) n");
+        jdbc.execute("INSERT INTO background_tasks(task_key,account_id,task_type,status) VALUES ('admin-task',1,'other','failed')");
+        var first = tasks.adminList(admin, 2L, " system_probe ", "queued", 1, 0);
+        assertThat(first.total()).isEqualTo(501);
+        assertThat(first.tasks().getFirst().get("task_key")).isEqualTo("task-501");
+        assertThat(first.tasks().getFirst().get("updated_at")).isEqualTo("2026-10-17T00:00:00.123456+00:00");
+        assertThat(first.tasks().getFirst()).hasSize(14).doesNotContainKeys("payload", "payload_json", "id", "session_id", "idempotency_key");
+        assertThat(tasks.adminList(admin, 2L, null, null, 1, 500).tasks().getFirst().get("task_key")).isEqualTo("task-1");
+        assertThat(tasks.adminList(admin, null, null, null, 100, 0).total()).isEqualTo(502);
+        assertThat(tasks.adminList(admin, 2L, "x' OR 1=1 --", null, 100, 0).total()).isZero();
+        assertThat(tasks.adminList(admin, 2L, "   ", null, 100, 0).total()).isZero();
+        assertThat(tasks.adminList(admin, 2L, null, "failed", 100, 0).total()).isZero();
+        assertThat(tasks.adminList(admin, 999L, null, null, 100, 0).total()).isZero();
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM background_tasks", Long.class)).isEqualTo(502);
+    }
+
+    @Test void personalTaskLookupUsesActualOwnerEvenForAdministratorAndReflectsWorkerUpdates() {
+        String user = sessions.login("user@example.com", "password-123", false, null, null).session_token();
+        String admin = sessions.login("admin@example.com", "password-123", false, null, null).session_token();
+        jdbc.execute("INSERT INTO background_tasks(task_key,account_id,task_type,payload_json,idempotency_key,session_id) VALUES ('user-task',2,'system_probe','{\"secret\":\"do-not-leak\"}','private-key','private-session')");
+        var queued = (java.util.Map<?, ?>) tasks.personal(user, "user-task").get("task");
+        assertThat(queued).hasSize(12);
+        for (String field : java.util.List.of("account_id", "candidate_id", "id", "payload_json", "payload", "session_id", "idempotency_key")) {
+            assertThat(queued.containsKey(field)).isFalse();
+        }
+        assertThat(queued.get("status")).isEqualTo("queued");
+        assertThat(queued.get("started_at")).isNull();
+        assertThatThrownBy(() -> tasks.personal(admin, "user-task")).isInstanceOf(AuthException.class).extracting("code").isEqualTo("TASK_NOT_FOUND");
+        assertThatThrownBy(() -> tasks.personal(user, "missing")).isInstanceOf(AuthException.class).extracting("code").isEqualTo("TASK_NOT_FOUND");
+        assertThatThrownBy(() -> tasks.personal(user, "x' OR 1=1 --")).isInstanceOf(AuthException.class).extracting("code").isEqualTo("TASK_NOT_FOUND");
+        jdbc.execute("UPDATE background_tasks SET status='running',progress=60,attempt=1,started_at=CURRENT_TIMESTAMP WHERE task_key='user-task'");
+        var running = (java.util.Map<?, ?>) tasks.personal(user, "user-task").get("task");
+        assertThat(running.get("progress")).isEqualTo(60);
+        assertThat(running.get("attempt")).isEqualTo(1);
+        jdbc.execute("UPDATE background_tasks SET status='succeeded',progress=100,result_json='{\"artifact_id\":7}',finished_at=CURRENT_TIMESTAMP WHERE task_key='user-task'");
+        assertThat(((java.util.Map<?, ?>) tasks.personal(user, "user-task").get("task")).get("result")).isEqualTo(java.util.Map.of("artifact_id", 7));
+        jdbc.execute("UPDATE background_tasks SET status='failed',error_summary='provider unavailable',result_json='[]' WHERE task_key='user-task'");
+        var failed = (java.util.Map<?, ?>) tasks.personal(user, "user-task").get("task");
+        assertThat(failed.get("error_summary")).isEqualTo("provider unavailable");
+        assertThat(failed.get("result")).isEqualTo(java.util.Map.of());
+    }
+
+    @Test void taskReadsRejectInvalidFiltersNonAdminsDisabledAndRevokedSessions() {
+        String user = sessions.login("user@example.com", "password-123", false, null, null).session_token();
+        String admin = sessions.login("admin@example.com", "password-123", false, null, null).session_token();
+        assertThatThrownBy(() -> tasks.adminList(user, null, null, null, 100, 0)).isInstanceOf(AuthException.class).extracting("code").isEqualTo("ADMIN_REQUIRED");
+        assertThatThrownBy(() -> tasks.adminList(admin, null, null, "unknown", 100, 0)).isInstanceOf(AuthException.class).extracting("status").isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST);
+        assertThatThrownBy(() -> taskQueries.adminList(0L, null, null, 100, 0)).isInstanceOf(AuthException.class);
+        assertThatThrownBy(() -> taskQueries.adminList(null, "", null, 100, 0)).isInstanceOf(AuthException.class);
+        assertThatThrownBy(() -> taskQueries.personal(2L, "a".repeat(65))).isInstanceOf(AuthException.class);
+        jdbc.execute("UPDATE accounts SET status='disabled' WHERE id=2");
+        assertThatThrownBy(() -> tasks.personal(user, "task-1")).isInstanceOf(AuthException.class).extracting("code").isEqualTo("ACCOUNT_DISABLED");
+        jdbc.execute("UPDATE accounts SET status='active' WHERE id=2");
+        sessions.logout(user);
+        assertThatThrownBy(() -> tasks.personal(user, "task-1")).isInstanceOf(AuthException.class).extracting("code").isEqualTo("SESSION_EXPIRED");
     }
 
     private void insertAccount(int id, String email, String role, String status) {

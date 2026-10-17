@@ -1,0 +1,144 @@
+openapi: 3.1.0
+info:
+  title: Background Task Read Contract
+  version: 1.0.0
+  description: >-
+    Java owns reads only. Python owns enqueue, retry, execution and progress writes.
+    Active session required; admin list additionally requires administrator role.
+    Personal lookup is owner-scoped, including for administrators: missing and foreign
+    tasks both return 404. No payload, idempotency key, session ID or internal row ID
+    is exposed. Reads are uncached, with read-only Repeatable Read snapshots.
+    Unknown status returns 400; invalid pagination, filters or task key return 422.
+    max_pages=5 is legacy UI metadata, NOT task retention. No task is deleted by reads.
+security: [{SessionCookie: []}]
+paths:
+  /api/admin/tasks:
+    get:
+      operationId: adminTaskList
+      parameters:
+        - {name: account_id, in: query, schema: {type: integer, format: int64, minimum: 1}}
+        - {name: task_type, in: query, schema: {type: string, minLength: 1, maxLength: 80}}
+        - {name: status, in: query, schema: {$ref: '#/components/schemas/Status'}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 100}}
+        - {name: offset, in: query, schema: {type: integer, format: int64, minimum: 0, default: 0}}
+      responses:
+        '200': {$ref: '#/components/responses/Page'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/tasks/{task_key}:
+    get:
+      operationId: personalTaskProgress
+      parameters:
+        - {name: task_key, in: path, required: true, schema: {type: string, minLength: 1, maxLength: 64}}
+      responses:
+        '200': {$ref: '#/components/responses/Detail'}
+        default: {$ref: '#/components/responses/Error'}
+  /internal/v1/tasks/admin/query:
+    post:
+      operationId: internalAdminTaskList
+      security: [{InternalServiceToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - {$ref: '#/components/schemas/SessionRequest'}
+                - type: object
+                  required: [limit, offset]
+                  properties:
+                    account_id: {type: [integer, 'null'], format: int64, minimum: 1}
+                    task_type: {type: [string, 'null'], minLength: 1, maxLength: 80}
+                    status: {type: [string, 'null'], minLength: 1, maxLength: 20}
+                    limit: {type: integer, minimum: 1, maximum: 100}
+                    offset: {type: integer, format: int64, minimum: 0}
+      responses:
+        '200': {$ref: '#/components/responses/Page'}
+        default: {$ref: '#/components/responses/Error'}
+  /internal/v1/tasks/me/query:
+    post:
+      operationId: internalPersonalTaskProgress
+      security: [{InternalServiceToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - {$ref: '#/components/schemas/SessionRequest'}
+                - type: object
+                  required: [task_key]
+                  properties:
+                    task_key: {type: string, minLength: 1, maxLength: 64}
+      responses:
+        '200': {$ref: '#/components/responses/Detail'}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    SessionCookie: {$ref: 'billing-personal.openapi.yaml#/components/securitySchemes/SessionCookie'}
+    InternalServiceToken: {$ref: 'billing-personal.openapi.yaml#/components/securitySchemes/InternalServiceToken'}
+  schemas:
+    SessionRequest:
+      type: object
+      required: [session_token]
+      properties:
+        session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+    Status: {type: string, enum: [queued, running, succeeded, failed, cancelled]}
+    Task:
+      type: object
+      required: [task_key, task_type, status, progress, attempt, max_attempts, result,
+                 error_summary, created_at, started_at, finished_at, updated_at]
+      properties:
+        task_key: {type: string}
+        task_type: {type: string}
+        status: {$ref: '#/components/schemas/Status'}
+        progress: {type: integer, minimum: 0, maximum: 100}
+        attempt: {type: integer, minimum: 0}
+        max_attempts: {type: integer, minimum: 1}
+        result: {type: object, additionalProperties: true}
+        error_summary: {type: [string, 'null']}
+        created_at: {type: string, format: date-time}
+        started_at: {type: [string, 'null'], format: date-time}
+        finished_at: {type: [string, 'null'], format: date-time}
+        updated_at: {type: string, format: date-time}
+    AdminTask:
+      allOf:
+        - {$ref: '#/components/schemas/Task'}
+        - type: object
+          required: [account_id, candidate_id]
+          properties:
+            account_id: {type: integer, format: int64}
+            candidate_id: {type: [integer, 'null'], format: int64}
+  responses:
+    Detail:
+      description: Owner-scoped task progress; Cache-Control no-store
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [task]
+            properties:
+              task: {$ref: '#/components/schemas/Task'}
+    Page:
+      description: Administrator page sorted by updated_at DESC, id DESC; no-store
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [tasks, total, limit, offset, page_size, max_pages]
+            properties:
+              tasks: {type: array, items: {$ref: '#/components/schemas/AdminTask'}}
+              total: {type: integer, format: int64, minimum: 0}
+              limit: {type: integer}
+              offset: {type: integer, format: int64}
+              page_size: {type: integer, const: 100}
+              max_pages: {type: integer, const: 5}
+    Error:
+      description: 400 invalid status; 401 session; 403 role/status; 404 missing/foreign; 422 input; 429 limit; 503 unavailable
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [code, message]
+            properties:
+              code: {type: string}
+              message: {type: string}

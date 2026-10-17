@@ -80,6 +80,9 @@ CI 还构建两份镜像，运行 `scripts/validate_python_java_docker.py` 验�
 还会暂停隔离的 Python Web，确认 Java 查询和充值继续响应，并检查 CSRF、重复充值、幂等冲突和额度上限；不会停止正常开发容器。
 同一阶段也验证管理员账务查询及自补款/他人补款，检查越权、CSRF、分页和会话撤销。
 还验证账号列表安全字段、启停后的旧会话持续失效，以及按请求 ID 查询状态变更审计。
+任务验收由 Python 创建任务并推进 queued/running/succeeded 状态，Java 下一次查询即读取已提交进度。
+同时验证个人归属、管理员筛选分页、低敏字段和撤销会话；暂停隔离 Python Web 后任务查询仍可用，
+而任务投递/重试写请求仍路由到 Python。任务不采用 Token/工具记录的 500 条保留窗口。
 价格、低余额阈值和演示充值限额共用 `.env` 参数，生产默认关闭演示充值，无需修改业务代码。
 Docker 验收还运行真实 Prometheus，验证独立凭据和 Java target UP；本地 Prometheus 默认在
 `http://127.0.0.1:9090`，可查询 `up{job="job-hunting-platform"}`。不要把监控令牌提交到 Git。
@@ -133,7 +136,8 @@ bash <release-dir>/scripts/deploy_production.sh \
 备份、恢复和 HTTPS 重载脚本会读取 `state/current-platform-image`，自动加载同一联合配置；
 备份期间暂停 Java 写入，恢复时重新启动 Java。不能手动删掉该状态文件。
 独立拓扑使用 `deploy/Caddyfile.hybrid`，共存拓扑使用
-`deploy/nginx/coexist-hybrid-ip-https.conf.template`；两者均只代理公开认证路径至 Java，
-拒绝公网 `/internal/*`，并将其他流量转至 Python。Java 端口只在容器网络内暴露。
+`deploy/nginx/coexist-hybrid-ip-https.conf.template`；两者均将已迁移的认证、个人账务、管理员账务、
+账号管理、审计、用量、工具轨迹和任务查询路径转至 Java，拒绝公网 `/internal/*`。
+任务查询按 GET 方法和精确路径分流，投递/重试及其他流量仍转至 Python。Java 端口只在容器网络内暴露。
 
 这些步骤只建立可部署能力，不代表已经做过真实服务器演练；本分支暂不部署。

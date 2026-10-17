@@ -166,6 +166,50 @@ class PlatformAuthClient:
             raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502)
         return payload
 
+    def task_query(self, resource: str, *, session_token: str | None, trace_id: str | None = None,
+                   **filters: Any) -> dict[str, Any]:
+        """Task reads require real sessions; Java failures never query Python's repository."""
+        if resource not in {"admin", "me"}:
+            raise ValueError("Unknown task read resource")
+        if not session_token:
+            raise PlatformAuthError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
+        try:
+            response = httpx.post(f"{self.base_url}/internal/v1/tasks/{resource}/query", headers={
+                "X-Internal-Service-Token": self.internal_token,
+                "X-Trace-Id": trace_id or f"platform-task-{uuid4().hex}",
+            }, json={"session_token": session_token, **filters}, timeout=self.timeout_seconds)
+        except httpx.HTTPError as error:
+            raise PlatformAuthUnavailableError() from error
+        if response.status_code >= 500:
+            raise PlatformAuthUnavailableError()
+        try:
+            result = response.json()
+        except ValueError as error:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台任务服务响应无效。", _platform_response_error_status(response)) from error
+        if not isinstance(result, dict):
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台任务服务响应无效。", _platform_response_error_status(response))
+        if response.is_error:
+            raise PlatformAuthError(str(result.get("code") or "PLATFORM_AUTH_ERROR"),
+                                    str(result.get("message") or result.get("detail") or "任务查询失败。"), response.status_code)
+        try:
+            if resource == "me":
+                valid = (_valid_task_projection(result["task"], admin=False)
+                         and result["task"]["task_key"] == filters["task_key"])
+            else:
+                valid = (type(result["total"]) is int and result["total"] >= 0
+                         and type(result["limit"]) is int and result["limit"] == filters["limit"]
+                         and type(result["offset"]) is int and result["offset"] == filters["offset"]
+                         and result["page_size"] == 100 and result["max_pages"] == 5 and isinstance(result["tasks"], list)
+                         and len(result["tasks"]) <= min(filters["limit"], max(0, result["total"] - filters["offset"]))
+                         and all(_valid_task_projection(row, admin=True)
+                                 and (filters.get("account_id") is None or row["account_id"] == filters["account_id"])
+                                 for row in result["tasks"]))
+            if not valid:
+                raise ValueError("Invalid task projection")
+        except (KeyError, TypeError, ValueError) as error:
+            raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台任务服务响应无效。", 502) from error
+        return result
+
     def admin_tool_traces(self, resource: str, *, session_token: str | None, trace_id: str | None = None,
                           **filters: Any) -> dict[str, Any]:
         """Read Java-owned projections without local trace fallback or cache."""
@@ -435,6 +479,24 @@ class PlatformAuthClient:
                 "INVALID_PLATFORM_RESPONSE", "平台认证服务响应无效。", 502
             )
         return payload
+
+
+def _valid_task_projection(value: Any, *, admin: bool) -> bool:
+    fields = {"task_key", "task_type", "status", "progress", "attempt", "max_attempts", "result", "error_summary",
+              "created_at", "started_at", "finished_at", "updated_at"}
+    if admin:
+        fields.update({"account_id", "candidate_id"})
+    if not isinstance(value, dict) or set(value) != fields:
+        return False
+    return (all(isinstance(value[key], str) for key in ("task_key", "task_type", "created_at", "updated_at"))
+            and value["status"] in {"queued", "running", "succeeded", "failed", "cancelled"}
+            and type(value["progress"]) is int and 0 <= value["progress"] <= 100
+            and type(value["attempt"]) is int and value["attempt"] >= 0
+            and type(value["max_attempts"]) is int and value["max_attempts"] > 0
+            and isinstance(value["result"], dict)
+            and all(value[key] is None or isinstance(value[key], str) for key in ("error_summary", "started_at", "finished_at"))
+            and (not admin or (type(value["account_id"]) is int and value["account_id"] > 0
+                               and (value["candidate_id"] is None or type(value["candidate_id"]) is int))))
 
 
 def _valid_tool_trace(value: Any, *, detail: bool) -> bool:

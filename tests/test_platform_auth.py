@@ -13,6 +13,86 @@ from job_hunting_agent.platform_auth import (
 from job_hunting_agent.web import create_web_app
 
 
+def _task_projection():
+    return {"task_key": "task-1", "task_type": "system_probe", "status": "running", "progress": 60,
+            "attempt": 1, "max_attempts": 3, "result": {"artifact_id": 7}, "error_summary": None,
+            "created_at": "2026-10-17T00:00:00+00:00", "updated_at": "2026-10-17T00:00:01+00:00",
+            "started_at": None, "finished_at": None}
+
+
+@pytest.mark.parametrize("resource", ["admin", "me"])
+@pytest.mark.parametrize("status", [200, 400, 403, 404, 503])
+def test_task_query_adapter_never_reads_local_tasks(tmp_path, monkeypatch, resource, status):
+    app = create_web_app(env_file=tmp_path / "missing.env")
+    with TestClient(app) as browser:
+        credentials = {"email": "tasks-adapter@example.com", "password": "password-123"}
+        assert browser.post("/api/auth/register", json=credentials).status_code == 200
+        assert browser.post("/api/auth/login", json=credentials).status_code == 200
+        task = _task_projection()
+        if resource == "admin":
+            task.update(account_id=3, candidate_id=None)
+            payload = {"tasks": [task], "total": 5, "limit": 2, "offset": 4, "page_size": 100, "max_pages": 5}
+            filters = {"account_id": 3, "task_type": "system_probe", "status": "running", "limit": 2, "offset": 4}
+            path = "/api/admin/tasks?account_id=3&task_type=system_probe&status=running&limit=2&offset=4"
+        else:
+            payload, filters = {"task": task}, {"task_key": "task-1"}
+            path = "/api/tasks/task-1?account_id=999"
+
+        def request(url, **kwargs):
+            if url.endswith("/internal/v1/auth/accounts/me"):
+                return httpx.Response(401, json={"code": "SESSION_EXPIRED", "message": "expired"})
+            assert url.endswith(f"/internal/v1/tasks/{resource}/query")
+            assert kwargs["json"] == {"session_token": browser.cookies["job_agent_session"], **filters}
+            assert kwargs["headers"]["X-Trace-Id"] == "tasks-adapter-trace"
+            return httpx.Response(status, json=payload if status == 200 else {"code": "TASK_NOT_FOUND", "message": "not allowed"})
+
+        monkeypatch.setattr(httpx, "post", request)
+        app.state.backend.platform_auth_client = PlatformAuthClient(PlatformAuthSettings(True, "http://java", "secret", 5))
+        for method in ("get_background_task", "list_background_tasks_for_admin", "count_background_tasks_for_admin"):
+            monkeypatch.setattr(app.state.backend.store, method, lambda *a, **k: pytest.fail("Local task fallback"))
+        response = browser.get(path, headers={"X-Request-ID": "tasks-adapter-trace"})
+        assert response.status_code == status, response.text
+        if status == 200:
+            assert response.json() == payload
+
+
+@pytest.mark.parametrize("invalid", ["html", "missing", "owner", "payload", "wrong-key", "progress", "result"])
+def test_task_query_client_rejects_malformed_or_private_data(monkeypatch, invalid):
+    task = _task_projection()
+    if invalid == "owner":
+        task["account_id"] = 999
+    elif invalid == "payload":
+        task["payload_json"] = {"secret": "must-not-leak"}
+    elif invalid == "wrong-key":
+        task["task_key"] = "other-task"
+    elif invalid == "progress":
+        task["progress"] = True
+    elif invalid == "result":
+        task["result"] = []
+    payload = {} if invalid == "missing" else {"task": task}
+    response = httpx.Response(200, text="html") if invalid == "html" else httpx.Response(200, json=payload)
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: response)
+    client = PlatformAuthClient(PlatformAuthSettings(True, "http://java", "secret", 5))
+    with pytest.raises(PlatformAuthError) as error:
+        client.task_query("me", session_token="opaque", task_key="task-1")
+    assert error.value.status_code == 502
+
+
+def test_task_query_requires_session_and_fails_closed_on_outage(monkeypatch):
+    client = PlatformAuthClient(PlatformAuthSettings(True, "http://java", "secret", 5))
+    with pytest.raises(PlatformAuthError) as error:
+        client.task_query("me", session_token=None, task_key="task-1")
+    assert error.value.status_code == 401
+    def offline(*a, **k):
+        raise httpx.ConnectError("offline")
+    monkeypatch.setattr(httpx, "post", offline)
+    with pytest.raises(PlatformAuthUnavailableError):
+        client.task_query("admin", session_token="opaque", limit=100, offset=0)
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(503, text="html"))
+    with pytest.raises(PlatformAuthUnavailableError):
+        client.task_query("me", session_token="opaque", task_key="task-1")
+
+
 def _tool_trace_projection():
     return {"id": 1, "account_id": 3, "candidate_id": None, "session_id": None, "root_request_id": "task-1",
             "title": "Task", "status": "failed", "source": "chat", "step_count": 2, "attempt_count": 3,

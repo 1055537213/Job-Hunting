@@ -213,6 +213,15 @@ Python 仍负责用量写入及物理清理，Java 不写运维记录，不裁�
 Python 保留执行、写入和定期物理清理职责，Java 不写工具表。
 契约见 [`admin-tools.openapi.yaml`](src/main/resources/admin-tools.openapi.yaml)。
 
+`GET /api/admin/tasks` 和 `GET /api/tasks/{task_key}` 经网关直达 Java。
+前者支持账号、类型、状态过滤及分页，后者始终按当前 Session 账号查询，管理员也不能通过个人接口读取他人任务。
+总数与分页使用只读 Repeatable Read 快照，不缓存进度，不查询或返回 payload、幂等键、内部 ID 和 Session。
+未知状态返回 400，无效参数返回 422，外部账号任务与不存在任务统一返回 404。
+每页默认/最多 100 条；`max_pages=5` 只是兼容 UI 元数据，不代表删除任务或限制全量查询。
+Python 仍独占任务投递、重试、认领、进度更新、完成及失败写入，无需数据库结构变更。
+Java 模式的 Python 查询入口只转发真实会话，故障不回退本地查询。
+契约见 [`task-reads.openapi.yaml`](src/main/resources/task-reads.openapi.yaml)。
+
 - Java 服务和 Python 服务不能同时写同一组账务表。
 - Java 账务开关关闭时，`account_balances`、`recharge_orders`、`account_balance_ledger` 仍由 Python 独占写入；开关打开后，余额、模拟充值和模型扣费由 Java 独占写入。
 - 跨服务请求必须带幂等键和 trace id。
