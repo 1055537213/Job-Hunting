@@ -622,6 +622,7 @@ def run_account_deletion_gateway_flow(gateway_url: str, web_url: str, java_url: 
     ids = [auth.register_account(email=email, password=password, display_name="Delete acceptance",
                                  email_verified=True, consents=[]).account_id for email in emails]
     store = SQLAlchemyStore(database_url)
+    in_flight = store.account_work.acquire(ids[0])
     try:
         fixture_code = f"""
 import json
@@ -697,6 +698,29 @@ app.store.close()
                 conn.execute("UPDATE platform_account_deletion_requests SET next_dispatch_at=CURRENT_TIMESTAMP-INTERVAL '1 second'")
             maintenance = "from job_hunting_agent.worker import create_worker_app; from job_hunting_agent.task_queue import STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME; print(create_worker_app().tasks[STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME].apply().get())"
             docker("exec", worker, "python", "-c", maintenance)
+            deadline = time.monotonic() + 45
+            while time.monotonic() < deadline:
+                waiting = store.get_background_task(first_key)
+                if waiting.status == "queued" and waiting.error_summary == "等待账号在途请求结束。":
+                    break
+                time.sleep(0.5)
+            assert waiting.status == "queued" and waiting.attempt == 0, waiting
+            assert store.get_account(ids[0]).deleted_at is None
+            # Model an already-admitted upload committing after Java disables the account.
+            late_file = f"""
+from job_hunting_agent.app import JobHuntingApp
+app=JobHuntingApp()
+obj=app.resume_files.save(account_id={ids[0]},candidate_id=1,filename='in-flight.txt',content=b'in-flight data')
+app.store.register_knowledge_asset(account_id={ids[0]},candidate_id=None,asset_kind='document',title='In flight',
+    original_filename='in-flight.txt',storage_key=obj.storage_key,media_type='text/plain',file_size=obj.file_size,sha256=obj.sha256)
+print(obj.storage_key)
+app.store.close()
+"""
+            keys.append(docker("exec", worker, "python", "-c", late_file).splitlines()[-1])
+            in_flight.release()
+            with store.connect() as conn:
+                conn.execute("UPDATE platform_account_deletion_requests SET next_dispatch_at=CURRENT_TIMESTAMP-INTERVAL '1 second' WHERE account_id=?", (ids[0],))
+            docker("exec", worker, "python", "-c", maintenance)
             deadline = time.monotonic() + 90
             while time.monotonic() < deadline:
                 if all(store.get_background_task(key).status == "succeeded" for key in (first_key, second_key)):
@@ -716,11 +740,12 @@ app.store.close()
             docker("exec", worker, "python", "-c", check_files)
             assert browser.post("/api/auth/login", json={"email": emails[1], "password": password}).status_code == 401
     finally:
+        in_flight.release()
         for name in (broker, worker, web):
             docker("start", name)
         wait(web_url + "/api/health")
         store.close()
-    print("==> Java deletion intent with Python/Worker stopped -> broker outage -> real maintenance/Worker -> files/RAG cleanup and financial retention: PASS")
+    print("==> Java deletion intent -> Python/broker recovery -> in-flight request drain -> late files/RAG cleanup and financial retention: PASS")
 
 
 def run_observability_gateway_flow(gateway_url: str, web_url: str, internal_token: str,

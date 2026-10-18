@@ -7,6 +7,18 @@ from .storage import now_iso
 logger = logging.getLogger(__name__)
 
 
+def defer_deletion_task(store, record):
+    """Waiting is not a failed cleanup; Java's durable intent will dispatch again."""
+    with store.connect() as conn:
+        changed = conn.execute("""UPDATE background_tasks SET status='queued',attempt=GREATEST(attempt-1,0),
+            started_at=NULL,finished_at=NULL,updated_at=?,error_summary='等待账号在途请求结束。'
+            WHERE task_key=? AND task_type='account_deletion' AND status='running' AND attempt=?""",
+            (now_iso(), record.task_key, record.attempt))
+        if changed.rowcount != 1:
+            raise RuntimeError("注销任务状态已变更。")
+    return {"task_key": record.task_key, "status": "queued", "deferred": True}
+
+
 def register_deletion_task(store, request):
     owner, key = request["account_id"], request["task_key"]
     now = now_iso()

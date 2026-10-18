@@ -317,8 +317,9 @@ class JobHuntingAgent:
         streamed_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         active_tool_names: set[str] = set()
 
+        graph_events = None
         try:
-            for stream_item in self.graph.stream(
+            graph_events = self.graph.stream(
                 {"messages": turn_messages},
                 config={
                     "configurable": {
@@ -339,7 +340,8 @@ class JobHuntingAgent:
                     "root_request_id": root_request_id,
                 },
                 stream_mode="messages",
-            ):
+            )
+            for stream_item in graph_events:
                 streamed_message = unpack_stream_message(stream_item)
                 if streamed_message is None:
                     continue
@@ -396,6 +398,10 @@ class JobHuntingAgent:
             reply = extract_final_reply(tool_and_final_messages)
             if reply.startswith("本轮没有生成") and streamed_reply_parts:
                 reply = "".join(streamed_reply_parts).strip()
+        finally:
+            close = getattr(graph_events, "close", None)
+            if close is not None:
+                close()
         usage = self.model_gateway.record_chat_usage_summary(
             self.model_gateway.new_call_context(
                 "agent_chat",

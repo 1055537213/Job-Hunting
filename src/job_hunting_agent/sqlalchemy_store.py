@@ -17,6 +17,7 @@ from typing import Any, Self
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection, CursorResult, Engine
 
+from .account_work import AccountWorkGuard
 from .config import normalize_database_url
 from .database_migrations import current_database_revision, latest_database_revision
 from .storage import RepositoryConnection, RepositoryStore
@@ -150,6 +151,7 @@ class SQLAlchemyStore(RepositoryStore):
         if os.environ.get("JOB_AGENT_TEST_DATABASE_URL"):
             engine_options["poolclass"] = sa.pool.NullPool
         self.engine = sa.create_engine(self.database_url, **engine_options)
+        self.account_work = AccountWorkGuard(self.database_url)
 
     def connect(self) -> RepositoryConnection:
         """返回一次短生命周期的 SQLAlchemy 事务连接。"""

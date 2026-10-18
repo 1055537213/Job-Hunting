@@ -48,6 +48,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .account_email_outbox import AccountEmailOutboxService, redact_email
 from .account_export import encode_export
+from .account_work import AccountWorkRoute, AccountWorkStreamingResponse
 from .account_lifecycle import (
     AccountEmailSender,
     action_token_hash,
@@ -529,6 +530,7 @@ def create_web_app(
             agent_error = str(error)
 
     web_app = FastAPI(title="Job Hunting Agent Web", version="0.1.0")
+    web_app.router.route_class = AccountWorkRoute
     web_app.state.backend = backend
     web_app.state.account_email_outbox = account_email_outbox
 
@@ -686,6 +688,7 @@ def create_web_app(
             if account.status != "active":
                 raise HTTPException(status_code=403, detail="账号已被禁用。")
             request.state.account = account
+            backend.store.account_work.protect_request(request, account.id)
             return account
         session = getattr(request.state, "auth_session", None)
         if session is None:
@@ -711,6 +714,9 @@ def create_web_app(
         if idle_expiry < session.absolute_expires_at:
             backend.store.touch_auth_session(session.id, utc_now().isoformat(timespec="seconds"), idle_expiry)
         request.state.account = account
+        # Native synchronous deletion must not wait on its own request lease.
+        if request.url.path != "/api/account/delete":
+            backend.store.account_work.protect_request(request, account.id)
         return account
 
     def require_admin(request: Request) -> AccountRecord:
@@ -1225,7 +1231,9 @@ def create_web_app(
             except PlatformAuthError as error:
                 raise HTTPException(401 if error.status_code == 401 else 503, "账号导出认证失败。") from None
             account = platform_account_record(result["account"])
-            return encode_export(backend.store.export_account_data(account.id, account=account), account.id)
+            # Keep the lease in the actual export thread, even if its HTTP caller disconnects.
+            with backend.store.account_work.acquire(account.id):
+                return encode_export(backend.store.export_account_data(account.id, account=account), account.id)
         except OverflowError:
             raise HTTPException(413, "数据量超过同步导出限制，请联系管理员。") from None
         finally:
@@ -1868,7 +1876,7 @@ def create_web_app(
                 detail=f"LangChain Agent 未就绪：{agent_error or '请检查 .env 配置'}",
             )
 
-        return StreamingResponse(
+        return AccountWorkStreamingResponse(
             stream_web_chat_events(
                 backend=backend,
                 chat_agent=chat_agent,
@@ -3503,10 +3511,11 @@ def stream_web_chat_events(
 
     if payload.use_env_llm:
         assert chat_agent is not None
+        agent_events = None
         try:
             # 真实模型可能会先经历一段思考/排队时间；先发状态事件，让前端立即有反馈。
             yield sse_event("status", {"content": "正在连接模型并等待首个 token..."})
-            for event in chat_agent.stream_chat(
+            agent_events = chat_agent.stream_chat(
                 user_message,
                 candidate_id=payload.candidate_id,
                 session_id=session_id,
@@ -3516,7 +3525,8 @@ def stream_web_chat_events(
                 auto_rag=payload.auto_rag,
                 account_id=account_id,
                 root_request_id=root_request_id,
-            ):
+            )
+            for event in agent_events:
                 event_type = event.get("type")
                 if event_type == "token":
                     yield sse_event("token", {"content": event.get("content", "")})
@@ -3635,6 +3645,10 @@ def stream_web_chat_events(
             )
             yield sse_event("task_failed", {"task_trace": serialize_user_task_trace(trace)})
             yield sse_event("error", {"detail": str(error)})
+        finally:
+            close = getattr(agent_events, "close", None)
+            if close is not None:
+                close()
         return
 
     try:

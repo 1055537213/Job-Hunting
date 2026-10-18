@@ -15,8 +15,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from .account_deletion import defer_deletion_task
 from .account_email_outbox import AccountEmailOutboxService
 from .account_lifecycle import build_account_email_sender, new_action_token
+from .account_work import AccountWorkBusy
 from .app import JobHuntingApp
 from .auth import hash_password, iso_utc
 from .config import (
@@ -595,6 +597,21 @@ def _run_account_deletion_task(
     backend: JobHuntingApp,
     record: BackgroundTaskRecord,
 ) -> dict[str, object]:
+    # Admission has disabled the account. Existing Web/SSE requests must finish
+    # before collecting the final object manifest and deleting business rows.
+    try:
+        with backend.store.account_work.deletion(record.account_id):
+            return _delete_drained_account(backend, record)
+    except AccountWorkBusy:
+        if backend.platform_auth_client is None:
+            raise
+        return defer_deletion_task(backend.store, record)
+
+
+def _delete_drained_account(
+    backend: JobHuntingApp,
+    record: BackgroundTaskRecord,
+) -> dict[str, object]:
     """幂等清理对象并最终删除账号业务数据。
 
     对象删除失败时直接抛出异常，由现有 Worker 重试策略重新投递。同一对象重复
@@ -621,7 +638,7 @@ def _run_account_deletion_task(
         record.account_id,
         exclude_task_key=record.task_key,
     ):
-        raise RuntimeError("账号仍有后台任务运行，注销清理将在稍后重试。")
+        raise AccountWorkBusy("账号仍有后台任务运行，注销清理将在稍后重试。")
     # Running work may have created objects after admission. Persist the complete
     # manifest before deleting anything, so retries survive partial DB cleanup.
     if java_deletion:

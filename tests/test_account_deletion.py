@@ -102,6 +102,27 @@ def test_late_objects_are_durably_recorded_before_deletion_and_retry(backend, mo
     assert backend.store.list_knowledge_assets(account_id=backend.owner) == []
 
 
+def test_waiting_for_requests_does_not_consume_java_cleanup_retry_budget(backend):
+    with backend.store.connect() as conn:
+        conn.execute("UPDATE accounts SET status='active' WHERE id=?", (backend.owner,))
+    lease = backend.store.account_work.acquire(backend.owner)
+    backend.store.prepare_account_deletion(backend.owner)
+    task = register_deletion_task(backend.store, intent(backend.owner))
+    completed = []
+    backend.platform_auth_client = SimpleNamespace(account=lambda *a, **kw: completed.append(kw))
+    try:
+        for _ in range(12):
+            result = run_registered_task(backend, task.task_key)
+            assert result["status"] == "queued" and result["deferred"] is True
+            assert backend.store.get_background_task(task.task_key).attempt == 0
+            assert backend.store.get_account(backend.owner).deleted_at is None
+        assert not completed
+    finally:
+        lease.release()
+    assert run_registered_task(backend, task.task_key)["status"] == "succeeded"
+    assert len(completed) == 1
+
+
 @pytest.mark.parametrize("status", [202, 400, 401, 403, 409, 422, 503])
 def test_compatibility_delete_only_forwards_and_clears_cookies_after_admission(tmp_path, monkeypatch, status):
     app = create_web_app(env_file=tmp_path / "missing.env")

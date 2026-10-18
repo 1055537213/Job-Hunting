@@ -154,6 +154,9 @@ def test_export_callbacks_do_not_wait_on_fastapi_sync_pool(tmp_path, monkeypatch
         backend = app.state.backend
         backend.platform_auth_client = java_client()
         value = export_fixture()
+        owner = backend.store.create_account(email="owner@example.com", password_hash="hash", display_name="Owner")
+        value["account"]["id"] = owner.id
+        value["account_balance"]["account_id"] = owner.id
         account = dict(value["account"])
         account["account_id"] = account.pop("id")
         monkeypatch.setattr(httpx, "post", lambda *a, **kw: httpx.Response(200, json={"account": account}))
