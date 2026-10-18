@@ -8,6 +8,7 @@ Web 只登记受控资源 ID，Worker 在独立进程中读取 PostgreSQL 事实
 from __future__ import annotations
 
 import time
+import json
 from uuid import uuid4
 from dataclasses import asdict
 from functools import lru_cache
@@ -621,6 +622,15 @@ def _run_account_deletion_task(
         exclude_task_key=record.task_key,
     ):
         raise RuntimeError("账号仍有后台任务运行，注销清理将在稍后重试。")
+    # Running work may have created objects after admission. Persist the complete
+    # manifest before deleting anything, so retries survive partial DB cleanup.
+    if java_deletion:
+        storage_keys = sorted(set(storage_keys) | set(backend.store.collect_account_deletion_storage_keys(record.account_id)))
+        record.payload["storage_keys"] = storage_keys
+        _account_deletion_task_payload(record)
+        with backend.store.connect() as conn:
+            conn.execute("UPDATE background_tasks SET payload_json=? WHERE task_key=? AND status='running'",
+                         (json.dumps(record.payload, ensure_ascii=False), record.task_key))
     total = len(storage_keys)
     for index, storage_key in enumerate(storage_keys, start=1):
         backend.resume_files.delete(storage_key)
@@ -1277,6 +1287,8 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
             counts = recover_stale_background_tasks(backend)
             from .task_commands import TaskCommands
             counts.update(TaskCommands(backend.store, backend.task_queue).dispatch_pending())
+            from .account_deletion import dispatch_account_deletions
+            counts.update(dispatch_account_deletions(backend))
             return {"status": "succeeded", **counts}
         finally:
             backend.store.close()

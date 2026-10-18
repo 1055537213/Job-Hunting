@@ -1291,6 +1291,20 @@ sa.Index(
 sa.Index("idx_background_tasks_candidate", background_tasks.c.candidate_id, background_tasks.c.updated_at.desc())
 
 
+platform_account_deletion_requests = sa.Table(
+    "platform_account_deletion_requests", metadata,
+    sa.Column("account_id", sa.Integer, sa.ForeignKey("accounts.id", ondelete="CASCADE"), primary_key=True),
+    sa.Column("request_key", sa.String(64), nullable=False, unique=True),
+    sa.Column("task_key", sa.String(64), nullable=False, unique=True),
+    sa.Column("request_id", sa.String(128)),
+    sa.Column("next_dispatch_at", timestamp_type, nullable=False, server_default=sa.func.now()),
+    sa.Column("created_at", timestamp_type, nullable=False, server_default=sa.func.now()),
+    sa.Column("completed_at", timestamp_type),
+)
+sa.Index("idx_platform_deletion_due", platform_account_deletion_requests.c.completed_at,
+         platform_account_deletion_requests.c.next_dispatch_at)
+
+
 task_commands = sa.Table(
     "task_commands", metadata,
     sa.Column("id", sa.Integer, primary_key=True),

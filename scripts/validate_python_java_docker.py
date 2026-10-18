@@ -610,6 +610,119 @@ def run_account_export_gateway_flow(gateway_url: str, web_url: str, java_url: st
     print("==> Java export -> real-session Python callback -> tenant isolation/no secrets -> outage/recovery/revocation: PASS")
 
 
+def run_account_deletion_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
+                                      web: str, worker: str, broker: str, database_url: str, credentials: tuple[str, str]) -> None:
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+    from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
+
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
+    password = "deletion-acceptance-password"
+    emails = [f"delete-{os.urandom(10).hex()}@example.com" for _ in range(2)]
+    ids = [auth.register_account(email=email, password=password, display_name="Delete acceptance",
+                                 email_verified=True, consents=[]).account_id for email in emails]
+    store = SQLAlchemyStore(database_url)
+    try:
+        fixture_code = f"""
+import json
+from job_hunting_agent.app import JobHuntingApp
+from job_hunting_agent.models import CandidateProfileInput
+app=JobHuntingApp()
+app.initialize()
+keys=[]
+for owner in {ids!r}:
+    profile=CandidateProfileInput(name='Deletion fixture',status='student',education='bachelor',experience_years=0,
+        skills={{}},preferred_cities=[],salary_floor_k=None,expected_salary_k=None,target_directions=[])
+    candidate=app.store.save_candidate_profile(profile,account_id=owner)
+    text=app.store.add_long_text('profile',candidate,'deletion-fixture','private fixture',account_id=owner,candidate_id=candidate)
+    with app.store.connect() as conn:
+        conn.execute('''INSERT INTO rag_chunks(id,account_id,candidate_id,long_text_id,entity_type,entity_id,
+            source_label,chunk_index,content,content_sha256,embedding,embedding_model,embedding_dimensions,created_at,updated_at)
+            VALUES (?,?,?,?,'profile',?,'deletion-fixture',0,'private fixture',?,'[0.1,0.2,0.3]'::vector,'fixture',3,now(),now()) RETURNING 1 AS fixture''',
+            ('deletion-fixture-'+str(owner),owner,candidate,text,candidate,'0'*64))
+    obj=app.resume_files.save(account_id=owner,candidate_id=candidate,filename='deletion.txt',content=b'private deletion fixture')
+    app.store.register_knowledge_asset(account_id=owner,candidate_id=candidate,asset_kind='document',title='Deletion fixture',
+        original_filename='deletion.txt',storage_key=obj.storage_key,media_type='text/plain',file_size=obj.file_size,sha256=obj.sha256)
+    keys.append(obj.storage_key)
+print(json.dumps(keys))
+app.store.close()
+"""
+        keys = json.loads(docker("exec", worker, "python", "-c", fixture_code).splitlines()[-1])
+        with httpx.Client(base_url=gateway_url, timeout=15) as browser, httpx.Client(base_url=gateway_url, timeout=15) as admin:
+            logged = admin.post("/api/auth/login", json={"email": credentials[0], "password": credentials[1]})
+            assert logged.status_code == 200
+            admin_headers = {"X-CSRF-Token": logged.json()["csrf_token"]}
+            for owner in ids:
+                assert admin.post(f"/api/admin/accounts/{owner}/balance/credit", json={"amount_yuan": 1,
+                                  "reason": "deletion fixture", "idempotency_key": f"deletion-credit-{owner}"}, headers=admin_headers).status_code == 200
+            assert admin.post("/api/account/delete", json={"current_password": credentials[1], "confirmation": "注销账号"},
+                              headers=admin_headers).status_code == 403
+            login = browser.post("/api/auth/login", json={"email": emails[0], "password": password})
+            assert login.status_code == 200
+            session = browser.cookies["job_agent_session"]
+            headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+            body = {"current_password": password, "confirmation": "注销账号", "account_id": ids[1]}
+            assert browser.post("/api/account/delete", json=body).status_code == 403
+            assert browser.post("/api/account/delete", json={**body, "current_password": "wrong"}, headers=headers).status_code == 400
+            docker("stop", "--time", "1", worker)
+            docker("stop", "--time", "1", web)
+            receipt = browser.post("/api/account/delete", json=body, headers=headers)
+            assert receipt.status_code == 202 and receipt.json()["status"] == "accepted", receipt.text[:300]
+            assert "job_agent_session=" in receipt.headers["set-cookie"] and "Max-Age=0" in receipt.headers["set-cookie"]
+            first_key = receipt.json()["task_key"]
+            assert store.get_account(ids[1]).status == "active"
+            assert store.get_account(ids[0]).status == "disabled" and store.get_account(ids[0]).deleted_at is None
+            assert admin.patch(f"/api/admin/accounts/{ids[0]}/status", json={"status": "active"}, headers=admin_headers).status_code == 409
+            assert httpx.get(java_url + "/api/account/export", cookies={"job_agent_session": session}).status_code == 401
+            assert store.list_background_tasks(account_id=ids[0]) == []
+            docker("start", web)
+            wait(web_url + "/api/health")
+            login = browser.post("/api/auth/login", json={"email": emails[1], "password": password})
+            assert login.status_code == 200
+            second = httpx.post(web_url + "/api/account/delete", json=body, cookies=browser.cookies,
+                                headers={"X-CSRF-Token": login.json()["csrf_token"]}, timeout=15)
+            assert second.status_code == 202, second.text[:300]
+            second_key = second.json()["task_key"]
+            assert httpx.post(java_url + "/internal/v1/accounts/deletions/due", json={"limit": 20}).status_code == 401
+            docker("stop", "--time", "1", broker)
+            docker("start", worker)
+            dispatch_code = "from job_hunting_agent.app import JobHuntingApp; from job_hunting_agent.account_deletion import dispatch_account_deletions; app=JobHuntingApp(); app.store.initialize(); print(dispatch_account_deletions(app)); app.store.close()"
+            docker("exec", worker, "python", "-c", dispatch_code)
+            assert store.get_background_task(first_key).status == "queued"
+            assert store.get_background_task(second_key).status == "queued"
+            docker("stop", "--time", "1", worker)
+            docker("start", broker)
+            docker("start", worker)
+            with store.connect() as conn:
+                conn.execute("UPDATE platform_account_deletion_requests SET next_dispatch_at=CURRENT_TIMESTAMP-INTERVAL '1 second'")
+            maintenance = "from job_hunting_agent.worker import create_worker_app; from job_hunting_agent.task_queue import STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME; print(create_worker_app().tasks[STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME].apply().get())"
+            docker("exec", worker, "python", "-c", maintenance)
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                if all(store.get_background_task(key).status == "succeeded" for key in (first_key, second_key)):
+                    break
+                time.sleep(1)
+            for owner, key in zip(ids, (first_key, second_key), strict=True):
+                assert store.get_background_task(key).status == "succeeded"
+                assert store.get_account(owner).deleted_at is not None
+                assert store.list_knowledge_assets(account_id=owner) == []
+                with store.connect() as conn:
+                    assert conn.execute("SELECT completed_at IS NOT NULL AS done FROM platform_account_deletion_requests WHERE account_id=?", (owner,)).fetchone()["done"]
+                    assert conn.execute("SELECT count(*) AS n FROM account_balance_ledger WHERE account_id=?", (owner,)).fetchone()["n"] == 1
+                    assert conn.execute("SELECT count(*) AS n FROM auth_sessions WHERE account_id=?", (owner,)).fetchone()["n"] == 0
+                    assert conn.execute("SELECT count(*) AS n FROM rag_chunks WHERE account_id=?", (owner,)).fetchone()["n"] == 0
+                    assert conn.execute("SELECT count(*) AS n FROM long_texts WHERE account_id=?", (owner,)).fetchone()["n"] == 0
+            check_files = f"from job_hunting_agent.app import JobHuntingApp; app=JobHuntingApp(); assert all(not app.resume_files.path_for(key).exists() for key in {keys!r}); app.store.close()"
+            docker("exec", worker, "python", "-c", check_files)
+            assert browser.post("/api/auth/login", json={"email": emails[1], "password": password}).status_code == 401
+    finally:
+        for name in (broker, worker, web):
+            docker("start", name)
+        wait(web_url + "/api/health")
+        store.close()
+    print("==> Java deletion intent with Python/Worker stopped -> broker outage -> real maintenance/Worker -> files/RAG cleanup and financial retention: PASS")
+
+
 def run_observability_gateway_flow(gateway_url: str, web_url: str, internal_token: str,
                                     credentials: tuple[str, str]) -> None:
     """Check real aggregation after Python recovery, without mocks or application data."""
@@ -846,6 +959,9 @@ def main() -> None:
         docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
         run_account_export_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                         f"http://127.0.0.1:{args.port}", token, web, isolated_url)
+        docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
+        run_account_deletion_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                                          f"http://127.0.0.1:{args.port}", token, web, worker, broker, isolated_url, admin_credentials)
         docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
         run_observability_gateway_flow(f"http://127.0.0.1:{args.port + 2}",
                                       f"http://127.0.0.1:{args.port + 1}", token, admin_credentials)

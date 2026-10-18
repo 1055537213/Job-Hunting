@@ -28,7 +28,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
         PublicAdminAccountController.class, BillingQueryController.class, PersonalRechargeController.class, AdminBillingController.class,
         AdminUsageController.class, AdminToolTraceController.class, TaskReadController.class, TaskCommandController.class,
         AdminObservabilityController.class, PublicAccountProfileController.class, PublicAccountExportController.class,
-        InternalAccountExportController.class})
+        InternalAccountExportController.class, AccountDeletionController.class})
 public class PublicAuthErrorHandler {
     @ExceptionHandler(AuthException.class)
     public ResponseEntity<Map<String, Object>> auth(AuthException error, HttpServletRequest request) {

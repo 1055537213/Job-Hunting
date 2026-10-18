@@ -132,6 +132,11 @@ public class AccountAdministrationService {
                     "LAST_ADMIN_FORBIDDEN", "至少需要保留一个可用管理员账号。", HttpStatus.BAD_REQUEST);
         }
 
+        if ("active".equals(nextStatus) && Boolean.TRUE.equals(jdbc.queryForObject(
+                "SELECT EXISTS(SELECT 1 FROM platform_account_deletion_requests WHERE account_id=? AND completed_at IS NULL)",
+                Boolean.class, targetId))) {
+            throw new AuthException("DELETION_PENDING", "账号正在注销清理，不能重新启用。", HttpStatus.CONFLICT);
+        }
         jdbc.update("UPDATE accounts SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 nextStatus, targetId);
         if ("disabled".equals(nextStatus)) {
@@ -179,6 +184,11 @@ public class AccountAdministrationService {
     public AccountResponse prepareDeletion(String sessionToken, String currentPassword, String requestId) {
         long accountId = sessions.prepareDeletion(sessionToken, currentPassword);
         jdbc.update("""
+                INSERT INTO platform_account_deletion_requests(account_id,request_key,task_key,request_id)
+                VALUES (?,?,?,?)
+                """, accountId, UUID.randomUUID().toString().replace("-", ""),
+                UUID.randomUUID().toString().replace("-", ""), cap(requestId));
+        jdbc.update("""
                 INSERT INTO admin_audit_events (actor_account_id, target_account_id, action, target_type,
                   target_id, outcome, summary, details_json, request_id, created_at)
                 VALUES (?, ?, 'account.deletion_requested', 'account', ?, 'succeeded', ?, CAST(? AS jsonb), ?, CURRENT_TIMESTAMP)
@@ -198,6 +208,11 @@ public class AccountAdministrationService {
             throw new AuthException("ACCOUNT_NOT_FOUND", "账号不存在。", HttpStatus.NOT_FOUND);
         }
         DeletionAccount account = rows.getFirst();
+        var requests = jdbc.query("SELECT task_key FROM platform_account_deletion_requests WHERE account_id=? FOR UPDATE",
+                (row, index) -> row.getString("task_key"), accountId);
+        if (requests.isEmpty() || !requests.getFirst().equals(taskKey)) {
+            throw new AuthException("DELETION_NOT_ADMITTED", "注销任务与准入记录不匹配。", HttpStatus.CONFLICT);
+        }
         if (account.deleted()) return new DeletionResult(accountId, true);
         if (!"disabled".equals(account.status())) {
             throw new AuthException("DELETION_NOT_ADMITTED", "账号尚未通过注销准入。", HttpStatus.CONFLICT);
@@ -211,6 +226,11 @@ public class AccountAdministrationService {
                 """, "deleted-" + accountId + "-" + deletedAt + "@invalid.local",
                 passwordHasher.encode("deleted-" + UUID.randomUUID()), accountId);
         emails.invalidateCredentialLinks(accountId);
+        for (String table : List.of("auth_sessions", "platform_account_action_emails", "account_action_tokens", "account_email_outbox")) {
+            jdbc.update("DELETE FROM " + table + " WHERE account_id=?", accountId);
+        }
+        jdbc.update("UPDATE account_consents SET ip_address=NULL,user_agent=NULL WHERE account_id=?", accountId);
+        jdbc.update("UPDATE platform_account_deletion_requests SET completed_at=CURRENT_TIMESTAMP WHERE account_id=?", accountId);
         jdbc.update("""
                 INSERT INTO admin_audit_events (actor_account_id, target_account_id, action, target_type,
                   target_id, outcome, summary, details_json, request_id, created_at)

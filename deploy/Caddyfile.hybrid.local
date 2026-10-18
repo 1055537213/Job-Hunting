@@ -14,6 +14,11 @@
 			path /api/account/export
 		}
 		reverse_proxy @account_export platform-service:8081
+		@account_deletion {
+			method POST
+			path /api/account/delete
+		}
+		reverse_proxy @account_deletion platform-service:8081
 		@billing_reads {
 			method GET
 			path /api/me/balance /api/me/recharge/orders

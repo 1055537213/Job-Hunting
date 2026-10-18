@@ -116,8 +116,8 @@ class AccountAdministrationControllerTest {
                 .header("X-Trace-Id", "trace-delete")
                 .contentType(APPLICATION_JSON)
                 .content("{\"session_token\":\"opaque\",\"current_password\":\"password-123\"}"))
-            .andExpect(status().isOk())
-            .andExpect(jsonPath("$.account.account_id").value(2));
+            .andExpect(status().isConflict())
+            .andExpect(jsonPath("$.code").value("DELETION_PROTOCOL_UPGRADED"));
         mvc.perform(post("/internal/v1/auth/accounts/delete-complete")
                 .header("X-Internal-Service-Token", "test-token")
                 .header("X-Trace-Id", "trace-complete")
@@ -132,7 +132,7 @@ class AccountAdministrationControllerTest {
         verify(service).updateProfile("opaque", "New Name", "trace-profile");
         verify(service).updateStatus("opaque", 2, "disabled", "trace-2");
         verify(service).bootstrap("admin@example.com", "password-123", null);
-        verify(service).prepareDeletion("opaque", "password-123", "trace-delete");
+        verify(service, org.mockito.Mockito.never()).prepareDeletion("opaque", "password-123", "trace-delete");
         verify(service).completeDeletion(2, "task-delete", "trace-complete");
         assertThat(new AccountAdministrationController.SessionRequest("opaque").toString())
             .doesNotContain("opaque");

@@ -46,6 +46,7 @@ class AccountAdministrationIntegrationTest {
     @Autowired AdminToolTraceService toolTraces;
     @Autowired TaskReadService tasks;
     @Autowired TaskQueryService taskQueries;
+    @Autowired AccountDeletionRequests deletions;
 
     @BeforeEach
     void reset() {
@@ -127,7 +128,14 @@ class AccountAdministrationIntegrationTest {
               started_at timestamptz, finished_at timestamptz, updated_at timestamptz DEFAULT CURRENT_TIMESTAMP)
             """);
         jdbc.execute("""
-            TRUNCATE background_tasks, usage_events, tool_call_traces, account_balance_ledger,
+            CREATE TABLE IF NOT EXISTS platform_account_deletion_requests (
+              account_id integer PRIMARY KEY REFERENCES accounts(id), request_key varchar(64) UNIQUE NOT NULL,
+              task_key varchar(64) UNIQUE NOT NULL, request_id varchar(128),
+              next_dispatch_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at timestamptz)
+            """);
+        jdbc.execute("""
+            TRUNCATE platform_account_deletion_requests, background_tasks, usage_events, tool_call_traces, account_balance_ledger,
                      platform_account_action_emails, account_email_outbox, account_action_tokens,
                      admin_audit_events, auth_sessions, account_consents, account_balances, accounts
                      RESTART IDENTITY CASCADE
@@ -173,7 +181,9 @@ class AccountAdministrationIntegrationTest {
             .satisfies(error -> assertThat(((AuthException) error).code()).isEqualTo("DELETION_NOT_ADMITTED"));
 
         accounts.prepareDeletion(user.session_token(), "password-123", "trace-admission");
-        var completed = accounts.completeDeletion(2, "task-delete", "trace-complete");
+        String key = deletions.forAccount(2).task_key();
+        assertThatThrownBy(() -> accounts.completeDeletion(2, "wrong-task", "trace-wrong")).isInstanceOf(AuthException.class);
+        var completed = accounts.completeDeletion(2, key, "trace-complete");
 
         assertThat(completed.deleted()).isTrue();
         assertThat(jdbc.queryForObject("SELECT deleted_at IS NOT NULL FROM accounts WHERE id=2", Boolean.class))
@@ -184,7 +194,9 @@ class AccountAdministrationIntegrationTest {
                 "SELECT count(*) FROM admin_audit_events WHERE action='account.deletion_completed' AND target_account_id=2",
                 Integer.class)).isEqualTo(1);
 
-        assertThat(accounts.completeDeletion(2, "task-delete", "trace-complete-retry").deleted()).isTrue();
+        assertThat(accounts.completeDeletion(2, key, "trace-complete-retry").deleted()).isTrue();
+        assertThat(jdbc.queryForObject("SELECT completed_at IS NOT NULL FROM platform_account_deletion_requests WHERE account_id=2", Boolean.class)).isTrue();
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM auth_sessions WHERE account_id=2", Integer.class)).isZero();
         assertThat(jdbc.queryForObject(
                 "SELECT count(*) FROM admin_audit_events WHERE action='account.deletion_completed' AND target_account_id=2",
                 Integer.class)).isEqualTo(1);
@@ -203,6 +215,33 @@ class AccountAdministrationIntegrationTest {
         assertThat(jdbc.queryForObject(
                 "SELECT action FROM admin_audit_events WHERE target_account_id=2", String.class))
             .isEqualTo("account.profile_updated");
+    }
+
+    @Test void deletionIntentSurvivesWithoutPythonAndCannotBeReenabledOrDoubleClaimed() {
+        var user = sessions.login("user@example.com", "password-123", false, null, null);
+        accounts.prepareDeletion(user.session_token(), "password-123", "trace-deletion");
+        assertThat(sessions.resolve(user.session_token())).isNull();
+        var batch = deletions.due(20);
+        assertThat(batch).hasSize(1);
+        assertThat(batch.getFirst().account_id()).isEqualTo(2L);
+        assertThat(deletions.due(20)).isEmpty();
+        jdbc.update("UPDATE platform_account_deletion_requests SET next_dispatch_at=CURRENT_TIMESTAMP-INTERVAL '1 second'");
+        assertThat(deletions.due(20).getFirst().task_key()).isEqualTo(batch.getFirst().task_key());
+        var admin = sessions.login("admin@example.com", "password-123", false, null, null);
+        assertThatThrownBy(() -> accounts.updateStatus(admin.session_token(), 2, "active", "trace-enable"))
+                .isInstanceOf(AuthException.class).hasMessage("账号正在注销清理，不能重新启用。");
+    }
+
+    @Test void failedIntentInsertRollsBackDisableAndSessionRevocation() {
+        var user = sessions.login("user@example.com", "password-123", false, null, null);
+        jdbc.execute("ALTER TABLE platform_account_deletion_requests ADD CONSTRAINT test_deny_intent CHECK (account_id<0)");
+        try {
+            assertThatThrownBy(() -> accounts.prepareDeletion(user.session_token(), "password-123", "trace-rollback"))
+                    .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+        } finally { jdbc.execute("ALTER TABLE platform_account_deletion_requests DROP CONSTRAINT test_deny_intent"); }
+        assertThat(sessions.resolve(user.session_token())).isEqualTo(2L);
+        assertThat(jdbc.queryForObject("SELECT status FROM accounts WHERE id=2", String.class)).isEqualTo("active");
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM platform_account_deletion_requests", Integer.class)).isZero();
     }
 
     @Test

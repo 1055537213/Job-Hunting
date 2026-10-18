@@ -1,0 +1,52 @@
+openapi: 3.1.0
+info:
+  title: Account deletion admission
+  version: 1.0.0
+paths:
+  /api/account/delete:
+    post:
+      summary: Admit a self-service deletion with durable recovery intent
+      description: >-
+        Java commits account disablement, session/link revocation, audit and cleanup intent atomically.
+        Python Worker/Beat later register and execute the fixed cleanup task, even after a Python/broker outage.
+        202 does not mean cleanup is complete. Failed cleanup remains visible for administrator retry.
+        Requires a real user session and matching CSRF cookie/header; administrators cannot self-delete.
+        Anonymous financial facts are retained. No owner selector or raw session/password is persisted in the intent.
+      security:
+        - session: []
+      parameters:
+        - in: header
+          name: X-CSRF-Token
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, confirmation]
+              properties:
+                current_password: {type: string, minLength: 1, maxLength: 1024, writeOnly: true}
+                confirmation: {type: string, const: 注销账号}
+      responses:
+        '202':
+          description: Durable admission committed; session and CSRF cookies expired
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, status, task_key]
+                properties:
+                  ok: {type: boolean, const: true}
+                  status: {type: string, const: accepted}
+                  task_key: {type: string, maxLength: 64}
+        '400': {description: Wrong password or confirmation; no admission}
+        '401': {description: Missing or revoked session}
+        '403': {description: CSRF rejection or administrator self-deletion forbidden}
+        '422': {description: Invalid request fields}
+        '429': {description: Rate limited}
+        '503': {description: Admission could not be confirmed; contact administrator if session was revoked}
+components:
+  securitySchemes:
+    session: {type: apiKey, in: cookie, name: job_agent_session}

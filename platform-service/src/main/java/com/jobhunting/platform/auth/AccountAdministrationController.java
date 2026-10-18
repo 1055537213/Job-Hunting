@@ -74,7 +74,10 @@ public class AccountAdministrationController {
             @RequestHeader(name = "X-Internal-Service-Token", required = false) String token,
             @RequestHeader(name = "X-Trace-Id", defaultValue = "") String traceId) {
         tokens.verify(token);
-        return accounts.prepareDeletion(body.session_token(), body.current_password(), traceId);
+        // Old Python code creates a different task key after admission. Fail before
+        // disabling the account rather than accepting that non-durable protocol.
+        throw new AuthException("DELETION_PROTOCOL_UPGRADED", "注销接口已迁移，请刷新页面后重试。",
+                org.springframework.http.HttpStatus.CONFLICT);
     }
 
     @PostMapping("/delete-complete")

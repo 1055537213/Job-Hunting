@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import math
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -394,6 +396,45 @@ class PlatformAuthClient:
         except (KeyError, TypeError, ValueError) as error:
             raise PlatformAuthError("INVALID_PLATFORM_RESPONSE", "平台审计服务响应无效。", 502) from error
         return result
+
+    def deletion_requests(self, operation: str, **data: Any) -> dict[str, Any]:
+        if operation not in {"request", "due"}:
+            raise ValueError("Unknown deletion operation")
+        try:
+            with httpx.Client(trust_env=False, follow_redirects=False, timeout=self.timeout_seconds) as client:
+                with client.stream("POST", f"{self.base_url}/internal/v1/accounts/deletions/{operation}",
+                                   headers={"X-Internal-Service-Token": self.internal_token, "X-Trace-Id": f"deletion-{uuid4().hex}"}, json=data) as response:
+                    if response.status_code not in {200, 202, 400, 401, 403, 409, 422}:
+                        raise ValueError("Unavailable deletion service")
+                    content = bytearray()
+                    for chunk in response.iter_bytes(chunk_size=8192):
+                        if len(content) + len(chunk) > 65536:
+                            raise ValueError("Oversized deletion response")
+                        content.extend(chunk)
+                    result = json.loads(content)
+                    if response.is_error:
+                        code = result.get("code") if isinstance(result, dict) else None
+                        message = {"INVALID_CONFIRMATION": "请输入“注销账号”完成确认。",
+                                   "INVALID_CURRENT_PASSWORD": "当前密码错误。",
+                                   "ADMIN_DELETE_FORBIDDEN": "管理员账号不能通过个人中心自助注销。"}.get(code, "账号注销请求未通过验证。")
+                        raise PlatformAuthError("DELETION_REJECTED", message, response.status_code)
+                    if operation == "request":
+                        if (not isinstance(result, dict) or set(result) != {"ok", "status", "task_key"}
+                                or result["ok"] is not True or result["status"] != "accepted"
+                                or not isinstance(result["task_key"], str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", result["task_key"])):
+                            raise ValueError("Invalid deletion receipt")
+                    else:
+                        if not isinstance(result, dict) or set(result) != {"requests"} or not isinstance(result["requests"], list) or len(result["requests"]) > data["limit"]:
+                            raise ValueError("Invalid deletion batch")
+                        for row in result["requests"]:
+                            if (not isinstance(row, dict) or set(row) != {"account_id", "request_key", "task_key", "request_id"}
+                                    or type(row["account_id"]) is not int or row["account_id"] <= 0
+                                    or any(not isinstance(row[field], str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", row[field]) for field in ("task_key", "request_key"))
+                                    or (row["request_id"] is not None and (not isinstance(row["request_id"], str) or len(row["request_id"]) > 128))):
+                                raise ValueError("Invalid deletion intent")
+                    return result
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            raise PlatformAuthError("DELETION_UNAVAILABLE", "账号注销服务暂时不可用，请稍后重试。", 503) from None
 
     def export_account(self, session_token: str) -> dict[str, Any]:
         """Forward the real session; never select an owner or fall back to local SQL."""

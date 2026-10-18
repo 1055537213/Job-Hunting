@@ -1300,6 +1300,8 @@ class RepositoryStore:
                 "account_email_outbox",
                 "account_action_tokens",
             ):
+                if preserve_account and table_name in {"auth_sessions", "account_email_outbox", "account_action_tokens"}:
+                    continue
                 if table_name == "background_tasks" and exclude_task_key:
                     conn.execute(
                         "DELETE FROM background_tasks WHERE account_id = ? AND task_key <> ?",
@@ -1310,14 +1312,15 @@ class RepositoryStore:
                         f"DELETE FROM {table_name} WHERE account_id = ?",
                         (account_id,),
                     )
-            conn.execute(
-                """
-                UPDATE account_consents
-                SET ip_address = NULL, user_agent = NULL
-                WHERE account_id = ?
-                """,
-                (account_id,),
-            )
+            if not preserve_account:
+                conn.execute(
+                    """
+                    UPDATE account_consents
+                    SET ip_address = NULL, user_agent = NULL
+                    WHERE account_id = ?
+                    """,
+                    (account_id,),
+                )
             if not preserve_account:
                 conn.execute(
                     """
@@ -3511,6 +3514,14 @@ class RepositoryStore:
 
         now = now_iso()
         with self.connect() as conn:
+            account = conn.execute("""SELECT a.status,a.deleted_at,t.task_type FROM accounts a
+                                      JOIN background_tasks t ON t.account_id=a.id WHERE t.task_key=? FOR SHARE OF a""", (task_key,)).fetchone()
+            if account is not None and account["task_type"] != "account_deletion" and (
+                account["status"] != "active" or account["deleted_at"] is not None
+            ):
+                conn.execute("""UPDATE background_tasks SET status='cancelled',finished_at=?,updated_at=?
+                                WHERE task_key=? AND status='queued'""", (now, now, task_key))
+                return None
             cursor = conn.execute(
                 """
                 UPDATE background_tasks
