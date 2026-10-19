@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterator, Mapping
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -91,6 +92,10 @@ class InsufficientBalanceError(ValueError):
 
 class IdempotencyConflictError(ValueError):
     """同一个幂等键被用于不同的资金操作。"""
+
+
+class ProfileCreateConflict(ValueError):
+    """A creation key was reused with a different payload or a deleted result."""
 
 
 class AccountEmailRequestSuppressed(ValueError):
@@ -1295,6 +1300,7 @@ class RepositoryStore:
                 "knowledge_assets",
                 "long_texts",
                 "jobs",
+                "profile_create_commands",
                 "candidate_profiles",
                 "auth_sessions",
                 "account_email_outbox",
@@ -3798,6 +3804,8 @@ class RepositoryStore:
         self,
         profile: CandidateProfileInput,
         account_id: int | None = None,
+        *,
+        _connection: RepositoryConnection | None = None,
     ) -> int:
         """保存候选人结构化档案，返回新建档案 ID。"""
 
@@ -3810,10 +3818,10 @@ class RepositoryStore:
         ]
         preference_weights = sanitize_preference_weights(profile.preference_weights)
         fingerprint = candidate_profile_content_fingerprint(profile)
-        if self.find_candidate_profile_by_content_fingerprint(account_id, fingerprint) is not None:
+        if self.find_candidate_profile_by_content_fingerprint(account_id, fingerprint, _connection=_connection) is not None:
             raise DuplicateResourceError("候选人档案")
         try:
-            with self.connect() as conn:
+            with (self.connect() if _connection is None else nullcontext(_connection)) as conn:
                 cursor = conn.execute(
                     """
                     INSERT INTO candidate_profiles (
@@ -3860,14 +3868,46 @@ class RepositoryStore:
                 raise DuplicateResourceError("候选人档案") from error
             raise
 
+    def create_candidate_profile_once(self, profile: CandidateProfileInput, account_id: int, key: str) -> CandidateProfile:
+        """Commit the receipt, facts and initial long text as one transaction."""
+        key_hash = hashlib.sha256(key.encode("ascii")).hexdigest()
+        payload_hash = hashlib.sha256(json.dumps(asdict(profile), sort_keys=True, ensure_ascii=False,
+                                                allow_nan=False).encode("utf-8")).hexdigest()
+        with self.connect() as conn:
+            conn.execute("SET LOCAL lock_timeout = '1000ms'")
+            conn.execute("SET LOCAL statement_timeout = '1500ms'")
+            conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ?, 0))",
+                         (f":profile-create:{account_id}:{key_hash}",))
+            actor = conn.execute("SELECT status, deleted_at FROM accounts WHERE id=? FOR SHARE", (account_id,)).fetchone()
+            if actor is None or actor["status"] != "active" or actor["deleted_at"] is not None:
+                raise PermissionError("账号已被停用，请重新登录。")
+            receipt = conn.execute("SELECT payload_hash,candidate_id FROM profile_create_commands WHERE account_id=? AND key_hash=?",
+                                   (account_id, key_hash)).fetchone()
+            if receipt is not None:
+                if receipt["payload_hash"] != payload_hash:
+                    raise ProfileCreateConflict("请求标识已用于其他档案内容，请重新发起创建。")
+                if receipt["candidate_id"] is None:
+                    raise ProfileCreateConflict("原档案已删除，请重新发起创建。")
+                candidate_id = receipt["candidate_id"]
+            else:
+                candidate_id = self.save_candidate_profile(profile, account_id, _connection=conn)
+                conn.execute("INSERT INTO profile_create_commands(account_id,key_hash,payload_hash,candidate_id) VALUES (?,?,?,?) RETURNING 1 AS receipt",
+                             (account_id, key_hash, payload_hash, candidate_id))
+            row = conn.execute("SELECT * FROM candidate_profiles WHERE id=? AND account_id=?", (candidate_id, account_id)).fetchone()
+            if row is None:
+                raise ProfileCreateConflict("原档案已删除，请重新发起创建。")
+            return candidate_profile_from_row(row)
+
     def find_candidate_profile_by_content_fingerprint(
         self,
         account_id: int | None,
         fingerprint: str,
+        *,
+        _connection: RepositoryConnection | None = None,
     ) -> CandidateProfile | None:
         """查找相同候选人档案，并兼容迁移前尚未回填指纹的历史记录。"""
 
-        with self.connect() as conn:
+        with (self.connect() if _connection is None else nullcontext(_connection)) as conn:
             if account_id is None:
                 row = conn.execute(
                     "SELECT * FROM candidate_profiles WHERE content_fingerprint = ?",

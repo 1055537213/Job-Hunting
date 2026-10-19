@@ -238,10 +238,12 @@ def test_cached_java_active_session_cannot_admit_write_after_disable(tmp_path):
         calls.append(args)
         backend.store.prepare_account_deletion(owner.id)
         return {"account": snapshot}
-    backend.platform_auth_client = SimpleNamespace(account=resolve)
+    backend.platform_auth_client = SimpleNamespace(account=resolve, internal_token="service-secret")
     with TestClient(app) as browser:
         browser.cookies.set("job_agent_session", "opaque-session")
-        response = browser.post("/api/profiles", json={"name": "Stale authentication"})
+        response = browser.post("/internal/v1/profiles/create", json={"session_token": "opaque-session",
+            "idempotency_key": "stale-intent", "profile": {"name": "Stale authentication"}},
+            headers={"X-Internal-Service-Token": "service-secret"})
         assert response.status_code == 403 and len(calls) == 1
         assert backend.store.list_candidate_profiles(account_id=owner.id) == []
     with backend.store.account_work.deletion(owner.id):

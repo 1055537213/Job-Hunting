@@ -675,6 +675,11 @@ class JobHuntingApp:
         self.invalidate_profile_cache(account_id, candidate_id)
         return candidate_id
 
+    def create_candidate_profile_once(self, profile: CandidateProfileInput, account_id: int, key: str) -> CandidateProfile:
+        result = self.store.create_candidate_profile_once(profile, account_id, key)
+        self.invalidate_profile_cache(account_id, result.id)
+        return result
+
     def get_candidate_profile(self, candidate_id: int, account_id: int | None = None) -> CandidateProfile:
         """读取候选人档案。
 

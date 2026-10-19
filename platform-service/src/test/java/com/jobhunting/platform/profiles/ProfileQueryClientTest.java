@@ -99,6 +99,36 @@ class ProfileQueryClientTest {
         assertThat(client(2000).query("real-session", 42, 7L, "profile-query-trace").path("profile").path("id").asLong()).isEqualTo(7);
     }
 
+    @Test void creationUsesSameBoundedTransportAndValidatesOwnerAndReceipt() {
+        var receipt = fixture(true).put("candidate_id", 7);
+        body = receipt.toString();
+        var input = mapper.createObjectNode().put("name", "Candidate");
+        var client = client(2000);
+        assertThat(client.create("real-session", 42, "stable-intent", input, "creation-trace").get("candidate_id").asLong()).isEqualTo(7);
+        assertThat(requests.getFirst()).startsWith("POST /internal/v1/profiles/create ").contains("stable-intent", "real-session");
+        assertThat(requests.getFirst()).doesNotContain("account_id");
+        for (String invalid : List.of("owner", "id", "secret", "profile")) {
+            var corrupt = receipt.deepCopy();
+            switch (invalid) {
+                case "owner" -> corrupt.put("account_id", 43);
+                case "id" -> corrupt.put("candidate_id", 8);
+                case "secret" -> corrupt.put("password_hash", "private-upstream");
+                default -> ((ObjectNode) corrupt.get("profile")).putNull("name");
+            }
+            body = corrupt.toString();
+            assertThatThrownBy(() -> client.create("real-session", 42, "stable-intent", input, "creation-trace"))
+                    .isInstanceOfSatisfying(AuthException.class, e -> assertThat(e.code()).isEqualTo("PROFILE_CREATE_UNAVAILABLE"));
+        }
+        status = 409;
+        body = "{\"code\":\"PROFILE_CREATE_CONFLICT\",\"detail\":\"private-upstream\"}";
+        assertThatThrownBy(() -> client.create("real-session", 42, "stable-intent", input, "creation-trace"))
+                .isInstanceOfSatisfying(AuthException.class, e -> assertThat(e.status().value()).isEqualTo(409)).hasMessageNotContaining("private-upstream");
+        status = 401;
+        body = "{\"code\":\"INTERNAL_UNAUTHORIZED\",\"detail\":\"private-upstream\"}";
+        assertThatThrownBy(() -> client.create("real-session", 42, "stable-intent", input, "creation-trace"))
+                .isInstanceOfSatisfying(AuthException.class, e -> assertThat(e.status().value()).isEqualTo(503));
+    }
+
     @ParameterizedTest @ValueSource(strings = {"owner", "secret", "missing", "id", "duplicate", "name", "number", "skills", "list", "weights", "salary", "root"})
     void rejectsCorruptOrCrossTenantProjection(String invalid) {
         var value = fixture(false);

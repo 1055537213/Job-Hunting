@@ -65,12 +65,46 @@ public class ProfileQueryClient {
     }
 
     public JsonNode query(String session, long accountId, Long candidateId, String requestId) {
+        var payload = mapper.createObjectNode().put("session_token", session);
+        if (candidateId == null) payload.putNull("candidate_id"); else payload.put("candidate_id", candidateId);
+        var value = exchange(payload, "query", requestId);
+        String key = candidateId == null ? "profiles" : "profile";
+        if (!fields(value, Set.of("account_id", key)) || !id(value.get("account_id")) || value.get("account_id").asLong() != accountId) throw unavailable();
+        if (candidateId == null) {
+            if (!value.get(key).isArray()) throw unavailable();
+            var ids = new HashSet<Long>();
+            for (var row : value.get(key)) {
+                validateProfile(row);
+                if (!ids.add(row.get("id").asLong())) throw unavailable();
+            }
+        } else {
+            validateProfile(value.get(key));
+            if (value.get(key).get("id").asLong() != candidateId) throw unavailable();
+        }
+        return mapper.createObjectNode().set(key, value.get(key));
+    }
+
+    public JsonNode create(String session, long accountId, String key, JsonNode profile, String requestId) {
+        var payload = mapper.createObjectNode().put("session_token", session).put("idempotency_key", key);
+        payload.set("profile", profile);
+        try {
+            var value = exchange(payload, "create", requestId);
+            if (!fields(value, Set.of("account_id", "candidate_id", "profile")) || !id(value.get("account_id"))
+                    || value.get("account_id").asLong() != accountId || !id(value.get("candidate_id"))) throw createUnavailable();
+            validateProfile(value.get("profile"));
+            if (value.get("candidate_id").asLong() != value.get("profile").get("id").asLong()) throw createUnavailable();
+            return mapper.createObjectNode().put("candidate_id", value.get("candidate_id").asLong()).set("profile", value.get("profile"));
+        } catch (AuthException error) {
+            if ("PROFILE_QUERY_UNAVAILABLE".equals(error.code())) throw createUnavailable();
+            throw error;
+        }
+    }
+
+    private JsonNode exchange(JsonNode payload, String operation, String requestId) {
         if (token.isBlank() || !slots.tryAcquire()) throw unavailable();
         CompletableFuture<HttpResponse<byte[]>> pending = null;
         try {
-            var payload = mapper.createObjectNode().put("session_token", session);
-            if (candidateId == null) payload.putNull("candidate_id"); else payload.put("candidate_id", candidateId);
-            var request = HttpRequest.newBuilder(endpoint).timeout(Duration.ofMillis(timeoutMs))
+            var request = HttpRequest.newBuilder(endpoint.resolve(operation)).timeout(Duration.ofMillis(timeoutMs))
                     .header("Content-Type", "application/json").header("Accept", "application/json")
                     .header("X-Internal-Service-Token", token).header("X-Request-ID", requestId).header("X-Trace-Id", requestId)
                     .POST(singleUse(mapper.writeValueAsBytes(payload))).build();
@@ -80,24 +114,12 @@ public class ProfileQueryClient {
             var value = mapper.readTree(response.body());
             if (response.statusCode() != 200) {
                 if (!fields(value, Set.of("code", "detail")) || !value.get("detail").isTextual() || !value.get("code").isTextual()) throw unavailable();
-                var safe = safeError(response.statusCode());
-                if (!safe.code().equals(value.get("code").asText()) || (response.statusCode() == 404 && candidateId == null)) throw unavailable();
+                var safe = "create".equals(operation) ? createError(response.statusCode(), value.get("code").asText()) : safeError(response.statusCode());
+                if (!safe.code().equals(value.get("code").asText())
+                        || (response.statusCode() == 404 && ("create".equals(operation) || payload.get("candidate_id").isNull()))) throw unavailable();
                 throw safe;
             }
-            String key = candidateId == null ? "profiles" : "profile";
-            if (!fields(value, Set.of("account_id", key)) || !id(value.get("account_id")) || value.get("account_id").asLong() != accountId) throw unavailable();
-            if (candidateId == null) {
-                if (!value.get(key).isArray()) throw unavailable();
-                var ids = new HashSet<Long>();
-                for (var row : value.get(key)) {
-                    validateProfile(row);
-                    if (!ids.add(row.get("id").asLong())) throw unavailable();
-                }
-            } else {
-                validateProfile(value.get(key));
-                if (value.get(key).get("id").asLong() != candidateId) throw unavailable();
-            }
-            return mapper.createObjectNode().set(key, value.get(key));
+            return value;
         } catch (AuthException error) {
             throw error;
         } catch (InterruptedException error) {
@@ -134,6 +156,23 @@ public class ProfileQueryClient {
 
     static AuthException unavailable() {
         return new AuthException("PROFILE_QUERY_UNAVAILABLE", "档案查询暂时不可用，请稍后重试。", HttpStatus.SERVICE_UNAVAILABLE);
+    }
+
+    static AuthException createUnavailable() {
+        return new AuthException("PROFILE_CREATE_UNAVAILABLE", "档案创建结果暂未确认，请使用相同请求重试。", HttpStatus.SERVICE_UNAVAILABLE);
+    }
+
+    private static AuthException createError(int status, String code) {
+        if (status == 401 || status == 403) return safeError(status);
+        if (status == 409 && "DUPLICATE_RESOURCE".equals(code))
+            return new AuthException(code, "候选人档案已存在，请勿重复创建。", HttpStatus.CONFLICT);
+        if (status == 409 && "PROFILE_CREATE_CONFLICT".equals(code))
+            return new AuthException(code, "创建请求已失效或内容已变更，请重新发起创建。", HttpStatus.CONFLICT);
+        if ((status == 400 || status == 422) && "INVALID_REQUEST".equals(code))
+            return new AuthException(code, "请求参数无效。", HttpStatus.valueOf(status));
+        if (status == 413 && "PROFILE_CREATE_TOO_LARGE".equals(code))
+            return new AuthException(code, "档案内容过大，请精简后重试。", HttpStatus.CONTENT_TOO_LARGE);
+        return createUnavailable();
     }
 
     private static AuthException safeError(int status) {

@@ -290,6 +290,7 @@ if (!window.Vue) {
         },
         loadingProfiles: false,
         creatingProfile: false,
+        pendingProfileCreate: null,
         deletingProfileId: 0,
         refreshingProfileSummary: false,
         profileSummaryError: "",
@@ -2606,6 +2607,7 @@ if (!window.Vue) {
 
       /** 创建候选人档案并自动切换到新档案。 */
       async createProfile() {
+        if (this.creatingProfile) return;
         if (!this.profileForm.name.trim()) {
           this.appendAssistant("请先填写候选人姓名。", true);
           return;
@@ -2626,9 +2628,16 @@ if (!window.Vue) {
             target_directions: this.splitItems(this.profileForm.directions),
             unacceptable: [],
           };
+          const body = JSON.stringify(payload);
+          const intent = `${this.auth.account?.id || "legacy"}:${body}`;
+          if (this.pendingProfileCreate?.intent !== intent) {
+            this.pendingProfileCreate = { intent, key: globalThis.crypto?.randomUUID?.()
+              || `profile-${Date.now()}-${Math.random().toString(36).slice(2)}` };
+          }
           const data = await this.requestJson("/api/profiles", {
             method: "POST",
-            body: JSON.stringify(payload),
+            headers: { "Idempotency-Key": this.pendingProfileCreate.key },
+            body,
           });
           this.currentProfileId = data.candidate_id;
           localStorage.setItem("currentProfileId", String(this.currentProfileId));
@@ -2644,7 +2653,13 @@ if (!window.Vue) {
           };
           this.closeCityPicker();
           this.activeCityProvince = "hot";
+          this.pendingProfileCreate = null;
         } catch (error) {
+          if (error.code === "PROFILE_CREATE_CONFLICT") {
+            this.pendingProfileCreate = null;
+            this.appendAssistant(error.message, true);
+            return;
+          }
           if (this.showDuplicateNotice(error, "候选人档案已存在")) {
             return;
           }
@@ -5471,6 +5486,7 @@ if (!window.Vue) {
         if (!response.ok) {
           const error = new Error(data.detail || `请求失败：${response.status}`);
           error.status = response.status;
+          error.code = data.code;
           throw error;
         }
         return data;

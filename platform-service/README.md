@@ -1,6 +1,8 @@
 # Job Hunting Platform Service
 
-这是求职助手的 Java 平台服务，当前实现账务垂直链路，以及账号注册、凭据校验、邮箱验证、邮箱变更、密码重置和会话管理。混合网关把公开的浏览器认证路径与个人账务查询直达 Java；其余页面/API 仍到 Python。
+这是求职助手的 Java 平台服务，承接账号认证、账务、管理端用量/工具调用记录、部分任务管理、请求观测，以及档案查询和创建的公开入口。Python 保留 AI、RAG、档案业务数据、文件和 Worker；完整职责划分见 [服务边界](../docs/architecture/python-java-boundary.md)。本分支只做本地联调，不部署现有服务器。
+
+档案 GET/POST 经 Java 认证入口后回调 Python。创建同时校验 CSRF；Python 在同一事务内提交档案、初始长文本和账号隔离的幂等凭据，不在 Java 建立第二份档案写入逻辑。契约见 [档案查询](src/main/resources/profile-query.openapi.yaml) 和 [档案创建](src/main/resources/profile-create.openapi.yaml)。
 
 运行基线为 Spring Boot 4.0、Spring Framework 7、Jackson 3、Tomcat 11 和 Java 21。
 依赖版本由 Maven 锁定，Tomcat/Jackson 的安全修复版本在 `pom.xml` 中显式覆盖；

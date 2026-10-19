@@ -69,6 +69,7 @@ jobs:
           tests/test_platform_auth.py
           tests/test_platform_profile.py
           tests/test_profile_queries.py
+          tests/test_profile_creation.py
           tests/test_platform_export.py
           tests/test_account_deletion.py
           tests/test_account_work.py

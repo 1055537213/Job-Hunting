@@ -1,0 +1,95 @@
+openapi: 3.0.3
+info:
+  title: Candidate Profile Creation Entry
+  version: 1.0.0
+  description: Java owns the public admission, Python owns the profile and atomic creation receipt. No Java SQL writer or fallback.
+paths:
+  /api/profiles:
+    post:
+      security: [{session: [], csrf: []}]
+      description: >-
+        Returns 200 with the existing candidate_id/profile contract. Idempotency-Key is scoped to the authenticated
+        account. The browser retains the same key and payload after an uncertain failure, generates a new key when
+        content changes, and prevents double clicks. Missing key is accepted for legacy callers and generated server-side;
+        legacy retries cannot recover a committed receipt, but content deduplication still rejects duplicate facts.
+        Same key and payload returns the current projection of the original profile, not a stale snapshot.
+        Changed payload or a deleted original returns 409 and never recreates the deleted profile.
+      parameters:
+        - {name: Idempotency-Key, in: header, required: false, schema: {type: string, pattern: '^[A-Za-z0-9:_-]{1,128}$'}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProfileInput'}
+      responses:
+        '200':
+          description: Created or replayed profile; Cache-Control no-store
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [candidate_id, profile]
+                properties:
+                  candidate_id: {type: integer, format: int64, minimum: 1}
+                  profile: {$ref: 'profile-query.openapi.yaml#/components/schemas/Profile'}
+        '400': {description: Blank candidate name or malformed JSON}
+        '401': {description: Missing or revoked session}
+        '403': {description: Disabled account or rejected CSRF}
+        '409': {description: DUPLICATE_RESOURCE or PROFILE_CREATE_CONFLICT}
+        '413': {description: Serialized profile input exceeds 64 KiB}
+        '422': {description: Invalid input or key; no input echoed}
+        '429': {description: Rate limited}
+        '503': {description: Creation outcome unavailable; Retry-After 3, retry same key/payload, never local fallback}
+  /internal/v1/profiles/create:
+    post:
+      security: [{serviceToken: []}]
+      description: >-
+        Same private path on both services: Python compatibility -> Java -> Python callback. Real session revalidated
+        in both services; account_id cannot be supplied. Python holds account drain guard through completion of its
+        independent callback thread. One transaction inserts profile, long text and durable key/payload SHA-256 receipt.
+        Receipt stores neither session nor profile text; deleted results retain tombstones until account cleanup.
+        Java shares bounded profile transport: connect <=1s, full callback <=2s, response <=4MiB, 8 in flight,
+        no redirect/proxy/automatic replay. Timeout does not cancel a committed Python transaction.
+        Python callback returns account_id in addition to public receipt; Java validates ownership and matching IDs and strips owner.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [session_token, idempotency_key, profile]
+              properties:
+                session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+                idempotency_key: {type: string, pattern: '^[A-Za-z0-9:_-]{1,128}$', writeOnly: true}
+                profile: {$ref: '#/components/schemas/ProfileInput'}
+      responses:
+        '200': {description: Validated public receipt or owner-enveloped Python callback receipt}
+        '401': {description: Service token or session invalid; credential faults become 503 at the public entry}
+        '403': {description: Account disabled}
+        '409': {description: Duplicate content or conflicting/deleted creation receipt}
+        '422': {description: Invalid input, sanitized}
+        '503': {description: Dependency or protocol failure}
+components:
+  securitySchemes:
+    session: {type: apiKey, in: cookie, name: job_agent_session}
+    csrf: {type: apiKey, in: header, name: X-CSRF-Token}
+    serviceToken: {type: apiKey, in: header, name: X-Internal-Service-Token}
+  schemas:
+    ProfileInput:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, maxLength: 128}
+        status: {type: string, maxLength: 64, default: 待补充}
+        education: {type: string, maxLength: 64, default: 待补充}
+        experience_years: {type: number, default: 0}
+        skills: {type: object, additionalProperties: {type: string}}
+        preferred_cities: {type: array, items: {type: string}}
+        acceptable_cities: {type: array, items: {type: string}}
+        salary_floor_k: {type: integer, format: int32, nullable: true}
+        expected_salary_k: {type: integer, format: int32, nullable: true}
+        target_directions: {type: array, items: {type: string}}
+        unacceptable: {type: array, items: {type: string}}

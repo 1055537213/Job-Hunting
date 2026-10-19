@@ -241,6 +241,17 @@ candidate_profiles = sa.Table(
 sa.Index("idx_candidate_profiles_account", candidate_profiles.c.account_id, candidate_profiles.c.id)
 
 
+profile_create_commands = sa.Table(
+    "profile_create_commands", metadata,
+    sa.Column("account_id", sa.Integer, sa.ForeignKey("accounts.id", ondelete="CASCADE"), primary_key=True),
+    sa.Column("key_hash", sa.String(64), primary_key=True),
+    sa.Column("payload_hash", sa.String(64), nullable=False),
+    sa.Column("candidate_id", sa.Integer, sa.ForeignKey("candidate_profiles.id", ondelete="SET NULL")),
+    sa.Column("created_at", timestamp_type, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+)
+sa.Index("idx_profile_create_candidate", profile_create_commands.c.candidate_id)
+
+
 jobs = sa.Table(
     "jobs",
     metadata,

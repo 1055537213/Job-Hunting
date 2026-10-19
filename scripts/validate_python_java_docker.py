@@ -626,15 +626,25 @@ def run_profile_read_gateway_flow(gateway_url: str, web_url: str, java_url: str,
         email = f"profile-query-{os.urandom(10).hex()}@example.com"
         owner = auth.register_account(email=email, password="profile-query-password", display_name="Profile acceptance",
                                       email_verified=True, consents=[]).account_id
-        session = auth.session("login", email=email, password="profile-query-password", email_verification_required=True,
-                               user_agent="profile-query-acceptance", ip_address="127.0.0.1")
-        accounts.append((owner, session["session_token"]))
+        accounts.append((owner, email))
     with httpx.Client(base_url=gateway_url, timeout=10) as first, httpx.Client(base_url=gateway_url, timeout=10) as second:
-        for browser, (_, session) in zip((first, second), accounts, strict=True):
-            browser.cookies.set("job_agent_session", session)
+        for index, browser in enumerate((first, second)):
+            logged = browser.post("/api/auth/login", json={"email": accounts[index][1], "password": "profile-query-password"})
+            assert logged.status_code == 200, logged.text[:200]
+            browser.headers["X-CSRF-Token"] = logged.json()["csrf_token"]
+            accounts[index] = (accounts[index][0], browser.cookies["job_agent_session"])
         assert first.get("/api/profiles").json() == {"profiles": []}
-        first_id = first.post("/api/profiles", json={"name": "Profile first", "preferred_cities": ["杭州"]}).json()["candidate_id"]
-        second_id = second.post("/api/profiles", json={"name": "Profile second"}).json()["candidate_id"]
+        body = {"name": "Profile first", "preferred_cities": ["杭州"]}
+        intent = {"Idempotency-Key": "profile-create-acceptance"}
+        assert httpx.post(gateway_url + "/api/profiles", cookies=first.cookies, json=body).status_code == 403
+        created = first.post("/api/profiles", json=body, headers=intent)
+        assert created.status_code == 200, created.text[:300]
+        first_id = created.json()["candidate_id"]
+        assert first.post("/api/profiles", json=body, headers=intent).json() == created.json()
+        assert first.post("/api/profiles", json={"name": "Other intent"}, headers=intent).status_code == 409
+        assert first.post("/api/profiles", json={**body, "account_id": accounts[1][0]}).status_code == 422
+        second_body = {"name": "Profile second"}
+        second_id = second.post("/api/profiles", json=second_body, headers=intent).json()["candidate_id"]
         path = f"/api/profiles/{first_id}"
         listed = first.get(f"/api/profiles?account_id={accounts[1][0]}", headers={"X-Request-ID": "profile-query-acceptance"})
         assert listed.status_code == 200 and [row["id"] for row in listed.json()["profiles"]] == [first_id]
@@ -650,26 +660,44 @@ def run_profile_read_gateway_flow(gateway_url: str, web_url: str, java_url: str,
         assert first.post("/internal/v1/profiles/query", json={"session_token": accounts[0][1]}).status_code == 404
         for url in (web_url, java_url):
             assert httpx.post(url + "/internal/v1/profiles/query", json={"session_token": accounts[0][1]}).status_code == 401
+            assert httpx.post(url + "/internal/v1/profiles/create", json={"session_token": accounts[0][1],
+                "idempotency_key": "blocked", "profile": body}).status_code == 401
+        assert first.post("/internal/v1/profiles/create", json={}).status_code == 404
+        compat = httpx.post(web_url + "/api/profiles", cookies=first.cookies,
+            headers={**intent, "X-CSRF-Token": first.headers["X-CSRF-Token"]}, json=body, timeout=10)
+        assert compat.status_code == 200 and compat.json() == created.json()
         update = f"from job_hunting_agent.app import JobHuntingApp; app=JobHuntingApp(); app.ingest_conversation_message({first_id}, '首选城市改成上海', auto_rebuild_rag=False, account_id={accounts[0][0]}); app.store.close()"
         docker("exec", web, "python", "-c", update)
         assert first.get(path).json()["profile"]["preferred_cities"] == ["上海"]
         assert second.delete(f"/api/profiles/{second_id}").status_code == 200
         assert second.get("/api/profiles").json() == {"profiles": []}
         assert second.get(f"/api/profiles/{second_id}").status_code == 404
+        assert second.post("/api/profiles", json=second_body, headers=intent).json()["code"] == "PROFILE_CREATE_CONFLICT"
+        compat_conflict = httpx.post(web_url + "/api/profiles", cookies=second.cookies, json=second_body,
+            headers={**intent, "X-CSRF-Token": second.headers["X-CSRF-Token"]}, timeout=10)
+        assert compat_conflict.status_code == 409 and compat_conflict.json()["code"] == "PROFILE_CREATE_CONFLICT"
         try:
             docker("stop", "--time", "1", web)
             failure = first.get("/api/profiles")
             assert failure.status_code == 503 and failure.json()["code"] == "PROFILE_QUERY_UNAVAILABLE"
             assert "profiles" not in failure.json() and failure.headers["retry-after"] == "3"
             assert first.get("/api/auth/me").json()["authenticated"] is True
+            failed_create = first.post("/api/profiles", json={"name": "Recovered create"}, headers={"Idempotency-Key": "outage-intent"})
+            assert failed_create.status_code == 503 and failed_create.json()["code"] == "PROFILE_CREATE_UNAVAILABLE"
         finally:
             docker("start", web)
             wait(web_url + "/api/health")
         assert first.get(path).json()["profile"]["preferred_cities"] == ["上海"]
+        recovered = first.post("/api/profiles", json={"name": "Recovered create"}, headers={"Idempotency-Key": "outage-intent"})
+        assert recovered.status_code == 200
+        assert first.post("/api/profiles", json={"name": "Recovered create"}, headers={"Idempotency-Key": "outage-intent"}).json() == recovered.json()
         try:
             docker("stop", "--time", "1", java)
             failure = httpx.get(web_url + "/api/profiles", cookies=first.cookies, timeout=10)
             assert failure.status_code == 503 and "profiles" not in failure.json()
+            failed_create = httpx.post(web_url + "/api/profiles", cookies=first.cookies, json={"name": "No local fallback"},
+                headers={"X-CSRF-Token": first.headers["X-CSRF-Token"], "Idempotency-Key": "no-fallback"}, timeout=10)
+            assert failed_create.status_code == 503
         finally:
             docker("start", java)
             wait(java_url + "/actuator/health")
@@ -677,7 +705,8 @@ def run_profile_read_gateway_flow(gateway_url: str, web_url: str, java_url: str,
         auth.session("logout", session_token=accounts[0][1])
         assert first.get(path).status_code == 401
         assert httpx.get(web_url + path, cookies=first.cookies).status_code == 401
-    print("==> Profile GET Java entry -> Python owned data/updates -> tenant scope -> dependency outages/no fallback -> recovery/revocation: PASS")
+        assert first.post("/api/profiles", json=body, headers=intent).status_code == 401
+    print("==> Profile GET/POST Java entry -> Python owned facts/atomic creation -> replay/conflict/tenant scope -> dependency outages/no fallback -> recovery/revocation: PASS")
 
 
 def run_account_deletion_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,

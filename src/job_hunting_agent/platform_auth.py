@@ -13,7 +13,7 @@ import httpx
 
 from .config import PlatformAuthSettings
 from .account_export import MAX_EXPORT_BYTES, decode_export
-from .profile_query import MAX_PROFILE_QUERY_BYTES, decode_json, validate_projection
+from .profile_query import MAX_PROFILE_QUERY_BYTES, decode_json, validate_creation, validate_projection
 
 
 def _platform_response_error_status(response: httpx.Response) -> int:
@@ -470,6 +470,40 @@ class PlatformAuthClient:
                     return validate_projection(value, candidate_id)
         except (httpx.HTTPError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
             raise PlatformAuthError("PROFILE_QUERY_UNAVAILABLE", "档案查询暂时不可用，请稍后重试。", 503) from None
+
+    def create_profile(self, session_token: str, profile: dict, key: str, *, trace_id: str | None = None) -> dict[str, Any]:
+        """Forward the same creation intent on retries; never write locally on failure."""
+        try:
+            with httpx.Client(trust_env=False, follow_redirects=False, timeout=5) as client:
+                with client.stream("POST", f"{self.base_url}/internal/v1/profiles/create",
+                                   headers={"X-Internal-Service-Token": self.internal_token, "X-Trace-Id": trace_id or uuid4().hex},
+                                   json={"session_token": session_token, "profile": profile, "idempotency_key": key}) as response:
+                    if response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                        raise ValueError("Invalid profile response")
+                    body = bytearray()
+                    for chunk in response.iter_bytes(chunk_size=65536):
+                        if len(body) + len(chunk) > MAX_PROFILE_QUERY_BYTES:
+                            raise ValueError("Oversized profile receipt")
+                        body.extend(chunk)
+                    value = decode_json(bytes(body))
+                    if response.status_code != 200:
+                        known = {
+                            (401, "SESSION_EXPIRED"): "登录状态已过期，请重新登录。",
+                            (403, "ACCOUNT_DISABLED"): "账号已被停用，请重新登录。",
+                            (409, "DUPLICATE_RESOURCE"): "候选人档案已存在，请勿重复创建。",
+                            (409, "PROFILE_CREATE_CONFLICT"): "创建请求已失效或内容已变更，请重新发起创建。",
+                            (400, "INVALID_REQUEST"): "请求参数无效。",
+                            (422, "INVALID_REQUEST"): "请求参数无效。",
+                            (413, "PROFILE_CREATE_TOO_LARGE"): "档案内容过大，请精简后重试。",
+                        }
+                        code = value.get("code") if isinstance(value, dict) else None
+                        message = known.get((response.status_code, code)) if isinstance(code, str) else None
+                        if message is None:
+                            raise ValueError("Invalid profile creation error")
+                        raise PlatformAuthError(code, message, response.status_code)
+                    return validate_creation(value)
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
+            raise PlatformAuthError("PROFILE_CREATE_UNAVAILABLE", "档案创建结果暂未确认，请使用相同请求重试。", 503) from None
 
     def export_account(self, session_token: str) -> dict[str, Any]:
         """Forward the real session; never select an owner or fall back to local SQL."""

@@ -9,6 +9,14 @@ from .models import CandidateProfile
 MAX_PROFILE_QUERY_BYTES = 4 * 1024 * 1024
 PROFILE_FIELDS = {field.name for field in fields(CandidateProfile)}
 MAX_PROFILE_ID = 2**63 - 1
+MAX_PROFILE_CREATE_BYTES = 64 * 1024
+
+
+def validate_creation(value):
+    if not isinstance(value, dict) or set(value) != {"candidate_id", "profile"} or not valid_id(value["candidate_id"]):
+        raise ValueError("Invalid profile creation receipt")
+    validate_projection({"profile": value["profile"]}, value["candidate_id"])
+    return value
 
 
 def valid_id(value):

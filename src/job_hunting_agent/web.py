@@ -49,7 +49,7 @@ from starlette.concurrency import run_in_threadpool
 from .account_email_outbox import AccountEmailOutboxService, redact_email
 from .account_export import encode_export
 from .account_work import AccountWorkDenied, AccountWorkRoute, AccountWorkStreamingResponse
-from .profile_query import encode_callback
+from .profile_query import MAX_PROFILE_CREATE_BYTES, encode_callback, validate_creation
 from .account_lifecycle import (
     AccountEmailSender,
     action_token_hash,
@@ -153,7 +153,7 @@ from .rag import RAGProviderRequestError
 from .rate_limiting import RateLimiter
 from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
 from .skill_normalization import normalize_skill_mapping
-from .storage import AccountEmailRequestSuppressed, IdempotencyConflictError
+from .storage import AccountEmailRequestSuppressed, IdempotencyConflictError, ProfileCreateConflict
 from .task_queue import (
     ACCOUNT_DELETION_TASK_TYPE,
     AccountEmailQueue,
@@ -276,6 +276,23 @@ class ProfilePayload(BaseModel):
     expected_salary_k: int | None = None
     target_directions: list[str] = Field(default_factory=list)
     unacceptable: list[str] = Field(default_factory=list)
+
+
+class ProfileCreatePayload(ProfilePayload):
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+    experience_years: float = 0.0
+    name: str = Field(max_length=128)
+    status: str = Field(default="待补充", max_length=64)
+    education: str = Field(default="待补充", max_length=64)
+    salary_floor_k: int | None = Field(default=None, ge=-(2**31), lt=2**31)
+    expected_salary_k: int | None = Field(default=None, ge=-(2**31), lt=2**31)
+
+
+class InternalProfileCreatePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_token: str = Field(min_length=1, max_length=128, repr=False)
+    idempotency_key: str = Field(pattern=r"^[A-Za-z0-9:_-]{1,128}$", repr=False)
+    profile: ProfileCreatePayload = Field(repr=False)
 
 
 class ChatPayload(BaseModel):
@@ -1223,8 +1240,10 @@ def create_web_app(
 
     @web_app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error: RequestValidationError):
-        if request.url.path in {"/internal/v1/accounts/export", "/internal/v1/profiles/query"}:
-            if request.url.path.endswith("/profiles/query"):
+        if request.url.path == "/api/profiles" and request.method == "POST":
+            return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
+        if request.url.path in {"/internal/v1/accounts/export", "/internal/v1/profiles/query", "/internal/v1/profiles/create"}:
+            if "/profiles/" in request.url.path:
                 return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
             return JSONResponse({"detail": "无效的导出请求。"}, status_code=422, headers={"Cache-Control": "no-store"})
         return await request_validation_exception_handler(request, error)
@@ -1631,30 +1650,97 @@ def create_web_app(
         account = current_account(request)
         return {"profiles": [asdict(profile) for profile in backend.list_candidate_profiles(account_id=account.id if account else None)]}
 
-    @web_app.post("/api/profiles")
-    def create_profile(payload: ProfilePayload, request: Request) -> dict[str, object]:
-        """创建候选人档案。"""
-
-        account = current_account(request)
+    def profile_input(payload: ProfilePayload):
         if not payload.name.strip():
             raise HTTPException(status_code=400, detail="候选人姓名不能为空。")
+        return CandidateProfileInput(
+            name=payload.name.strip(), status=payload.status.strip() or "待补充",
+            education=payload.education.strip() or "待补充", experience_years=payload.experience_years,
+            skills=clean_string_dict(payload.skills), preferred_cities=clean_string_list(payload.preferred_cities),
+            acceptable_cities=clean_string_list(payload.acceptable_cities), salary_floor_k=payload.salary_floor_k,
+            expected_salary_k=payload.expected_salary_k, target_directions=clean_string_list(payload.target_directions),
+            unacceptable=clean_string_list(payload.unacceptable),
+        )
+
+    profile_creations = BoundedSemaphore(8)
+
+    def build_internal_profile_create(payload: InternalProfileCreatePayload, trace_id: str | None):
+        if not profile_creations.acquire(blocking=False):
+            raise HTTPException(503, "档案创建暂时不可用，请使用相同请求重试。")
         try:
+            if len(payload.profile.model_dump_json().encode("utf-8")) > MAX_PROFILE_CREATE_BYTES:
+                raise HTTPException(413, "档案内容过大，请精简后重试。")
+            try:
+                resolved = backend.platform_auth_client.account("me", session_token=payload.session_token, trace_id=trace_id)
+            except PlatformAuthError as error:
+                raise HTTPException(error.status_code if error.status_code in (401, 403) else 503, "档案创建认证失败。") from None
+            account = platform_account_record(resolved["account"])
+            with backend.store.account_work.acquire(account.id):
+                profile = backend.create_candidate_profile_once(profile_input(payload.profile), account.id, payload.idempotency_key)
+                value = validate_creation({"candidate_id": profile.id, "profile": asdict(profile)})
+                return {"account_id": account.id, **value}
+        finally:
+            profile_creations.release()
+
+    @web_app.post("/internal/v1/profiles/create", include_in_schema=False)
+    async def internal_profile_create(payload: InternalProfileCreatePayload, request: Request):
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            return JSONResponse({"code": "INTERNAL_UNAUTHORIZED", "detail": "内部服务认证失败。"}, status_code=401,
+                                headers={"Cache-Control": "no-store"})
+        try:
+            result = await asyncio.to_thread(build_internal_profile_create, payload, request.headers.get("X-Trace-Id"))
+            return JSONResponse(result, headers={"Cache-Control": "no-store"})
+        except DuplicateResourceError:
+            status, code, detail = 409, "DUPLICATE_RESOURCE", "候选人档案已存在，请勿重复创建。"
+        except ProfileCreateConflict as error:
+            status, code, detail = 409, "PROFILE_CREATE_CONFLICT", str(error)
+        except (AccountWorkDenied, PermissionError):
+            status, code, detail = 403, "ACCOUNT_DISABLED", "账号已被停用，请重新登录。"
+        except HTTPException as error:
+            status, detail = error.status_code, error.detail
+            code = {400: "INVALID_REQUEST", 401: "SESSION_EXPIRED", 403: "ACCOUNT_DISABLED",
+                    413: "PROFILE_CREATE_TOO_LARGE"}.get(status, "PROFILE_CREATE_UNAVAILABLE")
+        except Exception:  # noqa: BLE001 - a timeout may have committed; retry only the same intent.
+            status, code, detail = 503, "PROFILE_CREATE_UNAVAILABLE", "档案创建结果暂未确认，请使用相同请求重试。"
+        return JSONResponse({"code": code, "detail": detail}, status_code=status,
+                            headers={"Cache-Control": "no-store", **({"Retry-After": "3"} if status == 503 else {})})
+
+    @web_app.post("/api/profiles")
+    def create_profile(payload: ProfileCreatePayload, request: Request):
+        """Hybrid writes enter Java; Python remains the single profile writer."""
+        key = request.headers.get("Idempotency-Key")
+        if key is not None and not re.fullmatch(r"[A-Za-z0-9:_-]{1,128}", key):
+            raise HTTPException(422, "请求标识无效。", headers={"Cache-Control": "no-store"})
+        if backend.platform_auth_client is not None:
+            token = request.cookies.get(SESSION_COOKIE_NAME)
+            if not token:
+                raise HTTPException(401, "登录状态已过期，请重新登录。", headers={"Cache-Control": "no-store"})
+            try:
+                result = backend.platform_auth_client.create_profile(token, payload.model_dump(), key or uuid.uuid4().hex,
+                    trace_id=getattr(request.state, "request_id", None))
+                return JSONResponse(result, headers={"Cache-Control": "no-store"})
+            except PlatformAuthError as error:
+                return JSONResponse({"code": error.code, "detail": str(error)}, status_code=error.status_code or 503,
+                                    headers={"Cache-Control": "no-store", **({"Retry-After": "3"} if error.status_code in (None, 503) else {})})
+        account = current_account(request)
+        if len(payload.model_dump_json().encode("utf-8")) > MAX_PROFILE_CREATE_BYTES:
+            raise HTTPException(413, "档案内容过大，请精简后重试。", headers={"Cache-Control": "no-store"})
+        try:
+            if key is not None and account is not None:
+                profile = backend.create_candidate_profile_once(profile_input(payload), account.id, key)
+                return JSONResponse({"candidate_id": profile.id, "profile": asdict(profile)}, headers={"Cache-Control": "no-store"})
             candidate_id = backend.save_candidate_profile(
-                CandidateProfileInput(
-                    name=payload.name.strip(),
-                    status=payload.status.strip() or "待补充",
-                    education=payload.education.strip() or "待补充",
-                    experience_years=payload.experience_years,
-                    skills=clean_string_dict(payload.skills),
-                    preferred_cities=clean_string_list(payload.preferred_cities),
-                    acceptable_cities=clean_string_list(payload.acceptable_cities),
-                    salary_floor_k=payload.salary_floor_k,
-                    expected_salary_k=payload.expected_salary_k,
-                    target_directions=clean_string_list(payload.target_directions),
-                    unacceptable=clean_string_list(payload.unacceptable),
-                ),
+                profile_input(payload),
                 account_id=account.id if account else None,
             )
+        except ProfileCreateConflict as error:
+            return JSONResponse({"code": "PROFILE_CREATE_CONFLICT", "detail": str(error)}, status_code=409, headers={"Cache-Control": "no-store"})
+        except PermissionError:
+            raise HTTPException(403, "账号已被停用，请重新登录。", headers={"Cache-Control": "no-store"}) from None
         except DuplicateResourceError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {"candidate_id": candidate_id, "profile": asdict(backend.get_candidate_profile(candidate_id, account_id=account.id if account else None))}
