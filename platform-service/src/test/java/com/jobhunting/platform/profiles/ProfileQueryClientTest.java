@@ -6,9 +6,11 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import com.sun.net.httpserver.HttpServer;
 import com.jobhunting.platform.auth.AuthException;
 import org.junit.jupiter.api.AfterEach;
@@ -33,6 +35,7 @@ class ProfileQueryClientTest {
     volatile String contentType = "application/json";
     volatile int delay;
     volatile boolean stall;
+    volatile CountDownLatch releaseBodies;
 
     @BeforeEach void setup() throws IOException {
         body = fixture(false).toString();
@@ -47,6 +50,7 @@ class ProfileQueryClientTest {
                     + new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
             try {
                 byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                if (releaseBodies != null) releaseBodies.await(3, TimeUnit.SECONDS);
                 if (!stall && delay > 0) Thread.sleep(delay);
                 exchange.getResponseHeaders().set("Content-Type", contentType);
                 exchange.getResponseHeaders().set("Location", origin + "/redirect");
@@ -174,17 +178,23 @@ class ProfileQueryClientTest {
     }
 
     @Test void rejectsNinthConcurrentCallbackWithoutMakingAnotherHttpRequest() throws Exception {
-        delay = 700;
+        releaseBodies = new CountDownLatch(1);
         var client = client(2000);
-        var pending = java.util.stream.IntStream.range(0, 8).mapToObj(i ->
-                CompletableFuture.supplyAsync(() -> client.query("real-session", 42, null, "profile-query-trace"))).toList();
-        try {
-            long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
-            while (requests.size() < 8 && System.nanoTime() < deadline) Thread.sleep(5);
-            assertThat(requests).hasSize(8);
-            unavailable(client);
-            assertThat(requests).hasSize(8);
-        } finally { for (var future : pending) future.join(); }
+        // Do not depend on common-pool parallelism or the runner's CPU count.
+        try (var callers = Executors.newFixedThreadPool(8)) {
+            var pending = java.util.stream.IntStream.range(0, 8).mapToObj(i ->
+                    CompletableFuture.supplyAsync(() -> client.query("real-session", 42, null, "profile-query-trace"), callers)).toList();
+            try {
+                long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+                while (requests.size() < 8 && System.nanoTime() < deadline) Thread.sleep(5);
+                assertThat(requests).hasSize(8);
+                unavailable(client);
+                assertThat(requests).hasSize(8);
+            } finally {
+                releaseBodies.countDown();
+                for (var future : pending) future.join();
+            }
+        }
     }
 
     @Test void validatesPrivateOriginTokenAndTimeoutsWithoutReflectingSettings() {
