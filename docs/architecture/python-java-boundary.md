@@ -331,7 +331,27 @@ schema 参与锁键，隔离测试不会阻塞正式数据；物理会话关闭/
 不能假设失去数据库会话的业务线程也已终止。不同协议代际的旧 Web 不持锁，首次升级仍需维护窗口。
 无需新环境变量或数据迁移，本地及生产镜像使用同一实现。
 
-## Java 安全入口准备阶段
+## 工作台档案只读入口
+
+`GET /api/profiles` 和 `GET /api/profiles/{candidate_id}` 经本地/生产网关进入 Java。
+Java 校验真实 Session 后结束认证事务，再使用独立服务 Token、原始 Session 和请求 ID 回调 Python
+`POST /internal/v1/profiles/query`；不使用调用方提供的账号 ID，不直接查询 Python 档案表。
+Python 再向 Java 验证会话，持有账号排空共享锁并按 account_id 调用原有应用门面和 Cache-Aside 缓存。
+回调放在独立线程执行，最多 8 个并发，避免 Python 兼容同步线程等待 Java 导致回调死锁；HTTP 取消不会提前释放仍在工作的查询线程的锁。
+
+Python 回调返回 account_id 加 profile/profiles；Java 严格验证归属、详情 ID、字段白名单/类型及列表 ID 唯一性，去掉内部归属字段后保留现有前端契约。
+列表仍按原有 ID 顺序全量返回，不静默分页/截断；完整响应限 4 MiB，超限显式 413。
+Java 回调连接最多 1 秒，完整响应最多 2 秒，最多 8 个并发，不重定向/自动重放；生产只接受内部服务 origin。
+该超时限制 HTTP 等待，不宣称能中止已经执行的 Python/SQL 查询；服务故障/协议错误返回 503 和 Retry-After，不回退数据库或伪造空列表。
+只有符合已知错误码的真正 missing/foreign 详情返回 404；服务路径错误或内部凭据错误按依赖故障处理。
+外部响应 no-store；Java 不建立第二份档案缓存。现有 Python 档案缓存策略及写后失效不变。
+
+Python 公开 GET 在混合模式仅转发到 Java 的同名内部入口；纯 Python 模式保持原实现。
+创建、修改、删除和对话更新仍由 Python 写入，本次不改变档案所有权或新增数据库迁移。
+本地 Compose 与生产继承配置均自动指向内部 web 服务，Caddy 与共存 Nginx 仅分流 GET，其余方法仍到 Python。
+只做本地隔离 Docker 验收和迁移分支 CI，不部署真实服务器。
+
+## Java 安全入口准备阶段（历史记录）
 
 Java `/api/*` 已增加真实 Session/RBAC、Redis 原子滑动窗口限流、CSRF、安全响应头、
 请求 ID、低基数 Micrometer 指标及脱敏错误响应。同步 Jedis 有界连接池规避 Windows Java 25

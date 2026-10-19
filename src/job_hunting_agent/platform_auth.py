@@ -13,6 +13,7 @@ import httpx
 
 from .config import PlatformAuthSettings
 from .account_export import MAX_EXPORT_BYTES, decode_export
+from .profile_query import MAX_PROFILE_QUERY_BYTES, decode_json, validate_projection
 
 
 def _platform_response_error_status(response: httpx.Response) -> int:
@@ -435,6 +436,40 @@ class PlatformAuthClient:
                     return result
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
             raise PlatformAuthError("DELETION_UNAVAILABLE", "账号注销服务暂时不可用，请稍后重试。", 503) from None
+
+    def query_profiles(self, session_token: str, candidate_id: int | None = None, *, trace_id: str | None = None) -> dict[str, Any]:
+        """Only forward the session/profile locator, never an account id or local fallback."""
+        if not session_token:
+            raise PlatformAuthError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
+        try:
+            with httpx.Client(trust_env=False, follow_redirects=False, timeout=5) as client:
+                with client.stream("POST", f"{self.base_url}/internal/v1/profiles/query",
+                                   headers={"X-Internal-Service-Token": self.internal_token, "X-Trace-Id": trace_id or uuid4().hex},
+                                   json={"session_token": session_token, "candidate_id": candidate_id}) as response:
+                    if response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                        raise ValueError("Invalid profile content type")
+                    body = bytearray()
+                    for chunk in response.iter_bytes(chunk_size=65536):
+                        if len(body) + len(chunk) > MAX_PROFILE_QUERY_BYTES:
+                            raise ValueError("Oversized profiles")
+                        body.extend(chunk)
+                    value = decode_json(bytes(body))
+                    if response.status_code != 200:
+                        known = {
+                            (401, "SESSION_EXPIRED"): "登录状态已过期，请重新登录。",
+                            (403, "ACCOUNT_DISABLED"): "账号已被停用，请重新登录。",
+                            (404, "PROFILE_NOT_FOUND"): "候选人档案不存在。",
+                            (413, "PROFILE_QUERY_TOO_LARGE"): "档案数据超出同步查询限制，请联系管理员。",
+                            (422, "INVALID_REQUEST"): "请求参数无效。",
+                        }
+                        code = value.get("code") if isinstance(value, dict) else None
+                        message = known.get((response.status_code, code)) if isinstance(code, str) else None
+                        if message is None or (response.status_code == 404 and candidate_id is None):
+                            raise ValueError("Invalid profile query error")
+                        raise PlatformAuthError(code, message, response.status_code)
+                    return validate_projection(value, candidate_id)
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
+            raise PlatformAuthError("PROFILE_QUERY_UNAVAILABLE", "档案查询暂时不可用，请稍后重试。", 503) from None
 
     def export_account(self, session_token: str) -> dict[str, Any]:
         """Forward the real session; never select an owner or fall back to local SQL."""

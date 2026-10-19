@@ -23,6 +23,11 @@
 			path /api/account/export
 		}
 		reverse_proxy @account_export platform-service:8081
+		@profile_reads {
+			method GET
+			path_regexp profileReads ^/api/profiles(/[^/]+)?$
+		}
+		reverse_proxy @profile_reads platform-service:8081
 		@account_deletion {
 			method POST
 			path /api/account/delete

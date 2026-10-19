@@ -1,0 +1,105 @@
+openapi: 3.0.3
+info:
+  title: Candidate Profile Read Entry
+  version: 1.0.0
+  description: Java owns public authentication and the read entry. Python owns profile data and changes. No local SQL fallback.
+paths:
+  /api/profiles:
+    get:
+      security: [{session: []}]
+      responses:
+        '200':
+          description: All profiles of the authenticated account, in existing ID order. No pagination or silent truncation.
+          headers:
+            Cache-Control: {schema: {type: string, enum: [no-store]}}
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [profiles]
+                additionalProperties: false
+                properties:
+                  profiles: {type: array, items: {$ref: '#/components/schemas/Profile'}}
+        '401': {description: Missing or revoked real session}
+        '403': {description: Account disabled during admission}
+        '413': {description: Profile data exceeds the synchronous response limit}
+        '429': {description: Rate limited}
+        '503': {description: Dependency or protocol unavailable, never a successful empty list}
+  /api/profiles/{candidate_id}:
+    get:
+      security: [{session: []}]
+      parameters:
+        - name: candidate_id
+          in: path
+          required: true
+          schema: {type: integer, format: int64, minimum: 1}
+      responses:
+        '200':
+          description: Current profile projection. Account ownership is resolved only from the real session.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [profile]
+                additionalProperties: false
+                properties:
+                  profile: {$ref: '#/components/schemas/Profile'}
+        '401': {description: Missing or revoked session}
+        '403': {description: Account disabled}
+        '404': {description: Missing profile or belongs to another account; indistinguishable}
+        '413': {description: Projection exceeds 4 MiB}
+        '422': {description: Invalid profile locator}
+        '429': {description: Rate limited}
+        '503': {description: Dependency unavailable or malformed projection}
+  /internal/v1/profiles/query:
+    post:
+      description: >-
+        Same path on both services, never public. Python compatibility -> Java, then Java -> Python callback.
+        Both require the service token and real session. No trusted account_id input.
+        Java authenticates before callback; Python authenticates again, checks active state and holds the account drain guard.
+        Java returns only the public projection; Python callback additionally returns the authenticated account_id for validation.
+        Trace ID is forwarded. Maximum callback body 4 MiB, 8 concurrent callbacks, connect <=1s and full callback <=2s.
+        Java never follows redirects, retries requests automatically, reads Python tables, or substitutes cached/empty data on failure.
+      security: [{serviceToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [session_token]
+              properties:
+                session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+                candidate_id: {type: integer, format: int64, minimum: 1, nullable: true}
+      responses:
+        '200': {description: Owner-validated public or callback projection, Cache-Control no-store}
+        '401': {description: Invalid service token or real session; internal credential failure is not forwarded as a user login error}
+        '403': {description: Disabled account}
+        '404': {description: Missing or foreign profile}
+        '413': {description: Callback projection too large}
+        '422': {description: Invalid request, sanitized without echoing input}
+        '503': {description: Callback capacity, database or transport unavailable; Retry-After 3}
+components:
+  securitySchemes:
+    session: {type: apiKey, in: cookie, name: job_agent_session}
+    serviceToken: {type: apiKey, in: header, name: X-Internal-Service-Token}
+  schemas:
+    Profile:
+      type: object
+      additionalProperties: false
+      required: [id, name, status, education, experience_years, skills, preferred_cities, acceptable_cities, salary_floor_k, expected_salary_k, target_directions, unacceptable, preference_weights]
+      properties:
+        id: {type: integer, format: int64, minimum: 1}
+        name: {type: string}
+        status: {type: string}
+        education: {type: string}
+        experience_years: {type: number}
+        skills: {type: object, additionalProperties: {type: string}}
+        preferred_cities: {type: array, items: {type: string}}
+        acceptable_cities: {type: array, items: {type: string}}
+        salary_floor_k: {type: integer, nullable: true}
+        expected_salary_k: {type: integer, nullable: true}
+        target_directions: {type: array, items: {type: string}}
+        unacceptable: {type: array, items: {type: string}}
+        preference_weights: {type: object, additionalProperties: {type: number}}

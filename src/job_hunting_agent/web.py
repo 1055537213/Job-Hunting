@@ -48,7 +48,8 @@ from starlette.concurrency import run_in_threadpool
 
 from .account_email_outbox import AccountEmailOutboxService, redact_email
 from .account_export import encode_export
-from .account_work import AccountWorkRoute, AccountWorkStreamingResponse
+from .account_work import AccountWorkDenied, AccountWorkRoute, AccountWorkStreamingResponse
+from .profile_query import encode_callback
 from .account_lifecycle import (
     AccountEmailSender,
     action_token_hash,
@@ -394,6 +395,12 @@ class InternalTaskCommandPayload(BaseModel):
     task_key: str | None = Field(default=None, min_length=1, max_length=64)
     session_token: str = Field(min_length=1, max_length=128, repr=False)
     request_id: str = Field(pattern=r"^[A-Za-z0-9._-]{8,128}$")
+
+
+class InternalProfileQueryPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_token: str = Field(min_length=1, max_length=128, repr=False)
+    candidate_id: int | None = Field(default=None, gt=0, le=2**63-1, strict=True)
 
 
 class ChatSessionPayload(BaseModel):
@@ -1216,7 +1223,9 @@ def create_web_app(
 
     @web_app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error: RequestValidationError):
-        if request.url.path == "/internal/v1/accounts/export":
+        if request.url.path in {"/internal/v1/accounts/export", "/internal/v1/profiles/query"}:
+            if request.url.path.endswith("/profiles/query"):
+                return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
             return JSONResponse({"detail": "无效的导出请求。"}, status_code=422, headers={"Cache-Control": "no-store"})
         return await request_validation_exception_handler(request, error)
 
@@ -1553,10 +1562,72 @@ def create_web_app(
         )
         return Response(content=body, media_type=PROMETHEUS_CONTENT_TYPE)
 
+    profile_queries = BoundedSemaphore(8)
+
+    def build_internal_profiles(payload: InternalProfileQueryPayload, trace_id: str | None):
+        if not profile_queries.acquire(blocking=False):
+            raise HTTPException(503, "档案查询暂时不可用，请稍后重试。", headers={"Retry-After": "3"})
+        try:
+            try:
+                resolved = backend.platform_auth_client.account("me", session_token=payload.session_token, trace_id=trace_id)
+            except PlatformAuthError as error:
+                raise HTTPException(error.status_code if error.status_code in (401, 403) else 503, "档案查询认证失败。") from None
+            account = platform_account_record(resolved["account"])
+            with backend.store.account_work.acquire(account.id):
+                if payload.candidate_id is None:
+                    result = {"profiles": [asdict(profile) for profile in backend.list_candidate_profiles(account_id=account.id)]}
+                else:
+                    try:
+                        profile = backend.get_candidate_profile(payload.candidate_id, account_id=account.id)
+                    except KeyError:
+                        raise HTTPException(404, "候选人档案不存在。") from None
+                    result = {"profile": asdict(profile)}
+                return encode_callback(account.id, result, payload.candidate_id)
+        except OverflowError:
+            raise HTTPException(413, "档案数据超出同步查询限制，请联系管理员。") from None
+        except AccountWorkDenied:
+            raise HTTPException(403, "账号已被停用，请重新登录。") from None
+        finally:
+            profile_queries.release()
+
+    @web_app.post("/internal/v1/profiles/query", include_in_schema=False)
+    async def internal_profiles(payload: InternalProfileQueryPayload, request: Request):
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            return JSONResponse({"code": "INTERNAL_UNAUTHORIZED", "detail": "内部服务认证失败。"}, status_code=401,
+                                headers={"Cache-Control": "no-store"})
+        try:
+            body = await asyncio.to_thread(build_internal_profiles, payload, request.headers.get("X-Trace-Id"))
+            return Response(body, media_type="application/json", headers={"Cache-Control": "no-store"})
+        except HTTPException as error:
+            code = {401: "SESSION_EXPIRED", 403: "ACCOUNT_DISABLED", 404: "PROFILE_NOT_FOUND",
+                    413: "PROFILE_QUERY_TOO_LARGE"}.get(error.status_code, "PROFILE_QUERY_UNAVAILABLE")
+            return JSONResponse({"code": code, "detail": error.detail}, status_code=error.status_code,
+                                headers={"Cache-Control": "no-store", **(error.headers or {})})
+        except Exception:  # noqa: BLE001 - never expose SQL/transport errors or profile text.
+            return JSONResponse({"code": "PROFILE_QUERY_UNAVAILABLE", "detail": "档案查询暂时不可用，请稍后重试。"},
+                                status_code=503, headers={"Cache-Control": "no-store", "Retry-After": "3"})
+
+    def platform_profiles(request: Request, candidate_id: int | None = None):
+        token = request.cookies.get(SESSION_COOKIE_NAME)
+        if not token:
+            raise HTTPException(401, "登录状态已过期，请重新登录。", headers={"Cache-Control": "no-store"})
+        try:
+            result = backend.platform_auth_client.query_profiles(token, candidate_id, trace_id=getattr(request.state, "request_id", None))
+            return JSONResponse(result, headers={"Cache-Control": "no-store"})
+        except PlatformAuthError as error:
+            raise HTTPException(error.status_code or 503, str(error),
+                                headers={"Cache-Control": "no-store", **({"Retry-After": "3"} if error.status_code in (None, 503) else {})}) from None
+
     @web_app.get("/api/profiles")
-    def list_profiles(request: Request) -> dict[str, object]:
+    def list_profiles(request: Request):
         """列出候选人档案，供左侧栏选择。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_profiles(request)
         account = current_account(request)
         return {"profiles": [asdict(profile) for profile in backend.list_candidate_profiles(account_id=account.id if account else None)]}
 
@@ -1589,9 +1660,13 @@ def create_web_app(
         return {"candidate_id": candidate_id, "profile": asdict(backend.get_candidate_profile(candidate_id, account_id=account.id if account else None))}
 
     @web_app.get("/api/profiles/{candidate_id}")
-    def get_profile(candidate_id: int, request: Request) -> dict[str, object]:
+    def get_profile(candidate_id: int, request: Request):
         """读取某个候选人档案。"""
 
+        if backend.platform_auth_client is not None:
+            if not 0 < candidate_id <= 2**63-1:
+                raise HTTPException(422, "请求参数无效。", headers={"Cache-Control": "no-store"})
+            return platform_profiles(request, candidate_id)
         account = current_account(request)
         return {"profile": asdict(get_profile_or_404(backend, candidate_id, account.id if account else None))}
 
