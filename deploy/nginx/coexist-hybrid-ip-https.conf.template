@@ -95,7 +95,7 @@ server {
 
     location ~ ^/api/profiles/[^/]+$ {
         error_page 418 = @python_task_write;
-        if ($request_method != GET) { return 418; }
+        if ($request_method !~ ^(GET|DELETE)$) { return 418; }
         proxy_pass http://platform-service:8081;
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;

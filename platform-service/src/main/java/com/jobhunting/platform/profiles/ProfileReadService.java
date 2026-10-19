@@ -16,12 +16,22 @@ public class ProfileReadService {
     public ProfileReadService(AccountAdministrationService accounts, ProfileQueryClient python) { this.accounts = accounts; this.python = python; }
 
     public JsonNode query(String session, Long candidateId, String requestId) {
+        long owner = owner(session, candidateId);
+        return python.query(session, owner, candidateId, WebSecurityFilter.requestId(requestId, null));
+    }
+
+    public JsonNode delete(String session, Long candidateId, String requestId) {
+        if (candidateId == null) throw new AuthException("INVALID_REQUEST", "请求参数无效。", HttpStatus.UNPROCESSABLE_CONTENT);
+        long owner = owner(session, candidateId);
+        return python.delete(session, owner, candidateId, WebSecurityFilter.requestId(requestId, null));
+    }
+
+    private long owner(String session, Long candidateId) {
         if (session == null || session.isBlank() || session.length() > 128) {
             throw new AuthException("SESSION_EXPIRED", "登录状态已过期，请重新登录。", HttpStatus.UNAUTHORIZED);
         }
         if (candidateId != null && candidateId <= 0) throw new AuthException("INVALID_REQUEST", "请求参数无效。", HttpStatus.UNPROCESSABLE_CONTENT);
         // Finish the authentication transaction before the callback authenticates again.
-        long owner = accounts.current(session).account().account_id();
-        return python.query(session, owner, candidateId, WebSecurityFilter.requestId(requestId, null));
+        return accounts.current(session).account().account_id();
     }
 }

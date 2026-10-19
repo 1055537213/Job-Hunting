@@ -129,6 +129,43 @@ class ProfileQueryClientTest {
                 .isInstanceOfSatisfying(AuthException.class, e -> assertThat(e.status().value()).isEqualTo(503));
     }
 
+    @Test void deletionValidatesResourceOwnerAndCleanupStateWithoutExposingObjectLocators() {
+        var receipt = mapper.createObjectNode().put("account_id", 42).put("candidate_id", 7).put("deleted", true)
+                .put("cleanup_status", "pending").put("rag_cleanup", "database_cascade");
+        body = receipt.toString();
+        var client = client(2000);
+        var result = client.delete("real-session", 42, 7, "deletion-trace");
+        assertThat(result.get("cleanup_status").asText()).isEqualTo("pending");
+        assertThat(result.has("account_id")).isFalse();
+        assertThat(requests.getFirst()).startsWith("POST /internal/v1/profiles/delete ").doesNotContain("account_id");
+        for (String invalid : List.of("owner", "id", "secret", "state", "deleted", "rag")) {
+            var value = receipt.deepCopy();
+            switch (invalid) {
+                case "owner" -> value.put("account_id", 43);
+                case "id" -> value.put("candidate_id", 8);
+                case "secret" -> value.put("storage_keys", "private-upstream");
+                case "state" -> value.put("cleanup_status", "unknown");
+                case "deleted" -> value.put("deleted", "true");
+                default -> value.put("rag_cleanup", "unknown");
+            }
+            body = value.toString();
+            assertThatThrownBy(() -> client.delete("real-session", 42, 7, "deletion-trace"))
+                    .isInstanceOfSatisfying(AuthException.class, e -> assertThat(e.code()).isEqualTo("PROFILE_DELETE_UNAVAILABLE"));
+        }
+        status = 409;
+        body = "{\"code\":\"PROFILE_DELETE_BUSY\",\"detail\":\"private-upstream\"}";
+        assertThatThrownBy(() -> client.delete("real-session", 42, 7, "deletion-trace"))
+                .isInstanceOfSatisfying(AuthException.class, e -> assertThat(e.status().value()).isEqualTo(409)).hasMessageNotContaining("private-upstream");
+        status = 404;
+        body = "{\"code\":\"PROFILE_NOT_FOUND\",\"detail\":\"private-upstream\"}";
+        assertThatThrownBy(() -> client.delete("real-session", 42, 7, "deletion-trace"))
+                .isInstanceOfSatisfying(AuthException.class, e -> assertThat(e.status().value()).isEqualTo(404));
+        status = 401;
+        body = "{\"code\":\"INTERNAL_UNAUTHORIZED\",\"detail\":\"private-upstream\"}";
+        assertThatThrownBy(() -> client.delete("real-session", 42, 7, "deletion-trace"))
+                .isInstanceOfSatisfying(AuthException.class, e -> assertThat(e.status().value()).isEqualTo(503));
+    }
+
     @ParameterizedTest @ValueSource(strings = {"owner", "secret", "missing", "id", "duplicate", "name", "number", "skills", "list", "weights", "salary", "root"})
     void rejectsCorruptOrCrossTenantProjection(String invalid) {
         var value = fixture(false);

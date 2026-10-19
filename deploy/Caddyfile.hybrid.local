@@ -24,6 +24,11 @@
 			path /api/profiles
 		}
 		reverse_proxy @profile_create platform-service:8081
+		@profile_delete {
+			method DELETE
+			path_regexp profileDelete ^/api/profiles/[^/]+$
+		}
+		reverse_proxy @profile_delete platform-service:8081
 		@account_deletion {
 			method POST
 			path /api/account/delete

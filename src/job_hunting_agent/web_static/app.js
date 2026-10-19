@@ -2840,6 +2840,7 @@ if (!window.Vue) {
 
       /** 删除当前候选人档案；后端会级联清理档案下的会话、资料和文件。 */
       async deleteCurrentProfile() {
+        if (this.deletingProfileId) return;
         const profile = this.currentProfile;
         if (
           !profile ||
@@ -2850,22 +2851,29 @@ if (!window.Vue) {
           return;
         }
         const candidateId = this.currentProfileId;
+        const accountId = this.auth.account?.id || "legacy";
         this.deletingProfileId = candidateId;
         try {
-          await this.requestJson(`/api/profiles/${candidateId}`, { method: "DELETE" });
-          localStorage.removeItem("currentProfileId");
-          localStorage.removeItem(`activeSessionId:${this.auth.account?.id || "legacy"}:${candidateId}`);
-          this.currentProfileId = 0;
-          this.activeSessionId = "";
-          this.sessions = [];
-          this.messages = [];
-          this.matches = [];
-          this.resumeArtifacts = [];
-          this.resumeJobSelections = {};
-          this.projectCards = [];
-          this.projectReviewSelections = {};
-          this.deletingProjectCardId = 0;
+          const deletion = await this.requestJson(`/api/profiles/${candidateId}`, { method: "DELETE" });
+          localStorage.removeItem(`activeSessionId:${accountId}:${candidateId}`);
+          if ((this.auth.account?.id || "legacy") !== accountId) return;
+          if (this.currentProfileId === candidateId) {
+            localStorage.removeItem("currentProfileId");
+            this.currentProfileId = 0;
+            this.activeSessionId = "";
+            this.sessions = [];
+            this.messages = [];
+            this.matches = [];
+            this.resumeArtifacts = [];
+            this.resumeJobSelections = {};
+            this.projectCards = [];
+            this.projectReviewSelections = {};
+            this.deletingProjectCardId = 0;
+          }
           await this.loadProfiles();
+          if (deletion.cleanup_status === "pending") {
+            this.appendAssistant("档案及知识库记录已删除，附件等待后台清理。", false);
+          }
         } catch (error) {
           this.appendAssistant(`删除档案失败：${error.message || "未知错误"}`, true);
         } finally {

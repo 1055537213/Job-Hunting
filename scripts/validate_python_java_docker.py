@@ -653,6 +653,7 @@ def run_profile_read_gateway_flow(gateway_url: str, web_url: str, java_url: str,
         assert "account_id" not in listed.json()["profiles"][0]
         assert first.get(f"/api/profiles/{second_id}").status_code == 404
         assert second.get(path).status_code == 404
+        assert second.delete(path).status_code == 404
         assert first.get("/api/profiles/0").status_code == 422
         assert first.get("/api/profiles/not-a-number").status_code == 422
         direct = httpx.get(web_url + path, cookies=first.cookies, timeout=10)
@@ -682,6 +683,8 @@ def run_profile_read_gateway_flow(gateway_url: str, web_url: str, java_url: str,
             assert failure.status_code == 503 and failure.json()["code"] == "PROFILE_QUERY_UNAVAILABLE"
             assert "profiles" not in failure.json() and failure.headers["retry-after"] == "3"
             assert first.get("/api/auth/me").json()["authenticated"] is True
+            failed_delete = first.delete(path)
+            assert failed_delete.status_code == 503 and failed_delete.json()["code"] == "PROFILE_DELETE_UNAVAILABLE"
             failed_create = first.post("/api/profiles", json={"name": "Recovered create"}, headers={"Idempotency-Key": "outage-intent"})
             assert failed_create.status_code == 503 and failed_create.json()["code"] == "PROFILE_CREATE_UNAVAILABLE"
         finally:
@@ -698,6 +701,8 @@ def run_profile_read_gateway_flow(gateway_url: str, web_url: str, java_url: str,
             failed_create = httpx.post(web_url + "/api/profiles", cookies=first.cookies, json={"name": "No local fallback"},
                 headers={"X-CSRF-Token": first.headers["X-CSRF-Token"], "Idempotency-Key": "no-fallback"}, timeout=10)
             assert failed_create.status_code == 503
+            failed_delete = httpx.delete(web_url + path, cookies=first.cookies, timeout=10)
+            assert failed_delete.status_code == 503 and failed_delete.json()["code"] == "PROFILE_DELETE_UNAVAILABLE"
         finally:
             docker("start", java)
             wait(java_url + "/actuator/health")
@@ -706,7 +711,93 @@ def run_profile_read_gateway_flow(gateway_url: str, web_url: str, java_url: str,
         assert first.get(path).status_code == 401
         assert httpx.get(web_url + path, cookies=first.cookies).status_code == 401
         assert first.post("/api/profiles", json=body, headers=intent).status_code == 401
+        assert first.delete(path).status_code == 401
     print("==> Profile GET/POST Java entry -> Python owned facts/atomic creation -> replay/conflict/tenant scope -> dependency outages/no fallback -> recovery/revocation: PASS")
+
+
+def run_profile_deletion_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
+                                      worker: str, broker: str, database_url: str) -> None:
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+    from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
+    email = f"delete-profile-{os.urandom(10).hex()}@example.com"
+    owner = auth.register_account(email=email, password="profile-deletion-password", display_name="Delete profile",
+                                  email_verified=True, consents=[]).account_id
+    store = SQLAlchemyStore(database_url)
+    try:
+        with httpx.Client(base_url=gateway_url, timeout=10) as browser:
+            login = browser.post("/api/auth/login", json={"email": email, "password": "profile-deletion-password"})
+            assert login.status_code == 200
+            headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+            candidate = browser.post("/api/profiles", json={"name": "Delete fixture"}, headers=headers).json()["candidate_id"]
+            path = f"/api/profiles/{candidate}"
+            assert browser.delete(path).status_code == 403
+            assert browser.post("/internal/v1/profiles/delete", json={}).status_code == 404
+            for url in (web_url, java_url):
+                assert httpx.post(url + "/internal/v1/profiles/delete", json={"session_token": browser.cookies["job_agent_session"],
+                    "candidate_id": candidate}).status_code == 401
+            with store.account_work.acquire(owner):
+                busy = browser.delete(path, headers=headers)
+                assert busy.status_code == 409 and busy.json()["code"] == "PROFILE_DELETE_BUSY"
+            fixture = f"""
+import json
+from job_hunting_agent.app import JobHuntingApp
+a=JobHuntingApp(); a.initialize()
+objects=[a.resume_files.save(account_id={owner},candidate_id={candidate},filename='fixture.txt',content=b'private-'+bytes([v])) for v in (1,2)]
+asset,version=a.store.register_knowledge_asset(account_id={owner},candidate_id={candidate},asset_kind='document',title='Private',
+    original_filename='fixture.txt',storage_key=objects[0].storage_key,media_type='text/plain',file_size=objects[0].file_size,sha256=objects[0].sha256)
+a.store.add_knowledge_asset_version(asset.id,account_id={owner},original_filename='fixture.txt',storage_key=objects[1].storage_key,
+    media_type='text/plain',file_size=objects[1].file_size,sha256=objects[1].sha256)
+text=a.store.add_long_text('candidate_profile',{candidate},'delete-fixture','private evidence',account_id={owner},candidate_id={candidate})
+with a.store.connect() as c:
+    c.execute('''INSERT INTO rag_chunks(id,account_id,candidate_id,long_text_id,entity_type,entity_id,source_label,chunk_index,
+        content,content_sha256,embedding,embedding_model,embedding_dimensions,created_at,updated_at)
+        VALUES (?,?,?,?,'candidate_profile',?,'delete-fixture',0,'private evidence',?,'[0.1,0.2,0.3]'::vector,'fixture',3,now(),now()) RETURNING 1 AS fixture''',
+        ('profile-delete-{candidate}',{owner},{candidate},text,{candidate},'0'*64))
+print(json.dumps([o.storage_key for o in objects])); a.store.close()
+"""
+            keys = json.loads(docker("exec", worker, "python", "-c", fixture).splitlines()[-1])
+            docker("stop", "--time", "1", worker)
+            docker("stop", "--time", "1", broker)
+            accepted = browser.delete(path, headers=headers)
+            assert accepted.status_code == 202 and accepted.json()["cleanup_status"] == "pending", accepted.text[:200]
+            assert not any(key in accepted.text for key in keys)
+            assert browser.get(path).status_code == 404
+            assert browser.get("/api/profiles").json() == {"profiles": []}
+            assert browser.delete(path, headers=headers).json() == accepted.json()
+            compat = httpx.delete(web_url + path, cookies=browser.cookies, timeout=10)
+            assert compat.status_code == 202 and compat.json() == accepted.json()
+            with store.connect() as conn:
+                assert conn.execute("SELECT COUNT(*) AS n FROM rag_chunks WHERE candidate_id=?", (candidate,)).fetchone()["n"] == 0
+                row = conn.execute("SELECT storage_keys_json FROM profile_deletions WHERE account_id=? AND candidate_id=?", (owner, candidate)).fetchone()
+                assert sorted(json.loads(row["storage_keys_json"])) == sorted(keys)
+            docker("start", broker)
+            docker("start", worker)
+            failure = f"""
+from job_hunting_agent.app import JobHuntingApp
+from job_hunting_agent.profile_deletion import cleanup
+a=JobHuntingApp(); a.initialize()
+def fail(key): raise RuntimeError('private storage failure')
+a.resume_files.delete=fail
+assert cleanup(a,{owner},{candidate},force=True)['cleanup_status']=='pending'
+a.store.close()
+"""
+            docker("exec", worker, "python", "-c", failure)
+            docker("restart", "--time", "1", worker)
+            with store.connect() as conn:
+                conn.execute("UPDATE profile_deletions SET next_attempt_at=now() WHERE account_id=? AND candidate_id=?", (owner, candidate))
+            maintenance = "from job_hunting_agent.worker import create_worker_app; from job_hunting_agent.task_queue import STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME; print(create_worker_app().tasks[STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME].apply().get())"
+            docker("exec", worker, "python", "-c", maintenance)
+            done = browser.delete(path, headers=headers)
+            assert done.status_code == 200 and done.json()["cleanup_status"] == "completed", done.text[:200]
+            physical = f"from job_hunting_agent.app import JobHuntingApp; a=JobHuntingApp(); assert all(not a.resume_files.path_for(k).exists() for k in {keys!r}); a.store.close()"
+            docker("exec", worker, "python", "-c", physical)
+    finally:
+        docker("start", broker)
+        docker("start", worker)
+        store.close()
+    print("==> Profile DELETE Java -> atomic SQL/RAG deletion + durable all-version manifest -> queue/storage outage -> Worker restart/maintenance recovery -> physical objects gone: PASS")
 
 
 def run_account_deletion_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
@@ -1077,6 +1168,8 @@ def main() -> None:
                "job-agent-worker", "--concurrency", "1", "--log-level", "WARNING")
         run_task_command_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                               f"http://127.0.0.1:{args.port}", token, admin_credentials, isolated_url, worker, broker)
+        run_profile_deletion_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                                          f"http://127.0.0.1:{args.port}", token, worker, broker, isolated_url)
         # This randomly named Redis belongs only to this test. Give the limiter stage
         # its own empty window, independent of preceding browser/Worker acceptance traffic.
         docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")

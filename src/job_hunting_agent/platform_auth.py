@@ -13,7 +13,7 @@ import httpx
 
 from .config import PlatformAuthSettings
 from .account_export import MAX_EXPORT_BYTES, decode_export
-from .profile_query import MAX_PROFILE_QUERY_BYTES, decode_json, validate_creation, validate_projection
+from .profile_query import MAX_PROFILE_QUERY_BYTES, decode_json, validate_creation, validate_deletion, validate_projection
 
 
 def _platform_response_error_status(response: httpx.Response) -> int:
@@ -504,6 +504,38 @@ class PlatformAuthClient:
                     return validate_creation(value)
         except (httpx.HTTPError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
             raise PlatformAuthError("PROFILE_CREATE_UNAVAILABLE", "档案创建结果暂未确认，请使用相同请求重试。", 503) from None
+
+    def delete_profile(self, session_token: str, candidate_id: int, *, trace_id: str | None = None) -> dict[str, Any]:
+        """The resource locator is the replay key; never delete locally on transport failure."""
+        try:
+            with httpx.Client(trust_env=False, follow_redirects=False, timeout=5) as client:
+                with client.stream("POST", f"{self.base_url}/internal/v1/profiles/delete",
+                                   headers={"X-Internal-Service-Token": self.internal_token, "X-Trace-Id": trace_id or uuid4().hex},
+                                   json={"session_token": session_token, "candidate_id": candidate_id}) as response:
+                    if response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                        raise ValueError("Invalid deletion response")
+                    body = bytearray()
+                    for chunk in response.iter_bytes(chunk_size=65536):
+                        if len(body) + len(chunk) > MAX_PROFILE_QUERY_BYTES:
+                            raise ValueError("Oversized deletion receipt")
+                        body.extend(chunk)
+                    value = decode_json(bytes(body))
+                    if response.status_code != 200:
+                        known = {
+                            (401, "SESSION_EXPIRED"): "登录状态已过期，请重新登录。",
+                            (403, "ACCOUNT_DISABLED"): "账号已被停用，请重新登录。",
+                            (404, "PROFILE_NOT_FOUND"): "候选人档案不存在。",
+                            (409, "PROFILE_DELETE_BUSY"): "当前仍有请求或后台任务执行，请稍后再删除档案。",
+                            (422, "INVALID_REQUEST"): "请求参数无效。",
+                        }
+                        code = value.get("code") if isinstance(value, dict) else None
+                        message = known.get((response.status_code, code)) if isinstance(code, str) else None
+                        if message is None:
+                            raise ValueError("Invalid profile deletion error")
+                        raise PlatformAuthError(code, message, response.status_code)
+                    return validate_deletion(value, candidate_id)
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
+            raise PlatformAuthError("PROFILE_DELETE_UNAVAILABLE", "档案删除结果暂未确认，请使用相同档案重试。", 503) from None
 
     def export_account(self, session_token: str) -> dict[str, Any]:
         """Forward the real session; never select an owner or fall back to local SQL."""

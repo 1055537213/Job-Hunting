@@ -1306,6 +1306,8 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
             counts.update(TaskCommands(backend.store, backend.task_queue).dispatch_pending())
             from .account_deletion import dispatch_account_deletions
             counts.update(dispatch_account_deletions(backend))
+            from .profile_deletion import resume_pending
+            counts.update(resume_pending(backend))
             return {"status": "succeeded", **counts}
         finally:
             backend.store.close()

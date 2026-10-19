@@ -252,6 +252,25 @@ profile_create_commands = sa.Table(
 sa.Index("idx_profile_create_candidate", profile_create_commands.c.candidate_id)
 
 
+profile_deletions = sa.Table(
+    "profile_deletions", metadata,
+    sa.Column("account_id", sa.Integer, sa.ForeignKey("accounts.id", ondelete="CASCADE"), primary_key=True),
+    sa.Column("candidate_id", sa.Integer, primary_key=True),
+    sa.Column("status", sa.String(16), nullable=False),
+    sa.Column("storage_keys_json", json_type, nullable=False),
+    sa.Column("attempts", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("next_attempt_at", timestamp_type, nullable=False, server_default=sa.func.now()),
+    sa.Column("lease_token", sa.String(64)),
+    sa.Column("lease_until", timestamp_type),
+    sa.Column("last_error", sa.String(256)),
+    sa.Column("created_at", timestamp_type, nullable=False, server_default=sa.func.now()),
+    sa.Column("updated_at", timestamp_type, nullable=False, server_default=sa.func.now()),
+    sa.CheckConstraint("status IN ('pending', 'completed')", name="profile_deletions_status"),
+    sa.CheckConstraint("attempts >= 0", name="profile_deletions_attempts"),
+)
+sa.Index("idx_profile_deletions_due", profile_deletions.c.status, profile_deletions.c.next_attempt_at)
+
+
 jobs = sa.Table(
     "jobs",
     metadata,

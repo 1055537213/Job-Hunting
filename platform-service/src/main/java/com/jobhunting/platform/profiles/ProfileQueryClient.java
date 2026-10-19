@@ -100,6 +100,24 @@ public class ProfileQueryClient {
         }
     }
 
+    public JsonNode delete(String session, long accountId, long candidateId, String requestId) {
+        try {
+            var value = exchange(mapper.createObjectNode().put("session_token", session).put("candidate_id", candidateId), "delete", requestId);
+            if (!fields(value, Set.of("account_id", "candidate_id", "deleted", "cleanup_status", "rag_cleanup"))
+                    || !id(value.get("account_id")) || value.get("account_id").asLong() != accountId
+                    || !id(value.get("candidate_id")) || value.get("candidate_id").asLong() != candidateId
+                    || !value.get("deleted").isBoolean() || !value.get("deleted").asBoolean()
+                    || !value.get("cleanup_status").isTextual() || !Set.of("pending", "completed").contains(value.get("cleanup_status").asText())
+                    || !value.get("rag_cleanup").isTextual() || !"database_cascade".equals(value.get("rag_cleanup").asText())) throw deleteUnavailable();
+            var result = (tools.jackson.databind.node.ObjectNode) value.deepCopy();
+            result.remove("account_id");
+            return result;
+        } catch (AuthException error) {
+            if ("PROFILE_QUERY_UNAVAILABLE".equals(error.code())) throw deleteUnavailable();
+            throw error;
+        }
+    }
+
     private JsonNode exchange(JsonNode payload, String operation, String requestId) {
         if (token.isBlank() || !slots.tryAcquire()) throw unavailable();
         CompletableFuture<HttpResponse<byte[]>> pending = null;
@@ -114,7 +132,11 @@ public class ProfileQueryClient {
             var value = mapper.readTree(response.body());
             if (response.statusCode() != 200) {
                 if (!fields(value, Set.of("code", "detail")) || !value.get("detail").isTextual() || !value.get("code").isTextual()) throw unavailable();
-                var safe = "create".equals(operation) ? createError(response.statusCode(), value.get("code").asText()) : safeError(response.statusCode());
+                var safe = switch (operation) {
+                    case "create" -> createError(response.statusCode(), value.get("code").asText());
+                    case "delete" -> deleteError(response.statusCode(), value.get("code").asText());
+                    default -> safeError(response.statusCode());
+                };
                 if (!safe.code().equals(value.get("code").asText())
                         || (response.statusCode() == 404 && ("create".equals(operation) || payload.get("candidate_id").isNull()))) throw unavailable();
                 throw safe;
@@ -160,6 +182,19 @@ public class ProfileQueryClient {
 
     static AuthException createUnavailable() {
         return new AuthException("PROFILE_CREATE_UNAVAILABLE", "档案创建结果暂未确认，请使用相同请求重试。", HttpStatus.SERVICE_UNAVAILABLE);
+    }
+
+    static AuthException deleteUnavailable() {
+        return new AuthException("PROFILE_DELETE_UNAVAILABLE", "档案删除结果暂未确认，请使用相同档案重试。", HttpStatus.SERVICE_UNAVAILABLE);
+    }
+
+    private static AuthException deleteError(int status, String code) {
+        if (status == 401 || status == 403 || status == 404) return safeError(status);
+        if (status == 409 && "PROFILE_DELETE_BUSY".equals(code))
+            return new AuthException(code, "当前仍有请求或后台任务执行，请稍后再删除档案。", HttpStatus.CONFLICT);
+        if (status == 422 && "INVALID_REQUEST".equals(code))
+            return new AuthException(code, "请求参数无效。", HttpStatus.UNPROCESSABLE_CONTENT);
+        return deleteUnavailable();
     }
 
     private static AuthException createError(int status, String code) {

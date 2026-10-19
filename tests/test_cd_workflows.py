@@ -593,6 +593,8 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
         assert "path_regexp profileReads ^/api/profiles(/[^/]+)?$" in edge
         assert "reverse_proxy @profile_reads platform-service:8081" in edge
         assert "reverse_proxy @profile_create platform-service:8081" in edge
+        assert "reverse_proxy @profile_delete platform-service:8081" in edge
+        assert "path_regexp profileDelete ^/api/profiles/[^/]+$" in edge
         assert "path /api/profiles" in edge
         assert "path /api/account/delete" in edge
         assert "reverse_proxy @account_deletion platform-service:8081" in edge
@@ -631,6 +633,7 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
     assert "location = /api/profiles" in nginx
     assert 'if ($request_method !~ ^(GET|POST)$) { return 418; }' in nginx
     assert "location ~ ^/api/profiles/[^/]+$" in nginx
+    assert 'if ($request_method !~ ^(GET|DELETE)$) { return 418; }' in nginx
     assert "location = /api/account/delete" in nginx
     assert 'if ($request_method != PATCH) { return 418; }' in nginx
     assert "location = /api/me/balance" in nginx

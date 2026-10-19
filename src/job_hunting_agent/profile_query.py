@@ -19,6 +19,14 @@ def validate_creation(value):
     return value
 
 
+def validate_deletion(value, candidate_id):
+    if (not isinstance(value, dict) or set(value) != {"deleted", "candidate_id", "cleanup_status", "rag_cleanup"}
+            or value["deleted"] is not True or not valid_id(value["candidate_id"]) or value["candidate_id"] != candidate_id
+            or value["cleanup_status"] not in ("pending", "completed") or value["rag_cleanup"] != "database_cascade"):
+        raise ValueError("Invalid profile deletion receipt")
+    return value
+
+
 def valid_id(value):
     return type(value) is int and 0 < value <= MAX_PROFILE_ID
 

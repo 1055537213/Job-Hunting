@@ -342,7 +342,7 @@ AI、RAG、OCR 和多模态文件处理仍然依赖 Python 生态；Java 更适�
 
 账号导出入口和注销准入/完成确认也已由 Java 接管；Python 负责导出业务数据、等待在途请求与后台任务排空，以及清理文件和 RAG 数据。
 
-工作台档案列表/详情 GET 和创建 POST 入口已迁移到 Java，内部回调由 Python 按真实会话归属处理；档案数据、规范化、创建事务、修改/删除、AI 更新和业务缓存仍由 Python 负责。创建请求使用账号隔离的幂等键，超时重试不会重复写入。接口契约见 [档案查询](platform-service/src/main/resources/profile-query.openapi.yaml) 与 [档案创建](platform-service/src/main/resources/profile-create.openapi.yaml)。
+工作台档案 GET、创建 POST、删除 DELETE 入口已迁移到 Java，内部回调由 Python 按真实会话归属处理；实际档案读写、AI 更新和业务缓存仍由 Python 负责。创建使用事务幂等，删除使用持久化清理清单；附件未清完返回 202，完成后返回 200，重复删除可查询进度。契约见 [档案查询](platform-service/src/main/resources/profile-query.openapi.yaml)、[档案创建](platform-service/src/main/resources/profile-create.openapi.yaml) 和 [档案删除](platform-service/src/main/resources/profile-delete.openapi.yaml)。
 
 ### Java 服务不可用时会不会偷偷回退到 Python？
 
@@ -389,6 +389,7 @@ AI、RAG、OCR 和多模态文件处理仍然依赖 Python 生态；Java 更适�
 - [x] 注销清理等待已受理的 Python 请求、SSE 和上传完成，完成后重新收集文件并删除；混合模式的等待不消耗清理失败预算。
 - [x] 工作台档案列表/详情查询经网关直达 Java；Python 保留数据所有权，验证账号隔离、摘要更新、依赖故障和恢复，无本地查询回退。
 - [x] 创建档案入口经 Java 校验 Session/CSRF，Python 原子提交档案和幂等凭据；同请求重放不重复创建，旧请求不复活已删除档案。
+- [x] 删除档案入口经 Java 鉴权，Python 原子删除事实/向量并持久化全版本附件清单；在途工作阻止删除，Worker 维护任务分批重试清理。
 - [ ] 接入真实支付、签名 Webhook、退款状态机和渠道对账。
 - [ ] 使用真实行业材料完成正式 RAG 发布集、Top-K/Top-N 和 P95 性能验收。
 - [ ] 增加工业 PDF 表格/图注坐标、父子 Chunk、数值范围检索和 CAD 解析能力。

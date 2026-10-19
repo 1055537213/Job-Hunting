@@ -48,8 +48,8 @@ from starlette.concurrency import run_in_threadpool
 
 from .account_email_outbox import AccountEmailOutboxService, redact_email
 from .account_export import encode_export
-from .account_work import AccountWorkDenied, AccountWorkRoute, AccountWorkStreamingResponse
-from .profile_query import MAX_PROFILE_CREATE_BYTES, encode_callback, validate_creation
+from .account_work import AccountWorkBusy, AccountWorkDenied, AccountWorkRoute, AccountWorkStreamingResponse
+from .profile_query import MAX_PROFILE_CREATE_BYTES, encode_callback, validate_creation, validate_deletion
 from .account_lifecycle import (
     AccountEmailSender,
     action_token_hash,
@@ -293,6 +293,12 @@ class InternalProfileCreatePayload(BaseModel):
     session_token: str = Field(min_length=1, max_length=128, repr=False)
     idempotency_key: str = Field(pattern=r"^[A-Za-z0-9:_-]{1,128}$", repr=False)
     profile: ProfileCreatePayload = Field(repr=False)
+
+
+class InternalProfileDeletePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_token: str = Field(min_length=1, max_length=128, repr=False)
+    candidate_id: int = Field(strict=True, gt=0, le=2**63-1)
 
 
 class ChatPayload(BaseModel):
@@ -694,7 +700,7 @@ def create_web_app(
     # 截图本体不持久化，无法安全地只向 Worker 投递 task_key；因此它是一个有界的
     # 前台导入例外。实际模型调用在线程池执行，共享并发控制器负责限制图片内存占用。
 
-    def current_account(request: Request, required: bool = True) -> AccountRecord | None:
+    def current_account(request: Request, required: bool = True, *, protect: bool = True) -> AccountRecord | None:
         """从 HttpOnly Cookie 解析当前账号，并顺延 Session 闲置窗口。"""
 
         token = request.cookies.get(SESSION_COOKIE_NAME)
@@ -712,7 +718,8 @@ def create_web_app(
             if account.status != "active":
                 raise HTTPException(status_code=403, detail="账号已被禁用。")
             request.state.account = account
-            backend.store.account_work.protect_request(request, account.id)
+            if protect:
+                backend.store.account_work.protect_request(request, account.id)
             return account
         session = getattr(request.state, "auth_session", None)
         if session is None:
@@ -739,7 +746,7 @@ def create_web_app(
             backend.store.touch_auth_session(session.id, utc_now().isoformat(timespec="seconds"), idle_expiry)
         request.state.account = account
         # Native synchronous deletion must not wait on its own request lease.
-        if request.url.path != "/api/account/delete":
+        if protect and request.url.path != "/api/account/delete":
             backend.store.account_work.protect_request(request, account.id)
         return account
 
@@ -1242,7 +1249,7 @@ def create_web_app(
     async def validation_error(request: Request, error: RequestValidationError):
         if request.url.path == "/api/profiles" and request.method == "POST":
             return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
-        if request.url.path in {"/internal/v1/accounts/export", "/internal/v1/profiles/query", "/internal/v1/profiles/create"}:
+        if request.url.path in {"/internal/v1/accounts/export", "/internal/v1/profiles/query", "/internal/v1/profiles/create", "/internal/v1/profiles/delete"}:
             if "/profiles/" in request.url.path:
                 return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
             return JSONResponse({"detail": "无效的导出请求。"}, status_code=422, headers={"Cache-Control": "no-store"})
@@ -1756,19 +1763,72 @@ def create_web_app(
         account = current_account(request)
         return {"profile": asdict(get_profile_or_404(backend, candidate_id, account.id if account else None))}
 
-    @web_app.delete("/api/profiles/{candidate_id}")
-    def delete_profile(candidate_id: int, request: Request) -> dict[str, object]:
-        """删除当前账号的候选人档案及其从属数据。"""
+    def deletion_response(result):
+        return JSONResponse(result, status_code=202 if result["cleanup_status"] == "pending" else 200,
+                            headers={"Cache-Control": "no-store"})
 
-        account = current_account(request)
+    def deletion_error(error):
+        if isinstance(error, KeyError):
+            return 404, "PROFILE_NOT_FOUND", "候选人档案不存在。"
+        if isinstance(error, AccountWorkBusy):
+            return 409, "PROFILE_DELETE_BUSY", "当前仍有请求或后台任务执行，请稍后再删除档案。"
+        if isinstance(error, PermissionError):
+            return 403, "ACCOUNT_DISABLED", "账号已被停用，请重新登录。"
+        if isinstance(error, PlatformAuthError) and error.status_code in (401, 403):
+            return error.status_code, "SESSION_EXPIRED" if error.status_code == 401 else "ACCOUNT_DISABLED", "登录状态已失效，请重新登录。"
+        return 503, "PROFILE_DELETE_UNAVAILABLE", "档案删除结果暂未确认，请使用相同档案重试。"
+
+    profile_deletes = BoundedSemaphore(8)
+
+    def build_internal_profile_delete(payload: InternalProfileDeletePayload, trace_id):
+        if not profile_deletes.acquire(blocking=False):
+            raise RuntimeError("Profile deletion callback busy")
         try:
-            result = backend.delete_candidate_profile(
-                candidate_id,
-                account_id=account.id if account else None,
-            )
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail="候选人档案不存在。") from error
-        return {"deleted": True, **result}
+            resolved = backend.platform_auth_client.account("me", session_token=payload.session_token, trace_id=trace_id)
+            account = platform_account_record(resolved["account"])
+            result = backend.request_candidate_profile_deletion(payload.candidate_id, account_id=account.id)
+            return {"account_id": account.id, **validate_deletion(result, payload.candidate_id)}
+        finally:
+            profile_deletes.release()
+
+    @web_app.post("/internal/v1/profiles/delete", include_in_schema=False)
+    async def internal_profile_delete(payload: InternalProfileDeletePayload, request: Request):
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            return JSONResponse({"code": "INTERNAL_UNAUTHORIZED", "detail": "内部服务认证失败。"}, status_code=401, headers={"Cache-Control": "no-store"})
+        try:
+            result = await asyncio.to_thread(build_internal_profile_delete, payload, request.headers.get("X-Trace-Id"))
+            return JSONResponse(result, headers={"Cache-Control": "no-store"})
+        except Exception as error:  # noqa: BLE001 - expose only a frozen error projection.
+            status, code, detail = deletion_error(error)
+            return JSONResponse({"code": code, "detail": detail}, status_code=status,
+                                headers={"Cache-Control": "no-store", **({"Retry-After": "3"} if status in (409, 503) else {})})
+
+    @web_app.delete("/api/profiles/{candidate_id}")
+    def delete_profile(candidate_id: int, request: Request):
+        if not 0 < candidate_id <= 2**63-1:
+            raise HTTPException(422, "请求参数无效。", headers={"Cache-Control": "no-store"})
+        if backend.platform_auth_client is not None:
+            token = request.cookies.get(SESSION_COOKIE_NAME)
+            if not token:
+                raise HTTPException(401, "登录状态已过期，请重新登录。", headers={"Cache-Control": "no-store"})
+            try:
+                return deletion_response(backend.platform_auth_client.delete_profile(token, candidate_id,
+                    trace_id=getattr(request.state, "request_id", None)))
+            except PlatformAuthError as error:
+                return JSONResponse({"code": error.code, "detail": str(error)}, status_code=error.status_code or 503,
+                                    headers={"Cache-Control": "no-store", **({"Retry-After": "3"} if error.status_code in (409, 503, None) else {})})
+        # Deletion acquires its own exclusive guard; do not wait on this request's shared lease.
+        account = current_account(request, protect=False)
+        try:
+            return deletion_response(backend.request_candidate_profile_deletion(candidate_id, account_id=account.id))
+        except Exception as error:  # noqa: BLE001 - native mode uses the same safe error contract.
+            status, code, detail = deletion_error(error)
+            return JSONResponse({"code": code, "detail": detail}, status_code=status,
+                                headers={"Cache-Control": "no-store", **({"Retry-After": "3"} if status in (409, 503) else {})})
 
     @web_app.post("/api/chat/sessions")
     def create_chat_session(payload: ChatSessionPayload, request: Request) -> dict[str, object]:

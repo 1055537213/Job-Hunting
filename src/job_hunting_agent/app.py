@@ -690,6 +690,8 @@ class JobHuntingApp:
         if cache_key is not None:
             cached = _candidate_profile_from_cache(self.business_cache.get_json(cache_key))
             if cached is not None:
+                if candidate_id in self.store.deleted_candidate_ids(account_id):
+                    raise KeyError(candidate_id)
                 return cached
         profile = self.store.get_candidate_profile(candidate_id, account_id=account_id)
         if cache_key is not None:
@@ -709,7 +711,8 @@ class JobHuntingApp:
             if isinstance(cached, list):
                 profiles = [_candidate_profile_from_cache(item) for item in cached]
                 if all(profile is not None for profile in profiles):
-                    return [profile for profile in profiles if profile is not None]
+                    deleted = self.store.deleted_candidate_ids(account_id)
+                    return [profile for profile in profiles if profile is not None and profile.id not in deleted]
         profiles = self.store.list_candidate_profiles(account_id=account_id)
         if cache_key is not None:
             self.business_cache.set_json(
@@ -724,14 +727,21 @@ class JobHuntingApp:
         candidate_id: int,
         account_id: int | None = None,
     ) -> dict[str, object]:
-        """删除候选人档案及其从属数据，并尽量同步移除 RAG 证据。"""
+        """Internal convenience API; durable manifest remains if eager cleanup fails."""
+        from .profile_deletion import cleanup
+        result = self.request_candidate_profile_deletion(candidate_id, account_id=account_id)
+        if result["cleanup_status"] == "pending":
+            owner = account_id
+            if owner is None:
+                raise ValueError("清理附件需要账号归属。")
+            return cleanup(self, owner, candidate_id, force=True, batch_size=100)
+        return result
 
-        result = self.store.delete_candidate_profile(candidate_id, account_id=account_id)
-        for storage_key in result.get("storage_keys", []):
-            self.resume_files.delete(str(storage_key))
-        cleaned = self._finish_deletion_cleanup(result)
-        self.invalidate_profile_cache(account_id, candidate_id)
-        return cleaned
+    def request_candidate_profile_deletion(self, candidate_id: int, account_id: int | None = None) -> dict[str, object]:
+        from .profile_deletion import request_deletion
+        if account_id is None:
+            raise ValueError("删除档案需要账号归属。")
+        return request_deletion(self, account_id, candidate_id)
 
     def delete_chat_session(self, session_id: str, account_id: int) -> dict[str, object]:
         """永久删除一段网页对话及其消息。"""

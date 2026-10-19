@@ -1,0 +1,76 @@
+openapi: 3.0.3
+info:
+  title: Candidate Profile Deletion Entry
+  version: 1.0.0
+  description: Java authenticates; Python atomically deletes facts and persists a durable object cleanup manifest. Resource locator is the idempotency key.
+paths:
+  /api/profiles/{candidate_id}:
+    delete:
+      security: [{session: [], csrf: []}]
+      parameters:
+        - {name: candidate_id, in: path, required: true, schema: {type: integer, format: int64, minimum: 1}}
+      description: >-
+        Owner comes only from a real session. Same account/resource replays the existing receipt; a foreign or never-existing
+        resource returns indistinguishable 404. No raw object keys, long-text IDs, tokens or profile text in response.
+        202 means SQL and RAG facts are gone but physical objects are still pending. 200 means the durable manifest is empty.
+        Running HTTP requests or Worker tasks reject admission with 409 before deleting anything.
+      responses:
+        '200':
+          description: Facts and physical object cleanup completed; Cache-Control no-store
+          content: {application/json: {schema: {$ref: '#/components/schemas/Receipt'}}}
+        '202':
+          description: Facts/RAG removed and object cleanup durably pending; not a claim that files are already gone
+          content: {application/json: {schema: {$ref: '#/components/schemas/Receipt'}}}
+        '401': {description: Session missing or revoked}
+        '403': {description: Account disabled or CSRF rejected}
+        '404': {description: Missing or foreign resource without an owned receipt}
+        '409': {description: PROFILE_DELETE_BUSY; retry after in-flight work finishes}
+        '422': {description: Invalid locator}
+        '429': {description: Rate limited}
+        '503': {description: Outcome unavailable; Retry-After 3; retry the same resource, no local fallback}
+  /internal/v1/profiles/delete:
+    post:
+      security: [{serviceToken: []}]
+      description: >-
+        Python compatibility -> Java -> Python callback; never public. Both services validate real session.
+        Python independently revalidates active state under an exclusive account request guard plus account row lock,
+        serialized against Worker claims. The callback runs in an independent thread until its transaction completes.
+        SQL fact deletion, RAG cascades and an all-version object manifest commit together. No object I/O in HTTP callback.
+        Internal success is always 200; Java public response chooses 200/202 from cleanup_status.
+        Python adds account_id; Java validates owner/resource/fields and strips that envelope.
+        Callback uses existing <=1s connect / <=2s whole response, 8 shared Java profile slots and <=4MiB response bound.
+        No redirect, automatic replay or SQL fallback. Timeout does not roll back a committed Python transaction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [session_token, candidate_id]
+              properties:
+                session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+                candidate_id: {type: integer, format: int64, minimum: 1}
+      responses:
+        '200': {description: Public receipt or owner-enveloped Python callback receipt}
+        '401': {description: Invalid service token or session; service credential failure becomes public 503}
+        '403': {description: Disabled account}
+        '404': {description: Missing or foreign profile}
+        '409': {description: In-flight work prevents admission}
+        '422': {description: Invalid input, sanitized}
+        '503': {description: Dependency or protocol failure}
+components:
+  securitySchemes:
+    session: {type: apiKey, in: cookie, name: job_agent_session}
+    csrf: {type: apiKey, in: header, name: X-CSRF-Token}
+    serviceToken: {type: apiKey, in: header, name: X-Internal-Service-Token}
+  schemas:
+    Receipt:
+      type: object
+      additionalProperties: false
+      required: [deleted, candidate_id, cleanup_status, rag_cleanup]
+      properties:
+        deleted: {type: boolean, enum: [true]}
+        candidate_id: {type: integer, format: int64, minimum: 1}
+        cleanup_status: {type: string, enum: [pending, completed]}
+        rag_cleanup: {type: string, enum: [database_cascade]}

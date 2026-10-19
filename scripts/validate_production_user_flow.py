@@ -274,7 +274,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         )
         check(
             "profile_delete",
-            deleted_profile.status_code == 200
+            (deleted_profile.status_code == 200 or (
+                deleted_profile.status_code == 202 and _value(deleted_profile.body, "cleanup_status", "") == "pending"))
             and bool(_value(deleted_profile.body, "deleted", False)),
             f"HTTP {deleted_profile.status_code}",
         )
