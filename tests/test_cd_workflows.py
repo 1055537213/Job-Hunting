@@ -621,7 +621,8 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
         assert "path_regexp taskCommands ^/api/admin/tasks/(probe|[^/]+/retry)$" in edge
         assert "reverse_proxy @task_commands platform-service:8081" in edge
         assert "path_regexp adminAccountStatus ^/api/admin/accounts/[0-9]+/status$" in edge
-        assert "path_regexp adminBillingReads ^/api/admin/(balance/events|recharge/orders|recharge/orders/[0-9]+/events)$" in edge
+        assert "path_regexp adminBillingReads ^/api/admin/(balance/events|recharge/orders|recharge/orders/[0-9]+/events|recharge/reconciliation)$" in edge
+        assert "path_regexp adminRefund ^/api/admin/recharge/orders/[0-9]+/refund$" in edge
         assert "path_regexp adminCredit ^/api/admin/accounts/[0-9]+/balance/credit$" in edge
         assert "respond @internal 404" in edge
     nginx = (ROOT / "deploy/nginx/coexist-hybrid-ip-https.conf.template").read_text(encoding="utf-8")
@@ -639,7 +640,7 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
     assert "location = /api/me/balance" in nginx
     assert "location = /api/me/recharge/orders" in nginx
     assert "location = /api/me/balance/recharge" in nginx
-    assert "location ~ ^/api/admin/(balance/events|recharge/orders|recharge/orders/[0-9]+/events|accounts/[0-9]+/balance/credit)$" in nginx
+    assert "location ~ ^/api/admin/(balance/events|recharge/orders|recharge/orders/[0-9]+/events|recharge/reconciliation|accounts/[0-9]+/balance/credit)$" in nginx
     assert "location ~ ^/api/admin/(accounts|audit/events|accounts/[0-9]+/status)$" in nginx
     assert "location ~ ^/api/admin/usage/(summary|events)$" in nginx
     assert "location = /api/admin/observability/requests" in nginx

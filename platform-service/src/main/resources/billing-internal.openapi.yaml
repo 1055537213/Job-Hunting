@@ -158,11 +158,11 @@ paths:
               $ref: '#/components/schemas/RefundRequest'
       responses:
         '200':
-          description: Refund applied or the previous idempotent result returned
+          description: Full refund applied to a paid recharge order or the previous idempotent result returned
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/BalanceProjection'
+                $ref: '#/components/schemas/RefundResponse'
         '409':
           $ref: '#/components/responses/IdempotencyConflict'
         '422':
@@ -319,11 +319,25 @@ components:
           format: int64
         replayed:
           type: boolean
+    RefundResponse:
+      type: object
+      required: [account_id, balance_micro_yuan, ledger_entry_id, replayed, refunded_micro_yuan, recharge_order_id]
+      properties:
+        account_id: {type: integer, format: int64}
+        balance_micro_yuan: {type: integer, format: int64}
+        ledger_entry_id: {type: integer, format: int64}
+        replayed: {type: boolean}
+        refunded_micro_yuan: {type: integer, format: int64}
+        recharge_order_id: {type: integer, format: int64}
     RefundRequest:
       type: object
-      required: [account_id, amount_micro_yuan, source_reference]
+      required: [account_id, recharge_order_id, amount_micro_yuan, source_reference]
       properties:
         account_id:
+          type: integer
+          format: int64
+          minimum: 1
+        recharge_order_id:
           type: integer
           format: int64
           minimum: 1

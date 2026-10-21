@@ -184,6 +184,12 @@ class BillingControllerTest {
         }
 
         @Override
+        public BillingDtos.RefundResponse refund(BillingDtos.RefundRequest request, String idempotencyKey) {
+            return new BillingDtos.RefundResponse(request.account_id(), 7_000_000, 9, false,
+                    request.amount_micro_yuan(), request.recharge_order_id());
+        }
+
+        @Override
         public BillingDtos.CreditResponse credit(BillingDtos.CreditRequest request, String key, String traceId) {
             return new BillingDtos.CreditResponse(request.account_id(), 9_000_000, 8, false);
         }

@@ -215,6 +215,83 @@ class BillingServiceIntegrationTest {
     }
 
     @Test
+    void administratorRefundIsFullAmountIdempotentAndAudited() {
+        billing.recharge(rechargeRequest(43, 2_000_000, "refund-order-0001"), "refund-order-0001");
+        long orderId = jdbc.queryForObject(
+                "SELECT id FROM recharge_orders WHERE account_id = 43 AND idempotency_key = ?",
+                Long.class, "refund-order-0001");
+
+        String admin = login(42);
+        var applied = adminBilling.refund(admin, orderId, "customer request", "refund-request-0001", "refund-trace-1");
+        var replayed = adminBilling.refund(admin, orderId, "customer request", "refund-request-0001", "refund-trace-2");
+
+        assertThat(applied.replayed()).isFalse();
+        assertThat(replayed.replayed()).isTrue();
+        assertThat(replayed.ledger_entry_id()).isEqualTo(applied.ledger_entry_id());
+        assertThat(applied.refunded_micro_yuan()).isEqualTo(2_000_000);
+        assertThat(billing.getBalance(43).balance_micro_yuan()).isEqualTo(10_000_000);
+        assertThat(billing.getBalance(43).total_recharge_micro_yuan()).isEqualTo(12_000_000);
+        assertThat(jdbc.queryForObject("SELECT status FROM recharge_orders WHERE id = ?", String.class, orderId))
+                .isEqualTo("refunded");
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM account_balance_ledger WHERE recharge_order_id = ?", Integer.class, orderId))
+                .isEqualTo(2);
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM payment_events WHERE recharge_order_id = ?", Integer.class, orderId))
+                .isEqualTo(2);
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM admin_audit_events WHERE action = 'billing.refund'", Integer.class))
+                .isEqualTo(1);
+    }
+
+    @Test
+    void refundRejectsPartialAmountAndInsufficientBalanceWithoutChangingOrder() {
+        billing.recharge(rechargeRequest(42, 8_000_000, "refund-guard-0001"), "refund-guard-0001");
+        long orderId = jdbc.queryForObject(
+                "SELECT id FROM recharge_orders WHERE account_id = 42 AND idempotency_key = ?",
+                Long.class, "refund-guard-0001");
+
+        assertThatThrownBy(() -> billing.refund(
+                new BillingDtos.RefundRequest(42L, orderId, 7_000_000L, "refund-partial-0001", "partial"),
+                "refund-partial-0001"))
+                .isInstanceOf(BillingException.class)
+                .extracting("code").isEqualTo("REFUND_AMOUNT_MISMATCH");
+
+        billing.consume(request(42, 17_000_000, "refund-spend-0001"), "refund-spend-0001");
+        assertThatThrownBy(() -> billing.refund(
+                new BillingDtos.RefundRequest(42L, orderId, 8_000_000L, "refund-insufficient-0001", "insufficient"),
+                "refund-insufficient-0001"))
+                .isInstanceOf(BillingException.class)
+                .extracting("code").isEqualTo("REFUND_BALANCE_INSUFFICIENT");
+        assertThat(jdbc.queryForObject("SELECT status FROM recharge_orders WHERE id = ?", String.class, orderId))
+                .isEqualTo("paid");
+    }
+
+    @Test
+    void reconciliationReportsHealthySettlementsAndOrphanedRechargeLedger() {
+        billing.recharge(rechargeRequest(42, 1_000_000, "reconcile-healthy-0001"), "reconcile-healthy-0001");
+        var healthy = adminBilling.reconciliation(login(42), null);
+        assertThat(healthy.paid_orders()).isEqualTo(1);
+        assertThat(healthy.refunded_orders()).isZero();
+        assertThat(healthy.paid_without_ledger()).isZero();
+        assertThat(healthy.ledger_without_paid_order()).isZero();
+        assertThat(healthy.consistent()).isTrue();
+
+        var pending = billing.createPendingOrder(
+                new BillingDtos.PendingOrderRequest(42L, 2_000_000L, "reconcile-pending-0001", "wechat", "pending"),
+                "reconcile-pending-0001");
+        jdbc.update("""
+                INSERT INTO account_balance_ledger (
+                    account_id, entry_kind, amount_micro_yuan, balance_before_micro_yuan,
+                    balance_after_micro_yuan, source_reference, summary, details_json,
+                    created_at, recharge_order_id
+                ) VALUES (42, 'recharge', 2000000, 11000000, 13000000, ?, 'fixture', '{}'::jsonb,
+                          CURRENT_TIMESTAMP, ?)
+                """, "reconcile-orphan-0001", pending.id());
+
+        var inconsistent = adminBilling.reconciliation(login(42), 42L);
+        assertThat(inconsistent.ledger_without_paid_order()).isEqualTo(1);
+        assertThat(inconsistent.consistent()).isFalse();
+    }
+
+    @Test
     void signedPaymentWebhookSettlesPendingOrderExactlyOnce() {
         var pending = billing.createPendingOrder(
                 new BillingDtos.PendingOrderRequest(42L, 2_500_000L, "webhook-order-0001", "wechat", "test order"),

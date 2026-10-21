@@ -16,6 +16,10 @@ public interface BillingOperations {
             BillingDtos.PendingOrderRequest request,
             String idempotencyKey);
 
+    BillingDtos.RefundResponse refund(
+            BillingDtos.RefundRequest request,
+            String idempotencyKey);
+
     BillingDtos.CreditResponse credit(
             BillingDtos.CreditRequest request,
             String idempotencyKey,

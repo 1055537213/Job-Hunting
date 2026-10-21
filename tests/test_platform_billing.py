@@ -57,6 +57,34 @@ def test_admin_client_uses_real_session_and_validates_financial_result(monkeypat
         client.admin_request(resource, **args)
 
 
+def test_admin_client_forwards_reconciliation_and_refund_with_idempotency(monkeypatch):
+    calls = []
+    reconciliation = {
+        "account_id": 42, "paid_orders": 1, "pending_orders": 0, "failed_orders": 0,
+        "cancelled_orders": 0, "refunded_orders": 0, "paid_without_ledger": 0,
+        "ledger_without_paid_order": 0, "refunded_without_reversal": 0,
+        "duplicate_recharge_ledger": 0, "consistent": True, "checked_at": "2026-10-22T00:00:00Z",
+    }
+    refund = {
+        "account_id": 42, "balance_micro_yuan": 8_000_000, "ledger_entry_id": 12,
+        "replayed": False, "refunded_micro_yuan": 2_000_000, "recharge_order_id": 9,
+    }
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return httpx.Response(200, json=refund if url.endswith("/orders/9/refund") else reconciliation)
+
+    monkeypatch.setattr(httpx, "request", request)
+    client = PlatformBillingClient(PlatformBillingSettings(True, "http://platform-service:8081", "secret", 5))
+    assert client.admin_request("reconciliation", session_token="session", account_id=42) == reconciliation
+    assert client.admin_request("refund", session_token="session", order_id=9,
+                                payload={"reason": "customer request", "idempotency_key": "refund-client-0001"}) == refund
+    assert calls[0][1].endswith("/internal/v1/billing/admin/reconciliation")
+    assert calls[0][2]["json"] == {"session_token": "session", "account_id": 42}
+    assert calls[1][1].endswith("/internal/v1/billing/admin/orders/9/refund")
+    assert calls[1][2]["headers"]["Idempotency-Key"] == "refund-client-0001"
+
+
 @pytest.mark.parametrize("resource", ["ledger", "orders", "events", "credit"])
 @pytest.mark.parametrize("available", [True, False])
 def test_python_admin_billing_has_no_local_query_or_credit_fallback(tmp_path, monkeypatch, resource, available):

@@ -40,6 +40,37 @@ paths:
       responses:
         '200': {$ref: '#/components/responses/OrderEvents'}
         default: {$ref: '#/components/responses/Error'}
+  /api/admin/recharge/reconciliation:
+    get:
+      operationId: adminRechargeReconciliation
+      parameters:
+        - {$ref: '#/components/parameters/AccountFilter'}
+      responses:
+        '200': {$ref: '#/components/responses/Reconciliation'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/admin/recharge/orders/{orderId}/refund:
+    post:
+      operationId: adminRechargeRefund
+      description: >-
+        Refunds one paid simulated recharge order in full. The balance must still
+        contain the credited amount. The request is idempotent and creates an
+        adjustment ledger entry plus an administrator audit event.
+      parameters:
+        - {$ref: '#/components/parameters/OrderId'}
+        - {name: X-CSRF-Token, in: header, required: true, schema: {type: string}}
+        - {name: X-Request-ID, in: header, schema: {type: string, maxLength: 128}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RefundRequest'}
+      responses:
+        '200':
+          description: Refund result and remaining balance
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RefundResult'}
+        default: {$ref: '#/components/responses/Error'}
   /api/admin/accounts/{accountId}/balance/credit:
     post:
       operationId: adminCredit
@@ -88,6 +119,38 @@ paths:
             schema: {$ref: '#/components/schemas/Session'}
       responses:
         '200': {$ref: '#/components/responses/OrderEvents'}
+        default: {$ref: '#/components/responses/Error'}
+  /internal/v1/billing/admin/reconciliation:
+    post:
+      operationId: internalAdminReconciliation
+      security: [{InternalServiceToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReconciliationRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/Reconciliation'}
+        default: {$ref: '#/components/responses/Error'}
+  /internal/v1/billing/admin/orders/{orderId}/refund:
+    post:
+      operationId: internalAdminRefund
+      security: [{InternalServiceToken: []}]
+      parameters:
+        - {$ref: '#/components/parameters/OrderId'}
+        - {name: Idempotency-Key, in: header, required: true, schema: {type: string, minLength: 16, maxLength: 128}}
+        - {name: X-Trace-Id, in: header, schema: {type: string, maxLength: 128}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/InternalRefund'}
+      responses:
+        '200':
+          description: Refund result and remaining balance
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RefundResult'}
         default: {$ref: '#/components/responses/Error'}
   /internal/v1/billing/admin/accounts/{accountId}/credit:
     post:
@@ -151,6 +214,52 @@ components:
       properties:
         entry: {$ref: 'billing-personal.openapi.yaml#/components/schemas/LedgerEntry'}
         summary: {$ref: 'billing-personal.openapi.yaml#/components/schemas/Summary'}
+    RefundRequest:
+      type: object
+      required: [reason, idempotency_key]
+      properties:
+        reason: {type: string, minLength: 2, maxLength: 500}
+        idempotency_key: {type: string, minLength: 16, maxLength: 128}
+    ReconciliationRequest:
+      type: object
+      required: [session_token]
+      properties:
+        session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+        account_id: {type: [integer, 'null'], format: int64}
+    InternalRefund:
+      type: object
+      required: [session_token, payload]
+      properties:
+        session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+        payload: {$ref: '#/components/schemas/RefundRequest'}
+    RefundResult:
+      type: object
+      required: [account_id, balance_micro_yuan, ledger_entry_id, replayed, refunded_micro_yuan, recharge_order_id]
+      properties:
+        account_id: {type: integer, format: int64}
+        balance_micro_yuan: {type: integer, format: int64}
+        ledger_entry_id: {type: integer, format: int64}
+        replayed: {type: boolean}
+        refunded_micro_yuan: {type: integer, format: int64}
+        recharge_order_id: {type: integer, format: int64}
+    Reconciliation:
+      type: object
+      required: [account_id, paid_orders, pending_orders, failed_orders, cancelled_orders, refunded_orders,
+                 paid_without_ledger, ledger_without_paid_order, refunded_without_reversal,
+                 duplicate_recharge_ledger, consistent, checked_at]
+      properties:
+        account_id: {type: [integer, 'null'], format: int64}
+        paid_orders: {type: integer, format: int64}
+        pending_orders: {type: integer, format: int64}
+        failed_orders: {type: integer, format: int64}
+        cancelled_orders: {type: integer, format: int64}
+        refunded_orders: {type: integer, format: int64}
+        paid_without_ledger: {type: integer, format: int64}
+        ledger_without_paid_order: {type: integer, format: int64}
+        refunded_without_reversal: {type: integer, format: int64}
+        duplicate_recharge_ledger: {type: integer, format: int64}
+        consistent: {type: boolean}
+        checked_at: {type: string, format: date-time}
     FinancialPage:
       type: object
       required: [total, limit, offset, page_size, max_pages]
@@ -213,6 +322,11 @@ components:
       content:
         application/json:
           schema: {$ref: '#/components/schemas/OrderEvents'}
+    Reconciliation:
+      description: Recharge order and ledger consistency report
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Reconciliation'}
     CreditResult:
       description: Adjustment and current balance; no payment order or recharge revenue
       content:

@@ -49,6 +49,23 @@ public final class BillingDtos {
             String idempotency_key) {
     }
 
+    public record RefundRequest(
+            @NotNull @Min(1) Long account_id,
+            @NotNull @Min(1) Long recharge_order_id,
+            @NotNull @Min(1) Long amount_micro_yuan,
+            @NotBlank @Size(min = 16, max = 128) String source_reference,
+            @Size(max = 512) String description) {
+    }
+
+    public record RefundResponse(
+            long account_id,
+            long balance_micro_yuan,
+            long ledger_entry_id,
+            boolean replayed,
+            long refunded_micro_yuan,
+            long recharge_order_id) {
+    }
+
     public record BalanceProjection(
             long account_id,
             long balance_micro_yuan,

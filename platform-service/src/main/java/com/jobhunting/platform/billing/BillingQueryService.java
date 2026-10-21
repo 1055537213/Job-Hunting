@@ -97,6 +97,64 @@ public class BillingQueryService {
     }
 
     @Transactional(readOnly = true)
+    public RechargeOrder order(long orderId) {
+        var orders = jdbc.query("SELECT * FROM recharge_orders WHERE id = ?", (row, index) -> order(row), orderId);
+        if (orders.isEmpty()) throw new BillingException("ORDER_NOT_FOUND", "充值订单不存在。", HttpStatus.NOT_FOUND);
+        return orders.getFirst();
+    }
+
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public ReconciliationReport reconciliation(Long accountId) {
+        String orderScope = accountId == null ? "" : " AND o.account_id = ?";
+        String ledgerScope = accountId == null ? "" : " AND l.account_id = ?";
+        long paid = count("SELECT COUNT(*) FROM recharge_orders WHERE status = 'paid'"
+                + (accountId == null ? "" : " AND account_id = ?"), accountId);
+        long pending = count("SELECT COUNT(*) FROM recharge_orders WHERE status = 'pending'"
+                + (accountId == null ? "" : " AND account_id = ?"), accountId);
+        long failed = count("SELECT COUNT(*) FROM recharge_orders WHERE status = 'failed'"
+                + (accountId == null ? "" : " AND account_id = ?"), accountId);
+        long cancelled = count("SELECT COUNT(*) FROM recharge_orders WHERE status = 'cancelled'"
+                + (accountId == null ? "" : " AND account_id = ?"), accountId);
+        long refunded = count("SELECT COUNT(*) FROM recharge_orders WHERE status = 'refunded'"
+                + (accountId == null ? "" : " AND account_id = ?"), accountId);
+        long paidWithoutLedger = count("""
+                SELECT COUNT(*) FROM recharge_orders o
+                WHERE o.status IN ('paid', 'refunded')
+                  AND NOT EXISTS (SELECT 1 FROM account_balance_ledger l
+                                  WHERE l.recharge_order_id = o.id AND l.entry_kind = 'recharge')
+                """ + orderScope, accountId);
+        long ledgerWithoutPaidOrder = count("""
+                SELECT COUNT(*) FROM account_balance_ledger l
+                LEFT JOIN recharge_orders o ON o.id = l.recharge_order_id
+                WHERE l.entry_kind = 'recharge'
+                  AND (o.id IS NULL OR o.status NOT IN ('paid', 'refunded'))
+                """ + ledgerScope, accountId);
+        long refundedWithoutReversal = count("""
+                SELECT COUNT(*) FROM recharge_orders o
+                WHERE o.status = 'refunded'
+                  AND NOT EXISTS (SELECT 1 FROM account_balance_ledger l
+                                  WHERE l.recharge_order_id = o.id
+                                    AND l.entry_kind = 'adjustment'
+                                    AND l.amount_micro_yuan = -o.amount_micro_yuan)
+                """ + orderScope, accountId);
+        long duplicateRechargeLedger = count("""
+                SELECT COUNT(*) FROM (
+                    SELECT l.recharge_order_id
+                    FROM account_balance_ledger l
+                    WHERE l.entry_kind = 'recharge' AND l.recharge_order_id IS NOT NULL
+                    """ + ledgerScope + """
+                    GROUP BY l.recharge_order_id
+                    HAVING COUNT(*) > 1
+                ) duplicates
+                """, accountId);
+        boolean consistent = paidWithoutLedger == 0 && ledgerWithoutPaidOrder == 0
+                && refundedWithoutReversal == 0 && duplicateRechargeLedger == 0;
+        return new ReconciliationReport(accountId, paid, pending, failed, cancelled, refunded,
+                paidWithoutLedger, ledgerWithoutPaidOrder, refundedWithoutReversal,
+                duplicateRechargeLedger, consistent, java.time.OffsetDateTime.now(java.time.ZoneOffset.UTC).toString());
+    }
+
+    @Transactional(readOnly = true)
     public CreditResult creditResult(long accountId, long ledgerId) {
         var entries = jdbc.query("SELECT * FROM account_balance_ledger WHERE id = ? AND account_id = ? AND entry_kind = 'adjustment'",
                 (row, index) -> ledger(row), ledgerId, accountId);
@@ -176,6 +234,11 @@ public class BillingQueryService {
         }
     }
 
+    private long count(String sql, Long accountId) {
+        return accountId == null ? jdbc.queryForObject(sql, Long.class)
+                : jdbc.queryForObject(sql, Long.class, accountId);
+    }
+
     private Map<String, Object> details(ResultSet row) throws SQLException {
         return mapper.readValue(row.getString("details_json"), new TypeReference<Map<String, Object>>() { });
     }
@@ -211,5 +274,10 @@ public class BillingQueryService {
             String event_type, String processing_status, boolean signature_valid, String payload_sha256,
             String error_summary, Map<String, Object> details, String received_at, String processed_at) { }
     public record OrderEvents(RechargeOrder order, List<PaymentEvent> events) { }
+    public record ReconciliationReport(Long account_id, long paid_orders, long pending_orders,
+            long failed_orders, long cancelled_orders, long refunded_orders,
+            long paid_without_ledger, long ledger_without_paid_order,
+            long refunded_without_reversal, long duplicate_recharge_ledger,
+            boolean consistent, String checked_at) { }
     public record CreditResult(LedgerEntry entry, Map<String, Object> summary) { }
 }

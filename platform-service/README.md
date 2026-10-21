@@ -170,6 +170,8 @@ Java 模式下不派发旧 Python 邮件任务；关闭迁移开关时仍保留�
 
 真实支付的第一阶段已经加入：内部 `POST /internal/v1/billing/orders` 只登记待支付订单，不改变余额；渠道适配器将回调规范化为 `POST /api/payments/webhooks/{provider}`，使用 `X-Payment-Timestamp` 和 `X-Payment-Signature: sha256=...` 校验 HMAC-SHA256。回调时间戳默认只接受 5 分钟内的请求，事件按渠道和事件 ID 幂等，成功回调在同一事务中写入充值流水、更新余额、更新订单状态和支付事件。失败、取消和重复事件不会重复到账。密钥由 `PLATFORM_PAYMENT_WEBHOOK_SECRET` 提供，默认关闭，未接入具体支付渠道前不应在生产开启。
 
+模拟充值的管理员退款也已完成：`POST /api/admin/recharge/orders/{orderId}/refund` 只允许对已到账订单执行一次全额退款，要求当前余额仍足以扣回充值金额；退款会原子写入负向 `adjustment` 流水、更新订单为 `refunded`、写入 `payment.refunded` 事件和管理员审计，使用幂等键重复提交不会重复扣款。`GET /api/admin/recharge/reconciliation` 提供充值订单、充值流水和退款冲销流水的一致性检查。两项能力均不调用真实支付渠道，真实支付适配仍保持关闭。
+
 ## 迁移规则
 
 个人中心 `GET /api/me/balance` 和 `GET /api/me/recharge/orders` 经混合网关直接到 Java，
@@ -188,12 +190,12 @@ Java 在事务中重新校验 Session，按服务端配置控制演示充值开�
 Python Java 模式只转发原会话和表单，失败不执行本地充值；关闭 Java 模式保留原有兼容路径。
 本阶段不接入真实支付，不改变管理员人工补款规则。
 
-管理员余额流水、充值订单、支付事件和人工补款公开路径也由混合网关直达 Java。
+管理员余额流水、充值订单、支付事件、退款、对账和人工补款公开路径也由混合网关直达 Java。
 Java 用真实 Session 校验管理员权限，补款不信任请求中的操作者 ID，余额/流水/审计同事务提交。
 补款返回原流水与当前余额；重试仍校验权限且不新增审计。管理员可为自己及其他账号补款，
-停用账号收到补款后仍保持停用。查询每页最多 100 条，不自动淘汰资金事实；
+停用账号收到补款后仍保持停用。查询每页最多 100 条，不自动淘汰资金事实；退款失败不会产生部分账务写入；
 契约见 [`billing-admin.openapi.yaml`](src/main/resources/billing-admin.openapi.yaml)。
-Python 在 Java 模式下仅转发这四类请求，不能回读旧数据或回退本地补款。
+Python 在 Java 模式下仅转发这些请求，不能回读旧数据或回退本地补款。
 工具执行和轨迹写入、后台任务及请求观测仍在 Python。
 
 `GET /api/admin/accounts`、`PATCH /api/admin/accounts/{account_id}/status` 和

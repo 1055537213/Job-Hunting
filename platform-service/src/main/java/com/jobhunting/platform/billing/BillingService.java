@@ -368,6 +368,117 @@ public class BillingService implements BillingOperations {
     }
 
     @Transactional
+    public BillingDtos.RefundResponse refund(
+            BillingDtos.RefundRequest request, String idempotencyKey) {
+        if (!idempotencyKey.equals(request.source_reference())) {
+            throw new BillingException("INVALID_REQUEST", "退款请求的 Idempotency-Key 必须与 source_reference 一致。",
+                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+
+        long accountId = request.account_id();
+        long orderId = request.recharge_order_id();
+        long amount = request.amount_micro_yuan();
+        ExistingLedger existing = findExistingLedger(request.source_reference());
+        if (existing != null) {
+            if (existing.accountId() != accountId || existing.entryKind() == null
+                    || !"adjustment".equals(existing.entryKind())
+                    || existing.amountMicroYuan() != -amount) {
+                throw refundConflict();
+            }
+            return new BillingDtos.RefundResponse(accountId, existing.balanceAfterMicroYuan(), existing.id(), true,
+                    amount, orderId);
+        }
+
+        RefundOrder order = jdbcTemplate.query(
+                """
+                SELECT id, account_id, amount_micro_yuan, status, payment_provider
+                FROM recharge_orders
+                WHERE id = ? AND account_id = ?
+                FOR UPDATE
+                """,
+                (result, rowNum) -> new RefundOrder(
+                        result.getLong("id"), result.getLong("account_id"),
+                        result.getLong("amount_micro_yuan"), result.getString("status"),
+                        result.getString("payment_provider")),
+                orderId, accountId).stream().findFirst().orElse(null);
+        if (order == null) {
+            throw new BillingException("ORDER_NOT_FOUND", "充值订单不存在。", org.springframework.http.HttpStatus.NOT_FOUND);
+        }
+        if (!"paid".equals(order.status())) {
+            if ("refunded".equals(order.status())) {
+                throw new BillingException("REFUND_ALREADY_APPLIED", "该充值订单已经退款。",
+                        org.springframework.http.HttpStatus.CONFLICT);
+            }
+            throw new BillingException("REFUND_ORDER_NOT_PAID", "只有已到账的充值订单可以退款。",
+                    org.springframework.http.HttpStatus.CONFLICT);
+        }
+        if (order.amountMicroYuan() != amount) {
+            throw new BillingException("REFUND_AMOUNT_MISMATCH", "退款金额必须与充值订单金额一致。",
+                    org.springframework.http.HttpStatus.CONFLICT);
+        }
+
+        // Recheck after the order lock so a concurrent retry returns the original result.
+        existing = findExistingLedger(request.source_reference());
+        if (existing != null) {
+            if (existing.accountId() != accountId || !"adjustment".equals(existing.entryKind())
+                    || existing.amountMicroYuan() != -amount) {
+                throw refundConflict();
+            }
+            return new BillingDtos.RefundResponse(accountId, existing.balanceAfterMicroYuan(), existing.id(), true,
+                    amount, orderId);
+        }
+
+        BalanceRow balance = lockBalance(accountId);
+        if (balance.balanceMicroYuan() < amount) {
+            throw new BillingException("REFUND_BALANCE_INSUFFICIENT", "当前余额低于待退款金额，暂时无法退款。",
+                    org.springframework.http.HttpStatus.CONFLICT);
+        }
+        long after = balance.balanceMicroYuan() - amount;
+        String description = request.description() == null || request.description().isBlank()
+                ? "充值订单退款" : request.description().trim();
+        String details = serializeRefundDetails(order, request.source_reference(), amount, description);
+        long ledgerId = jdbcTemplate.queryForObject(
+                """
+                INSERT INTO account_balance_ledger (
+                    account_id, entry_kind, amount_micro_yuan,
+                    balance_before_micro_yuan, balance_after_micro_yuan,
+                    token_count, price_per_million_tokens_yuan,
+                    source_reference, summary, details_json, created_at, recharge_order_id
+                ) VALUES (?, 'adjustment', ?, ?, ?, NULL, NULL, ?, ?, CAST(? AS jsonb),
+                          CURRENT_TIMESTAMP, ?)
+                RETURNING id
+                """,
+                Long.class, accountId, -amount, balance.balanceMicroYuan(), after,
+                request.source_reference(), description, details, orderId);
+        jdbcTemplate.update(
+                """
+                UPDATE account_balances
+                SET balance_micro_yuan = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE account_id = ?
+                """,
+                after, accountId);
+        jdbcTemplate.update(
+                """
+                UPDATE recharge_orders
+                SET status = 'refunded', refunded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                orderId);
+        jdbcTemplate.update(
+                """
+                INSERT INTO payment_events (
+                    recharge_order_id, payment_provider, provider_event_id, event_type,
+                    processing_status, signature_valid, payload_sha256, error_summary,
+                    details_json, received_at, processed_at
+                ) VALUES (?, ?, ?, 'payment.refunded', 'processed', TRUE, ?, NULL,
+                          CAST(? AS jsonb), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                orderId, order.paymentProvider(), "internal-refund:" + request.source_reference(),
+                sha256Hex(request.source_reference() + ":" + amount + ":refunded"), details);
+        return new BillingDtos.RefundResponse(accountId, after, ledgerId, false, amount, orderId);
+    }
+
+    @Transactional
     public BillingDtos.CreditResponse credit(
             BillingDtos.CreditRequest request, String idempotencyKey, String traceId) {
         String key = request.idempotency_key().strip();
@@ -557,6 +668,19 @@ public class BillingService implements BillingOperations {
         }
     }
 
+    private String serializeRefundDetails(RefundOrder order, String sourceReference, long amount, String description) {
+        try {
+            return objectMapper.writeValueAsString(Map.of(
+                    "payment_provider", order.paymentProvider(),
+                    "recharge_order_id", order.id(),
+                    "source_reference", sourceReference,
+                    "amount_micro_yuan", amount,
+                    "description", description));
+        } catch (JacksonException exception) {
+            throw new IllegalStateException("退款明细序列化失败。", exception);
+        }
+    }
+
     private String sha256Hex(String value) {
         try {
             byte[] digest = MessageDigest.getInstance("SHA-256")
@@ -578,6 +702,13 @@ public class BillingService implements BillingOperations {
                 org.springframework.http.HttpStatus.CONFLICT);
     }
 
+    private BillingException refundConflict() {
+        return new BillingException(
+                "IDEMPOTENCY_CONFLICT",
+                "该退款幂等键已用于另一笔退款。",
+                org.springframework.http.HttpStatus.CONFLICT);
+    }
+
     private record BalanceRow(long accountId, long balanceMicroYuan) {
     }
 
@@ -590,5 +721,9 @@ public class BillingService implements BillingOperations {
     }
 
     private record ExistingRecharge(long amountMicroYuan, String paymentProvider) {
+    }
+
+    private record RefundOrder(long id, long accountId, long amountMicroYuan, String status,
+            String paymentProvider) {
     }
 }

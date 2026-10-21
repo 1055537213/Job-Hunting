@@ -63,6 +63,16 @@ public class BillingController {
         return billingService.createPendingOrder(request, idempotencyKey);
     }
 
+    @PostMapping("/refund")
+    public BillingDtos.RefundResponse refund(
+            @Valid @RequestBody BillingDtos.RefundRequest request,
+            @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @RequestHeader("X-Trace-Id") String traceId,
+            @RequestHeader(name = "X-Internal-Service-Token", required = false) String internalToken) {
+        tokenVerifier.verify(internalToken);
+        return billingService.refund(request, idempotencyKey);
+    }
+
     @PostMapping("/credit")
     public BillingDtos.CreditResponse credit(
             @Valid @RequestBody BillingDtos.CreditRequest request,

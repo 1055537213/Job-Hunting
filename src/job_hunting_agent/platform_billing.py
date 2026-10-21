@@ -125,12 +125,19 @@ class PlatformBillingClient:
             body.update(account_id=account_id, limit=limit, offset=offset)
         elif resource == "events" and order_id is not None:
             path = f"/internal/v1/billing/admin/orders/{int(order_id)}/events"
+        elif resource == "reconciliation":
+            path = "/internal/v1/billing/admin/reconciliation"
+            body["account_id"] = account_id
+        elif resource == "refund" and order_id is not None and payload is not None:
+            path = f"/internal/v1/billing/admin/orders/{int(order_id)}/refund"
+            body["payload"] = payload
         elif resource == "credit" and account_id is not None and payload is not None:
             path = f"/internal/v1/billing/admin/accounts/{int(account_id)}/credit"
             body["payload"] = payload
         else:
             raise ValueError("Unsupported administrator billing resource")
-        result = self._request("POST", path, trace_id=trace_id, json=body)
+        request_key = payload.get("idempotency_key") if resource == "refund" and payload else None
+        result = self._request("POST", path, trace_id=trace_id, idempotency_key=request_key, json=body)
         try:
             if resource in {"ledger", "orders"}:
                 rows = result["entries" if resource == "ledger" else "orders"]
@@ -144,6 +151,21 @@ class PlatformBillingClient:
                 if (result["order"]["id"] != order_id or not isinstance(result["events"], list)
                         or any(row["recharge_order_id"] != order_id for row in result["events"])):
                     raise ValueError("Invalid order events")
+            elif resource == "reconciliation":
+                required = ("account_id", "paid_orders", "pending_orders", "failed_orders",
+                            "cancelled_orders", "refunded_orders", "paid_without_ledger",
+                            "ledger_without_paid_order", "refunded_without_reversal",
+                            "duplicate_recharge_ledger", "consistent", "checked_at")
+                if any(field not in result for field in required) or type(result["consistent"]) is not bool:
+                    raise ValueError("Invalid reconciliation report")
+                if account_id is not None and result["account_id"] != account_id:
+                    raise ValueError("Invalid reconciliation account")
+            elif resource == "refund":
+                if (result["recharge_order_id"] != order_id
+                        or type(result["replayed"]) is not bool
+                        or int(result["ledger_entry_id"]) <= 0
+                        or int(result["refunded_micro_yuan"]) <= 0):
+                    raise ValueError("Invalid refund result")
             elif (result["entry"]["account_id"] != account_id or result["summary"]["account_id"] != account_id
                     or result["entry"]["operator_account_id"] != actor_account_id
                     or result["entry"]["entry_kind"] != "adjustment"):

@@ -499,6 +499,13 @@ class AdminBalanceCreditPayload(BaseModel):
     idempotency_key: str = Field(min_length=16, max_length=128)
 
 
+class AdminRefundPayload(BaseModel):
+    """管理员对已到账模拟充值订单执行全额退款。"""
+
+    reason: str = Field(min_length=2, max_length=500)
+    idempotency_key: str = Field(min_length=16, max_length=128)
+
+
 def create_web_app(
     env_file: str | Path = ".env",
     resume_dir: str | Path | None = None,
@@ -3262,6 +3269,32 @@ def create_web_app(
             "order": asdict(order),
             "events": [asdict(event) for event in backend.store.list_payment_events(order_id)],
         }
+
+    @web_app.get("/api/admin/recharge/reconciliation")
+    def admin_recharge_reconciliation(
+        request: Request,
+        account_id: int | None = Query(default=None),
+    ) -> dict[str, object]:
+        """Java 账务模式下返回充值订单、流水与退款一致性报告。"""
+
+        require_admin(request)
+        if backend.platform_billing_client is None:
+            raise HTTPException(status_code=503, detail="平台账务服务未配置。")
+        return platform_admin_billing(request, "reconciliation", account_id=account_id)
+
+    @web_app.post("/api/admin/recharge/orders/{order_id}/refund")
+    def admin_refund_recharge_order(
+        order_id: int,
+        payload: AdminRefundPayload,
+        request: Request,
+    ) -> dict[str, object]:
+        """Java 账务模式下对已到账模拟充值订单执行全额退款。"""
+
+        require_admin(request)
+        if backend.platform_billing_client is None:
+            raise HTTPException(status_code=503, detail="平台账务服务未配置。")
+        return platform_admin_billing(request, "refund", order_id=order_id,
+            payload={"reason": payload.reason, "idempotency_key": payload.idempotency_key})
 
     def platform_admin_billing(request: Request, resource: str, **kwargs) -> dict[str, object]:
         if backend.platform_billing_client is None:
