@@ -168,6 +168,8 @@ Java 模式下不派发旧 Python 邮件任务；关闭迁移开关时仍保留�
 
 充值和扣费接口都要求 `Idempotency-Key` 与请求中的 `source_reference` 相同。Java 在充值时同一事务写入 `recharge_orders`、`account_balance_ledger` 和 `payment_events`，重复充值只返回原账务结果，不会重复到账。余额不足时返回 `INSUFFICIENT_BALANCE` 和 `余额不足，请先充值后重试`。余额行使用 PostgreSQL 行锁，账务流水使用唯一约束保证重试不会重复写入。Python 在远端扣费失败时保留 `usage_events`，后续使用同一个 `call_id` 重试，不会重复扣费。
 
+真实支付的第一阶段已经加入：内部 `POST /internal/v1/billing/orders` 只登记待支付订单，不改变余额；渠道适配器将回调规范化为 `POST /api/payments/webhooks/{provider}`，使用 `X-Payment-Timestamp` 和 `X-Payment-Signature: sha256=...` 校验 HMAC-SHA256。回调时间戳默认只接受 5 分钟内的请求，事件按渠道和事件 ID 幂等，成功回调在同一事务中写入充值流水、更新余额、更新订单状态和支付事件。失败、取消和重复事件不会重复到账。密钥由 `PLATFORM_PAYMENT_WEBHOOK_SECRET` 提供，默认关闭，未接入具体支付渠道前不应在生产开启。
+
 ## 迁移规则
 
 个人中心 `GET /api/me/balance` 和 `GET /api/me/recharge/orders` 经混合网关直接到 Java，

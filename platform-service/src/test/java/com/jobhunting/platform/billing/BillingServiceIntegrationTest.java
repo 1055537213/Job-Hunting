@@ -3,7 +3,12 @@ package com.jobhunting.platform.billing;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.util.HexFormat;
 import java.util.List;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -28,7 +33,8 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE,
-        properties = {"platform.billing.enabled=true", "platform.auth.enabled=true",
+        properties = {"platform.billing.enabled=true", "platform.billing.webhook-enabled=true",
+                "platform.billing.webhook-secret=test-webhook-secret", "platform.auth.enabled=true",
                 "JOB_AGENT_BILLING_LOW_BALANCE_THRESHOLD_YUAN=12.5"})
 @Testcontainers
 @EnabledIfSystemProperty(named = "run.integration.tests", matches = "true")
@@ -58,6 +64,7 @@ class BillingServiceIntegrationTest {
     @Autowired private BillingQueryService queries;
     @Autowired private PersonalRechargeService personalRecharges;
     @Autowired private AdminBillingService adminBilling;
+    @Autowired private PaymentWebhookService webhooks;
 
     @BeforeEach
     void resetDatabase() {
@@ -205,6 +212,54 @@ class BillingServiceIntegrationTest {
         assertThat(jdbc.queryForObject(
                 "SELECT COUNT(*) FROM payment_events",
                 Integer.class)).isEqualTo(1);
+    }
+
+    @Test
+    void signedPaymentWebhookSettlesPendingOrderExactlyOnce() {
+        var pending = billing.createPendingOrder(
+                new BillingDtos.PendingOrderRequest(42L, 2_500_000L, "webhook-order-0001", "wechat", "test order"),
+                "webhook-order-0001");
+        String timestamp = Long.toString(java.time.Instant.now().getEpochSecond());
+        byte[] body = ("{\"event_id\":\"wechat-event-0001\",\"event_type\":\"payment.succeeded\","
+                + "\"provider_order_id\":\"" + pending.provider_order_id() + "\",\"amount_micro_yuan\":2500000}")
+                .getBytes(StandardCharsets.UTF_8);
+
+        var applied = webhooks.process("wechat", timestamp, signature(timestamp, body), body);
+        var replayed = webhooks.process("wechat", timestamp, signature(timestamp, body), body);
+
+        assertThat(applied.replayed()).isFalse();
+        assertThat(applied.status()).isEqualTo("paid");
+        assertThat(applied.balance_micro_yuan()).isEqualTo(12_500_000L);
+        assertThat(replayed.replayed()).isTrue();
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM payment_events", Integer.class)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM account_balance_ledger", Integer.class)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("SELECT status FROM recharge_orders WHERE id=?", String.class, pending.id()))
+                .isEqualTo("paid");
+    }
+
+    @Test
+    void invalidPaymentWebhookSignatureCannotCreateEvent() {
+        var pending = billing.createPendingOrder(
+                new BillingDtos.PendingOrderRequest(42L, 1_000_000L, "webhook-invalid-0001", "wechat", null),
+                "webhook-invalid-0001");
+        String timestamp = Long.toString(java.time.Instant.now().getEpochSecond());
+        byte[] body = ("{\"event_id\":\"wechat-event-invalid\",\"event_type\":\"payment.succeeded\","
+                + "\"provider_order_id\":\"" + pending.provider_order_id() + "\",\"amount_micro_yuan\":1000000}")
+                .getBytes(StandardCharsets.UTF_8);
+        assertThatThrownBy(() -> webhooks.process("wechat", timestamp, "sha256=" + "0".repeat(64), body))
+                .isInstanceOf(BillingException.class).extracting("code").isEqualTo("PAYMENT_SIGNATURE_INVALID");
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM payment_events", Integer.class)).isZero();
+    }
+
+    private String signature(String timestamp, byte[] body) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec("test-webhook-secret".getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            return "sha256=" + HexFormat.of().formatHex(mac.doFinal(
+                    (timestamp + "." + new String(body, StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8)));
+        } catch (GeneralSecurityException error) {
+            throw new IllegalStateException(error);
+        }
     }
 
     @Test

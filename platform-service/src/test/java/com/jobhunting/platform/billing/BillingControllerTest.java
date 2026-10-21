@@ -176,6 +176,14 @@ class BillingControllerTest {
         }
 
         @Override
+        public BillingDtos.PendingOrderResponse createPendingOrder(
+                BillingDtos.PendingOrderRequest request, String idempotencyKey) {
+            return new BillingDtos.PendingOrderResponse(11, "recharge-test-order", request.account_id(),
+                    request.amount_micro_yuan(), "pending", request.payment_provider(),
+                    "recharge-test-order", request.source_reference());
+        }
+
+        @Override
         public BillingDtos.CreditResponse credit(BillingDtos.CreditRequest request, String key, String traceId) {
             return new BillingDtos.CreditResponse(request.account_id(), 9_000_000, 8, false);
         }

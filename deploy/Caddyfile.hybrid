@@ -53,6 +53,11 @@
 			path /api/me/balance/recharge
 		}
 		reverse_proxy @personal_recharge platform-service:8081
+		@payment_webhook {
+			method POST
+			path_regexp paymentWebhook ^/api/payments/webhooks/[a-z0-9_-]{1,32}$
+		}
+		reverse_proxy @payment_webhook platform-service:8081
 		@admin_billing_reads {
 			method GET
 			path_regexp adminBillingReads ^/api/admin/(balance/events|recharge/orders|recharge/orders/[0-9]+/events)$

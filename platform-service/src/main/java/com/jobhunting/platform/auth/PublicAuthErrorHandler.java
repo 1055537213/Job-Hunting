@@ -14,6 +14,7 @@ import com.jobhunting.platform.security.WebSecurityFilter;
 import com.jobhunting.platform.profiles.ProfileReadController;
 import com.jobhunting.platform.profiles.ProfileCreateController;
 import com.jobhunting.platform.profiles.ProfileDeleteController;
+import com.jobhunting.platform.billing.PaymentWebhookController;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
@@ -31,7 +32,8 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
         PublicAdminAccountController.class, BillingQueryController.class, PersonalRechargeController.class, AdminBillingController.class,
         AdminUsageController.class, AdminToolTraceController.class, TaskReadController.class, TaskCommandController.class,
         AdminObservabilityController.class, PublicAccountProfileController.class, PublicAccountExportController.class,
-        InternalAccountExportController.class, AccountDeletionController.class, ProfileReadController.class, ProfileCreateController.class, ProfileDeleteController.class})
+        InternalAccountExportController.class, AccountDeletionController.class, ProfileReadController.class, ProfileCreateController.class, ProfileDeleteController.class,
+        PaymentWebhookController.class})
 public class PublicAuthErrorHandler {
     @ExceptionHandler(AuthException.class)
     public ResponseEntity<Map<String, Object>> auth(AuthException error, HttpServletRequest request) {

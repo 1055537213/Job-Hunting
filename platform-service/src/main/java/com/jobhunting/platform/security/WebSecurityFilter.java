@@ -88,16 +88,18 @@ public class WebSecurityFilter extends OncePerRequestFilter {
                 return;
             }
             String token = cookie(request, "job_agent_session");
-            boolean resolve = !ANONYMOUS.contains(path) || path.equals("/api/auth/me") || path.equals("/api/auth/logout");
+            boolean webhook = path.startsWith("/api/payments/webhooks/");
+            boolean anonymous = webhook || ANONYMOUS.contains(path);
+            boolean resolve = !anonymous || path.equals("/api/auth/me") || path.equals("/api/auth/logout");
             AccountAdministrationService.AccountView account = null;
             if (resolve && token != null && token.length() <= 128) {
                 try {
                     account = accounts.current(token).account();
                 } catch (AuthException error) {
-                    if (!"SESSION_EXPIRED".equals(error.code()) || !ANONYMOUS.contains(path)) throw error;
+                    if (!"SESSION_EXPIRED".equals(error.code()) || !anonymous) throw error;
                 }
             }
-            if (account == null && !ANONYMOUS.contains(path)) {
+            if (account == null && !anonymous) {
                 outcome = "unauthenticated";
                 reject(response, 401, "SESSION_EXPIRED", "登录状态已过期，请重新登录。", id, 0);
                 return;
@@ -117,7 +119,7 @@ public class WebSecurityFilter extends OncePerRequestFilter {
                 reject(response, 403, "ADMIN_REQUIRED", "需要管理员权限。", id, 0);
                 return;
             }
-            if (settings.csrfEnabled() && token != null && !SAFE.contains(request.getMethod())
+            if (settings.csrfEnabled() && !webhook && token != null && !SAFE.contains(request.getMethod())
                     && !path.equals("/api/auth/login") && !path.equals("/api/auth/register")
                     && !validCsrf(request)) {
                 outcome = "csrf_rejected";

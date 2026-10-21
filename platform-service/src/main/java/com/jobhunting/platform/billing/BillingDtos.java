@@ -5,6 +5,7 @@ import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
+import jakarta.validation.constraints.Pattern;
 
 public final class BillingDtos {
 
@@ -27,6 +28,25 @@ public final class BillingDtos {
             @Min(1) Long max_amount_micro_yuan,
             @Min(1) Long max_total_micro_yuan,
             @Size(max = 512) String description) {
+    }
+
+    public record PendingOrderRequest(
+            @NotNull @Min(1) Long account_id,
+            @NotNull @Min(1) Long amount_micro_yuan,
+            @NotBlank @Size(min = 16, max = 128) String source_reference,
+            @NotBlank @Pattern(regexp = "[a-z0-9_-]{1,32}") String payment_provider,
+            @Size(max = 512) String description) {
+    }
+
+    public record PendingOrderResponse(
+            long id,
+            String order_number,
+            long account_id,
+            long amount_micro_yuan,
+            String status,
+            String payment_provider,
+            String provider_order_id,
+            String idempotency_key) {
     }
 
     public record BalanceProjection(

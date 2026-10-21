@@ -90,6 +90,9 @@ platform:
     retention-days: ${JOB_AGENT_ACCOUNT_EMAIL_RETENTION_DAYS:14}
   billing:
     enabled: ${PLATFORM_BILLING_ENABLED:false}
+    webhook-enabled: ${PLATFORM_PAYMENT_WEBHOOK_ENABLED:false}
+    webhook-secret: ${PLATFORM_PAYMENT_WEBHOOK_SECRET:}
+    webhook-max-skew-seconds: ${PLATFORM_PAYMENT_WEBHOOK_MAX_SKEW_SECONDS:300}
     price-per-million-tokens-yuan: ${PLATFORM_PRICE_PER_MILLION_TOKENS_YUAN:${JOB_AGENT_BILLING_PRICE_PER_MILLION_TOKENS_YUAN:25.0}}
     low-balance-threshold-micro-yuan: ${PLATFORM_LOW_BALANCE_THRESHOLD_MICRO_YUAN:10000000}
     low-balance-threshold-yuan: ${JOB_AGENT_BILLING_LOW_BALANCE_THRESHOLD_YUAN:}

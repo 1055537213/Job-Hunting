@@ -312,6 +312,62 @@ public class BillingService implements BillingOperations {
     }
 
     @Transactional
+    public BillingDtos.PendingOrderResponse createPendingOrder(
+            BillingDtos.PendingOrderRequest request, String idempotencyKey) {
+        if (!idempotencyKey.equals(request.source_reference())) {
+            throw new BillingException("INVALID_REQUEST", "订单幂等键必须与 source_reference 一致。",
+                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+        String provider = request.payment_provider().strip().toLowerCase();
+        if (!provider.matches("[a-z0-9_-]{1,32}")) {
+            throw new BillingException("INVALID_REQUEST", "支付渠道无效。",
+                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+        var existing = jdbcTemplate.query("""
+                SELECT id, order_number, account_id, amount_micro_yuan, status,
+                       payment_provider, provider_order_id, idempotency_key
+                FROM recharge_orders WHERE account_id=? AND idempotency_key=?
+                """, (row, index) -> new BillingDtos.PendingOrderResponse(
+                row.getLong("id"), row.getString("order_number"), row.getLong("account_id"),
+                row.getLong("amount_micro_yuan"), row.getString("status"), row.getString("payment_provider"),
+                row.getString("provider_order_id"), row.getString("idempotency_key")),
+                request.account_id(), request.source_reference()).stream().findFirst();
+        if (existing.isPresent()) {
+            var order = existing.get();
+            if (order.amount_micro_yuan() != request.amount_micro_yuan()
+                    || !provider.equals(order.payment_provider())) {
+                throw new BillingException("IDEMPOTENCY_CONFLICT", "该幂等键已用于另一笔支付订单。",
+                        org.springframework.http.HttpStatus.CONFLICT);
+            }
+            return order;
+        }
+        lockBalance(request.account_id());
+        String orderNumber = "recharge-" + UUID.randomUUID().toString().replace("-", "");
+        String description = request.description() == null || request.description().isBlank()
+                ? "待支付充值订单" : request.description().strip();
+        try {
+            Long id = jdbcTemplate.queryForObject("""
+                    INSERT INTO recharge_orders (
+                        order_number, account_id, created_by_account_id, amount_micro_yuan,
+                        status, payment_provider, provider_order_id, idempotency_key,
+                        description, failure_reason, details_json, created_at, updated_at,
+                        paid_at, cancelled_at, refunded_at
+                    ) VALUES (?, ?, NULL, ?, 'pending', ?, ?, ?, ?, NULL, CAST(? AS jsonb),
+                              CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL, NULL, NULL)
+                    RETURNING id
+                    """, Long.class, orderNumber, request.account_id(), request.amount_micro_yuan(), provider,
+                    orderNumber, request.source_reference(), description,
+                    json(Map.of("payment_provider", provider, "order_number", orderNumber,
+                            "settlement", "signed_webhook")));
+            return new BillingDtos.PendingOrderResponse(id, orderNumber, request.account_id(),
+                    request.amount_micro_yuan(), "pending", provider, orderNumber, request.source_reference());
+        } catch (DuplicateKeyException exception) {
+            throw new BillingException("IDEMPOTENCY_CONFLICT", "该幂等键已用于另一笔支付订单。",
+                    org.springframework.http.HttpStatus.CONFLICT);
+        }
+    }
+
+    @Transactional
     public BillingDtos.CreditResponse credit(
             BillingDtos.CreditRequest request, String idempotencyKey, String traceId) {
         String key = request.idempotency_key().strip();

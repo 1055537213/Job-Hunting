@@ -12,6 +12,10 @@ public interface BillingOperations {
             BillingDtos.RechargeRequest request,
             String idempotencyKey);
 
+    BillingDtos.PendingOrderResponse createPendingOrder(
+            BillingDtos.PendingOrderRequest request,
+            String idempotencyKey);
+
     BillingDtos.CreditResponse credit(
             BillingDtos.CreditRequest request,
             String idempotencyKey,
