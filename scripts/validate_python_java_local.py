@@ -340,6 +340,7 @@ def run_web_billing_flow(
             raise RuntimeError(f"Web recharge failed: {recharged.status_code} {recharged.text[:300]}")
         if recharged.json()["summary"]["balance_micro_yuan"] != 10_000_000:
             raise AssertionError(recharged.json())
+        recharge_order_id = recharged.json()["order"]["id"]
 
         replayed_recharge = client.post("/api/me/balance/recharge", json=recharge_payload)
         if replayed_recharge.status_code != 200:
@@ -434,6 +435,34 @@ def run_web_billing_flow(
                 assert replay.json()["entry"]["recharge_order_id"] is None
                 for changed in ({**credit_body, "amount_yuan": 8}, {**credit_body, "reason": "different reason"}):
                     assert admin_client.post(credit_path, json=changed).status_code == 409
+                refund_path = f"/api/admin/recharge/orders/{recharge_order_id}/refund"
+                refund_body = {
+                    "reason": "local billing acceptance refund",
+                    "idempotency_key": f"web-refund-{suffix}",
+                }
+                refunded = admin_client.post(refund_path, json=refund_body,
+                                             headers={"X-Request-ID": f"web-refund-trace-{suffix}"})
+                refunded.raise_for_status()
+                assert refunded.json()["recharge_order_id"] == recharge_order_id
+                assert refunded.json()["replayed"] is False
+                assert refunded.json()["refunded_micro_yuan"] == 10_000_000
+                replayed_refund = admin_client.post(refund_path, json=refund_body)
+                replayed_refund.raise_for_status()
+                assert replayed_refund.json()["replayed"] is True
+                assert replayed_refund.json()["ledger_entry_id"] == refunded.json()["ledger_entry_id"]
+                reconciliation = admin_client.get(
+                    f"/api/admin/recharge/reconciliation?account_id={account_id}"
+                )
+                reconciliation.raise_for_status()
+                assert reconciliation.json()["consistent"] is True
+                assert reconciliation.json()["refunded_orders"] == 1
+                assert reconciliation.json()["refunded_without_reversal"] == 0
+                refunded_order = admin_client.get(
+                    f"/api/admin/recharge/orders?account_id={account_id}&limit=100&offset=0"
+                )
+                refunded_order.raise_for_status()
+                assert refunded_order.json()["orders"][0]["status"] == "refunded"
+                assert refunded_order.json()["orders"][0]["id"] == recharge_order_id
                 audit = [e for e in store.list_admin_audit_events(limit=100)
                          if e.action == "balance.manual_credit" and e.target_account_id == account_id]
                 assert len(audit) == 1 and audit[0].request_id == trace_id
@@ -446,8 +475,9 @@ def run_web_billing_flow(
                          "amount_micro_yuan": 7_000_000, "idempotency_key": credit_key,
                          "reason": "payment correction", "session_token": session}, timeout=10)
                 assert denied.status_code == 401
-            assert client.get("/api/me/balance").json()["summary"]["balance_micro_yuan"] == 15_000_000
-            print("==> Web manual credit -> Java Session/RBAC -> atomic ledger/audit -> replay/conflict/revocation: PASS")
+            assert client.get("/api/me/balance").json()["summary"]["balance_micro_yuan"] == 5_000_000
+            print("==> Web manual credit -> Java Session/RBAC -> atomic ledger/audit -> replay/conflict: PASS")
+            print("==> Admin refund -> idempotent replay -> reconciliation consistency: PASS")
         finally:
             store.close()
     print("Local Python Web + Java billing flow: PASS")
@@ -562,6 +592,10 @@ def main() -> int:
     log_dir = Path(tempfile.mkdtemp(prefix="job-agent-java-local-"))
     log_path = log_dir / "platform-service.log"
     web_log_path = log_dir / "python-web.log"
+    # JDK 25 on Windows rejects the longer nested temp path when HttpClient
+    # creates its internal loopback pipe; keep this path short and stable.
+    unix_socket_dir = Path("C:/task-command-no-unix-sockets")
+    unix_socket_dir.mkdir(exist_ok=True)
     log_file = None
     web_log_file = None
     web_env_path = log_dir / "local-web.env"
@@ -630,8 +664,9 @@ def main() -> int:
             raise RuntimeError("Java platform packaging failed")
         java_home = java_environment.get("JAVA_HOME")
         java = str(Path(java_home) / "bin" / ("java.exe" if os.name == "nt" else "java")) if java_home else "java"
+        java_options = [f"-Djdk.net.unixdomain.tmpdir={unix_socket_dir}"]
         rejected = subprocess.run([
-            java, "-jar", "target/platform-service-0.1.0-SNAPSHOT.jar",
+            java, *java_options, "-jar", "target/platform-service-0.1.0-SNAPSHOT.jar",
             "--platform.auth.enabled=false", "--platform.web-security.environment=PRODUCTION",
             "--platform.web-security.enabled=false",
         ], cwd=ROOT / "platform-service", env=java_environment, capture_output=True, text=True, timeout=45,
@@ -639,7 +674,7 @@ def main() -> int:
         assert rejected.returncode != 0 and "Production requires web security" in rejected.stdout + rejected.stderr
         print("==> Java production rejects disabled protections even with auth disabled: PASS")
         process = subprocess.Popen(
-            [java, "-jar", "target/platform-service-0.1.0-SNAPSHOT.jar"],
+            [java, *java_options, "-jar", "target/platform-service-0.1.0-SNAPSHOT.jar"],
             cwd=ROOT / "platform-service",
             env=java_environment,
             stdout=log_file,

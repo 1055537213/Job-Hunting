@@ -260,6 +260,30 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
         assert events.status_code == 200 and len(events.json()["events"]) == 1
         assert events.json()["events"][0]["recharge_order_id"] == order_id
         assert admin.get("/api/admin/recharge/orders/999999999/events").status_code == 404
+        refund_path = f"/api/admin/recharge/orders/{order_id}/refund"
+        refund_body = {
+            "reason": "Docker billing acceptance refund",
+            "idempotency_key": f"gateway-admin-refund-{os.urandom(12).hex()}",
+        }
+        refunded = admin.post(refund_path, json=refund_body,
+                              headers={"X-Request-ID": "gateway-admin-refund-trace"})
+        assert refunded.status_code == 200, refunded.text[:300]
+        assert refunded.json()["recharge_order_id"] == order_id
+        assert refunded.json()["replayed"] is False
+        assert refunded.json()["refunded_micro_yuan"] == 2_000_000
+        replayed_refund = admin.post(refund_path, json=refund_body)
+        assert replayed_refund.status_code == 200
+        assert replayed_refund.json()["replayed"] is True
+        assert replayed_refund.json()["ledger_entry_id"] == refunded.json()["ledger_entry_id"]
+        reconciliation = admin.get(f"/api/admin/recharge/reconciliation?account_id={account_id}")
+        assert reconciliation.status_code == 200, reconciliation.text[:300]
+        assert reconciliation.json()["consistent"] is True
+        assert reconciliation.json()["refunded_orders"] == 1
+        assert reconciliation.json()["refunded_without_reversal"] == 0
+        refunded_order = admin.get(f"/api/admin/recharge/orders?account_id={account_id}&limit=100&offset=0")
+        assert refunded_order.status_code == 200
+        assert any(row["id"] == order_id and row["status"] == "refunded"
+                   for row in refunded_order.json()["orders"])
         assert admin.get("/api/admin/balance/events?limit=101").status_code == 422
         self_path = f"/api/admin/accounts/{login.json()['account']['id']}/balance/credit"
         assert admin.post(self_path, json={**body, "amount_yuan": "0.000001", "idempotency_key": key + "-self"}, headers=headers).status_code == 200
@@ -273,7 +297,7 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
         assert usage.status_code == 200 and usage.headers["cache-control"] == "no-store", usage.text[:300]
         assert usage.json()["page_size"] == 100 and usage.json()["max_pages"] == 5
         balance = next(row for row in usage.json()["billing"]["by_account"] if row["account_id"] == account_id)
-        assert balance["balance_micro_yuan"] == credited.json()["summary"]["balance_micro_yuan"]
+        assert balance["balance_micro_yuan"] == 3_000_002
         token_page = admin.get(f"/api/admin/usage/events?account_id={account_id}&limit=1&offset=0")
         assert token_page.status_code == 200 and token_page.json()["max_pages"] == 5
         assert token_page.json()["total"] == 2 and len(token_page.json()["events"]) == 1
