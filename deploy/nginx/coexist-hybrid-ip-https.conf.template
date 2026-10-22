@@ -135,7 +135,7 @@ server {
         proxy_read_timeout 300s;
     }
 
-    location ~ ^/api/payments/webhooks/[a-z0-9_-]{1,32}$ {
+    location ~ "^/api/payments/webhooks/[a-z0-9_-]{1,32}$" {
         if ($request_method != POST) { return 405; }
         proxy_pass http://platform-service:8081;
         proxy_set_header Host $http_host;
