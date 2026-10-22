@@ -3535,6 +3535,7 @@ textarea:focus-visible,
 .admin-balance-credit-head > span { color: var(--auth-muted); font-family: var(--font-mono); font-size: var(--text-xs); white-space: nowrap; }
 .admin-balance-credit-form .field-group { min-width: 0; }
 .admin-balance-credit-form .primary-button { min-width: 7.5rem; }
+.admin-billing-operations { display: grid; gap: var(--space-sm); margin-block-start: var(--space-lg); }
 .admin-detail-tabs {
   width: 100%;
   display: grid;

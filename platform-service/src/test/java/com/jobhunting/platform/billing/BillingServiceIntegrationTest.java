@@ -242,6 +242,31 @@ class BillingServiceIntegrationTest {
     }
 
     @Test
+    void concurrentRefundsWithSameKeyReturnOneAppliedAndOneReplay() throws Exception {
+        billing.recharge(rechargeRequest(42, 2_000_000, "refund-concurrent-order-0001"),
+                "refund-concurrent-order-0001");
+        long orderId = jdbc.queryForObject(
+                "SELECT id FROM recharge_orders WHERE account_id = 42 AND idempotency_key = ?",
+                Long.class, "refund-concurrent-order-0001");
+        var request = new BillingDtos.RefundRequest(
+                42L, orderId, 2_000_000L, "refund-concurrent-request-0001", "concurrent refund");
+
+        List<BillingDtos.RefundResponse> responses = runTogether(
+                () -> billing.refund(request, request.source_reference()),
+                () -> billing.refund(request, request.source_reference()));
+
+        assertThat(responses).filteredOn(BillingDtos.RefundResponse::replayed).hasSize(1);
+        assertThat(responses).filteredOn(response -> !response.replayed()).hasSize(1);
+        assertThat(responses.get(0).ledger_entry_id()).isEqualTo(responses.get(1).ledger_entry_id());
+        assertThat(billing.getBalance(42).balance_micro_yuan()).isEqualTo(10_000_000);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM account_balance_ledger WHERE recharge_order_id = ? AND entry_kind = 'adjustment'",
+                Integer.class, orderId)).isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                "SELECT status FROM recharge_orders WHERE id = ?", String.class, orderId)).isEqualTo("refunded");
+    }
+
+    @Test
     void refundRejectsPartialAmountAndInsufficientBalanceWithoutChangingOrder() {
         billing.recharge(rechargeRequest(42, 8_000_000, "refund-guard-0001"), "refund-guard-0001");
         long orderId = jdbc.queryForObject(

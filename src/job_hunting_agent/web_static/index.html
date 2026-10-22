@@ -1641,6 +1641,78 @@
                           <button class="admin-ledger-page-button" type="button" :disabled="admin.balancePage >= balanceLedgerPageCount(admin.balanceTotal)" @click="loadAdminBalanceEvents(selectedAdminAccount.id, admin.balancePage + 1)">下一页</button>
                         </div>
                       </div>
+                      <section class="admin-billing-operations" aria-labelledby="adminRechargeOrdersTitle">
+                        <div class="panel-title-row">
+                          <div>
+                            <p class="eyebrow">Recharge Operations</p>
+                            <h4 id="adminRechargeOrdersTitle">充值订单与对账</h4>
+                          </div>
+                          <button
+                            class="ghost-button compact"
+                            type="button"
+                            :disabled="admin.reconciliationLoading || admin.rechargeOrdersLoading"
+                            @click="loadAdminActiveDetail(selectedAdminAccount.id)"
+                          >
+                            {{ admin.reconciliationLoading || admin.rechargeOrdersLoading ? "刷新中" : "刷新" }}
+                          </button>
+                        </div>
+                        <div v-if="admin.reconciliationError || admin.rechargeOrdersError" class="inline-error" role="alert">
+                          {{ admin.reconciliationError || admin.rechargeOrdersError }}
+                        </div>
+                        <div v-else-if="admin.reconciliation" class="admin-usage-notice" role="status">
+                          对账：{{ admin.reconciliation.consistent ? "一致" : "发现异常" }}
+                          · 已到账 {{ admin.reconciliation.paid_orders }}
+                          · 已退款 {{ admin.reconciliation.refunded_orders }}
+                          · 异常 {{ Number(admin.reconciliation.paid_without_ledger || 0) + Number(admin.reconciliation.ledger_without_paid_order || 0) + Number(admin.reconciliation.refunded_without_reversal || 0) + Number(admin.reconciliation.duplicate_recharge_ledger || 0) }}
+                        </div>
+                        <div v-if="admin.rechargeOrdersLoading" class="admin-usage-notice" role="status">正在加载充值订单...</div>
+                        <div v-else-if="!admin.rechargeOrders.length" class="empty-state compact-empty">
+                          <strong>暂无充值订单</strong><span>该账号尚未产生可展示的充值订单。</span>
+                        </div>
+                        <div v-else class="admin-table-wrap">
+                          <table class="admin-table">
+                            <thead><tr><th>订单</th><th>时间</th><th>金额</th><th>状态</th><th>渠道</th><th>操作</th></tr></thead>
+                            <tbody>
+                              <tr v-for="order in admin.rechargeOrders" :key="order.id">
+                                <td>#{{ order.id }}</td>
+                                <td>{{ formatDate(order.created_at) }}</td>
+                                <td>{{ formatYuanAmount(order.amount_micro_yuan) }} 元</td>
+                                <td>{{ rechargeOrderStatusLabel(order.status) }}</td>
+                                <td>{{ order.payment_provider || "-" }}</td>
+                                <td>
+                                  <button
+                                    v-if="order.status === 'paid'"
+                                    class="ghost-button compact"
+                                    type="button"
+                                    :disabled="admin.refundBusy[order.id]"
+                                    @click="refundAdminRechargeOrder(order)"
+                                  >
+                                    {{ admin.refundBusy[order.id] ? "处理中" : "全额退款" }}
+                                  </button>
+                                  <span v-else>-</span>
+                                </td>
+                              </tr>
+                            </tbody>
+                          </table>
+                        </div>
+                        <div class="admin-ledger-pagination" role="navigation" aria-label="充值订单分页">
+                          <span class="admin-ledger-page-info">{{ adminLedgerPageInfo(admin.rechargeOrderTotal) }}</span>
+                          <div class="admin-ledger-page-nav">
+                            <button class="admin-ledger-page-button" type="button" :disabled="admin.rechargeOrderPage <= 1" @click="loadAdminRechargeOrders(selectedAdminAccount.id, admin.rechargeOrderPage - 1)">上一页</button>
+                            <button
+                              v-for="page in adminLedgerPageNumbers(admin.rechargeOrderTotal, admin.rechargeOrderPage)"
+                              :key="`recharge-order-page-${page}`"
+                              class="admin-ledger-page-button"
+                              type="button"
+                              :aria-selected="String(admin.rechargeOrderPage === page)"
+                              @click="loadAdminRechargeOrders(selectedAdminAccount.id, page)"
+                            >
+                              {{ page }}
+                            </button>
+                            <button class="admin-ledger-page-button" type="button" :disabled="admin.rechargeOrderPage >= adminLedgerPageCount(admin.rechargeOrderTotal)" @click="loadAdminRechargeOrders(selectedAdminAccount.id, admin.rechargeOrderPage + 1)">下一页</button>
+                          </div>
+                        </div>
+                      </section>
                     </template>
 
                     <template v-else-if="admin.activeDetailTab === 'tokens'">

@@ -150,6 +150,18 @@ if (!window.Vue) {
           balanceEvents: [],
           balanceTotal: 0,
           balancePage: 1,
+          rechargeOrders: [],
+          rechargeOrderTotal: 0,
+          rechargeOrderPage: 1,
+          rechargeOrdersLoading: false,
+          rechargeOrdersError: "",
+          rechargeOrdersRequestVersion: 0,
+          reconciliation: null,
+          reconciliationLoading: false,
+          reconciliationError: "",
+          reconciliationRequestVersion: 0,
+          refundBusy: {},
+          refundIdempotencyKeys: {},
           toolTraces: [],
           auditEvents: [],
           activeSection: "usage",
@@ -1524,6 +1536,14 @@ if (!window.Vue) {
         this.admin.toolTraceDetail = null;
         this.admin.usagePage = 1;
         this.admin.balancePage = 1;
+        this.admin.rechargeOrders = [];
+        this.admin.rechargeOrderTotal = 0;
+        this.admin.rechargeOrderPage = 1;
+        this.admin.reconciliation = null;
+        this.admin.rechargeOrdersError = "";
+        this.admin.reconciliationError = "";
+        this.admin.rechargeOrdersRequestVersion += 1;
+        this.admin.reconciliationRequestVersion += 1;
         this.admin.toolTracePage = 1;
         this.admin.eventsError = "";
         this.admin.balanceEventsError = "";
@@ -1553,6 +1573,14 @@ if (!window.Vue) {
         this.admin.balanceEvents = [];
         this.admin.balanceTotal = 0;
         this.admin.balancePage = 1;
+        this.admin.rechargeOrders = [];
+        this.admin.rechargeOrderTotal = 0;
+        this.admin.rechargeOrderPage = 1;
+        this.admin.reconciliation = null;
+        this.admin.rechargeOrdersError = "";
+        this.admin.reconciliationError = "";
+        this.admin.rechargeOrdersRequestVersion += 1;
+        this.admin.reconciliationRequestVersion += 1;
         this.admin.toolTraces = [];
         this.admin.selectedToolTraceId = "";
         this.admin.toolTraceDetail = null;
@@ -1575,7 +1603,11 @@ if (!window.Vue) {
         if (this.admin.activeDetailTab === "tools") {
           await this.loadAdminToolTraces(accountId, this.admin.toolTracePage);
         } else if (this.admin.activeDetailTab === "balance") {
-          await this.loadAdminBalanceEvents(accountId, this.admin.balancePage);
+          await Promise.all([
+            this.loadAdminBalanceEvents(accountId, this.admin.balancePage),
+            this.loadAdminRechargeOrders(accountId),
+            this.loadAdminReconciliation(accountId),
+          ]);
         } else {
           await this.loadAdminUsageEvents(accountId, this.admin.usagePage);
         }
@@ -1635,6 +1667,119 @@ if (!window.Vue) {
             this.admin.loadingBalanceEvents = false;
           }
         }
+      },
+
+      /** 读取当前账号的充值订单，供管理员执行退款和核对到账状态。 */
+      async loadAdminRechargeOrders(accountId = this.admin.selectedAccountId, page = this.admin.rechargeOrderPage) {
+        const selectedAccountId = Number(accountId);
+        if (!Number.isInteger(selectedAccountId) || selectedAccountId <= 0) return;
+        const requestedPage = Math.max(1, Math.floor(Number(page) || 1));
+        const requestVersion = this.admin.rechargeOrdersRequestVersion + 1;
+        this.admin.rechargeOrdersRequestVersion = requestVersion;
+        this.admin.rechargeOrdersLoading = true;
+        this.admin.rechargeOrdersError = "";
+        this.admin.rechargeOrderPage = requestedPage;
+        try {
+          const pageSize = Math.max(1, Number(this.admin.ledgerPageSize || ADMIN_LEDGER_PAGE_SIZE));
+          const data = await this.requestJson(
+            `/api/admin/recharge/orders?account_id=${encodeURIComponent(selectedAccountId)}&limit=${encodeURIComponent(pageSize)}&offset=${encodeURIComponent((requestedPage - 1) * pageSize)}`
+          );
+          if (requestVersion !== this.admin.rechargeOrdersRequestVersion
+              || !this.isAdminAccountSelected(selectedAccountId)) return;
+          const total = Number(data.total || 0);
+          const pageCount = this.adminLedgerPageCount(total);
+          if (pageCount > 0 && requestedPage > pageCount) {
+            await this.loadAdminRechargeOrders(selectedAccountId, pageCount);
+            return;
+          }
+          this.admin.rechargeOrders = data.orders || [];
+          this.admin.rechargeOrderTotal = total;
+          this.admin.rechargeOrderPage = pageCount > 0 ? requestedPage : 1;
+        } catch (error) {
+          if (requestVersion !== this.admin.rechargeOrdersRequestVersion
+              || !this.isAdminAccountSelected(selectedAccountId)) return;
+          this.admin.rechargeOrders = [];
+          this.admin.rechargeOrderTotal = 0;
+          this.admin.rechargeOrdersError = error.message || "充值订单加载失败，请稍后重试。";
+        } finally {
+          if (requestVersion === this.admin.rechargeOrdersRequestVersion) {
+            this.admin.rechargeOrdersLoading = false;
+          }
+        }
+      },
+
+      /** 读取当前账号的账务对账结果，帮助管理员确认订单与余额流水一致。 */
+      async loadAdminReconciliation(accountId = this.admin.selectedAccountId) {
+        const selectedAccountId = Number(accountId);
+        if (!Number.isInteger(selectedAccountId) || selectedAccountId <= 0) return;
+        const requestVersion = this.admin.reconciliationRequestVersion + 1;
+        this.admin.reconciliationRequestVersion = requestVersion;
+        this.admin.reconciliationLoading = true;
+        this.admin.reconciliationError = "";
+        try {
+          const data = await this.requestJson(
+            `/api/admin/recharge/reconciliation?account_id=${encodeURIComponent(selectedAccountId)}`
+          );
+          if (requestVersion !== this.admin.reconciliationRequestVersion
+              || !this.isAdminAccountSelected(selectedAccountId)) return;
+          this.admin.reconciliation = data;
+        } catch (error) {
+          if (requestVersion !== this.admin.reconciliationRequestVersion
+              || !this.isAdminAccountSelected(selectedAccountId)) return;
+          this.admin.reconciliation = null;
+          this.admin.reconciliationError = error.message || "充值对账加载失败，请稍后重试。";
+        } finally {
+          if (requestVersion === this.admin.reconciliationRequestVersion) {
+            this.admin.reconciliationLoading = false;
+          }
+        }
+      },
+
+      /** 对已到账的模拟充值订单执行一次全额退款；重复点击会被幂等键保护。 */
+      async refundAdminRechargeOrder(order) {
+        const orderId = Number(order?.id);
+        if (!Number.isInteger(orderId) || orderId <= 0 || order.status !== "paid"
+            || this.admin.refundBusy[orderId]) return;
+        const amount = this.formatYuanAmount(order.amount_micro_yuan);
+        if (!window.confirm(`确认将订单 #${orderId} 的 ${amount} 元模拟充值全额退款吗？`)) return;
+        const idempotencyKey = this.admin.refundIdempotencyKeys[orderId]
+          || this.newIdempotencyKey("admin-refund");
+        this.admin.refundIdempotencyKeys[orderId] = idempotencyKey;
+        this.admin.refundBusy[orderId] = true;
+        try {
+          await this.requestJson(`/api/admin/recharge/orders/${encodeURIComponent(orderId)}/refund`, {
+            method: "POST",
+            body: JSON.stringify({ reason: "管理员后台退款", idempotency_key: idempotencyKey }),
+          });
+          this.showAccountAction(`订单 #${orderId} 已完成退款。`, true);
+          await Promise.all([
+            this.loadAdminBalanceEvents(this.admin.selectedAccountId, 1),
+            this.loadAdminRechargeOrders(this.admin.selectedAccountId),
+            this.loadAdminReconciliation(this.admin.selectedAccountId),
+            this.loadAdminAuditEvents(),
+          ]);
+          const summary = await this.requestJson("/api/admin/usage/summary");
+          this.admin.billing = {
+            settings: summary.billing?.settings || {},
+            summary: summary.billing?.summary || {},
+            by_account: summary.billing?.by_account || [],
+          };
+          delete this.admin.refundIdempotencyKeys[orderId];
+        } catch (error) {
+          this.showAccountAction(error.message || "退款失败，请稍后重试。", false);
+        } finally {
+          this.admin.refundBusy[orderId] = false;
+        }
+      },
+
+      rechargeOrderStatusLabel(status) {
+        return {
+          pending: "待支付",
+          paid: "已到账",
+          failed: "失败",
+          cancelled: "已取消",
+          refunded: "已退款",
+        }[status] || status || "未知";
       },
 
       /** 管理员对当前选中账号执行人工补款；失败重试复用同一幂等键。 */

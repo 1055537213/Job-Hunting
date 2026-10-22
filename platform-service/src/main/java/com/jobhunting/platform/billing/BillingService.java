@@ -382,7 +382,9 @@ public class BillingService implements BillingOperations {
         if (existing != null) {
             if (existing.accountId() != accountId || existing.entryKind() == null
                     || !"adjustment".equals(existing.entryKind())
-                    || existing.amountMicroYuan() != -amount) {
+                    || existing.amountMicroYuan() != -amount
+                    || existing.rechargeOrderId() == null
+                    || existing.rechargeOrderId() != orderId) {
                 throw refundConflict();
             }
             return new BillingDtos.RefundResponse(accountId, existing.balanceAfterMicroYuan(), existing.id(), true,
@@ -404,6 +406,20 @@ public class BillingService implements BillingOperations {
         if (order == null) {
             throw new BillingException("ORDER_NOT_FOUND", "充值订单不存在。", org.springframework.http.HttpStatus.NOT_FOUND);
         }
+        // The first request may have committed while this request waited for the order lock.
+        // Recheck the unique ledger before interpreting the order's new status so retries stay idempotent.
+        existing = findExistingLedger(request.source_reference());
+        if (existing != null) {
+            if (existing.accountId() != accountId || !"adjustment".equals(existing.entryKind())
+                    || existing.amountMicroYuan() != -amount
+                    || existing.rechargeOrderId() == null
+                    || existing.rechargeOrderId() != orderId) {
+                throw refundConflict();
+            }
+            return new BillingDtos.RefundResponse(accountId, existing.balanceAfterMicroYuan(), existing.id(), true,
+                    amount, orderId);
+        }
+
         if (!"paid".equals(order.status())) {
             if ("refunded".equals(order.status())) {
                 throw new BillingException("REFUND_ALREADY_APPLIED", "该充值订单已经退款。",
@@ -415,17 +431,6 @@ public class BillingService implements BillingOperations {
         if (order.amountMicroYuan() != amount) {
             throw new BillingException("REFUND_AMOUNT_MISMATCH", "退款金额必须与充值订单金额一致。",
                     org.springframework.http.HttpStatus.CONFLICT);
-        }
-
-        // Recheck after the order lock so a concurrent retry returns the original result.
-        existing = findExistingLedger(request.source_reference());
-        if (existing != null) {
-            if (existing.accountId() != accountId || !"adjustment".equals(existing.entryKind())
-                    || existing.amountMicroYuan() != -amount) {
-                throw refundConflict();
-            }
-            return new BillingDtos.RefundResponse(accountId, existing.balanceAfterMicroYuan(), existing.id(), true,
-                    amount, orderId);
         }
 
         BalanceRow balance = lockBalance(accountId);
@@ -618,7 +623,7 @@ public class BillingService implements BillingOperations {
     private ExistingLedger findExistingLedger(String sourceReference) {
         return jdbcTemplate.query(
                 """
-                SELECT id, account_id, entry_kind, amount_micro_yuan, balance_after_micro_yuan
+                SELECT id, account_id, entry_kind, amount_micro_yuan, balance_after_micro_yuan, recharge_order_id
                 FROM account_balance_ledger
                 WHERE source_reference = ?
                 """,
@@ -627,8 +632,13 @@ public class BillingService implements BillingOperations {
                         result.getLong("account_id"),
                         result.getString("entry_kind"),
                         result.getLong("amount_micro_yuan"),
-                        result.getLong("balance_after_micro_yuan")),
+                        result.getLong("balance_after_micro_yuan"),
+                        nullableLong(result.getObject("recharge_order_id"))),
                 sourceReference).stream().findFirst().orElse(null);
+    }
+
+    private Long nullableLong(Object value) {
+        return value == null ? null : ((Number) value).longValue();
     }
 
     private ExistingRecharge findExistingRecharge(long accountId, String idempotencyKey) {
@@ -717,7 +727,8 @@ public class BillingService implements BillingOperations {
             long accountId,
             String entryKind,
             long amountMicroYuan,
-            long balanceAfterMicroYuan) {
+            long balanceAfterMicroYuan,
+            Long rechargeOrderId) {
     }
 
     private record ExistingRecharge(long amountMicroYuan, String paymentProvider) {
