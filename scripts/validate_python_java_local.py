@@ -592,10 +592,18 @@ def main() -> int:
     log_dir = Path(tempfile.mkdtemp(prefix="job-agent-java-local-"))
     log_path = log_dir / "platform-service.log"
     web_log_path = log_dir / "python-web.log"
-    # JDK 25 on Windows rejects the longer nested temp path when HttpClient
-    # creates its internal loopback pipe; keep this path short and stable.
-    unix_socket_dir = Path("C:/task-command-no-unix-sockets")
-    unix_socket_dir.mkdir(exist_ok=True)
+    # Keep the JDK HttpClient loopback pipe in a short stable directory. The
+    # default must follow the runner OS because this validator also runs in
+    # Linux CI containers.
+    default_unix_socket_dir = (
+        Path("C:/task-command-no-unix-sockets")
+        if os.name == "nt"
+        else Path("/tmp/task-command-no-unix-sockets")
+    )
+    unix_socket_dir = Path(
+        os.environ.get("JOB_AGENT_UNIX_SOCKET_TMPDIR", str(default_unix_socket_dir))
+    )
+    unix_socket_dir.mkdir(parents=True, exist_ok=True)
     log_file = None
     web_log_file = None
     web_env_path = log_dir / "local-web.env"
