@@ -266,7 +266,7 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
             "idempotency_key": f"gateway-admin-refund-{os.urandom(12).hex()}",
         }
         refunded = admin.post(refund_path, json=refund_body,
-                              headers={"X-Request-ID": "gateway-admin-refund-trace"})
+                              headers={**headers, "X-Request-ID": "gateway-admin-refund-trace"})
         assert refunded.status_code == 200, refunded.text[:300]
         assert refunded.json()["recharge_order_id"] == order_id
         assert refunded.json()["replayed"] is False
