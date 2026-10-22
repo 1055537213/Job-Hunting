@@ -25,6 +25,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
+import com.jobhunting.platform.observability.TraceHeaders;
 import tools.jackson.core.StreamReadFeature;
 import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.JsonNode;
@@ -73,7 +74,7 @@ public class AccountExportClient {
         CompletableFuture<HttpResponse<byte[]>> pending = null;
         try {
             byte[] payload = mapper.writeValueAsBytes(mapper.createObjectNode().put("session_token", session));
-            var request = HttpRequest.newBuilder(endpoint).timeout(Duration.ofMillis(timeoutMs))
+            var request = TraceHeaders.apply(HttpRequest.newBuilder(endpoint), null).timeout(Duration.ofMillis(timeoutMs))
                     .header("X-Internal-Service-Token", token).header("Content-Type", "application/json")
                     .header("Accept", "application/json").POST(singleUseBody(payload)).build();
             pending = http.sendAsync(request, ignored -> new BoundedBody());

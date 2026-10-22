@@ -103,6 +103,13 @@ platform:
     environment: ${JOB_AGENT_ENVIRONMENT:development}
 
 management:
+  tracing:
+    enabled: ${PLATFORM_TRACING_ENABLED:false}
+    sampling:
+      probability: ${PLATFORM_TRACE_SAMPLE_RATIO:0.1}
+  otlp:
+    tracing:
+      endpoint: ${PLATFORM_OTLP_TRACING_ENDPOINT:http://alloy:4318/v1/traces}
   metrics:
     distribution:
       percentiles-histogram:
@@ -121,3 +128,7 @@ management:
   info:
     env:
       enabled: false
+
+logging:
+  pattern:
+    level: "%5p [traceId=%X{traceId:-} spanId=%X{spanId:-} requestId=%X{request_id:-}]"

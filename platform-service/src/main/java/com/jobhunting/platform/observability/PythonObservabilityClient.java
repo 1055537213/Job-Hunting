@@ -63,7 +63,7 @@ public class PythonObservabilityClient {
         if (token.isBlank()) return unavailable();
         CompletableFuture<HttpResponse<byte[]>> pending = null;
         try {
-            var request = HttpRequest.newBuilder(endpoint).timeout(Duration.ofMillis(readTimeoutMs))
+            var request = TraceHeaders.apply(HttpRequest.newBuilder(endpoint), null).timeout(Duration.ofMillis(readTimeoutMs))
                     .header("Accept", "application/json").header("X-Internal-Service-Token", token).GET().build();
             pending = http.sendAsync(request, ignored -> new BoundedBody());
             // Bound the entire response, including a stalled body after headers arrive.

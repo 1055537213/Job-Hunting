@@ -21,6 +21,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.jobhunting.platform.auth.AuthException;
+import com.jobhunting.platform.observability.TraceHeaders;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpStatus;
@@ -79,10 +80,9 @@ public class TaskCommandClient {
         CompletableFuture<HttpResponse<byte[]>> pending = null;
         try {
             byte[] payload = mapper.writeValueAsBytes(body);
-            var request = HttpRequest.newBuilder(endpoint).timeout(Duration.ofMillis(readTimeoutMs))
+            var request = TraceHeaders.apply(HttpRequest.newBuilder(endpoint), requestId).timeout(Duration.ofMillis(readTimeoutMs))
                     .header("Content-Type", "application/json").header("Accept", "application/json")
-                    .header("X-Internal-Service-Token", internalToken).header("X-Request-ID", requestId)
-                    .header("X-Trace-Id", requestId).POST(singleUseBody(payload)).build();
+                    .header("X-Internal-Service-Token", internalToken).POST(singleUseBody(payload)).build();
             pending = http.sendAsync(request, ignored -> new BoundedBody());
             // The deadline covers the complete response, including a slow/dripping body.
             var response = pending.get(readTimeoutMs, TimeUnit.MILLISECONDS);

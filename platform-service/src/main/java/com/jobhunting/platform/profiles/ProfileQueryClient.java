@@ -20,6 +20,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.jobhunting.platform.auth.AuthException;
+import com.jobhunting.platform.observability.TraceHeaders;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpStatus;
@@ -122,9 +123,9 @@ public class ProfileQueryClient {
         if (token.isBlank() || !slots.tryAcquire()) throw unavailable();
         CompletableFuture<HttpResponse<byte[]>> pending = null;
         try {
-            var request = HttpRequest.newBuilder(endpoint.resolve(operation)).timeout(Duration.ofMillis(timeoutMs))
+            var request = TraceHeaders.apply(HttpRequest.newBuilder(endpoint.resolve(operation)), requestId).timeout(Duration.ofMillis(timeoutMs))
                     .header("Content-Type", "application/json").header("Accept", "application/json")
-                    .header("X-Internal-Service-Token", token).header("X-Request-ID", requestId).header("X-Trace-Id", requestId)
+                    .header("X-Internal-Service-Token", token)
                     .POST(singleUse(mapper.writeValueAsBytes(payload))).build();
             pending = http.sendAsync(request, ignored -> new BoundedBody());
             var response = pending.get(timeoutMs, TimeUnit.MILLISECONDS);

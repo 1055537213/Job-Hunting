@@ -85,6 +85,12 @@ Java 故障一律失败关闭，不退回 Python Session 数据库路径。
 迁移的账号 API。两端共享 Java Session 和同一个 PostgreSQL，但只有 Java 写认证事实。
 纯 Python 分支的入口和代码不受这个混合路由影响。网关拒绝公网 `/internal/*`。
 
+Java 与 Python 统一使用 W3C `traceparent` 传播上下文，同时保留现有
+`X-Request-ID`/`X-Trace-Id` 兼容关联字段。Java 的 Spring/Micrometer Trace 默认关闭，
+生产通过 `PLATFORM_TRACING_ENABLED=true` 导出到与 Python 相同的 OTLP Collector；日志只
+写 Trace/Span ID、请求 ID、路由和状态，不写 Cookie、账号标识或请求正文。Trace 后端不可用
+不阻断业务请求。
+
 本地使用 `compose.yaml + compose.platform.yaml`，可通过 `hybrid-local` profile 在
 `127.0.0.1:18082` 验收同一分流；生产加载 `compose.yaml`、`compose.prod.yaml` 和
 `compose.hybrid.prod.yaml`；共存部署另加 `compose.coexist.yaml` 与
