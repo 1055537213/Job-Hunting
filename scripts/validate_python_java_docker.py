@@ -271,7 +271,7 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
         assert refunded.json()["recharge_order_id"] == order_id
         assert refunded.json()["replayed"] is False
         assert refunded.json()["refunded_micro_yuan"] == 2_000_000
-        replayed_refund = admin.post(refund_path, json=refund_body)
+        replayed_refund = admin.post(refund_path, json=refund_body, headers=headers)
         assert replayed_refund.status_code == 200
         assert replayed_refund.json()["replayed"] is True
         assert replayed_refund.json()["ledger_entry_id"] == refunded.json()["ledger_entry_id"]
