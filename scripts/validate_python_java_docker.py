@@ -285,8 +285,14 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
         assert any(row["id"] == order_id and row["status"] == "refunded"
                    for row in refunded_order.json()["orders"])
         assert admin.get("/api/admin/balance/events?limit=101").status_code == 422
-        self_path = f"/api/admin/accounts/{login.json()['account']['id']}/balance/credit"
-        assert admin.post(self_path, json={**body, "amount_yuan": "0.000001", "idempotency_key": key + "-self"}, headers=headers).status_code == 200
+        admin_account_id = login.json()["account"]["id"]
+        self_path = f"/api/admin/accounts/{admin_account_id}/balance/credit"
+        self_credit = admin.post(
+            self_path,
+            json={**body, "amount_yuan": "0.000001", "idempotency_key": key + "-self"},
+            headers=headers,
+        )
+        assert self_credit.status_code == 200, self_credit.text[:300]
         listed = admin.get("/api/admin/accounts")
         assert listed.status_code == 200, listed.text[:300]
         safe_fields = {"id", "email", "display_name", "role", "status", "must_change_password",
@@ -297,7 +303,10 @@ def run_admin_billing_gateway_flow(gateway_url: str, user: httpx.Client, credent
         assert usage.status_code == 200 and usage.headers["cache-control"] == "no-store", usage.text[:300]
         assert usage.json()["page_size"] == 100 and usage.json()["max_pages"] == 5
         balance = next(row for row in usage.json()["billing"]["by_account"] if row["account_id"] == account_id)
-        assert balance["balance_micro_yuan"] == 3_000_002
+        assert balance["balance_micro_yuan"] == 3_000_001
+        admin_balance = next(row for row in usage.json()["billing"]["by_account"]
+                             if row["account_id"] == admin_account_id)
+        assert admin_balance["balance_micro_yuan"] == 1
         token_page = admin.get(f"/api/admin/usage/events?account_id={account_id}&limit=1&offset=0")
         assert token_page.status_code == 200 and token_page.json()["max_pages"] == 5
         assert token_page.json()["total"] == 2 and len(token_page.json()["events"]) == 1
