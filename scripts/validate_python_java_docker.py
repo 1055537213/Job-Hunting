@@ -411,6 +411,27 @@ def docker(*args: str) -> str:
     return result.stdout.strip()
 
 
+def dump_container_diagnostics(names: tuple[str, ...], secrets: tuple[str, ...] = ()) -> None:
+    """Print bounded, redacted logs before acceptance cleanup removes containers."""
+
+    print("==> Docker acceptance failure diagnostics (last 200 lines per container)")
+    for name in names:
+        result = subprocess.run(
+            ["docker", "logs", "--tail", "200", name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        output = (result.stdout + result.stderr).strip()
+        for secret in secrets:
+            if secret:
+                output = output.replace(secret, "<redacted>")
+        if len(output) > 12000:
+            output = output[-12000:]
+        print(f"--- {name} ---")
+        print(output or "<no container output>")
+
+
 def run_task_command_flow(gateway_url, web_url, java_url, token, credentials, database_url, worker, broker):
     from job_hunting_agent.config import PlatformAuthSettings
     from job_hunting_agent.platform_auth import PlatformAuthClient
@@ -1070,6 +1091,7 @@ def main() -> None:
     engine = sa.create_engine(base_url, pool_pre_ping=True)
     schema_created = False
     network_created = False
+    acceptance_passed = False
     try:
         with engine.begin() as conn:
             conn.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
@@ -1249,7 +1271,13 @@ def main() -> None:
             finally:
                 docker("rm", "-f", prometheus)
         print("Docker Python-Java account and billing acceptance: PASS")
+        acceptance_passed = True
     finally:
+        if not acceptance_passed:
+            dump_container_diagnostics(
+                (prometheus, gateway, worker, web, java, redis_name, broker),
+                (token, metrics_token, redis_password, container_url, jdbc, password),
+            )
         for name in (prometheus, gateway, worker, web, java, redis_name, broker):
             subprocess.run(
                 ["docker", "rm", "-f", name], capture_output=True, check=False
