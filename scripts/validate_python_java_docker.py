@@ -666,7 +666,9 @@ def run_profile_read_gateway_flow(gateway_url: str, web_url: str, java_url: str,
             assert logged.status_code == 200, logged.text[:200]
             browser.headers["X-CSRF-Token"] = logged.json()["csrf_token"]
             accounts[index] = (accounts[index][0], browser.cookies["job_agent_session"])
-        assert first.get("/api/profiles").json() == {"profiles": []}
+        first_profiles = first.get("/api/profiles")
+        assert first_profiles.status_code == 200, first_profiles.text[:500]
+        assert first_profiles.json() == {"profiles": []}, first_profiles.text[:500]
         body = {"name": "Profile first", "preferred_cities": ["杭州"]}
         intent = {"Idempotency-Key": "profile-create-acceptance"}
         assert httpx.post(gateway_url + "/api/profiles", cookies=first.cookies, json=body).status_code == 403
