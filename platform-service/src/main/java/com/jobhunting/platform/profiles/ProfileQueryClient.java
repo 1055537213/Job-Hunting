@@ -48,11 +48,11 @@ public class ProfileQueryClient {
             @Value("${platform.profiles.python-base-url:http://web:8000}") String baseUrl,
             @Value("${platform.internal-token:}") String token,
             @Value("${platform.profiles.connect-timeout-ms:1000}") int connectMs,
-            @Value("${platform.profiles.read-timeout-ms:2000}") int timeoutMs,
+            @Value("${platform.profiles.read-timeout-ms:5000}") int timeoutMs,
             @Value("${platform.web-security.environment:development}") String environment,
             @Value("${platform.web-security.public-base-url:http://localhost:8000}") String publicBaseUrl) {
         this.endpoint = endpoint(baseUrl, environment, publicBaseUrl);
-        if (connectMs < 1 || connectMs > 1000 || timeoutMs < 1 || timeoutMs > 2000
+        if (connectMs < 1 || connectMs > 1000 || timeoutMs < 1 || timeoutMs > 10000
                 || token.chars().anyMatch(c -> c < 33 || c > 126)
                 || ("production".equalsIgnoreCase(environment.strip()) && token.length() < 32)) {
             throw new IllegalArgumentException("Invalid profile callback settings");

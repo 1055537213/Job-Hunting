@@ -53,7 +53,7 @@ platform:
   profiles:
     python-base-url: ${PLATFORM_PROFILES_PYTHON_BASE_URL:http://web:8000}
     connect-timeout-ms: ${PLATFORM_PROFILES_CONNECT_TIMEOUT_MS:1000}
-    read-timeout-ms: ${PLATFORM_PROFILES_READ_TIMEOUT_MS:2000}
+    read-timeout-ms: ${PLATFORM_PROFILES_READ_TIMEOUT_MS:5000}
   observability:
     python-base-url: ${PLATFORM_OBSERVABILITY_PYTHON_BASE_URL:http://web:8000}
     connect-timeout-ms: ${PLATFORM_OBSERVABILITY_CONNECT_TIMEOUT_MS:1000}
