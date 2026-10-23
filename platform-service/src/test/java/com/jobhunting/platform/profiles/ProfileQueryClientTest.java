@@ -270,7 +270,7 @@ class ProfileQueryClientTest {
                     .isInstanceOf(IllegalArgumentException.class).hasMessageNotContaining("private@");
         }
         assertThatCode(() -> new ProfileQueryClient(mapper, "http://web:8000", token, 1000, 2000, "production", "https://public.example.com")).doesNotThrowAnyException();
-        assertThatCode(() -> new ProfileQueryClient(mapper, "http://web:8000", token, 1000, 5000, "production", "https://public.example.com")).doesNotThrowAnyException();
+        assertThatCode(() -> new ProfileQueryClient(mapper, "http://web:8000", token, 1000, 10000, "production", "https://public.example.com")).doesNotThrowAnyException();
         assertThatThrownBy(() -> new ProfileQueryClient(mapper, origin, "short", 1000, 2000, "production", "https://public.example.com")).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> client(10001)).isInstanceOf(IllegalArgumentException.class);
     }

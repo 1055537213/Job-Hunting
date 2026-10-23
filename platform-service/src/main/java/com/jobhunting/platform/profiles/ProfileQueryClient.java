@@ -48,7 +48,9 @@ public class ProfileQueryClient {
             @Value("${platform.profiles.python-base-url:http://web:8000}") String baseUrl,
             @Value("${platform.internal-token:}") String token,
             @Value("${platform.profiles.connect-timeout-ms:1000}") int connectMs,
-            @Value("${platform.profiles.read-timeout-ms:5000}") int timeoutMs,
+            // The Python callback performs a nested Java account lookup with its own
+            // five-second deadline, so the outer profile request needs a larger budget.
+            @Value("${platform.profiles.read-timeout-ms:10000}") int timeoutMs,
             @Value("${platform.web-security.environment:development}") String environment,
             @Value("${platform.web-security.public-base-url:http://localhost:8000}") String publicBaseUrl) {
         this.endpoint = endpoint(baseUrl, environment, publicBaseUrl);
