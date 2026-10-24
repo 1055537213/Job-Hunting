@@ -1157,6 +1157,12 @@ def main() -> None:
     broker = f"{prefix}-broker"
     worker = f"{prefix}-worker"
     redis_password = os.urandom(24).hex()
+
+    def reset_scenario_limits():
+        # Only this run's randomly named protection Redis, never the broker or application Redis.
+        # Independent scenarios must not consume one another's IP authentication budget.
+        docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
+
     base_url = os.environ.get("JOB_AGENT_TEST_DATABASE_URL", DEFAULT_DATABASE_URL)
     isolated_url = schema_database_url(base_url, schema)
     container_url = (
@@ -1298,31 +1304,33 @@ def main() -> None:
         run_browser_gateway_flow(f"http://127.0.0.1:{args.port + 2}",
                                  f"http://127.0.0.1:{args.port + 1}",
                                  f"http://127.0.0.1:{args.port}", token, web, admin_credentials, isolated_url)
+        reset_scenario_limits()
         run_profile_read_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                       f"http://127.0.0.1:{args.port}", token, web, java)
+        reset_scenario_limits()
         run_chat_session_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                       f"http://127.0.0.1:{args.port}", token, web, java, isolated_url)
+        reset_scenario_limits()
         docker("run", "-d", "--name", worker, *common, *env_args, args.ai_image,
                "job-agent-worker", "--concurrency", "1", "--log-level", "WARNING")
         run_task_command_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                               f"http://127.0.0.1:{args.port}", token, admin_credentials, isolated_url, worker, broker)
+        reset_scenario_limits()
         run_profile_deletion_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                           f"http://127.0.0.1:{args.port}", token, worker, broker, isolated_url)
-        # This randomly named Redis belongs only to this test. Give the limiter stage
-        # its own empty window, independent of preceding browser/Worker acceptance traffic.
-        docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
+        reset_scenario_limits()
         run_account_profile_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                          f"http://127.0.0.1:{args.port}", token, web, isolated_url, admin_credentials[0])
-        docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
+        reset_scenario_limits()
         run_account_export_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                         f"http://127.0.0.1:{args.port}", token, web, isolated_url)
-        docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
+        reset_scenario_limits()
         run_account_deletion_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                           f"http://127.0.0.1:{args.port}", token, web, worker, broker, isolated_url, admin_credentials)
-        docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
+        reset_scenario_limits()
         run_observability_gateway_flow(f"http://127.0.0.1:{args.port + 2}",
                                       f"http://127.0.0.1:{args.port + 1}", token, admin_credentials)
-        docker("exec", redis_name, "redis-cli", "--no-auth-warning", "-a", redis_password, "-n", "1", "FLUSHDB")
+        reset_scenario_limits()
         run_java_security_flow(f"http://127.0.0.1:{args.port}", token, admin_credentials, redis_name)
         run_java_ingress_flow(f"http://127.0.0.1:{args.port}", metrics_token, token)
         with tempfile.TemporaryDirectory(prefix="job-agent-prometheus-") as scratch:
