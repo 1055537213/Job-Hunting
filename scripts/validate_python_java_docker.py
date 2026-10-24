@@ -850,6 +850,86 @@ def run_chat_session_gateway_flow(gateway_url: str, web_url: str, java_url: str,
     print("==> Java chat-session entry -> Python-owned history/create/archive/delete -> scope/CSRF/redaction/in-flight guard -> outages/recovery/revocation: PASS")
 
 
+def run_chat_message_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
+                                   web: str, java: str, model: str, database_url: str) -> None:
+    """Real Agent/tools/billing with a private deterministic provider, never a paid model."""
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+    from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
+    email = f"chat-message-{os.urandom(10).hex()}@example.com"
+    password = "chat-message-acceptance-password"
+    owner = auth.register_account(email=email, password=password, display_name="Chat messages",
+                                  email_verified=True, consents=[]).account_id
+    store = SQLAlchemyStore(database_url)
+    def model_stats():
+        return json.loads(docker("exec", model, "python", "-c",
+            "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8099/stats').read().decode())"))
+    try:
+        with httpx.Client(base_url=gateway_url, timeout=40) as browser:
+            login = browser.post("/api/auth/login", json={"email": email, "password": password})
+            assert login.status_code == 200, login.text[:300]
+            browser.headers["X-CSRF-Token"] = login.json()["csrf_token"]
+            candidate = browser.post("/api/profiles", json={"name": "Chat message scope"}).json()["candidate_id"]
+            key = browser.post("/api/chat/sessions", json={"candidate_id": candidate}).json()["session"]["session_id"]
+            body = {"candidate_id": candidate, "session_id": key, "message": "acceptance-update", "auto_rag": False}
+            before = model_stats()
+            assert httpx.post(gateway_url + "/api/chat", cookies=browser.cookies, json=body).status_code == 403
+            assert browser.post("/internal/v1/chat/invoke", json={}).status_code == 404
+            for origin in (web_url, java_url):
+                assert httpx.post(origin + "/internal/v1/chat/invoke", json={**body, "session_token": browser.cookies["job_agent_session"]}).status_code == 401
+            failed = browser.post("/api/chat", json=body)
+            assert failed.status_code == 402 and failed.json()["detail"] == "余额不足，请先充值后重试。", failed.text[:500]
+            assert model_stats() == before
+            assert store.list_chat_messages(candidate, key, account_id=owner) == []
+            credit = browser.post("/api/me/balance/recharge", json={"amount_yuan": 1, "idempotency_key": os.urandom(16).hex()})
+            assert credit.status_code == 200, credit.text[:300]
+            response = browser.post("/api/chat", json=body, headers={"X-Request-ID": "chat-message-acceptance"})
+            assert response.status_code == 200, response.text[:500]
+            result = response.json()
+            assert response.headers["x-request-id"] == "chat-message-acceptance" and response.headers["cache-control"] == "no-store"
+            assert result["profile"]["preferred_cities"] == ["上海"]
+            assert re.fullmatch(r"[a-f0-9]{32}", result["task_trace"]["root_request_id"]) and result["task_trace"]["steps"]
+            assert set(result) == {"mode", "reply", "display_reply", "task_trace", "background_tasks", "profile"}
+            assert model_stats().get("update", 0) - before.get("update", 0) == 2
+            assert len(store.list_chat_messages(candidate, key, account_id=owner)) == 2
+            charges = [entry for entry in store.list_account_balance_ledger(owner) if entry.entry_kind == "consumption"]
+            assert len(charges) == 1 and charges[0].token_count == 160, str(charges)
+            assert store.get_account_balance_summary(owner).total_consumed_micro_yuan == 4000
+            repeated_trace = browser.post("/api/chat", json={**body, "message": "acceptance-plain"},
+                headers={"X-Request-ID": "chat-message-acceptance"})
+            assert repeated_trace.status_code == 200, repeated_trace.text[:300]
+            charges = [entry for entry in store.list_account_balance_ledger(owner) if entry.entry_kind == "consumption"]
+            assert len(charges) == 2 and len({e.source_reference for e in charges}) == 2, str(charges)
+            assert store.get_account_balance_summary(owner).total_consumed_micro_yuan == 6000
+            before_failure = model_stats().get("failure", 0)
+            failure = browser.post("/api/chat", json={**body, "message": "acceptance-failure"})
+            assert failure.status_code == 502 and "private-model-error" not in failure.text, failure.text[:300]
+            assert model_stats().get("failure", 0) == before_failure + 1
+            assert len(store.list_chat_messages(candidate, key, account_id=owner)) == 4
+            assert len([e for e in store.list_account_balance_ledger(owner) if e.entry_kind == "consumption"]) == 2
+            for container, health, origin in ((web, web_url + "/api/health", gateway_url),
+                                              (java, java_url + "/actuator/health", web_url)):
+                try:
+                    docker("stop", "--time", "1", container)
+                    failure = httpx.post(origin + "/api/chat", cookies=browser.cookies,
+                        headers={"X-CSRF-Token": browser.headers["X-CSRF-Token"]}, json=body, timeout=20)
+                    assert failure.status_code == 503 and failure.json()["code"] == "CHAT_EXECUTION_UNCONFIRMED", failure.text[:300]
+                finally:
+                    docker("start", container)
+                    wait(health)
+            assert len(store.list_chat_messages(candidate, key, account_id=owner)) == 4
+            assert browser.post("/api/chat", json={**body, "message": "我的首选城市改为北京", "use_env_llm": False}).json()["profile"]["preferred_cities"] == ["北京"]
+            compat = httpx.post(web_url + "/api/chat", cookies=browser.cookies, json={**body,
+                "message": "我的首选城市改为上海", "use_env_llm": False}, timeout=30)
+            assert compat.status_code == 200 and compat.json()["profile"]["preferred_cities"] == ["上海"], compat.text[:300]
+            auth.session("logout", session_token=browser.cookies["job_agent_session"])
+            assert browser.post("/api/chat", json=body).status_code == 401
+    finally:
+        store.close()
+    print("==> Java chat entry -> real Python Agent/tool -> profile/history/160 provider tokens -> one Java charge; zero-balance/CSRF/failure/outages/recovery/revocation: PASS")
+
+
 def run_profile_deletion_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
                                       worker: str, broker: str, database_url: str) -> None:
     from job_hunting_agent.config import PlatformAuthSettings
@@ -1156,6 +1236,7 @@ def main() -> None:
     redis_name = f"{prefix}-redis"
     broker = f"{prefix}-broker"
     worker = f"{prefix}-worker"
+    model = f"{prefix}-chat-model"
     redis_password = os.urandom(24).hex()
 
     def reset_scenario_limits():
@@ -1197,6 +1278,10 @@ def main() -> None:
         docker("run", "-d", "--name", broker, "--network", prefix,
                "--network-alias", "task-broker", "redis:7.4-alpine",
                "redis-server", "--requirepass", redis_password)
+        root = Path(__file__).resolve().parents[1]
+        docker("run", "-d", "--name", model, "--network", prefix, "--network-alias", "chat-model",
+               "--mount", f"type=bind,source={root / 'tests/fixtures/chat_completion_server.py'},target=/tmp/chat_completion_server.py,readonly",
+               args.ai_image, "python", "/tmp/chat_completion_server.py")
         docker(
             "run",
             "--rm",
@@ -1272,6 +1357,13 @@ def main() -> None:
             "JOB_AGENT_JAVA_BILLING_BASE_URL": "http://platform-service:8081",
             "JOB_AGENT_JAVA_AUTH_INTERNAL_TOKEN": token,
             "JOB_AGENT_JAVA_BILLING_INTERNAL_TOKEN": token,
+            "JOB_AGENT_LLM_PROVIDER": "acceptance",
+            "JOB_AGENT_LLM_MODEL": "acceptance-chat",
+            "JOB_AGENT_LLM_API_KEY": "local-fixture-only",
+            "JOB_AGENT_LLM_BASE_URL": "http://chat-model:8099/v1",
+            "JOB_AGENT_LLM_TIMEOUT_SECONDS": "10",
+            "JOB_AGENT_MODEL_GATEWAY_CHAT_MAX_RETRIES": "0",
+            "JOB_AGENT_INTENT_ROUTER_ENABLED": "false",
         }
         env_args = [
             arg for key, value in settings.items() for arg in ("-e", f"{key}={value}")
@@ -1310,6 +1402,9 @@ def main() -> None:
         reset_scenario_limits()
         run_chat_session_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                       f"http://127.0.0.1:{args.port}", token, web, java, isolated_url)
+        reset_scenario_limits()
+        run_chat_message_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                                      f"http://127.0.0.1:{args.port}", token, web, java, model, isolated_url)
         reset_scenario_limits()
         docker("run", "-d", "--name", worker, *common, *env_args, args.ai_image,
                "job-agent-worker", "--concurrency", "1", "--log-level", "WARNING")
@@ -1364,10 +1459,10 @@ def main() -> None:
     finally:
         if not acceptance_passed:
             dump_container_diagnostics(
-                (prometheus, gateway, worker, web, java, redis_name, broker),
+                (prometheus, gateway, worker, web, java, redis_name, broker, model),
                 (token, metrics_token, redis_password, container_url, jdbc, password),
             )
-        for name in (prometheus, gateway, worker, web, java, redis_name, broker):
+        for name in (prometheus, gateway, worker, web, java, redis_name, broker, model):
             subprocess.run(
                 ["docker", "rm", "-f", name], capture_output=True, check=False
             )

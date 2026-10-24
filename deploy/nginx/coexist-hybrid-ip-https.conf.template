@@ -105,6 +105,19 @@ server {
         proxy_read_timeout 5s;
     }
 
+    location = /api/chat {
+        error_page 418 = @python_task_write;
+        if ($request_method != POST) { return 418; }
+        proxy_pass http://platform-service:8081;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_cache off;
+        proxy_next_upstream off;
+        proxy_read_timeout 330s;
+    }
+
     location ~ ^/api/chat/(sessions(/[^/]+(/archive)?)?|history)$ {
         error_page 418 = @python_task_write;
         if ($request_method !~ ^(GET|POST|DELETE)$) { return 418; }

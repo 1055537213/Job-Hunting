@@ -8,6 +8,7 @@
 """
 
 import warnings
+from types import SimpleNamespace
 from io import BytesIO
 
 from docx import Document
@@ -15,13 +16,53 @@ from langchain_core.language_models.fake_chat_models import (
     FakeListChatModel,
     FakeMessagesListChatModel,
 )
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
 from pydantic import Field
 
 from job_hunting_agent.agent import JobHuntingAgent, tool_message_to_output
 from job_hunting_agent.app import JobHuntingApp
 from job_hunting_agent.config import AgentMemorySettings
 from job_hunting_agent.models import CandidateProfileInput
+
+
+def test_agent_sums_independent_model_calls_without_recounting_cumulative_chunks():
+    def chunk(total, *, step, message_id="provider-reused-id"):
+        return AIMessageChunk(content="", id=message_id, usage_metadata={
+            "input_tokens": total - 20, "output_tokens": 20, "total_tokens": total}), {
+                "langgraph_step": step, "langgraph_node": "model"}
+    cases = [
+        ([chunk(80, step=1), chunk(80, step=3)], 160),
+        ([chunk(40, step=1), chunk(80, step=1), chunk(80, step=1)], 80),
+        ([chunk(80, step=1, message_id="first"), chunk(80, step=3, message_id="second")], 160),
+        ([(AIMessage(content="Done", usage_metadata={"input_tokens": 60, "output_tokens": 20, "total_tokens": 80}),
+            {"langgraph_step": 1, "langgraph_node": "model"})], 80),
+    ]
+    for events, total in cases:
+        agent = object.__new__(JobHuntingAgent)
+        agent.graph = SimpleNamespace(stream=lambda *args, **kwargs: iter(events))
+        agent.tool_llm_available = False
+        _, _, _, usage = agent._collect_main_agent_stream([], account_id=1, candidate_id=1,
+            session_id="test", use_tool_llm=False, auto_rag=False, root_request_id="usage-test")
+        assert usage["total_tokens"] == total
+
+
+def test_stream_and_nonstream_count_both_model_calls():
+    app = JobHuntingApp()
+    app.initialize()
+    agent = JobHuntingAgent(app, model=ToolCallingFakeChatModel(responses=[AIMessage(content="Unused")]),
+        memory_settings=AgentMemorySettings(enabled=False))
+    def events(*args, **kwargs):
+        for step in (1, 3):
+            yield AIMessageChunk(content="Done", id="provider-reused-id", usage_metadata={
+                "input_tokens": 60, "output_tokens": 20, "total_tokens": 80}), {
+                    "langgraph_step": step, "langgraph_node": "model"}
+    agent.graph = SimpleNamespace(stream=events)
+    try:
+        assert agent.chat("Hello", candidate_id=None, auto_rag=False).usage["total_tokens"] == 160
+        result = list(agent.stream_chat("Hello", candidate_id=None, auto_rag=False))[-1]
+        assert result["type"] == "final" and result["result"].usage["total_tokens"] == 160
+    finally:
+        app.store.close()
 
 
 def test_tool_message_error_status_is_preserved_for_task_audit() -> None:

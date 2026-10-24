@@ -159,7 +159,7 @@ public class ProfileQueryClient {
         }
     }
 
-    private static void validateProfile(JsonNode row) {
+    public static void validateProfile(JsonNode row) {
         if (!fields(row, FIELDS) || !id(row.get("id"))) throw unavailable();
         for (String key : List.of("name", "status", "education")) if (!row.get(key).isTextual()) throw unavailable();
         if (!number(row.get("experience_years"))) throw unavailable();

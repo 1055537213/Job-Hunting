@@ -594,6 +594,9 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
         assert "reverse_proxy @profile_reads platform-service:8081" in edge
         assert "reverse_proxy @profile_create platform-service:8081" in edge
         assert "reverse_proxy @profile_delete platform-service:8081" in edge
+        assert "reverse_proxy @chat_message platform-service:8081" in edge
+        assert "response_header_timeout 330s" in edge
+        assert "path_regexp chatManagement ^/api/chat/(sessions(/[^/]+(/archive)?)?|history)$" in edge
         assert "path_regexp profileDelete ^/api/profiles/[^/]+$" in edge
         assert "path /api/profiles" in edge
         assert "path /api/account/delete" in edge
@@ -636,6 +639,8 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
     assert "location ~ ^/api/profiles/[^/]+$" in nginx
     assert 'if ($request_method !~ ^(GET|DELETE)$) { return 418; }' in nginx
     assert "location = /api/account/delete" in nginx
+    assert "location = /api/chat {" in nginx and "proxy_next_upstream off;" in nginx
+    assert "proxy_read_timeout 330s;" in nginx
     assert 'if ($request_method != PATCH) { return 418; }' in nginx
     assert "location = /api/me/balance" in nginx
     assert "location = /api/me/recharge/orders" in nginx

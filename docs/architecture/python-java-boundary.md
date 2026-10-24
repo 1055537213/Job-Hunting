@@ -434,8 +434,46 @@ Python 再验证同一 Session，从真实账号确定档案/职位/会话范围
 会话删除保留 Token/账务流水，不影响档案事实。失败返回显式错误，禁止伪装空列表或回退本地数据。
 
 本地、生产 Caddy 和共存 Nginx 同步分流，会话回调默认连接 web:8000，
-Compose 自动设置连接地址，无需新增手填配置或数据库迁移。模型聊天 `/api/chat`、SSE、RAG、
-对话摘要与 Worker 继续由 Python 执行。本分支只在本地隔离 Docker 验证。
+Compose 自动设置连接地址，无需新增手填配置或数据库迁移。SSE、RAG、
+对话摘要与 Worker 继续由 Python 执行，普通聊天入口见下节。本分支只在本地隔离 Docker 验证。
+
+## 普通聊天入口
+
+`POST /api/chat` 在本地/生产混合 Caddy 和共存 Nginx 中按精确路径进入 Java；
+`/api/chat/stream` 暂不分流，保持 Python SSE 行为。Java 校验真实 Session、CSRF、请求字段，
+使用 Redis 的独立 model 限流组，按 IP 和账号分别计数。
+`JOB_AGENT_RATE_LIMIT_MODEL_REQUESTS` 沿用默认每 60 秒 60 次；窗口仍由原窗口配置控制。
+Java 鉴权结束后调用 Python `/internal/v1/chat/invoke`，不持有数据库事务等待模型。
+Python 公开 `/api/chat` 在混合模式仅调用 Java 同名内部兼容入口，禁止本地执行回退。
+
+两端内部入口必须携带服务令牌和真实 Session。Python 再验证 Session、档案和会话归属，
+复用唯一 `execute_chat`，保留 Agent、工具、RAG、低敏任务轨迹、历史落库和原有 Java 扣费链路。
+输入只接受 candidate_id、message、session_id、use_env_llm、auto_rag，禁止指定 account_id；
+message 最多 16000 个 Unicode 字符，ID 必须为正整数，布尔标志不接受字符串。
+响应仍为 mode、reply、display_reply、task_trace、background_tasks、profile 六字段。
+内部包装另含 account_id、session_id；Java 校验真实账号、会话、档案 ID 和嵌套字段白名单后剥离包装。
+HTTP 请求 ID 贯穿 Java/Python 传输日志；Java 为每次聊天独立生成随机 execution_id，
+作为 Agent root_request_id 关联工具和账务。Python 日志记录两者映射，但不记录正文或会话令牌。
+禁止把可重复的客户端请求 ID 作为账务幂等键；相同追踪 ID 的两次独立聊天必须分别结算。
+
+回调共用最多 8 个本机槽位，连接期限 1 秒；普通聊天完整响应期限最多 300 秒（会话管理仍为 10 秒），
+响应上限 4 MiB。Python 兼容转发读取超时 310 秒，网关响应等待 330 秒。应用传输不重试、不跟随重定向，
+共存 Nginx 显式关闭下一上游重试；模型 SDK 自身的单次调用重试策略保持原配置，不等于重放整个聊天命令。
+客户端断开或 Java 超时不代表 Python 工作已经取消；执行线程继续持有账号工作锁，
+直到工具、消息和结算处理结束，防止注销/删除与迟到写入交错。普通聊天尚不提供幂等请求或强制取消。
+超时、断链、非法回包等不确定结果返回 503/CHAT_EXECUTION_UNCONFIRMED，
+提示先查看历史记录，不能自动重试或把结果显示成成功；没有 Retry-After 自动重发暗示。
+模型异常返回脱敏 502；工具可能已产生副作用，需先检查历史与档案。余额不足明确返回
+402/INSUFFICIENT_BALANCE 和“余额不足，请先充值后重试。”，不执行模型、不追加成功消息。
+
+契约见 `chat-invocation.openapi.yaml`。隔离 Docker 验收使用私网模拟模型供应商，但运行真实
+LangChain Agent、工具、数据库、网关、Java 鉴权和结算；验证一次工具更新、两条历史、
+供应商 160 Token 只生成一笔消费以及零余额拒绝、依赖故障恢复。模拟供应商不打包进产品镜像，
+不使用真实模型密钥或现有账号数据。无数据库迁移、无需新增手填项；本轮不部署服务器。
+
+验收同时修复原有整轮 Token 取最大值的问题：同一个模型执行步骤内的累计 usage 仍取最大，
+不同 LangGraph 模型步骤的用量相加，普通和 SSE 路径共享该规则。
+例如两次各 80 Token 的模型调用应按 160 Token 结算，而不是只记录 80。
 
 ## Java 安全入口准备阶段（历史记录）
 

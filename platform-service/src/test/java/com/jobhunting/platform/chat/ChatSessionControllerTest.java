@@ -28,10 +28,12 @@ class ChatSessionControllerTest {
                 new AccountAdministrationService.AccountView(42L,"owner@example.com","Owner","user","active",false,null,null,"now","now")));
         var result = mapper.createObjectNode(); result.putArray("sessions");
         when(python.execute(anyString(), eq("real-session"), eq(42L), any(), anyString())).thenReturn(result);
+        when(python.invoke(eq("real-session"), eq(42L), any(), anyString())).thenReturn(mapper.createObjectNode().put("reply", "Done"));
         var filter = new WebSecurityFilter(accounts, limiter,
             new WebSecuritySettings(true,"development",true,false,"http://localhost:8000","test:chat",60,20,120,120,240),
             mapper,new SimpleMeterRegistry(),new ClientAddressResolver(""));
-        mvc = standaloneSetup(new ChatSessionController(accounts, python, new InternalTokenVerifier("service-secret"), mapper))
+        mvc = standaloneSetup(new ChatSessionController(accounts, python, new InternalTokenVerifier("service-secret"), mapper),
+                new ChatMessageController(accounts, python, new InternalTokenVerifier("service-secret")))
             .setControllerAdvice(new PublicAuthErrorHandler()).addFilter(filter,"/api/*").build();
     }
     @Test void sessionAndCsrfAreRequiredBeforeCallingPython() throws Exception {
@@ -68,5 +70,39 @@ class ChatSessionControllerTest {
         verifyNoInteractions(python);
         mvc.perform(post("/internal/v1/chat/sessions/list").header("X-Internal-Service-Token","service-secret")
             .contentType("application/json").content(body)).andExpect(status().isOk());
+    }
+    @Test void messagesRequireSessionCsrfAndModelRateBudgetBeforeExecution() throws Exception {
+        String body = "{\"candidate_id\":7,\"message\":\"Hello\"}";
+        mvc.perform(post("/api/chat").contentType("application/json").content(body)).andExpect(status().isUnauthorized());
+        mvc.perform(post("/api/chat").cookie(session).contentType("application/json").content(body)).andExpect(status().isForbidden());
+        verifyNoInteractions(python);
+        mvc.perform(post("/api/chat").cookie(session, csrf).header("X-CSRF-Token","csrf").header("X-Request-ID","message-trace")
+                .contentType("application/json").content(body)).andExpect(status().isOk()).andExpect(header().string("Cache-Control","no-store"));
+        verify(python).invoke(eq("real-session"), eq(42L), argThat(v -> v.path("use_env_llm").asBoolean() && v.path("auto_rag").asBoolean()
+            && !v.has("account_id") && v.path("message").asText().equals("Hello")), eq("message-trace"));
+        when(limiter.check(anyString(),eq("model"))).thenReturn(7L);
+        mvc.perform(post("/api/chat").cookie(session, csrf).header("X-CSRF-Token","csrf").contentType("application/json").content(body))
+            .andExpect(status().isTooManyRequests()).andExpect(header().string("Retry-After","7"));
+        verify(python, times(1)).invoke(anyString(), anyLong(), any(), anyString());
+    }
+    @Test void invalidMessagesCannotInjectAnOwnerOrExecuteThroughInternalEndpoint() throws Exception {
+        for (String body : new String[]{"{\"candidate_id\":true,\"message\":\"Hello\"}", "{\"candidate_id\":7,\"message\":\"   \"}",
+                "{\"candidate_id\":7,\"message\":\"Hello\",\"account_id\":99}", "{\"candidate_id\":7,\"message\":\"Hello\",\"auto_rag\":\"false\"}",
+                "{\"candidate_id\":7,\"message\":\"" + "x".repeat(16001) + "\"}"})
+            mvc.perform(post("/api/chat").cookie(session, csrf).header("X-CSRF-Token","csrf").contentType("application/json").content(body))
+                .andExpect(status().isUnprocessableContent());
+        String internal = "{\"session_token\":\"real-session\",\"candidate_id\":7,\"message\":\"Hello\"}";
+        mvc.perform(post("/internal/v1/chat/invoke").contentType("application/json").content(internal)).andExpect(status().isUnauthorized());
+        verifyNoInteractions(python);
+        mvc.perform(post("/internal/v1/chat/invoke").header("X-Internal-Service-Token","service-secret").contentType("application/json").content(internal))
+            .andExpect(status().isOk());
+    }
+    @Test void ambiguousMessagesHaveNoRetryHintOrSuccessfulEmptyResponse() throws Exception {
+        when(python.invoke(anyString(),anyLong(),any(),anyString())).thenThrow(ChatSessionClient.unconfirmed());
+        mvc.perform(post("/api/chat").cookie(session,csrf).header("X-CSRF-Token","csrf").contentType("application/json")
+                .content("{\"candidate_id\":7,\"message\":\"Hello\"}"))
+            .andExpect(status().isServiceUnavailable()).andExpect(jsonPath("$.code").value("CHAT_EXECUTION_UNCONFIRMED"))
+            .andExpect(header().doesNotExist("Retry-After"));
+        verify(python,times(1)).invoke(anyString(),anyLong(),any(),anyString());
     }
 }

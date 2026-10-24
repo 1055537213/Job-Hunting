@@ -51,6 +51,7 @@ from .account_export import encode_export
 from .account_work import AccountWorkBusy, AccountWorkDenied, AccountWorkRoute, AccountWorkStreamingResponse
 from .profile_query import MAX_PROFILE_CREATE_BYTES, encode_callback, validate_creation, validate_deletion
 from .chat_session_query import MAX_CHAT_BYTES, valid_session_key, validate_chat_projection
+from .chat_reply import CHAT_UNCONFIRMED_MESSAGE, validate_reply
 from .account_lifecycle import (
     AccountEmailSender,
     action_token_hash,
@@ -154,7 +155,7 @@ from .rag import RAGProviderRequestError
 from .rate_limiting import RateLimiter
 from .resume_document import MAX_RESUME_FILE_BYTES, ResumeDocumentError
 from .skill_normalization import normalize_skill_mapping
-from .storage import AccountEmailRequestSuppressed, IdempotencyConflictError, ProfileCreateConflict
+from .storage import AccountEmailRequestSuppressed, IdempotencyConflictError, ProfileCreateConflict, InsufficientBalanceError
 from .task_queue import (
     ACCOUNT_DELETION_TASK_TYPE,
     AccountEmailQueue,
@@ -316,6 +317,20 @@ class ChatPayload(BaseModel):
     use_env_llm: bool = True
     auto_rag: bool = True
     session_id: str | None = None
+
+
+class ChatInvokePayload(ChatPayload):
+    model_config = ConfigDict(extra="forbid")
+    candidate_id: int = Field(strict=True, gt=0, le=2**63-1)
+    message: str = Field(strict=True, min_length=1, max_length=16000, repr=False)
+    use_env_llm: bool = Field(default=True, strict=True)
+    auto_rag: bool = Field(default=True, strict=True)
+    session_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,128}$")
+
+
+class InternalChatInvokePayload(ChatInvokePayload):
+    session_token: str = Field(min_length=1, max_length=128, repr=False)
+    execution_id: str = Field(default_factory=lambda: uuid.uuid4().hex, pattern=r"^[a-f0-9]{32}$")
 
 
 class JobPayload(BaseModel):
@@ -1267,7 +1282,7 @@ def create_web_app(
 
     @web_app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error: RequestValidationError):
-        if request.url.path == "/api/profiles" and request.method == "POST":
+        if request.url.path in {"/api/profiles", "/api/chat", "/internal/v1/chat/invoke"} and request.method == "POST":
             return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
         if (request.url.path in {"/internal/v1/accounts/export", "/internal/v1/profiles/query", "/internal/v1/profiles/create", "/internal/v1/profiles/delete"}
                 or request.url.path.startswith("/internal/v1/chat/sessions/")):
@@ -2008,24 +2023,20 @@ def create_web_app(
         account = current_account(request)
         return chat_operation("delete", account.id, session_id=session_id)
 
-    @web_app.post("/api/chat")
-    def chat(payload: ChatPayload, request: Request) -> dict[str, object]:
+    def execute_chat(payload: ChatPayload, account_id: int, root_request_id: str | None = None) -> dict[str, object]:
         """处理网页聊天消息。
 
         - 开启 Agent 时：执行标准 LangChain Agent 对话。
         - 关闭 Agent 时：回退到原有“对话式自动入库”规则链路。
         """
 
-        account = current_account(request)
-        assert account is not None
-        account_id = account.id
         get_profile_or_404(backend, payload.candidate_id, account_id)
         user_message = payload.message.strip()
         session_id = payload.session_id or default_web_session_id(payload.candidate_id, account_id)
         validate_chat_session(account_id, payload.candidate_id, session_id)
         if not user_message:
             raise HTTPException(status_code=400, detail="消息不能为空。")
-        root_request_id = uuid.uuid4().hex
+        root_request_id = root_request_id or uuid.uuid4().hex
         trace_started_at = time.monotonic()
 
         if payload.use_env_llm:
@@ -2047,6 +2058,8 @@ def create_web_app(
                     account_id=account_id,
                     root_request_id=root_request_id,
                 )
+            except (InsufficientBalanceError, PlatformBillingUnavailableError):
+                raise
             except ConcurrencyLimitExceeded as error:
                 raise HTTPException(
                     status_code=429,
@@ -2169,6 +2182,79 @@ def create_web_app(
             "background_tasks": [],
             "profile": asdict(backend.get_candidate_profile(payload.candidate_id, account_id=account_id)),
         }
+
+    @web_app.post("/api/chat")
+    def chat(payload: ChatInvokePayload, request: Request):
+        if backend.platform_auth_client is not None:
+            try:
+                result = backend.platform_auth_client.chat_invoke(request.cookies.get(SESSION_COOKIE_NAME),
+                    trace_id=getattr(request.state, "request_id", None), **payload.model_dump())
+                return JSONResponse(result, headers={"Cache-Control": "no-store"})
+            except PlatformAuthError as error:
+                return JSONResponse({"code": error.code, "detail": str(error)}, status_code=error.status_code or 503,
+                    headers={"Cache-Control": "no-store"})
+        account = current_account(request)
+        try:
+            return execute_chat(payload, account.id)
+        except InsufficientBalanceError:
+            raise HTTPException(402, "余额不足，请先充值后重试。") from None
+
+    def build_internal_chat_reply(payload, trace_id):
+        if not chat_callbacks.acquire(blocking=False):
+            raise AccountWorkBusy()
+        try:
+            resolved = backend.platform_auth_client.account("me", session_token=payload.session_token, trace_id=trace_id)
+            owner = platform_account_record(resolved["account"]).id
+            # The execution thread owns the lease until persistence/settlement completes,
+            # even when the HTTP caller times out. Never retry an ambiguous chat command.
+            with backend.store.account_work.acquire(owner):
+                web_logger.info("Chat execution accepted request_id=%s execution_id=%s", trace_id, payload.execution_id)
+                result = execute_chat(payload, owner, payload.execution_id)
+                validate_reply(result, payload.candidate_id)
+                key = payload.session_id or default_web_session_id(payload.candidate_id, owner)
+                body = json.dumps({"account_id": owner, "session_id": key, "result": result},
+                    ensure_ascii=False, allow_nan=False).encode("utf-8")
+                if len(body) > MAX_CHAT_BYTES:
+                    raise ValueError("Chat reply exceeds transport budget")
+                return body
+        finally:
+            chat_callbacks.release()
+
+    @web_app.post("/internal/v1/chat/invoke", include_in_schema=False)
+    async def internal_chat_invoke(payload: InternalChatInvokePayload, request: Request):
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            return JSONResponse({"code": "INTERNAL_UNAUTHORIZED", "detail": "内部服务认证失败。"}, status_code=401)
+        status, code, detail = 503, "CHAT_EXECUTION_UNCONFIRMED", CHAT_UNCONFIRMED_MESSAGE
+        try:
+            body = await asyncio.to_thread(build_internal_chat_reply, payload, request.headers.get("X-Trace-Id"))
+            return Response(body, media_type="application/json", headers={"Cache-Control": "no-store"})
+        except InsufficientBalanceError:
+            status, code, detail = 402, "INSUFFICIENT_BALANCE", "余额不足，请先充值后重试。"
+        except PlatformAuthError as error:
+            if error.status_code in (401, 403):
+                status, code, detail = error.status_code, "SESSION_EXPIRED" if error.status_code == 401 else "CHAT_SCOPE_DENIED", "登录状态失效或账号不可用。"
+        except (AccountWorkDenied, PermissionError):
+            status, code, detail = 403, "CHAT_SCOPE_DENIED", "账号不可用或无权访问会话。"
+        except AccountWorkBusy:
+            status, code, detail = 409, "CHAT_BUSY", "当前仍有请求执行，请稍后重试。"
+        except HTTPException as error:
+            status = error.status_code
+            code, detail = {
+                400: ("CHAT_NOT_READY", "消息为空或聊天服务未就绪。"),
+                404: ("CHAT_NOT_FOUND", "会话或档案不存在。"),
+                409: ("CHAT_SESSION_ARCHIVED", "该会话已经归档，请新建对话。"),
+                429: ("CHAT_CONCURRENCY_LIMIT", "当前请求较多，请稍后重试。"),
+                502: ("CHAT_MODEL_FAILED", "本次对话未正常完成，请先查看历史记录和档案后再操作。"),
+            }.get(status, ("CHAT_EXECUTION_UNCONFIRMED", CHAT_UNCONFIRMED_MESSAGE))
+            if code == "CHAT_EXECUTION_UNCONFIRMED":
+                status = 503
+        except Exception:  # noqa: BLE001 - never reflect prompts, credentials or upstream model errors.
+            pass
+        return JSONResponse({"code": code, "detail": detail}, status_code=status, headers={"Cache-Control": "no-store"})
 
     @web_app.post("/api/chat/stream")
     def chat_stream(payload: ChatPayload, request: Request) -> StreamingResponse:

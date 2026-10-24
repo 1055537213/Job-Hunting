@@ -1,0 +1,157 @@
+openapi: 3.1.0
+info:
+  title: Non-stream chat entry
+  version: 1.0.0
+  description: >-
+    Java owns browser authentication, CSRF and Redis model-group limits. Python owns
+    Agent execution, tools, RAG and history; Java billing remains unchanged.
+    No redirects or automatic command retries. A lost response does not mean the
+    operation was cancelled: inspect history/profile before sending again.
+    The callback has a 1s connect and 300s whole-response deadline, 4 MiB response
+    limit and 8 shared per-instance chat slots. SSE is NOT migrated by this contract.
+paths:
+  /api/chat:
+    post:
+      security:
+        - session: []
+          csrf: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+      responses:
+        '200':
+          description: >-
+            Existing public six-field reply: mode, reply, display_reply, task_trace,
+            background_tasks, profile. No raw tool outputs, routing metadata or usage.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatReply'
+        '400': {description: Invalid JSON or chat service not ready}
+        '401': {description: Missing/revoked/expired session}
+        '402': {description: 'INSUFFICIENT_BALANCE; 余额不足，请先充值后重试。'}
+        '403': {description: CSRF rejected or disabled account}
+        '404': {description: CHAT_NOT_FOUND; inaccessible profile/session}
+        '409': {description: CHAT_BUSY or CHAT_SESSION_ARCHIVED}
+        '422': {description: INVALID_REQUEST; redacted field validation}
+        '429': {description: Redis model-group limit or model concurrency budget reached}
+        '502': {description: CHAT_MODEL_FAILED; tool side effects may exist; inspect history/profile}
+        '503': {description: CHAT_EXECUTION_UNCONFIRMED or unavailable request protection; no local fallback}
+  /internal/v1/chat/invoke:
+    post:
+      description: >-
+        Service-token protected on both services, blocked at the public gateway.
+        Python compatibility callers invoke Java and receive ChatReply.
+        Java invokes Python using the SAME real session, never a caller-supplied owner.
+        Java adds a fresh random execution_id (32 lowercase hex characters) per call;
+        Python uses this as the Agent/billing root ID, independent of X-Request-ID.
+        Python returns {account_id, session_id, result: ChatReply}; Java checks account,
+        session and candidate scope before stripping the wrapper. No public cookie is
+        substituted for session_token and no transaction spans the callback.
+        Both public and private responses have Cache-Control no-store.
+      security:
+        - serviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InternalRequest'
+      responses:
+        '200':
+          description: Java returns ChatReply; Python returns the scoped callback wrapper
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ChatReply'
+                  - type: object
+                    additionalProperties: false
+                    required: [account_id, session_id, result]
+                    properties:
+                      account_id: {type: integer, minimum: 1}
+                      session_id: {type: string, pattern: '^[A-Za-z0-9_-]{1,128}$'}
+                      result: {$ref: '#/components/schemas/ChatReply'}
+        default:
+          description: >-
+            Safe status/code allowlist. Python callback errors are {code, detail};
+            Java may add message/request_id/trace_id. Never forward raw model exceptions.
+components:
+  securitySchemes:
+    session: {type: apiKey, in: cookie, name: job_agent_session}
+    csrf: {type: apiKey, in: header, name: X-CSRF-Token}
+    serviceToken: {type: apiKey, in: header, name: X-Internal-Service-Token}
+  schemas:
+    ChatRequest:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, message]
+      properties:
+        candidate_id: {type: integer, minimum: 1, maximum: 9223372036854775807}
+        message: {type: string, minLength: 1, maxLength: 16000}
+        session_id: {type: [string, 'null'], pattern: '^[A-Za-z0-9_-]{1,128}$'}
+        use_env_llm: {type: boolean, default: true}
+        auto_rag: {type: boolean, default: true}
+    InternalRequest:
+      type: object
+      additionalProperties: false
+      required: [session_token, candidate_id, message]
+      properties:
+        session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+        execution_id:
+          description: Python callback only; Java compatibility input rejects this server-owned field
+          type: string
+          pattern: '^[a-f0-9]{32}$'
+        candidate_id: {type: integer, minimum: 1, maximum: 9223372036854775807}
+        message: {type: string, minLength: 1, maxLength: 16000}
+        session_id: {type: [string, 'null'], pattern: '^[A-Za-z0-9_-]{1,128}$'}
+        use_env_llm: {type: boolean, default: true}
+        auto_rag: {type: boolean, default: true}
+    ChatReply:
+      type: object
+      additionalProperties: false
+      required: [mode, reply, display_reply, task_trace, background_tasks, profile]
+      properties:
+        mode: {type: string}
+        reply: {type: string}
+        display_reply: {type: string}
+        task_trace:
+          description: >-
+            Null or the existing public trace projection only: version, root_request_id,
+            title, status, duration_ms, steps (id/label/status/summary), approval.
+            Approval exposes kind/record_id/title/message/items(label/value)/
+            confirm_label/cancel_label/status, never raw tool names/arguments/results.
+          type: [object, 'null']
+        background_tasks:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [task_key, task_type, status, progress]
+            properties:
+              task_key: {type: string}
+              task_type: {type: string}
+              status: {type: string}
+              progress: {type: integer}
+        profile:
+          description: Existing CandidateProfile projection, matching the requested candidate_id
+          type: object
+          additionalProperties: false
+          required: [id, name, status, education, experience_years, skills, preferred_cities, acceptable_cities, salary_floor_k, expected_salary_k, target_directions, unacceptable, preference_weights]
+          properties:
+            id: {type: integer, minimum: 1}
+            name: {type: string}
+            status: {type: string}
+            education: {type: string}
+            experience_years: {type: number}
+            skills: {type: object, additionalProperties: {type: string}}
+            preferred_cities: {type: array, items: {type: string}}
+            acceptable_cities: {type: array, items: {type: string}}
+            salary_floor_k: {type: [integer, 'null']}
+            expected_salary_k: {type: [integer, 'null']}
+            target_directions: {type: array, items: {type: string}}
+            unacceptable: {type: array, items: {type: string}}
+            preference_weights: {type: object, additionalProperties: {type: number}}

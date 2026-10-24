@@ -315,6 +315,7 @@ class JobHuntingAgent:
         tool_and_final_messages: list[BaseMessage] = []
         streamed_reply_parts: list[str] = []
         streamed_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        usage_by_call: dict[tuple, dict[str, int]] = {}
         active_tool_names: set[str] = set()
 
         graph_events = None
@@ -345,6 +346,8 @@ class JobHuntingAgent:
                 streamed_message = unpack_stream_message(stream_item)
                 if streamed_message is None:
                     continue
+                if isinstance(streamed_message, AIMessage):
+                    merge_stream_usage(streamed_usage, usage_by_call, stream_item, streamed_message)
 
                 if isinstance(streamed_message, ToolMessage):
                     tool_and_final_messages.append(streamed_message)
@@ -364,7 +367,6 @@ class JobHuntingAgent:
                     continue
 
                 if isinstance(streamed_message, AIMessageChunk):
-                    merge_usage(streamed_usage, extract_usage_metadata(streamed_message))
                     for tool_name in extract_tool_call_names(streamed_message):
                         if tool_name not in active_tool_names:
                             active_tool_names.add(tool_name)
@@ -520,6 +522,7 @@ class JobHuntingAgent:
         messages: list[BaseMessage] = []
         reply_parts: list[str] = []
         usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        usage_by_call: dict[tuple, dict[str, int]] = {}
         try:
             for stream_item in self.graph.stream(
                 {"messages": turn_messages},
@@ -542,8 +545,9 @@ class JobHuntingAgent:
                 streamed_message = unpack_stream_message(stream_item)
                 if streamed_message is None:
                     continue
+                if isinstance(streamed_message, AIMessage):
+                    merge_stream_usage(usage, usage_by_call, stream_item, streamed_message)
                 if isinstance(streamed_message, AIMessageChunk):
-                    merge_usage(usage, extract_usage_metadata(streamed_message))
                     token = extract_stream_token(streamed_message)
                     if token:
                         reply_parts.append(token)
@@ -657,11 +661,21 @@ def extract_usage_metadata(message: object) -> dict[str, int]:
     }
 
 
-def merge_usage(target: dict[str, int], incoming: dict[str, int]) -> None:
-    """合并流式 usage；流式结束块通常携带累计值，因此取最大值避免重复累加。"""
-
+def merge_stream_usage(target: dict[str, int], calls: dict[tuple, dict[str, int]], stream_item, message) -> None:
+    """Take cumulative maxima within one model invocation; sum independent graph steps."""
+    incoming = extract_usage_metadata(message)
+    if not incoming:
+        return
+    metadata = stream_item[1] if isinstance(stream_item, tuple) and len(stream_item) > 1 and isinstance(stream_item[1], dict) else {}
+    if type(metadata.get("langgraph_step")) is int:
+        key = ("graph", str(metadata.get("langgraph_checkpoint_ns", "")), str(metadata.get("langgraph_node", "")), metadata["langgraph_step"])
+    else:
+        key = ("message", message.id or "unidentified")
+    previous = calls.setdefault(key, {})
     for key in ("input_tokens", "output_tokens", "total_tokens"):
-        target[key] = max(target.get(key, 0), incoming.get(key, 0))
+        updated = max(previous.get(key, 0), incoming.get(key, 0))
+        target[key] = target.get(key, 0) + updated - previous.get(key, 0)
+        previous[key] = updated
 
 
 def merge_usage_summaries(

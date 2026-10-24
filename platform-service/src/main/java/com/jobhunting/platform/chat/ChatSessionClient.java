@@ -12,6 +12,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Flow;
@@ -42,18 +43,22 @@ public class ChatSessionClient {
     private final HttpClient http;
     private final URI endpoint;
     private final String token;
+    private final int invokeTimeoutMs;
     private final Semaphore slots = new Semaphore(8);
 
     public ChatSessionClient(ObjectMapper mapper,
             @Value("${platform.chat.python-base-url:http://web:8000}") String baseUrl,
             @Value("${platform.internal-token:}") String token,
             @Value("${platform.web-security.environment:development}") String environment,
-            @Value("${platform.web-security.public-base-url:http://localhost:8000}") String publicUrl) {
+            @Value("${platform.web-security.public-base-url:http://localhost:8000}") String publicUrl,
+            @Value("${platform.chat.invoke-timeout-ms:300000}") int invokeTimeoutMs) {
         endpoint = endpoint(baseUrl, environment, publicUrl);
         if (token.chars().anyMatch(c -> c < 33 || c > 126)
                 || ("production".equalsIgnoreCase(environment.strip()) && token.length() < 32))
             throw new IllegalArgumentException("Invalid chat callback credentials");
+        if (invokeTimeoutMs < 1 || invokeTimeoutMs > 300000) throw new IllegalArgumentException("Invalid chat deadline");
         this.token = token;
+        this.invokeTimeoutMs = invokeTimeoutMs;
         this.mapper = mapper.rebuild().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
                 .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
         http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(1)).proxy(ProxySelector.of(null))
@@ -70,27 +75,46 @@ public class ChatSessionClient {
         return result;
     }
 
+    public JsonNode invoke(String session, long owner, ObjectNode data, String requestId) {
+        // A caller-supplied trace ID is not a command/billing identity.
+        String executionId = UUID.randomUUID().toString().replace("-", "");
+        var value = exchange("invoke", data.deepCopy().put("session_token", session).put("execution_id", executionId), requestId);
+        try {
+            String key = data.path("session_id").isTextual() ? data.get("session_id").asText()
+                    : "account-" + owner + "-candidate-" + data.get("candidate_id").asLong();
+            if (!fields(value, Set.of("account_id", "session_id", "result")) || !id(value.get("account_id"))
+                    || value.get("account_id").asLong() != owner || !value.path("session_id").isTextual()
+                    || !key.equals(value.get("session_id").asText())) throw unconfirmed();
+            ChatReply.validate(value.get("result"), data.get("candidate_id").asLong(), executionId);
+            return value.get("result");
+        } catch (RuntimeException error) { throw unconfirmed(); }
+    }
+
     private JsonNode exchange(String operation, JsonNode payload, String requestId) {
-        if (token.isBlank() || !slots.tryAcquire()) throw unavailable();
+        boolean invocation = "invoke".equals(operation);
+        var failure = invocation ? unconfirmed() : unavailable();
+        if (token.isBlank() || !slots.tryAcquire()) throw failure;
         CompletableFuture<HttpResponse<byte[]>> pending = null;
         try {
-            var request = TraceHeaders.apply(HttpRequest.newBuilder(endpoint.resolve(operation)), requestId)
-                    .timeout(Duration.ofSeconds(10)).header("Content-Type", "application/json").header("Accept", "application/json")
+            int timeoutMs = invocation ? invokeTimeoutMs : 10000;
+            var request = TraceHeaders.apply(HttpRequest.newBuilder(endpoint.resolve(invocation ? "../invoke" : operation)), requestId)
+                    .timeout(Duration.ofMillis(timeoutMs)).header("Content-Type", "application/json").header("Accept", "application/json")
                     .header("X-Internal-Service-Token", token).POST(singleUse(mapper.writeValueAsBytes(payload))).build();
             pending = http.sendAsync(request, ignored -> new BoundedBody());
-            var response = pending.get(10, TimeUnit.SECONDS);
-            if (!response.headers().firstValue("Content-Type").orElse("").split(";", 2)[0].strip().equalsIgnoreCase("application/json")) throw unavailable();
+            var response = pending.get(timeoutMs, TimeUnit.MILLISECONDS);
+            if (!response.headers().firstValue("Content-Type").orElse("").split(";", 2)[0].strip().equalsIgnoreCase("application/json")) throw failure;
             var value = mapper.readTree(response.body());
-            if (value == null || !value.isObject()) throw unavailable();
+            if (value == null || !value.isObject()) throw failure;
             if (response.statusCode() != 200) {
-                if (!fields(value, Set.of("code", "detail")) || !value.path("code").isTextual() || !value.path("detail").isTextual()) throw unavailable();
-                throw safeError(response.statusCode(), value.get("code").asText());
+                if (!fields(value, Set.of("code", "detail")) || !value.path("code").isTextual() || !value.path("detail").isTextual()) throw failure;
+                throw invocation ? invocationError(response.statusCode(), value.get("code").asText())
+                        : safeError(response.statusCode(), value.get("code").asText());
             }
             return value;
         } catch (AuthException error) { throw error;
         } catch (InterruptedException error) {
-            Thread.currentThread().interrupt(); throw unavailable();
-        } catch (Exception error) { throw unavailable();
+            Thread.currentThread().interrupt(); throw failure;
+        } catch (Exception error) { throw failure;
         } finally {
             if (pending != null && !pending.isDone()) pending.cancel(true);
             slots.release();
@@ -149,6 +173,19 @@ public class ChatSessionClient {
     static boolean fields(JsonNode node, Set<String> fields) { return node != null && node.isObject() && node.propertyNames().equals(fields); }
     static AuthException unavailable() { return new AuthException("CHAT_UNAVAILABLE", "会话操作结果暂未确认，请刷新会话列表核实后重试。", HttpStatus.SERVICE_UNAVAILABLE); }
     static AuthException invalid() { return new AuthException("INVALID_REQUEST", "请求参数无效。", HttpStatus.UNPROCESSABLE_CONTENT); }
+    static AuthException unconfirmed() { return new AuthException("CHAT_EXECUTION_UNCONFIRMED", "对话结果暂未确认，请先查看历史记录，勿立即重复发送。", HttpStatus.SERVICE_UNAVAILABLE); }
+    private static AuthException invocationError(int status, String code) {
+        String detail = switch (status + ":" + code) {
+            case "402:INSUFFICIENT_BALANCE" -> "余额不足，请先充值后重试。";
+            case "400:CHAT_NOT_READY" -> "消息为空或聊天服务未就绪。";
+            case "429:CHAT_CONCURRENCY_LIMIT" -> "当前请求较多，请稍后重试。";
+            case "502:CHAT_MODEL_FAILED" -> "本次对话未正常完成，请先查看历史记录和档案后再操作。";
+            default -> null;
+        };
+        if (detail != null) return new AuthException(code, detail, HttpStatus.valueOf(status));
+        var error = safeError(status, code);
+        return "CHAT_UNAVAILABLE".equals(error.code()) ? unconfirmed() : error;
+    }
     private static AuthException safeError(int status, String code) {
         String detail = switch (status + ":" + code) {
             case "401:SESSION_EXPIRED" -> "登录状态已过期，请重新登录。";

@@ -77,6 +77,7 @@ platform:
     auth-requests: ${JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS:20}
     admin-requests: ${JOB_AGENT_RATE_LIMIT_ADMIN_REQUESTS:120}
     write-requests: ${JOB_AGENT_RATE_LIMIT_WRITE_REQUESTS:120}
+    model-requests: ${JOB_AGENT_RATE_LIMIT_MODEL_REQUESTS:60}
     default-requests: ${JOB_AGENT_RATE_LIMIT_DEFAULT_REQUESTS:240}
   email:
     action-secret: ${JOB_AGENT_ACCOUNT_ACTION_SECRET:development-only-account-action-secret}

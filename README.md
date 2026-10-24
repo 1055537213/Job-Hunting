@@ -308,6 +308,7 @@ PR 和 `master` 推送仍运行完整验收。部署门禁要求目标 SHA 的�
 | 账号 | POST /api/account/delete | 校验密码和确认文本，202 表示注销已受理，后台清理尚未完成 |
 | 账号 | GET /api/account/export | 导出本人数据 |
 | 档案 | GET/POST /api/profiles | 查询或创建候选人档案 |
+| 对话 | POST /api/chat | 普通 Agent 对话，混合模式由 Java 鉴权后交给 Python 执行 |
 | 对话 | POST /api/chat/stream | SSE Agent 对话 |
 | 职位 | POST /api/jobs | 导入职位文本 |
 | 职位 | POST /api/jobs/screenshots | 导入职位截图 |
@@ -391,6 +392,8 @@ AI、RAG、OCR 和多模态文件处理仍然依赖 Python 生态；Java 更适�
 - [x] 创建档案入口经 Java 校验 Session/CSRF，Python 原子提交档案和幂等凭据；同请求重放不重复创建，旧请求不复活已删除档案。
 - [x] 删除档案入口经 Java 鉴权，Python 原子删除事实/向量并持久化全版本附件清单；在途工作阻止删除，Worker 维护任务分批重试清理。
 - [x] 聊天会话列表、历史、新建、归档、删除入口经 Java 鉴权和回调，Python 保留消息与会话读写；验证历史脱敏、账号隔离、在途删除保护、依赖恢复和会话撤销。
+- [x] 普通聊天入口 `/api/chat` 经 Java Session/CSRF/模型限流进入 Python Agent；有界回包、完整调用期限、禁止命令自动重放，验证工具更新档案、历史、真实账务链路与余额不足。
+- [ ] 迁移 `/api/chat/stream` 的 Java SSE 转发入口，验证增量输出、断连取消和资源释放；模型推理仍归 Python。
 - [x] 建立渠道无关的待支付订单和签名 Webhook 结算边界。
 - [ ] 接入具体支付渠道适配、退款状态机和渠道对账。
 - [ ] 使用真实行业材料完成正式 RAG 发布集、Top-K/Top-N 和 P95 性能验收。
