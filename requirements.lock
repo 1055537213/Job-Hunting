@@ -35,7 +35,7 @@ botocore==1.43.72
     #   s3transfer
 celery==5.6.3
     # via job-hunting-agent (pyproject.toml)
-certifi==2026.7.22
+certifi==2026.10.19
     # via
     #   httpcore
     #   httpx
@@ -167,36 +167,42 @@ openai==3.1.0
     # via langchain-openai
 opencv-python==5.0.0.93
     # via rapidocr
-opentelemetry-api==1.44.0
+opentelemetry-api==1.45.1
     # via
     #   job-hunting-agent (pyproject.toml)
+    #   opentelemetry-exporter-http-transport
     #   opentelemetry-exporter-otlp-proto-http
     #   opentelemetry-instrumentation
     #   opentelemetry-instrumentation-celery
     #   opentelemetry-instrumentation-sqlalchemy
     #   opentelemetry-sdk
     #   opentelemetry-semantic-conventions
-opentelemetry-exporter-otlp-proto-common==1.44.0
+opentelemetry-exporter-http-transport==0.66b1
     # via opentelemetry-exporter-otlp-proto-http
-opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-exporter-otlp-common==0.66b1
+    # via opentelemetry-exporter-otlp-proto-http
+opentelemetry-exporter-otlp-proto-common==1.45.1
+    # via opentelemetry-exporter-otlp-proto-http
+opentelemetry-exporter-otlp-proto-http==1.45.1
     # via job-hunting-agent (pyproject.toml)
-opentelemetry-instrumentation==0.65b0
+opentelemetry-instrumentation==0.66b1
     # via
     #   opentelemetry-instrumentation-celery
     #   opentelemetry-instrumentation-sqlalchemy
-opentelemetry-instrumentation-celery==0.65b0
+opentelemetry-instrumentation-celery==0.66b1
     # via job-hunting-agent (pyproject.toml)
-opentelemetry-instrumentation-sqlalchemy==0.65b0
+opentelemetry-instrumentation-sqlalchemy==0.66b1
     # via job-hunting-agent (pyproject.toml)
-opentelemetry-proto==1.44.0
+opentelemetry-proto==1.45.1
     # via
     #   opentelemetry-exporter-otlp-proto-common
     #   opentelemetry-exporter-otlp-proto-http
-opentelemetry-sdk==1.44.0
+opentelemetry-sdk==1.45.1
     # via
     #   job-hunting-agent (pyproject.toml)
+    #   opentelemetry-exporter-otlp-common
     #   opentelemetry-exporter-otlp-proto-http
-opentelemetry-semantic-conventions==0.65b0
+opentelemetry-semantic-conventions==0.66b1
     # via
     #   opentelemetry-instrumentation
     #   opentelemetry-instrumentation-celery
@@ -222,7 +228,7 @@ pdfplumber==0.11.10
     # via job-hunting-agent (pyproject.toml)
 pgvector==0.5.0
     # via job-hunting-agent (pyproject.toml)
-pillow==12.3.0
+pillow==13.0.0
     # via
     #   job-hunting-agent (pyproject.toml)
     #   pdfplumber
@@ -283,6 +289,7 @@ reportlab==5.0.0
 requests==2.34.2
     # via
     #   langsmith
+    #   opentelemetry-exporter-http-transport
     #   opentelemetry-exporter-otlp-proto-http
     #   rapidocr
     #   requests-toolbelt
@@ -322,9 +329,7 @@ truststore==0.10.4
 typing-extensions==4.16.0
     # via
     #   alembic
-    #   anyio
     #   fastapi
-    #   httpx2
     #   langchain-core
     #   langchain-protocol
     #   langsmith
@@ -333,12 +338,10 @@ typing-extensions==4.16.0
     #   opentelemetry-exporter-otlp-proto-http
     #   opentelemetry-sdk
     #   opentelemetry-semantic-conventions
-    #   psycopg
     #   pydantic
     #   pydantic-core
     #   python-docx
     #   sqlalchemy
-    #   starlette
     #   typing-inspection
 typing-inspection==0.4.4
     # via
