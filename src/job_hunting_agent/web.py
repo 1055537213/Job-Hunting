@@ -50,6 +50,7 @@ from .account_email_outbox import AccountEmailOutboxService, redact_email
 from .account_export import encode_export
 from .account_work import AccountWorkBusy, AccountWorkDenied, AccountWorkRoute, AccountWorkStreamingResponse
 from .profile_query import MAX_PROFILE_CREATE_BYTES, encode_callback, validate_creation, validate_deletion
+from .chat_session_query import MAX_CHAT_BYTES, valid_session_key, validate_chat_projection
 from .account_lifecycle import (
     AccountEmailSender,
     action_token_hash,
@@ -429,9 +430,21 @@ class InternalProfileQueryPayload(BaseModel):
 class ChatSessionPayload(BaseModel):
     """创建独立求职对话时提交的档案、职位和标题。"""
 
-    candidate_id: int
-    title: str = "新对话"
-    job_id: int | None = None
+    model_config = ConfigDict(extra="forbid")
+    candidate_id: int = Field(gt=0, le=2**63-1, strict=True)
+    title: str = Field(default="新对话", max_length=200)
+    job_id: int | None = Field(default=None, gt=0, le=2**63-1, strict=True)
+
+
+class InternalChatSessionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_token: str = Field(min_length=1, max_length=128, repr=False)
+    candidate_id: int | None = Field(default=None, gt=0, le=2**63-1, strict=True)
+    session_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,128}$")
+    title: str = Field(default="新对话", max_length=200)
+    job_id: int | None = Field(default=None, gt=0, le=2**63-1, strict=True)
+    include_archived: bool = False
+    limit: int = Field(default=100, ge=1, le=500, strict=True)
 
 
 class TailorResumePayload(BaseModel):
@@ -1256,8 +1269,9 @@ def create_web_app(
     async def validation_error(request: Request, error: RequestValidationError):
         if request.url.path == "/api/profiles" and request.method == "POST":
             return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
-        if request.url.path in {"/internal/v1/accounts/export", "/internal/v1/profiles/query", "/internal/v1/profiles/create", "/internal/v1/profiles/delete"}:
-            if "/profiles/" in request.url.path:
+        if (request.url.path in {"/internal/v1/accounts/export", "/internal/v1/profiles/query", "/internal/v1/profiles/create", "/internal/v1/profiles/delete"}
+                or request.url.path.startswith("/internal/v1/chat/sessions/")):
+            if "/profiles/" in request.url.path or "/chat/sessions/" in request.url.path:
                 return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
             return JSONResponse({"detail": "无效的导出请求。"}, status_code=422, headers={"Cache-Control": "no-store"})
         return await request_validation_exception_handler(request, error)
@@ -1837,25 +1851,111 @@ def create_web_app(
             return JSONResponse({"code": code, "detail": detail}, status_code=status,
                                 headers={"Cache-Control": "no-store", **({"Retry-After": "3"} if status in (409, 503) else {})})
 
-    @web_app.post("/api/chat/sessions")
-    def create_chat_session(payload: ChatSessionPayload, request: Request) -> dict[str, object]:
-        """创建一个绑定当前账号和候选人档案的独立会话。"""
+    chat_callbacks = BoundedSemaphore(8)
 
+    def chat_operation(operation, account_id, *, candidate_id=None, session_id=None, title="新对话",
+                       job_id=None, include_archived=False, limit=100):
+        if session_id is not None and not valid_session_key(session_id):
+            raise HTTPException(422, "请求参数无效。")
+        if candidate_id is not None:
+            get_profile_or_404(backend, candidate_id, account_id)
+        if operation in {"create", "history"} and candidate_id is None:
+            raise HTTPException(422, "请求参数无效。")
+        if operation in {"archive", "delete"} and session_id is None:
+            raise HTTPException(422, "请求参数无效。")
+        if operation == "create":
+            if job_id is not None:
+                try:
+                    backend.store.get_job(job_id, account_id=account_id)
+                except KeyError:
+                    raise HTTPException(404, "职位不存在。") from None
+            record = backend.store.create_chat_session(f"chat-{uuid.uuid4().hex}", account_id, candidate_id,
+                                                       title.strip() or "新对话", job_id)
+            return {"session": asdict(record)}
+        if operation == "list":
+            return {"sessions": [asdict(row) for row in backend.store.list_chat_sessions(account_id, candidate_id, include_archived)]}
+        if operation in {"archive", "delete"}:
+            try:
+                if operation == "archive":
+                    return {"session": asdict(backend.store.archive_chat_session(session_id, account_id))}
+                return {"deleted": True, **backend.delete_chat_session(session_id, account_id)}
+            except KeyError:
+                raise HTTPException(404, "会话不存在。") from None
+        actual = session_id or default_web_session_id(candidate_id, account_id)
+        validate_chat_session(account_id, candidate_id, actual)
+        return {"candidate_id": candidate_id, "session_id": actual, "messages": [
+            {**asdict(message), "content": sanitize_web_chat_reply(message.content) if message.role == "assistant" else message.content,
+             "metadata": serialize_user_chat_metadata(message.metadata)}
+            for message in backend.list_chat_messages(candidate_id, actual, limit, account_id=account_id)]}
+
+    def platform_chat(request, operation, **data):
+        try:
+            result = backend.platform_auth_client.chat_sessions(operation, request.cookies.get(SESSION_COOKIE_NAME),
+                trace_id=getattr(request.state, "request_id", None), **data)
+            return JSONResponse(result, headers={"Cache-Control": "no-store"})
+        except PlatformAuthError as error:
+            status = error.status_code or 503
+            return JSONResponse({"code": error.code, "detail": str(error)}, status_code=status,
+                headers={"Cache-Control": "no-store", **({"Retry-After": "3"} if status in (409, 503) else {})})
+
+    def build_internal_chat(operation, payload, trace_id):
+        if not chat_callbacks.acquire(blocking=False):
+            raise HTTPException(503, "会话服务暂时繁忙。")
+        try:
+            try:
+                resolved = backend.platform_auth_client.account("me", session_token=payload.session_token, trace_id=trace_id)
+            except PlatformAuthError as error:
+                raise HTTPException(error.status_code if error.status_code in (401, 403) else 503, "会话认证失败。") from None
+            owner = platform_account_record(resolved["account"]).id
+            # Exclusive deletion prevents an accepted chat/SSE from recreating a deleted session.
+            with backend.store.account_work.acquire(owner, deletion=operation == "delete"):
+                if operation == "delete":
+                    active = backend.store.get_account(owner)
+                    if active.status != "active" or active.deleted_at is not None:
+                        raise AccountWorkDenied()
+                data = payload.model_dump(exclude={"session_token"})
+                result = chat_operation(operation, owner, **data)
+                validate_chat_projection(result, operation, account_id=owner, candidate_id=payload.candidate_id,
+                    session_id=payload.session_id, limit=payload.limit, include_archived=payload.include_archived)
+                body = json.dumps({"account_id": owner, **result}, ensure_ascii=False).encode("utf-8")
+                if len(body) > MAX_CHAT_BYTES:
+                    raise HTTPException(413, "会话数据超出同步查询限制。")
+                return body
+        finally:
+            chat_callbacks.release()
+
+    @web_app.post("/internal/v1/chat/sessions/{operation}", include_in_schema=False)
+    async def internal_chat_sessions(operation: str, payload: InternalChatSessionPayload, request: Request):
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            return JSONResponse({"code": "INTERNAL_UNAUTHORIZED", "detail": "内部服务认证失败。"}, status_code=401)
+        if operation not in {"list", "create", "archive", "delete", "history"}:
+            raise HTTPException(404, "接口不存在。")
+        try:
+            body = await asyncio.to_thread(build_internal_chat, operation, payload, request.headers.get("X-Trace-Id"))
+            return Response(body, media_type="application/json", headers={"Cache-Control": "no-store"})
+        except HTTPException as error:
+            status, detail = error.status_code, error.detail
+            code = {401: "SESSION_EXPIRED", 403: "CHAT_SCOPE_DENIED", 404: "CHAT_NOT_FOUND",
+                    409: "CHAT_SESSION_ARCHIVED", 413: "CHAT_TOO_LARGE", 422: "INVALID_REQUEST"}.get(status, "CHAT_UNAVAILABLE")
+        except AccountWorkBusy:
+            status, code, detail = 409, "CHAT_BUSY", "当前仍有请求执行，请稍后重试。"
+        except (AccountWorkDenied, PermissionError):
+            status, code, detail = 403, "CHAT_SCOPE_DENIED", "账号不可用或无权访问会话。"
+        except Exception:  # noqa: BLE001 - never reflect chat content or transport errors.
+            status, code, detail = 503, "CHAT_UNAVAILABLE", "会话操作结果暂未确认，请刷新会话列表核实后重试。"
+        return JSONResponse({"code": code, "detail": detail}, status_code=status,
+            headers={"Cache-Control": "no-store", **({"Retry-After": "3"} if status in (409, 503) else {})})
+
+    @web_app.post("/api/chat/sessions")
+    def create_chat_session(payload: ChatSessionPayload, request: Request):
+        if backend.platform_auth_client is not None:
+            return platform_chat(request, "create", **payload.model_dump())
         account = current_account(request)
-        assert account is not None
-        account_id = account.id
-        get_profile_or_404(backend, payload.candidate_id, account_id)
-        if payload.job_id is not None:
-            backend.store.get_job(payload.job_id, account_id=account_id)
-        session_id = f"chat-{uuid.uuid4().hex}"
-        record = backend.store.create_chat_session(
-            session_id=session_id,
-            account_id=account_id or 0,
-            candidate_id=payload.candidate_id,
-            title=payload.title.strip() or "新对话",
-            job_id=payload.job_id,
-        )
-        return {"session": asdict(record)}
+        return chat_operation("create", account.id, **payload.model_dump())
 
     def validate_chat_session(
         account_id: int,
@@ -1885,36 +1985,28 @@ def create_web_app(
     ) -> dict[str, object]:
         """列出当前账号的会话索引，默认隐藏已归档会话。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_chat(request, "list", candidate_id=candidate_id, include_archived=include_archived)
         account = current_account(request)
-        assert account is not None
-        if candidate_id is not None:
-            get_profile_or_404(backend, candidate_id, account.id)
-        records = backend.store.list_chat_sessions(account.id, candidate_id, include_archived)
-        return {"sessions": [asdict(record) for record in records]}
+        return chat_operation("list", account.id, candidate_id=candidate_id, include_archived=include_archived)
 
     @web_app.post("/api/chat/sessions/{session_id}/archive")
     def archive_chat_session(session_id: str, request: Request) -> dict[str, object]:
         """软归档当前账号的会话，历史和用量流水仍然保留。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_chat(request, "archive", session_id=session_id)
         account = current_account(request)
-        assert account is not None
-        try:
-            record = backend.store.archive_chat_session(session_id, account.id)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail="会话不存在。") from error
-        return {"session": asdict(record)}
+        return chat_operation("archive", account.id, session_id=session_id)
 
     @web_app.delete("/api/chat/sessions/{session_id}")
     def delete_chat_session(session_id: str, request: Request) -> dict[str, object]:
         """永久删除当前账号的一段对话及其消息。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_chat(request, "delete", session_id=session_id)
         account = current_account(request)
-        assert account is not None
-        try:
-            result = backend.delete_chat_session(session_id, account.id)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail="会话不存在。") from error
-        return {"deleted": True, **result}
+        return chat_operation("delete", account.id, session_id=session_id)
 
     @web_app.post("/api/chat")
     def chat(payload: ChatPayload, request: Request) -> dict[str, object]:
@@ -2130,33 +2222,10 @@ def create_web_app(
     ) -> dict[str, object]:
         """返回网页聊天历史，供页面刷新或重新打开时恢复对话。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_chat(request, "history", candidate_id=candidate_id, session_id=session_id, limit=limit)
         account = current_account(request)
-        assert account is not None
-        account_id = account.id
-        get_profile_or_404(backend, candidate_id, account_id)
-        actual_session_id = session_id or default_web_session_id(candidate_id, account_id)
-        validate_chat_session(account_id, candidate_id, actual_session_id)
-        return {
-            "candidate_id": candidate_id,
-            "session_id": actual_session_id,
-            "messages": [
-                {
-                    **asdict(message),
-                    "content": (
-                        sanitize_web_chat_reply(message.content)
-                        if message.role == "assistant"
-                        else message.content
-                    ),
-                    "metadata": serialize_user_chat_metadata(message.metadata),
-                }
-                for message in backend.list_chat_messages(
-                    candidate_id,
-                    actual_session_id,
-                    limit,
-                    account_id=account_id,
-                )
-            ],
-        }
+        return chat_operation("history", account.id, candidate_id=candidate_id, session_id=session_id, limit=limit)
 
     @web_app.post("/api/jobs")
     def import_job(payload: JobPayload, request: Request) -> dict[str, object]:

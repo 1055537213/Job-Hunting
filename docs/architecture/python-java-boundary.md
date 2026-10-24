@@ -414,6 +414,29 @@ HTTP 回调不等待对象存储。无附件时 200/completed；存在附件则 
 内部应用同步便利方法仍可尝试最多 100 个对象，失败保留 pending；公开接口始终异步清附件，200/202 不混淆。
 无需新手填配置，本地/生产网关与现有部署迁移命令同步；本分支只进行本地隔离 Docker 验收，不部署真实服务器。
 
+## 聊天会话管理入口
+
+`GET/POST /api/chat/sessions`、`POST /api/chat/sessions/{session_id}/archive`、
+`DELETE /api/chat/sessions/{session_id}` 和 `GET /api/chat/history` 经混合网关进入 Java。
+Java 使用真实 Session、CSRF、Redis 限流和请求 ID，认证事务结束后向 Python
+`POST /internal/v1/chat/sessions/{list|create|archive|delete|history}` 回调；Python 公开兼容入口仅转发到 Java。
+两端内部接口均要求服务令牌，网关拒绝所有 `/internal/*`。契约见 `chat-sessions.openapi.yaml`。
+
+Python 再验证同一 Session，从真实账号确定档案/职位/会话范围，复用原有会话和消息业务实现。
+回调独立线程持有账号工作锁；删除使用排他锁，已有 HTTP/SSE 请求未结束时返回 409/CHAT_BUSY，
+避免迟到回复复活会话。Java 验证回调 account_id、档案及会话定位、字段白名单、重复记录和消息上限，
+剥离内部 account_id 包装，但保留原会话行本来就有的 account_id。历史继续使用已有文本和元数据脱敏。
+
+查询默认隐藏归档会话，include_archived 可显式列出；历史 limit 默认 100、最大 500，
+列表不静默分页或截断，完整响应超过 4 MiB 返回 413。回调连接超时 1 秒、完整响应期限 10 秒，
+并发最多 8 个，不自动跟随重定向或重放写入。创建超时可能已经提交，提示刷新会话列表核实，
+本轮没有增加创建幂等凭据；重复归档返回归档记录，重复删除返回 404。归档历史仍按原规则返回 409。
+会话删除保留 Token/账务流水，不影响档案事实。失败返回显式错误，禁止伪装空列表或回退本地数据。
+
+本地、生产 Caddy 和共存 Nginx 同步分流，会话回调默认连接 web:8000，
+Compose 自动设置连接地址，无需新增手填配置或数据库迁移。模型聊天 `/api/chat`、SSE、RAG、
+对话摘要与 Worker 继续由 Python 执行。本分支只在本地隔离 Docker 验证。
+
 ## Java 安全入口准备阶段（历史记录）
 
 Java `/api/*` 已增加真实 Session/RBAC、Redis 原子滑动窗口限流、CSRF、安全响应头、

@@ -29,6 +29,11 @@
 			path_regexp profileDelete ^/api/profiles/[^/]+$
 		}
 		reverse_proxy @profile_delete platform-service:8081
+		@chat_management {
+			method GET POST DELETE
+			path_regexp chatManagement ^/api/chat/(sessions(/[^/]+(/archive)?)?|history)$
+		}
+		reverse_proxy @chat_management platform-service:8081
 		@account_deletion {
 			method POST
 			path /api/account/delete

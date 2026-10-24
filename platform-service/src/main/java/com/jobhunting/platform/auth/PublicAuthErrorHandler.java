@@ -15,12 +15,14 @@ import com.jobhunting.platform.profiles.ProfileReadController;
 import com.jobhunting.platform.profiles.ProfileCreateController;
 import com.jobhunting.platform.profiles.ProfileDeleteController;
 import com.jobhunting.platform.billing.PaymentWebhookController;
+import com.jobhunting.platform.chat.ChatSessionController;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -33,7 +35,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
         AdminUsageController.class, AdminToolTraceController.class, TaskReadController.class, TaskCommandController.class,
         AdminObservabilityController.class, PublicAccountProfileController.class, PublicAccountExportController.class,
         InternalAccountExportController.class, AccountDeletionController.class, ProfileReadController.class, ProfileCreateController.class, ProfileDeleteController.class,
-        PaymentWebhookController.class})
+        PaymentWebhookController.class, ChatSessionController.class})
 public class PublicAuthErrorHandler {
     @ExceptionHandler(AuthException.class)
     public ResponseEntity<Map<String, Object>> auth(AuthException error, HttpServletRequest request) {
@@ -41,7 +43,8 @@ public class PublicAuthErrorHandler {
         var response = ResponseEntity.status(error.status()).header("Cache-Control", "no-store");
         if ("TASK_COMMAND_UNAVAILABLE".equals(error.code()) || "EXPORT_UNAVAILABLE".equals(error.code())
                 || "PROFILE_QUERY_UNAVAILABLE".equals(error.code()) || "PROFILE_CREATE_UNAVAILABLE".equals(error.code())
-                || "PROFILE_DELETE_UNAVAILABLE".equals(error.code()) || "PROFILE_DELETE_BUSY".equals(error.code())) response.header("Retry-After", "3");
+                || "PROFILE_DELETE_UNAVAILABLE".equals(error.code()) || "PROFILE_DELETE_BUSY".equals(error.code())
+                || "CHAT_UNAVAILABLE".equals(error.code()) || "CHAT_BUSY".equals(error.code())) response.header("Retry-After", "3");
         return response.body(Map.of("code", error.code(), "detail", error.getMessage(),
                 "message", error.getMessage(), "request_id", id, "trace_id", id));
     }
@@ -54,7 +57,7 @@ public class PublicAuthErrorHandler {
     }
 
     @ExceptionHandler({MethodArgumentNotValidException.class, HttpMessageNotReadableException.class,
-            HandlerMethodValidationException.class, MethodArgumentTypeMismatchException.class})
+            HandlerMethodValidationException.class, MethodArgumentTypeMismatchException.class, MissingServletRequestParameterException.class})
     public ResponseEntity<Map<String, Object>> invalid(Exception error, HttpServletRequest request) {
         String id = WebSecurityFilter.requestId(request.getHeader("X-Request-ID"), request.getHeader("X-Trace-Id"));
         String detail = "请求参数无效。";

@@ -771,6 +771,85 @@ def run_profile_read_gateway_flow(gateway_url: str, web_url: str, java_url: str,
     print("==> Profile GET/POST Java entry -> Python owned facts/atomic creation -> replay/conflict/tenant scope -> dependency outages/no fallback -> recovery/revocation: PASS")
 
 
+def run_chat_session_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
+                                  web: str, java: str, database_url: str) -> None:
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+    from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
+    store = SQLAlchemyStore(database_url)
+    owners = []
+    password = "chat-acceptance-password"
+    for _ in range(2):
+        email = f"chat-gateway-{os.urandom(10).hex()}@example.com"
+        owner = auth.register_account(email=email, password=password, display_name="Chat acceptance",
+                                      email_verified=True, consents=[]).account_id
+        owners.append((owner, email))
+    try:
+        with httpx.Client(base_url=gateway_url, timeout=20) as first, httpx.Client(base_url=gateway_url, timeout=20) as second:
+            for browser, (_, email) in zip((first, second), owners, strict=True):
+                login = browser.post("/api/auth/login", json={"email": email, "password": password})
+                assert login.status_code == 200, login.text[:200]
+                browser.headers["X-CSRF-Token"] = login.json()["csrf_token"]
+            candidate = first.post("/api/profiles", json={"name": "Chat scope"}).json()["candidate_id"]
+            assert first.get("/api/chat/sessions").json() == {"sessions": []}
+            data = {"candidate_id": candidate, "title": "Interview preparation"}
+            assert httpx.post(gateway_url + "/api/chat/sessions", cookies=first.cookies, json=data).status_code == 403
+            created = first.post("/api/chat/sessions", json=data, headers={"X-Request-ID": "chat-session-acceptance"})
+            assert created.status_code == 200, created.text[:500]
+            assert created.headers["x-request-id"] == "chat-session-acceptance"
+            key = created.json()["session"]["session_id"]
+            path = f"/api/chat/sessions/{key}"
+            history = f"/api/chat/history?candidate_id={candidate}&session_id={key}&limit=5"
+            store.save_chat_message(candidate, key, "user", "Prepare an interview", account_id=owners[0][0])
+            store.save_chat_message(candidate, key, "assistant", "Ready.", metadata={"tool_outputs": "private-secret"}, account_id=owners[0][0])
+            response = first.get(history)
+            assert response.status_code == 200 and len(response.json()["messages"]) == 2, response.text[:500]
+            assert "private-secret" not in response.text and response.json()["messages"][1]["metadata"] == {}
+            assert response.headers["cache-control"] == "no-store"
+            assert httpx.get(web_url + history, cookies=first.cookies, timeout=20).json() == response.json()
+            assert second.get(history).status_code == 404
+            assert second.post(path + "/archive").status_code == 404
+            assert second.delete(path).status_code == 404
+            assert second.post("/api/chat/sessions", json=data).status_code == 404
+            assert first.get(f"/api/chat/history?candidate_id={candidate}&limit=501").status_code == 422
+            assert first.post("/api/chat/sessions", json={**data, "account_id": owners[1][0]}).status_code == 422
+            for origin in (java_url, web_url):
+                assert httpx.post(origin + "/internal/v1/chat/sessions/list", json={"session_token": first.cookies["job_agent_session"]}).status_code == 401
+            assert first.post("/internal/v1/chat/sessions/list", json={}).status_code == 404
+            with store.account_work.acquire(owners[0][0]):
+                busy = first.delete(path)
+                assert busy.status_code == 409 and busy.json()["code"] == "CHAT_BUSY", busy.text[:300]
+            assert first.post(path + "/archive").status_code == 200
+            assert first.post(path + "/archive").status_code == 200
+            assert first.get("/api/chat/sessions").json() == {"sessions": []}
+            assert len(first.get("/api/chat/sessions?include_archived=true").json()["sessions"]) == 1
+            assert first.get(history).status_code == 409
+            assert first.delete(path).json()["deleted"] is True
+            assert first.delete(path).status_code == 404
+            assert store.list_chat_messages(candidate, key, account_id=owners[0][0]) == []
+            for container, health, origin in ((web, web_url + "/api/health", gateway_url),
+                                              (java, java_url + "/actuator/health", web_url)):
+                try:
+                    docker("stop", "--time", "1", container)
+                    failed = httpx.get(origin + "/api/chat/sessions", cookies=first.cookies, timeout=20)
+                    assert failed.status_code == 503 and "sessions" not in failed.json(), failed.text[:300]
+                    failed_create = httpx.post(origin + "/api/chat/sessions", cookies=first.cookies,
+                        headers={"X-CSRF-Token": first.headers["X-CSRF-Token"]}, json=data, timeout=20)
+                    assert failed_create.status_code == 503
+                finally:
+                    docker("start", container)
+                    wait(health)
+                assert first.get("/api/chat/sessions").json() == {"sessions": []}
+            assert first.post("/api/chat/sessions", json=data).status_code == 200
+            auth.session("logout", session_token=first.cookies["job_agent_session"])
+            assert first.get("/api/chat/sessions").status_code == 401
+            assert httpx.get(web_url + "/api/chat/sessions", cookies=first.cookies, timeout=20).status_code == 401
+    finally:
+        store.close()
+    print("==> Java chat-session entry -> Python-owned history/create/archive/delete -> scope/CSRF/redaction/in-flight guard -> outages/recovery/revocation: PASS")
+
+
 def run_profile_deletion_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
                                       worker: str, broker: str, database_url: str) -> None:
     from job_hunting_agent.config import PlatformAuthSettings
@@ -1221,6 +1300,8 @@ def main() -> None:
                                  f"http://127.0.0.1:{args.port}", token, web, admin_credentials, isolated_url)
         run_profile_read_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                       f"http://127.0.0.1:{args.port}", token, web, java)
+        run_chat_session_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                                      f"http://127.0.0.1:{args.port}", token, web, java, isolated_url)
         docker("run", "-d", "--name", worker, *common, *env_args, args.ai_image,
                "job-agent-worker", "--concurrency", "1", "--log-level", "WARNING")
         run_task_command_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",

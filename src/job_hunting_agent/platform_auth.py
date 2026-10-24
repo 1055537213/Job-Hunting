@@ -14,6 +14,7 @@ import httpx
 from .config import PlatformAuthSettings
 from .account_export import MAX_EXPORT_BYTES, decode_export
 from .profile_query import MAX_PROFILE_QUERY_BYTES, decode_json, validate_creation, validate_deletion, validate_projection
+from .chat_session_query import MAX_CHAT_BYTES, validate_chat_projection
 
 
 def _platform_response_error_status(response: httpx.Response) -> int:
@@ -436,6 +437,45 @@ class PlatformAuthClient:
                     return result
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
             raise PlatformAuthError("DELETION_UNAVAILABLE", "账号注销服务暂时不可用，请稍后重试。", 503) from None
+
+    def chat_sessions(self, operation: str, session_token: str | None, *, trace_id=None, **data):
+        if operation not in {"list", "create", "archive", "delete", "history"}:
+            raise ValueError("Unknown chat operation")
+        if not session_token:
+            raise PlatformAuthError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
+        try:
+            with httpx.Client(trust_env=False, follow_redirects=False, timeout=15) as client:
+                with client.stream("POST", f"{self.base_url}/internal/v1/chat/sessions/{operation}",
+                    headers={"X-Internal-Service-Token": self.internal_token, "X-Trace-Id": trace_id or uuid4().hex},
+                    json={"session_token": session_token, **data}) as response:
+                    if response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                        raise ValueError("Invalid chat content type")
+                    body = bytearray()
+                    for chunk in response.iter_bytes(chunk_size=65536):
+                        if len(body) + len(chunk) > MAX_CHAT_BYTES:
+                            raise ValueError("Oversized chat response")
+                        body.extend(chunk)
+                    value = decode_json(bytes(body))
+                    if response.status_code != 200:
+                        known = {
+                            (401, "SESSION_EXPIRED"): "登录状态已过期，请重新登录。",
+                            (403, "ACCOUNT_DISABLED"): "账号已被停用，请重新登录。",
+                            (403, "CHAT_SCOPE_DENIED"): "账号不可用或无权访问会话。",
+                            (404, "CHAT_NOT_FOUND"): "会话、档案或职位不存在。",
+                            (409, "CHAT_SESSION_ARCHIVED"): "该会话已经归档，请新建对话。",
+                            (409, "CHAT_BUSY"): "当前仍有请求执行，请稍后重试。",
+                            (413, "CHAT_TOO_LARGE"): "会话数据超出同步查询限制。",
+                            (422, "INVALID_REQUEST"): "请求参数无效。",
+                        }
+                        code = value.get("code") if isinstance(value, dict) else None
+                        message = known.get((response.status_code, code)) if isinstance(code, str) else None
+                        if message is None:
+                            raise ValueError("Invalid chat error")
+                        raise PlatformAuthError(code, message, response.status_code)
+                    return validate_chat_projection(value, operation, candidate_id=data.get("candidate_id"),
+                        session_id=data.get("session_id"), limit=data.get("limit", 100), include_archived=data.get("include_archived", False))
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
+            raise PlatformAuthError("CHAT_UNAVAILABLE", "会话操作结果暂未确认，请刷新会话列表核实后重试。", 503) from None
 
     def query_profiles(self, session_token: str, candidate_id: int | None = None, *, trace_id: str | None = None) -> dict[str, Any]:
         """Only forward the session/profile locator, never an account id or local fallback."""

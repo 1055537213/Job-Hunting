@@ -151,6 +151,11 @@ Java 端口只在容器网络内暴露。
 请求观测 `/api/admin/observability/requests` 也分流至 Java，后台可以分别查看两端 API 与内部调用。
 Compose 自动配置 `PLATFORM_OBSERVABILITY_PYTHON_BASE_URL=http://web:8000`；非容器本地验收脚本会配置对应回环地址。
 Java 不在启动阶段调用 Python；Python 未就绪时观测返回部分可用，合计未知而非 0，恢复后下次刷新自动恢复。
+聊天会话管理（列表、历史、新建、归档、删除）也经同一混合网关进入 Java，再回调 Python 所有者。
+`PLATFORM_CHAT_PYTHON_BASE_URL` 由本地 Compose 配置为 `http://web:8000`，生产默认相同；
+没有新增手填项。回调响应最多 4 MiB、期限 10 秒，创建失败后先刷新会话列表核实，禁止自动重放创建。
+隔离 Docker 验收包含真实历史脱敏、跨账号拒绝、CSRF、在途删除阻断及 Python/Java 依赖故障恢复。
+
 纯 Python 模式不要求 Java 存在。本次无新数据库迁移，不需要修改已有服务凭据或开放新端口。
 
 这些步骤只建立可部署能力，不代表已经做过真实服务器演练；本分支暂不部署。

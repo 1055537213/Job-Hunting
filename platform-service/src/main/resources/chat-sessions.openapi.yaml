@@ -1,0 +1,181 @@
+openapi: 3.0.3
+info:
+  title: Chat session management boundary
+  version: 1.0.0
+  description: >-
+    Java authenticates browser/compatibility requests and calls the Python owner using
+    a service token and the real session. Python owns session/message writes and history
+    sanitization. No AI call is made by these endpoints. Successful public contracts are
+    unchanged. Callbacks are internal only, limited to 4 MiB, 8 concurrent calls and
+    10 seconds. Requests are never automatically replayed. A failed create can have
+    committed; refresh the session list before creating again. Repeated archive returns
+    the archived session; repeated delete returns 404. Archived history returns 409.
+security:
+  - browserSession: []
+paths:
+  /api/chat/sessions:
+    get:
+      parameters:
+        - {name: candidate_id, in: query, schema: {$ref: '#/components/schemas/Id'}}
+        - {name: include_archived, in: query, schema: {type: boolean, default: false}}
+      responses:
+        '200':
+          description: All matching sessions in existing updated_at/id descending order; no silent truncation.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [sessions]
+                properties:
+                  sessions: {type: array, items: {$ref: '#/components/schemas/Session'}}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      parameters: [{$ref: '#/components/parameters/Csrf'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Create'}
+      responses:
+        '200': &sessionResponse
+          description: Session owned by the authenticated account.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [session]
+                properties:
+                  session: {$ref: '#/components/schemas/Session'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/chat/sessions/{session_id}/archive:
+    parameters: [{$ref: '#/components/parameters/SessionKey'}]
+    post:
+      parameters: [{$ref: '#/components/parameters/Csrf'}]
+      responses:
+        '200': *sessionResponse
+        default: {$ref: '#/components/responses/Error'}
+  /api/chat/sessions/{session_id}:
+    parameters: [{$ref: '#/components/parameters/SessionKey'}]
+    delete:
+      parameters: [{$ref: '#/components/parameters/Csrf'}]
+      responses:
+        '200':
+          description: Session and messages deleted; usage and billing records retained.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [deleted, candidate_id, session_id]
+                properties:
+                  deleted: {type: boolean, enum: [true]}
+                  candidate_id: {$ref: '#/components/schemas/Id'}
+                  session_id: {$ref: '#/components/schemas/SessionKey'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/chat/history:
+    get:
+      parameters:
+        - {name: candidate_id, in: query, required: true, schema: {$ref: '#/components/schemas/Id'}}
+        - {name: session_id, in: query, schema: {$ref: '#/components/schemas/SessionKey'}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
+      responses:
+        '200':
+          description: Persisted messages; omitted session_id resolves to the account/candidate default.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [candidate_id, session_id, messages]
+                properties:
+                  candidate_id: {$ref: '#/components/schemas/Id'}
+                  session_id: {$ref: '#/components/schemas/SessionKey'}
+                  messages: {type: array, maxItems: 500, items: {$ref: '#/components/schemas/Message'}}
+        default: {$ref: '#/components/responses/Error'}
+  /internal/v1/chat/sessions/{operation}:
+    post:
+      description: >-
+        Same relative internal route in Java and Python. Java is the compatibility entry;
+        its callback targets Python. Never route this path through the public gateway.
+        Python callback additionally returns account_id, verified and stripped by Java.
+      security: [{internalService: []}]
+      parameters:
+        - {name: operation, in: path, required: true, schema: {type: string, enum: [list, create, archive, delete, history]}}
+        - {name: X-Trace-Id, in: header, schema: {type: string, maxLength: 128}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [session_token]
+              properties:
+                session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+                candidate_id: {$ref: '#/components/schemas/Id'}
+                session_id: {$ref: '#/components/schemas/SessionKey'}
+                title: {type: string, maxLength: 200}
+                job_id: {$ref: '#/components/schemas/Id'}
+                include_archived: {type: boolean}
+                limit: {type: integer, minimum: 1, maximum: 500}
+      responses:
+        '200': {description: Operation-specific public projection; Python callback includes account_id.}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    browserSession: {type: apiKey, in: cookie, name: job_agent_session}
+    internalService: {type: apiKey, in: header, name: X-Internal-Service-Token}
+  parameters:
+    Csrf: {name: X-CSRF-Token, in: header, required: true, schema: {type: string}}
+    SessionKey: {name: session_id, in: path, required: true, schema: {$ref: '#/components/schemas/SessionKey'}}
+  responses:
+    Error:
+      description: >-
+        401 expired session; 403 forbidden/CSRF; 404 missing or foreign record;
+        409 archived history or busy deletion; 413 response too large; 422 invalid input;
+        429 rate limited; 503 unavailable or write outcome unconfirmed. Responses use
+        Cache-Control no-store. 409 busy and 503 include Retry-After 3. Errors are redacted.
+  schemas:
+    Id: {type: integer, format: int64, minimum: 1, maximum: 9223372036854775807}
+    SessionKey: {type: string, pattern: '^[A-Za-z0-9_-]{1,128}$'}
+    Create:
+      type: object
+      additionalProperties: false
+      required: [candidate_id]
+      properties:
+        candidate_id: {$ref: '#/components/schemas/Id'}
+        title: {type: string, maxLength: 200, default: 新对话}
+        job_id: {type: integer, format: int64, minimum: 1, nullable: true}
+    Session:
+      type: object
+      additionalProperties: false
+      required: [id, session_id, account_id, candidate_id, job_id, title, status, created_at, updated_at, archived_at]
+      properties:
+        id: {$ref: '#/components/schemas/Id'}
+        account_id: {$ref: '#/components/schemas/Id'}
+        candidate_id: {$ref: '#/components/schemas/Id'}
+        session_id: {$ref: '#/components/schemas/SessionKey'}
+        job_id: {type: integer, format: int64, minimum: 1, nullable: true}
+        title: {type: string}
+        status: {type: string, enum: [active, archived]}
+        created_at: {type: string}
+        updated_at: {type: string}
+        archived_at: {type: string, nullable: true}
+    Message:
+      type: object
+      additionalProperties: false
+      required: [id, candidate_id, session_id, role, content, metadata, created_at]
+      properties:
+        id: {$ref: '#/components/schemas/Id'}
+        candidate_id: {$ref: '#/components/schemas/Id'}
+        session_id: {$ref: '#/components/schemas/SessionKey'}
+        role: {type: string, enum: [user, assistant]}
+        content: {type: string}
+        created_at: {type: string}
+        metadata:
+          type: object
+          additionalProperties: false
+          properties:
+            task_trace: {type: object, description: Existing sanitized user-visible trace projection.}
