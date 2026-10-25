@@ -1,0 +1,158 @@
+openapi: 3.1.0
+info:
+  title: Project Lifecycle Entry
+  version: 1.0.0
+  description: Java validates the real Session; Python owns project facts, confirmation and deletion. No automatic callback replay or local fallback.
+paths:
+  /api/projects:
+    get:
+      parameters:
+        - in: query
+          name: candidate_id
+          required: true
+          schema: {type: integer, minimum: 1, maximum: 9223372036854775807}
+      responses:
+        '200':
+          description: Owned project cards; no-store, maximum 4 MiB.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [project_cards]
+                properties:
+                  project_cards: {type: array, items: {$ref: '#/components/schemas/Record'}}
+  /api/projects/{record_id}/confirm:
+    parameters:
+      - {$ref: '#/components/parameters/RecordId'}
+    post:
+      description: Requires Session and CSRF. Same confirmed summary reuses evidence and rag_index task; changed summary returns 409. Queue failure is unconfirmed, not successful indexing; repeat confirmation can recover delivery.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                confirmed_summary: {type: [string, 'null'], maxLength: 20000}
+                root_request_id: {type: [string, 'null'], pattern: '^[A-Fa-f0-9]{32}$'}
+      responses:
+        '200':
+          description: Confirmed fact with optional asynchronous RAG task. Does not modify structured profile skills.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [project_card, task, root_request_id]
+                properties:
+                  project_card: {$ref: '#/components/schemas/Record'}
+                  task: {oneOf: [{$ref: '#/components/schemas/Task'}, {type: 'null'}]}
+                  root_request_id: {type: string, pattern: '^[a-f0-9]{32}$'}
+  /api/projects/{record_id}:
+    parameters:
+      - {$ref: '#/components/parameters/RecordId'}
+    delete:
+      description: Requires Session and CSRF. Exclusive account-work admission rejects in-flight HTTP/SSE and running tasks. SQL facts, derived vectors and all-version object manifest commit atomically. Worker maintenance retries object deletion. Replays return the owned receipt, never recreate a project.
+      responses:
+        '200':
+          description: Database deletion committed; cleanup_status explicitly distinguishes pending attachment cleanup from completed cleanup.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Receipt'}
+  /internal/v1/projects/{operation}:
+    post:
+      description: Private adapter on both services, hidden by gateways. Requires X-Internal-Service-Token and real session_token. Java verifies account, Python revalidates the same Session. Python adds account_id solely for Java scope checking; never exposed publicly. 8 callbacks, 10-second Java deadline, 4 MiB response. Development contexts may start without callback token but cannot call; production requires a strong token and internal origin.
+      parameters:
+        - in: path
+          name: operation
+          required: true
+          schema: {enum: [list, confirm, delete]}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [session_token]
+              properties:
+                session_token: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+                candidate_id: {type: integer, minimum: 1}
+                record_id: {type: integer, minimum: 1}
+                confirmed_summary: {type: [string, 'null'], maxLength: 20000}
+                root_request_id: {type: [string, 'null'], pattern: '^[A-Fa-f0-9]{32}$'}
+      responses:
+        '200': {description: Public projection; Python additionally includes authenticated account_id. Only operation-specific fields are accepted.}
+        '400': {description: PROJECT_CONFIRMATION_REQUIRED}
+        '401': {description: SESSION_EXPIRED or INTERNAL_UNAUTHORIZED}
+        '403': {description: PROJECT_SCOPE_DENIED}
+        '404': {description: PROJECT_NOT_FOUND}
+        '409': {description: PROJECT_BUSY or PROJECT_CONFLICT}
+        '413': {description: PROJECT_TOO_LARGE}
+        '422': {description: INVALID_REQUEST}
+        '503': {description: PROJECT_UNAVAILABLE; do not claim success or retry automatically.}
+components:
+  parameters:
+    RecordId: {in: path, name: record_id, required: true, schema: {type: integer, minimum: 1, maximum: 9223372036854775807}}
+  schemas:
+    Record:
+      type: object
+      additionalProperties: false
+      required: [id, candidate_id, status, card, confirmed_summary, created_at, confirmed_at]
+      properties:
+        id: {type: integer, minimum: 1}
+        candidate_id: {type: integer, minimum: 1}
+        status: {enum: [待确认, 已确认]}
+        card: {$ref: '#/components/schemas/Card'}
+        confirmed_summary: {type: [string, 'null']}
+        created_at: {type: string}
+        confirmed_at: {type: [string, 'null']}
+    Card:
+      type: object
+      additionalProperties: false
+      required: [card_type, project_name, read_files, skipped_summary, detected_tech_stack, detected_core_features, responsibility_draft, highlight_draft, resume_expression_draft, questions_for_candidate, source_type, source_url, source_ref, discovered_file_kinds, deferred_files]
+      properties:
+        card_type: {type: string}
+        project_name: {type: string}
+        read_files: {type: array, items: {type: string}}
+        skipped_summary: {type: object, additionalProperties: {type: integer, minimum: 0}}
+        detected_tech_stack: {type: array, items: {type: string}}
+        detected_core_features: {type: array, items: {type: string}}
+        responsibility_draft: {type: array, items: {type: string}}
+        highlight_draft: {type: array, items: {type: string}}
+        resume_expression_draft: {type: array, items: {type: string}}
+        questions_for_candidate: {type: array, items: {type: string}}
+        source_type: {type: string}
+        source_url: {type: [string, 'null']}
+        source_ref: {type: [string, 'null']}
+        discovered_file_kinds: {type: object, additionalProperties: {type: integer, minimum: 0}}
+        deferred_files: {type: array, items: {type: string}}
+    Task:
+      type: object
+      additionalProperties: false
+      required: [task_key, task_type, status, progress, attempt, max_attempts, result, error_summary, created_at, started_at, finished_at, updated_at]
+      properties:
+        task_key: {type: string}
+        task_type: {const: rag_index}
+        status: {enum: [queued, running, succeeded, failed, cancelled]}
+        progress: {type: integer, minimum: 0, maximum: 100}
+        attempt: {type: integer, minimum: 0}
+        max_attempts: {type: integer, minimum: 1}
+        result: {type: 'null'}
+        error_summary: {type: [string, 'null']}
+        created_at: {type: string}
+        started_at: {type: [string, 'null']}
+        finished_at: {type: [string, 'null']}
+        updated_at: {type: string}
+    Receipt:
+      type: object
+      additionalProperties: false
+      required: [deleted, project_card_id, candidate_id, cleanup_status, rag_cleanup]
+      properties:
+        deleted: {const: true}
+        project_card_id: {type: integer, minimum: 1}
+        candidate_id: {type: integer, minimum: 1}
+        cleanup_status: {enum: [pending, completed]}
+        rag_cleanup: {const: database_cascade}

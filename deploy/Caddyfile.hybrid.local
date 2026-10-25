@@ -43,6 +43,21 @@
 				response_header_timeout 330s
 			}
 		}
+		@project_list {
+			method GET
+			path /api/projects
+		}
+		reverse_proxy @project_list platform-service:8081
+		@project_confirm {
+			method POST
+			path_regexp projectConfirm ^/api/projects/[0-9]+/confirm$
+		}
+		reverse_proxy @project_confirm platform-service:8081
+		@project_delete {
+			method DELETE
+			path_regexp projectDelete ^/api/projects/[0-9]+$
+		}
+		reverse_proxy @project_delete platform-service:8081
 		@account_deletion {
 			method POST
 			path /api/account/delete

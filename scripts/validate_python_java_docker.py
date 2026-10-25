@@ -1043,6 +1043,119 @@ def run_chat_stream_gateway_flow(gateway_url: str, web_url: str, java_url: str, 
     print("==> Java SSE -> incremental Unicode-safe events -> real Agent/tool/history/160-token settlement -> disconnect drains guard/no false history/80 known tokens -> scope/CSRF/balance/outages/recovery: PASS")
 
 
+def run_project_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
+                             web: str, java: str, worker: str, database_url: str) -> None:
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+    from job_hunting_agent.models import ProjectExperienceCard
+    from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
+    store = SQLAlchemyStore(database_url)
+    owners = []
+    password = "project-acceptance-password"
+    for _ in range(2):
+        email = f"projects-{os.urandom(10).hex()}@example.com"
+        owners.append((auth.register_account(email=email, password=password, display_name="Projects", email_verified=True, consents=[]).account_id, email))
+    try:
+        with httpx.Client(base_url=gateway_url, timeout=20) as browser, httpx.Client(base_url=gateway_url, timeout=20) as other:
+            for client, (_, email) in zip((browser, other), owners, strict=True):
+                login = client.post("/api/auth/login", json={"email": email, "password": password})
+                assert login.status_code == 200, login.text[:200]
+                client.headers["X-CSRF-Token"] = login.json()["csrf_token"]
+            owner = owners[0][0]
+            candidate = browser.post("/api/profiles", json={"name": "Project lifecycle"}).json()["candidate_id"]
+            assert browser.post("/api/me/balance/recharge", json={"amount_yuan": 1, "idempotency_key": os.urandom(16).hex()}).status_code == 200
+            card = ProjectExperienceCard("project", "Cross-industry design", ["design.pdf"], {}, [], ["Tolerance review"], [], [], [], [])
+            record = store.save_project_card(candidate, card, account_id=owner)
+            path = f"/api/projects/{record.id}"
+            listing = f"/api/projects?candidate_id={candidate}"
+            assert other.get(listing).status_code == 404
+            assert other.delete(path).status_code == 404
+            assert other.post(path + "/confirm", json={"confirmed_summary": "Mine"}).status_code == 404
+            assert httpx.delete(gateway_url + path, cookies=browser.cookies).status_code == 403
+            assert browser.post("/internal/v1/projects/delete", json={}).status_code == 404
+            for origin in (java_url, web_url):
+                assert httpx.post(origin + "/internal/v1/projects/list", json={"session_token": browser.cookies["job_agent_session"], "candidate_id": candidate}).status_code == 401
+            response = browser.get(listing)
+            assert response.status_code == 200 and response.json()["project_cards"][0]["id"] == record.id, response.text[:300]
+            assert httpx.get(web_url + listing, cookies=browser.cookies).json() == response.json()
+            fixture = f"""
+import json
+from job_hunting_agent.app import JobHuntingApp
+a=JobHuntingApp(); a.initialize()
+files=[a.resume_files.save(account_id={owner},candidate_id={candidate},filename='design.zip',content=b'archive'+bytes([i])) for i in (1,2)]
+item=a.store.register_project_archive_import(account_id={owner},candidate_id={candidate},original_filename='design.zip',
+    storage_key=files[0].storage_key,file_size=files[0].file_size,sha256=files[0].sha256,scan_engine='acceptance')
+a.store.add_knowledge_asset_version(item.knowledge_asset_id,account_id={owner},original_filename='design.zip',storage_key=files[1].storage_key,
+    media_type='application/zip',file_size=files[1].file_size,sha256=files[1].sha256)
+with a.store.connect() as c:c.execute('UPDATE project_archive_imports SET project_card_id=? WHERE id=?',({record.id},item.id))
+print(json.dumps([f.storage_key for f in files]));a.store.close()
+"""
+            keys = json.loads(docker("exec", worker, "python", "-c", fixture).splitlines()[-1])
+            summary = {"confirmed_summary": "I reviewed design tolerances and acceptance criteria."}
+            confirmed = browser.post(path + "/confirm", json=summary)
+            assert confirmed.status_code == 200, confirmed.text[:400]
+            key = confirmed.json()["task"]["task_key"]
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                task = browser.get(f"/api/tasks/{key}").json()["task"]
+                if task["status"] in {"succeeded", "failed"}:
+                    break
+                time.sleep(0.2)
+            assert task["status"] == "succeeded", task
+            assert browser.post(path + "/confirm", json=summary).json()["task"]["task_key"] == key
+            assert browser.post(path + "/confirm", json={"confirmed_summary": "Different"}).status_code == 409
+            assert httpx.post(web_url + path + "/confirm", cookies=browser.cookies, json=summary).json()["task"]["task_key"] == key
+            assert browser.get(f"/api/profiles/{candidate}").json()["profile"]["skills"] == {}
+            with store.connect() as conn:
+                assert conn.execute("SELECT count(*) AS n FROM long_texts WHERE entity_type='project_experience_card' AND entity_id=?", (record.id,)).fetchone()["n"] == 1
+                assert conn.execute("SELECT count(*) AS n FROM rag_chunks WHERE candidate_id=?", (candidate,)).fetchone()["n"] > 0
+                assert conn.execute("SELECT count(*) AS n FROM background_tasks WHERE account_id=? AND task_type='rag_index'", (owner,)).fetchone()["n"] == 1
+            with store.account_work.acquire(owner):
+                assert browser.delete(path).json()["code"] == "PROJECT_BUSY"
+            accepted = browser.delete(path)
+            assert accepted.status_code == 200 and accepted.json()["cleanup_status"] == "pending", accepted.text[:300]
+            assert not any(k in accepted.text for k in keys)
+            assert browser.delete(path).json() == accepted.json()
+            assert browser.post(path + "/confirm", json=summary).status_code == 404
+            assert browser.get(listing).json() == {"project_cards": []}
+            with store.connect() as conn:
+                assert conn.execute("SELECT count(*) AS n FROM rag_chunks WHERE candidate_id=?", (candidate,)).fetchone()["n"] == 0
+                assert conn.execute("SELECT count(*) AS n FROM knowledge_assets WHERE account_id=?", (owner,)).fetchone()["n"] == 0
+            failed_cleanup = f"""
+from job_hunting_agent.app import JobHuntingApp
+from job_hunting_agent.project_deletion import cleanup
+a=JobHuntingApp();a.initialize()
+def fail(key):raise RuntimeError('private storage credentials')
+a.resume_files.delete=fail
+assert cleanup(a,{owner},{record.id},force=True)['cleanup_status']=='pending'
+a.store.close()
+"""
+            docker("exec", worker, "python", "-c", failed_cleanup)
+            docker("restart", "--time", "1", worker)
+            with store.connect() as conn:
+                conn.execute("UPDATE project_deletions SET next_attempt_at=now() WHERE account_id=?", (owner,))
+            maintenance = "from job_hunting_agent.worker import create_worker_app; from job_hunting_agent.task_queue import STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME; print(create_worker_app().tasks[STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME].apply().get())"
+            docker("exec", worker, "python", "-c", maintenance)
+            assert browser.delete(path).json()["cleanup_status"] == "completed"
+            docker("exec", worker, "python", "-c", f"from job_hunting_agent.app import JobHuntingApp; a=JobHuntingApp(); assert all(not a.resume_files.path_for(k).exists() for k in {keys!r}); a.store.close()")
+            for container, health, origin in ((web, web_url + "/api/health", gateway_url), (java, java_url + "/actuator/health", web_url)):
+                try:
+                    docker("stop", "--time", "1", container)
+                    unavailable = httpx.get(origin + listing, cookies=browser.cookies, timeout=20)
+                    assert unavailable.status_code == 503 and "project_cards" not in unavailable.json()
+                    assert httpx.delete(origin + path, cookies=browser.cookies, headers={"X-CSRF-Token": browser.headers["X-CSRF-Token"]}, timeout=20).status_code == 503
+                finally:
+                    docker("start", container)
+                    wait(health)
+                assert browser.get(listing).json() == {"project_cards": []}
+            auth.session("logout", session_token=browser.cookies["job_agent_session"])
+            assert browser.delete(path).status_code == 401
+    finally:
+        store.close()
+    print("==> Java project entry -> confirmation/real Worker RAG/idempotency -> atomic SQL/vector deletion + all-version manifest -> storage failure/restart cleanup -> scope/CSRF/outages/revocation: PASS")
+
+
 def run_profile_deletion_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
                                       worker: str, broker: str, database_url: str) -> None:
     from job_hunting_agent.config import PlatformAuthSettings
@@ -1526,6 +1639,9 @@ def main() -> None:
                "job-agent-worker", "--concurrency", "1", "--log-level", "WARNING")
         run_task_command_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                               f"http://127.0.0.1:{args.port}", token, admin_credentials, isolated_url, worker, broker)
+        reset_scenario_limits()
+        run_project_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                                 f"http://127.0.0.1:{args.port}", token, web, java, worker, isolated_url)
         reset_scenario_limits()
         run_profile_deletion_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                           f"http://127.0.0.1:{args.port}", token, worker, broker, isolated_url)

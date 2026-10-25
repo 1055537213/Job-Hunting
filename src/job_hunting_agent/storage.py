@@ -1170,8 +1170,11 @@ class RepositoryStore:
                 UNION
                 SELECT jsonb_array_elements_text(storage_keys_json) AS storage_key
                 FROM profile_deletions WHERE account_id = ? AND status='pending'
+                UNION
+                SELECT jsonb_array_elements_text(storage_keys_json) AS storage_key
+                FROM project_deletions WHERE account_id = ? AND status='pending'
                 """,
-                (account_id, account_id, account_id, account_id, account_id),
+                (account_id, account_id, account_id, account_id, account_id, account_id),
             ).fetchall()
         return sorted({str(row["storage_key"]) for row in key_rows if row["storage_key"]})
 
@@ -1220,8 +1223,11 @@ class RepositoryStore:
                 UNION
                 SELECT jsonb_array_elements_text(storage_keys_json) AS storage_key
                 FROM profile_deletions WHERE account_id = ? AND status='pending'
+                UNION
+                SELECT jsonb_array_elements_text(storage_keys_json) AS storage_key
+                FROM project_deletions WHERE account_id = ? AND status='pending'
                 """,
-                (account_id, account_id, account_id, account_id, account_id),
+                (account_id, account_id, account_id, account_id, account_id, account_id),
             ).fetchall()
             conn.execute(
                 "UPDATE accounts SET status = 'disabled', updated_at = ? WHERE id = ?",
@@ -1308,6 +1314,7 @@ class RepositoryStore:
                 "jobs",
                 "profile_create_commands",
                 "profile_deletions",
+                "project_deletions",
                 "candidate_profiles",
                 "auth_sessions",
                 "account_email_outbox",
@@ -4721,6 +4728,8 @@ class RepositoryStore:
         self,
         record_id: int,
         account_id: int | None = None,
+        *,
+        _connection: RepositoryConnection | None = None,
     ) -> dict[str, object]:
         """删除项目卡片及其全部来源版本、长文本、视觉对象和派生索引。"""
 
@@ -4735,13 +4744,13 @@ class RepositoryStore:
             archive_owner_clause = " AND import.account_id = ?"
         collection_owner_clause = archive_owner_clause.replace("import.", "session.")
 
-        with self.connect() as conn:
+        with (self.connect() if _connection is None else nullcontext(_connection)) as conn:
             archive_rows = conn.execute(
                 f"""
                 SELECT import.knowledge_asset_id, version.storage_key
                 FROM project_archive_imports AS import
                 JOIN knowledge_asset_versions AS version
-                  ON version.id = import.knowledge_asset_version_id
+                  ON version.asset_id = import.knowledge_asset_id
                 WHERE import.project_card_id = ?{archive_owner_clause}
                 """,
                 (record_id, *owner_parameters),
@@ -4794,6 +4803,9 @@ class RepositoryStore:
                 """,
                 (record_id, *owner_parameters),
             ).fetchall()
+            version_keys = []
+            for asset_id in {int(row["knowledge_asset_id"]) for row in collection_file_rows if row["knowledge_asset_id"] is not None}:
+                version_keys.extend(conn.execute("SELECT storage_key FROM knowledge_asset_versions WHERE asset_id=?", (asset_id,)).fetchall())
             card_long_text_rows = conn.execute(
                 f"""
                 SELECT id FROM long_texts
@@ -4843,6 +4855,7 @@ class RepositoryStore:
             "candidate_id": existing.candidate_id,
             "long_text_ids": sorted(long_text_ids),
             "storage_keys": [
+                *[str(row["storage_key"]) for row in version_keys],
                 *[str(row["storage_key"]) for row in archive_rows],
                 *[str(row["storage_key"]) for row in archive_visual_rows],
                 *[

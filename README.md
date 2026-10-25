@@ -316,6 +316,7 @@ PR 和 `master` 推送仍运行完整验收。部署门禁要求目标 SHA 的�
 | 项目 | POST /api/projects/github | 提交公开 GitHub 项目分析 |
 | 项目 | POST /api/projects/local/manifest | 提交本地项目清单 |
 | 项目 | POST /api/projects/{record_id}/confirm | 确认项目经历卡片 |
+| 项目 | GET /api/projects / DELETE /api/projects/{record_id} | Java 校验入口，Python 查询/删除项目与关联知识 |
 | 简历 | POST /api/resumes/upload | 上传简历 |
 | 任务 | GET /api/tasks/{task_key} | 查询后台任务 |
 | 计费 | GET /api/me/balance | 查询余额和消费摘要 |
@@ -395,6 +396,7 @@ AI、RAG、OCR 和多模态文件处理仍然依赖 Python 生态；Java 更适�
 - [x] 聊天会话列表、历史、新建、归档、删除入口经 Java 鉴权和回调，Python 保留消息与会话读写；验证历史脱敏、账号隔离、在途删除保护、依赖恢复和会话撤销。
 - [x] 普通聊天入口 `/api/chat` 经 Java Session/CSRF/模型限流进入 Python Agent；有界回包、完整调用期限、禁止命令自动重放，验证工具更新档案、历史、真实账务链路与余额不足。
 - [x] `/api/chat/stream` 经 Java 校验逐条转发，Python 使用有界缓冲与心跳；断连协作取消、保护在途工作，已确认 Token 用量只结算一次，不伪造成功历史。
+- [x] 项目列表、确认和删除公开入口经 Java；Python 保留项目事实与 RAG 写入。重复确认复用索引任务，冲突摘要返回 409；删除与在途工作互斥，SQL/向量与全版本附件清单同事务提交，Worker 可恢复清理原件。
 - [x] 建立渠道无关的待支付订单和签名 Webhook 结算边界。
 - [ ] 接入具体支付渠道适配、退款状态机和渠道对账。
 - [ ] 使用真实行业材料完成正式 RAG 发布集、Top-K/Top-N 和 P95 性能验收。

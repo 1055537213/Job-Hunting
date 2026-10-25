@@ -534,6 +534,42 @@ class PlatformAuthClient:
         finally:
             self._stream_slots.release()
 
+    def projects(self, operation: str, session_token: str | None, *, trace_id=None, **data):
+        from .project_contract import MAX_PROJECT_BYTES, PROJECT_UNAVAILABLE, validate_projection
+        if operation not in {"list", "confirm", "delete"}:
+            raise ValueError("Unknown project operation")
+        if not session_token:
+            raise PlatformAuthError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
+        try:
+            with httpx.Client(trust_env=False, follow_redirects=False, timeout=15) as client:
+                with client.stream("POST", f"{self.base_url}/internal/v1/projects/{operation}",
+                    headers={"X-Internal-Service-Token": self.internal_token, "X-Trace-Id": trace_id or uuid4().hex},
+                    json={"session_token": session_token, **data}) as response:
+                    if response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                        raise ValueError("Invalid project content type")
+                    body = bytearray()
+                    for chunk in response.iter_bytes(chunk_size=65536):
+                        if len(body) + len(chunk) > MAX_PROJECT_BYTES:
+                            raise ValueError("Project response exceeds limit")
+                        body.extend(chunk)
+                    value = decode_json(bytes(body))
+                    if response.status_code != 200:
+                        codes = {401: {"SESSION_EXPIRED"}, 403: {"ACCOUNT_DISABLED", "PROJECT_SCOPE_DENIED"},
+                            404: {"PROJECT_NOT_FOUND"}, 400: {"PROJECT_CONFIRMATION_REQUIRED"},
+                            409: {"PROJECT_BUSY", "PROJECT_CONFLICT"}, 413: {"PROJECT_TOO_LARGE"}, 422: {"INVALID_REQUEST"}}
+                        code = value.get("code") if isinstance(value, dict) else None
+                        if not isinstance(code, str) or code not in codes.get(response.status_code, set()):
+                            raise ValueError("Invalid project error")
+                        message = {"SESSION_EXPIRED": "登录状态已过期，请重新登录。", "ACCOUNT_DISABLED": "账号已被停用，请重新登录。",
+                            "PROJECT_SCOPE_DENIED": "账号不可用或无权访问项目。", "PROJECT_NOT_FOUND": "项目或档案不存在。",
+                            "PROJECT_CONFIRMATION_REQUIRED": "确认项目经历前至少确认一组属于本人的内容。",
+                            "PROJECT_BUSY": "当前仍有请求或任务执行，请稍后重试。", "PROJECT_CONFLICT": "已确认内容与本次请求不一致，请刷新项目列表核实。",
+                            "PROJECT_TOO_LARGE": "项目数据超出同步查询限制。", "INVALID_REQUEST": "请求参数无效。"}[code]
+                        raise PlatformAuthError(code, message, response.status_code)
+                    return validate_projection(value, operation, candidate_id=data.get("candidate_id"), record_id=data.get("record_id"))
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
+            raise PlatformAuthError("PROJECT_UNAVAILABLE", PROJECT_UNAVAILABLE, 503) from None
+
     def chat_sessions(self, operation: str, session_token: str | None, *, trace_id=None, **data):
         if operation not in {"list", "create", "archive", "delete", "history"}:
             raise ValueError("Unknown chat operation")

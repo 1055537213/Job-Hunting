@@ -471,6 +471,15 @@ class TailorResumePayload(BaseModel):
     use_rag: bool = True
 
 
+class InternalProjectPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_token: str = Field(min_length=1, max_length=128, repr=False)
+    candidate_id: int | None = Field(default=None, gt=0, le=2**63-1, strict=True)
+    record_id: int | None = Field(default=None, gt=0, le=2**63-1, strict=True)
+    confirmed_summary: str | None = Field(default=None, max_length=20_000)
+    root_request_id: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{32}$")
+
+
 class GitHubProjectPayload(BaseModel):
     """网页提交公开 GitHub 项目分析时需要的归属和仓库链接。"""
 
@@ -504,6 +513,7 @@ class LocalProjectManifestPayload(BaseModel):
 class ProjectCardConfirmationPayload(BaseModel):
     """候选人确认项目卡片时可选提供的本人职责摘要。"""
 
+    model_config = ConfigDict(extra="forbid")
     confirmed_summary: str | None = Field(default=None, max_length=20_000)
     root_request_id: str | None = Field(
         default=None,
@@ -1284,11 +1294,13 @@ def create_web_app(
 
     @web_app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error: RequestValidationError):
+        if request.url.path == "/api/projects" or re.fullmatch(r"/api/projects/[0-9]+(?:/confirm)?", request.url.path):
+            return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
         if request.url.path in {"/api/profiles", "/api/chat", "/api/chat/stream", "/internal/v1/chat/invoke", "/internal/v1/chat/stream"} and request.method == "POST":
             return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
         if (request.url.path in {"/internal/v1/accounts/export", "/internal/v1/profiles/query", "/internal/v1/profiles/create", "/internal/v1/profiles/delete"}
-                or request.url.path.startswith("/internal/v1/chat/sessions/")):
-            if "/profiles/" in request.url.path or "/chat/sessions/" in request.url.path:
+                or request.url.path.startswith(("/internal/v1/chat/sessions/", "/internal/v1/projects/"))):
+            if "/profiles/" in request.url.path or "/chat/sessions/" in request.url.path or "/projects/" in request.url.path:
                 return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
             return JSONResponse({"detail": "无效的导出请求。"}, status_code=422, headers={"Cache-Control": "no-store"})
         return await request_validation_exception_handler(request, error)
@@ -2561,6 +2573,100 @@ def create_web_app(
             ],
         }
 
+    project_callbacks = BoundedSemaphore(8)
+
+    def platform_project(request, operation, **data):
+        try:
+            result = backend.platform_auth_client.projects(operation, request.cookies.get(SESSION_COOKIE_NAME),
+                trace_id=getattr(request.state, "request_id", None), **data)
+            return JSONResponse(result, headers={"Cache-Control": "no-store"})
+        except PlatformAuthError as error:
+            status = error.status_code or 503
+            return JSONResponse({"code": error.code, "detail": str(error)}, status_code=status,
+                headers={"Cache-Control": "no-store", **({"Retry-After": "3"} if status in (409, 503) else {})})
+
+    def build_internal_project(operation, payload, trace_id):
+        from .project_contract import MAX_PROJECT_BYTES, validate_projection
+        from .project_deletion import request_deletion
+        if not project_callbacks.acquire(blocking=False):
+            raise AccountWorkBusy()
+        try:
+            resolved = backend.platform_auth_client.account("me", session_token=payload.session_token, trace_id=trace_id)
+            owner = platform_account_record(resolved["account"]).id
+            if operation == "delete":
+                if payload.record_id is None:
+                    raise HTTPException(422, "请求参数无效。")
+                result = request_deletion(backend, owner, payload.record_id)
+            else:
+                with backend.store.account_work.acquire(owner):
+                    if operation == "list":
+                        if payload.candidate_id is None:
+                            raise HTTPException(422, "请求参数无效。")
+                        get_profile_or_404(backend, payload.candidate_id, owner)
+                        result = {"project_cards": [asdict(row) for row in backend.list_project_cards(payload.candidate_id, account_id=owner)]}
+                    else:
+                        if payload.record_id is None:
+                            raise HTTPException(422, "请求参数无效。")
+                        existing = backend.store.get_project_card(payload.record_id, account_id=owner)
+                        summary = payload.confirmed_summary.strip() if payload.confirmed_summary is not None else None
+                        if not summary and not existing.confirmed_summary:
+                            raise HTTPException(400, "至少确认一组属于本人的内容。")
+                        if existing.status == "已确认" and summary is not None and summary != existing.confirmed_summary:
+                            raise HTTPException(409, "已确认内容与本次请求不一致。")
+                        request_id = owned_or_new_root_request_id(backend, account_id=owner,
+                            candidate_id=existing.candidate_id, root_request_id=payload.root_request_id)
+                        record, task = backend.confirm_project_card_and_enqueue_rag(payload.record_id, summary,
+                            account_id=owner, session_id=f"project-confirmation-{payload.record_id}", root_request_id=request_id)
+                        if summary is not None and record.confirmed_summary != summary:
+                            raise HTTPException(409, "已确认内容与本次请求不一致。")
+                        task_view = serialize_background_task(task) if task is not None else None
+                        if task_view is not None:
+                            task_view["result"] = None
+                            task_view["error_summary"] = "索引任务未完成，请查看任务状态。" if task.error_summary else None
+                        update_confirmation_tool_trace(backend, root_request_id=request_id, account_id=owner,
+                            candidate_id=record.candidate_id, session_id=f"project-confirmation-{record.id}",
+                            record=asdict(record), rag_task=task_view)
+                        result = {"project_card": asdict(record), "task": task_view, "root_request_id": request_id}
+            validate_projection(result, operation, candidate_id=payload.candidate_id, record_id=payload.record_id)
+            body = json.dumps({"account_id": owner, **result}, ensure_ascii=False).encode("utf-8")
+            if len(body) > MAX_PROJECT_BYTES:
+                raise HTTPException(413, "项目数据超出同步查询限制。")
+            return body
+        finally:
+            project_callbacks.release()
+
+    @web_app.post("/internal/v1/projects/{operation}", include_in_schema=False)
+    async def internal_projects(operation: str, payload: InternalProjectPayload, request: Request):
+        from .project_contract import PROJECT_UNAVAILABLE
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            return JSONResponse({"code": "INTERNAL_UNAUTHORIZED", "detail": "内部服务认证失败。"}, status_code=401)
+        allowed = {"list": {"candidate_id"}, "confirm": {"record_id", "confirmed_summary", "root_request_id"}, "delete": {"record_id"}}
+        if operation not in allowed or payload.model_fields_set - {"session_token"} - allowed[operation]:
+            return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422)
+        try:
+            body = await asyncio.to_thread(build_internal_project, operation, payload, request.headers.get("X-Trace-Id"))
+            return Response(body, media_type="application/json", headers={"Cache-Control": "no-store"})
+        except PlatformAuthError as error:
+            status = error.status_code if error.status_code in (401, 403) else 503
+            code = {401: "SESSION_EXPIRED", 403: "PROJECT_SCOPE_DENIED"}.get(status, "PROJECT_UNAVAILABLE")
+        except HTTPException as error:
+            status = error.status_code
+            code = {400: "PROJECT_CONFIRMATION_REQUIRED", 404: "PROJECT_NOT_FOUND", 409: "PROJECT_CONFLICT", 413: "PROJECT_TOO_LARGE", 422: "INVALID_REQUEST"}.get(status, "PROJECT_UNAVAILABLE")
+        except KeyError:
+            status, code = 404, "PROJECT_NOT_FOUND"
+        except AccountWorkBusy:
+            status, code = 409, "PROJECT_BUSY"
+        except (AccountWorkDenied, PermissionError):
+            status, code = 403, "PROJECT_SCOPE_DENIED"
+        except Exception:  # noqa: BLE001 - never expose source content, SQL or object keys.
+            status, code = 503, "PROJECT_UNAVAILABLE"
+        return JSONResponse({"code": code, "detail": PROJECT_UNAVAILABLE}, status_code=status,
+            headers={"Cache-Control": "no-store", **({"Retry-After": "3"} if status in (409, 503) else {})})
+
     @web_app.get("/api/projects")
     def list_project_cards(
         request: Request,
@@ -2568,6 +2674,8 @@ def create_web_app(
     ) -> dict[str, object]:
         """列出当前候选人的项目经历卡片，供网页复核与确认。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_project(request, "list", candidate_id=candidate_id)
         account = current_account(request)
         assert account is not None
         get_profile_or_404(backend, candidate_id, account.id)
@@ -2585,6 +2693,8 @@ def create_web_app(
     ) -> dict[str, object]:
         """删除当前账号的一张项目经历卡片及其摘要证据。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_project(request, "delete", record_id=record_id)
         account = current_account(request)
         assert account is not None
         try:
@@ -2883,6 +2993,8 @@ def create_web_app(
     ) -> dict[str, object]:
         """确认当前账号的一张项目经历卡片，不回写候选人档案事实。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_project(request, "confirm", record_id=record_id, **payload.model_dump(exclude_unset=True))
         account = current_account(request)
         assert account is not None
         try:
