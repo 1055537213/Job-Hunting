@@ -159,7 +159,7 @@ jobs:
         run: docker run --rm -v "$PWD:/repo" -w /repo "$ACTIONLINT_IMAGE"
 
       - name: Run Python tests
-        run: python -m pytest -q
+        run: python -m pytest -q --durations=15
 
       - name: Run lint
         run: ruff check src tests alembic
