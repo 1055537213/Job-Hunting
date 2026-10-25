@@ -137,7 +137,7 @@ def test_deletion_cancels_only_queued_work_for_this_project(projects):
     with store.connect() as conn:
         conn.execute("UPDATE project_experience_cards SET card_json=? WHERE id=?", (json.dumps(asdict(records[0].card)), records[0].id))
     related = store.create_background_task(account_id=owners[0], candidate_id=candidates[0], task_type="github_project_analysis",
-        payload={"repository_url": records[0].card.source_url})
+        payload={"repository_url": "https://github.com/EXAMPLE/Project"})
     other = store.create_background_task(account_id=owners[0], candidate_id=candidates[0], task_type="github_project_analysis",
         payload={"repository_url": "https://github.com/example/other"})
     assert submit(browser, "delete", record_id=records[0].id).status_code == 200
