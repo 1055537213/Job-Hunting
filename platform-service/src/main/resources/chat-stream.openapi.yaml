@@ -1,0 +1,119 @@
+openapi: 3.1.0
+info:
+  title: Authenticated streaming chat
+  version: 1.0.0
+  description: >-
+    Java authenticates and validates a bounded SSE relay. Python owns Agent, tools,
+    RAG and persistence. No replay, redirect or local execution fallback.
+    Cancellation is cooperative, not rollback: in-flight synchronous work drains
+    under its account lease, known provider usage settles once, incomplete turns
+    do not append successful history. A disconnect after commit is ambiguous.
+paths:
+  /api/chat/stream:
+    post:
+      security:
+        - session: []
+          csrf: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: './chat-invocation.openapi.yaml#/components/schemas/ChatRequest'}
+      responses:
+        '200':
+          description: >-
+            text/event-stream, no-store, no buffering. Multiple public events followed
+            by one final or error. Scope is NEVER public. Heartbeat comments every 2s
+            when idle, 15s upstream idle deadline, 300s total, 4 MiB/event and 8 MiB/stream.
+            Premature EOF must be presented as error, never as successful final.
+          content:
+            text/event-stream:
+              schema: {type: string}
+          x-sse-events:
+            token: {schema: {$ref: '#/components/schemas/TextEvent'}}
+            status: {schema: {$ref: '#/components/schemas/TextEvent'}}
+            task_started: {schema: {$ref: '#/components/schemas/TraceEvent'}}
+            task_completed: {schema: {$ref: '#/components/schemas/TraceEvent'}}
+            task_failed: {schema: {$ref: '#/components/schemas/TraceEvent'}}
+            approval_required: {schema: {$ref: '#/components/schemas/TraceEvent'}}
+            step_started: {schema: {$ref: '#/components/schemas/StepEvent'}}
+            step_completed: {schema: {$ref: '#/components/schemas/StepEvent'}}
+            final: {schema: {$ref: './chat-invocation.openapi.yaml#/components/schemas/ChatReply'}}
+            error: {schema: {$ref: '#/components/schemas/ErrorEvent'}}
+        '400': {description: Invalid JSON or CHAT_NOT_READY}
+        '401': {description: Missing/expired/revoked session}
+        '402': {description: 'INSUFFICIENT_BALANCE; 余额不足，请先充值后重试。'}
+        '403': {description: CSRF rejection or disabled account}
+        '404': {description: CHAT_NOT_FOUND; inaccessible profile/session}
+        '409': {description: CHAT_BUSY or CHAT_SESSION_ARCHIVED}
+        '422': {description: INVALID_REQUEST; inputs never reflected}
+        '429': {description: Shared model-group Redis limits}
+        '503': {description: CHAT_EXECUTION_UNCONFIRMED or protection unavailable; no empty success}
+  /internal/v1/chat/stream:
+    post:
+      description: >-
+        Service-only on both runtimes; blocked at the public gateway. Python compatibility
+        calls Java with ChatRequest plus session_token; Java revalidates the session and adds
+        a server-generated execution_id before calling Python. No caller-supplied account_id.
+        Python checks scope and balance before HTTP 200; first event is private scope.
+        Java strips it and reuses the public SSE format; Java never moves Agent execution.
+      security:
+        - serviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: './chat-invocation.openapi.yaml#/components/schemas/InternalRequest'}
+      responses:
+        '200':
+          description: >-
+            Python emits scope first (account_id, candidate_id, session_id, execution_id),
+            then public events. Java compatibility response omits scope. Both enforce
+            response budgets and release sockets/slots on cancellation or terminal events.
+          content:
+            text/event-stream: {schema: {type: string}}
+        default:
+          description: >-
+            Safe startup HTTP error. After headers are committed, only a redacted SSE
+            error can signal failure. Cancellation never retries the command.
+components:
+  securitySchemes:
+    session: {type: apiKey, in: cookie, name: job_agent_session}
+    csrf: {type: apiKey, in: header, name: X-CSRF-Token}
+    serviceToken: {type: apiKey, in: header, name: X-Internal-Service-Token}
+  schemas:
+    TextEvent:
+      type: object
+      additionalProperties: false
+      required: [content]
+      properties:
+        content: {type: string}
+    TraceEvent:
+      type: object
+      additionalProperties: false
+      required: [task_trace]
+      properties:
+        task_trace:
+          description: Existing public trace; root_request_id must equal the server execution_id
+          type: object
+    StepEvent:
+      type: object
+      additionalProperties: false
+      required: [step]
+      properties:
+        step:
+          type: object
+          additionalProperties: false
+          required: [id, label, status, summary]
+          properties:
+            id: {type: string}
+            label: {type: string}
+            status: {type: string}
+            summary: {type: string}
+    ErrorEvent:
+      type: object
+      additionalProperties: false
+      required: [code, detail]
+      properties:
+        code: {enum: [INSUFFICIENT_BALANCE, CHAT_EXECUTION_UNCONFIRMED]}
+        detail: {type: string}

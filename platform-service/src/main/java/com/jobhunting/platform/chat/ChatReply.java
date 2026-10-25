@@ -12,15 +12,22 @@ final class ChatReply {
         text(reply, "mode", "reply", "display_reply");
         ProfileQueryClient.validateProfile(reply.get("profile"));
         require(reply.get("profile").get("id").asLong() == candidate);
-        var trace = reply.get("task_trace");
+        validateTrace(reply.get("task_trace"), requestId);
+        require(reply.get("background_tasks").isArray());
+        for (var task : reply.get("background_tasks")) {
+            require(ChatSessionClient.fields(task, Set.of("task_key", "task_type", "status", "progress")) && task.get("progress").isIntegralNumber());
+            text(task, "task_key", "task_type", "status");
+        }
+    }
+    static void validateTrace(JsonNode trace, String requestId) {
+        require(trace != null);
         if (!trace.isNull()) {
             require(ChatSessionClient.fields(trace, Set.of("version", "root_request_id", "title", "status", "duration_ms", "steps", "approval")));
             text(trace, "root_request_id", "title", "status");
             require(trace.get("version").isIntegralNumber() && requestId.equals(trace.get("root_request_id").asText())
                     && (trace.get("duration_ms").isNull() || trace.get("duration_ms").isIntegralNumber()) && trace.get("steps").isArray());
             for (var step : trace.get("steps")) {
-                require(ChatSessionClient.fields(step, Set.of("id", "label", "status", "summary")));
-                text(step, "id", "label", "status", "summary");
+                validateStep(step);
             }
             var approval = trace.get("approval");
             if (!approval.isNull()) {
@@ -33,11 +40,10 @@ final class ChatReply {
                 }
             }
         }
-        require(reply.get("background_tasks").isArray());
-        for (var task : reply.get("background_tasks")) {
-            require(ChatSessionClient.fields(task, Set.of("task_key", "task_type", "status", "progress")) && task.get("progress").isIntegralNumber());
-            text(task, "task_key", "task_type", "status");
-        }
+    }
+    static void validateStep(JsonNode step) {
+        require(ChatSessionClient.fields(step, Set.of("id", "label", "status", "summary")));
+        text(step, "id", "label", "status", "summary");
     }
     private static void text(JsonNode node, String... keys) { for (var key : keys) require(node.path(key).isTextual()); }
     private static void require(boolean valid) { if (!valid) throw ChatSessionClient.unconfirmed(); }

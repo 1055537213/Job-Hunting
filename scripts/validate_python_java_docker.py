@@ -930,6 +930,119 @@ def run_chat_message_gateway_flow(gateway_url: str, web_url: str, java_url: str,
     print("==> Java chat entry -> real Python Agent/tool -> profile/history/160 provider tokens -> one Java charge; zero-balance/CSRF/failure/outages/recovery/revocation: PASS")
 
 
+def run_chat_stream_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
+                                  web: str, java: str, model: str, database_url: str) -> None:
+    """Exercise the real proxy/SSE/disconnect path, not an in-memory TestClient stream."""
+    from job_hunting_agent.account_work import AccountWorkBusy
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+    from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
+    store = SQLAlchemyStore(database_url)
+    owners = []
+    password = "stream-acceptance-password"
+    for _ in range(2):
+        email = f"chat-stream-{os.urandom(10).hex()}@example.com"
+        owner = auth.register_account(email=email, password=password, display_name="Stream acceptance", email_verified=True, consents=[]).account_id
+        owners.append((owner, email))
+    def events(response):
+        name, data = None, []
+        for line in response.iter_lines():
+            if line.startswith("event: "):
+                name = line[7:]
+            elif line.startswith("data: "):
+                data.append(line[6:])
+            elif not line and name is not None:
+                yield name, json.loads("\n".join(data))
+                name, data = None, []
+    try:
+        with httpx.Client(base_url=gateway_url, timeout=40) as browser, httpx.Client(base_url=gateway_url, timeout=40) as other:
+            for client, (_, email) in zip((browser, other), owners, strict=True):
+                login=client.post("/api/auth/login",json={"email":email,"password":password})
+                assert login.status_code == 200, login.text[:300]
+                client.headers["X-CSRF-Token"] = login.json()["csrf_token"]
+            owner=owners[0][0]
+            candidate=browser.post("/api/profiles",json={"name":"Stream scope"}).json()["candidate_id"]
+            key=browser.post("/api/chat/sessions",json={"candidate_id":candidate}).json()["session"]["session_id"]
+            body={"candidate_id":candidate,"session_id":key,"message":"acceptance-stream-update","auto_rag":False}
+            assert httpx.post(gateway_url+"/api/chat/stream",cookies=browser.cookies,json=body).status_code==403
+            assert other.post("/api/chat/stream",json=body).status_code==404
+            assert browser.post("/internal/v1/chat/stream",json={}).status_code==404
+            for origin in (java_url,web_url):
+                assert httpx.post(origin+"/internal/v1/chat/stream",json={**body,"session_token":browser.cookies["job_agent_session"]}).status_code==401
+            denied=browser.post("/api/chat/stream",json=body)
+            assert denied.status_code==402 and denied.json()["detail"]=="余额不足，请先充值后重试。",denied.text[:300]
+            assert browser.post("/api/me/balance/recharge",json={"amount_yuan":1,"idempotency_key":os.urandom(16).hex()}).status_code==200
+            collected=[]
+            first_token=None
+            with browser.stream("POST","/api/chat/stream",json=body,headers={"X-Request-ID":"stream-acceptance"}) as response:
+                assert response.status_code==200 and response.headers["content-type"].startswith("text/event-stream")
+                assert response.headers["x-request-id"]=="stream-acceptance" and response.headers["cache-control"]=="no-store"
+                for name,value in events(response):
+                    if name=="token" and first_token is None:
+                        first_token=time.monotonic()
+                    collected.append((name,value))
+            assert first_token is not None and time.monotonic()-first_token>=0.5, "Proxy buffered until final instead of streaming tokens"
+            assert collected[-1][0]=="final" and sum(name=="final" for name,_ in collected)==1,str(collected)[-500:]
+            assert collected[-1][1]["profile"]["preferred_cities"]==["上海"]
+            assert "scope" not in [name for name,_ in collected]
+            assert not any(secret in json.dumps(collected) for secret in ("session_token","account_id","tool_outputs"))
+            assert len(store.list_chat_messages(candidate,key,account_id=owner))==2
+            charges=[entry for entry in store.list_account_balance_ledger(owner) if entry.entry_kind=="consumption"]
+            assert len(charges)==1 and charges[0].token_count==160,str(charges)
+            # Disconnect during the second model call. The first call/tool is already complete.
+            with browser.stream("POST","/api/chat/stream",json={**body,"message":"acceptance-cancel"},
+                headers={"X-Request-ID":"stream-acceptance"}) as response:
+                assert response.status_code==200
+                for name,value in events(response):
+                    if name=="token" and value["content"]=="Partial":
+                        break
+                else:
+                    raise AssertionError("Missing partial token before cancellation")
+            with_error=False
+            try:
+                store.account_work.acquire(owner,deletion=True).release()
+            except AccountWorkBusy:
+                with_error=True
+            assert with_error,"Cancellation released account guard while model work was still running"
+            deadline=time.monotonic()+12
+            while True:
+                try:
+                    store.account_work.acquire(owner,deletion=True).release()
+                    break
+                except AccountWorkBusy:
+                    assert time.monotonic()<deadline,"Disconnected worker failed to drain"
+                    time.sleep(0.1)
+            assert len(store.list_chat_messages(candidate,key,account_id=owner))==2,"Cancelled request persisted a false successful turn"
+            charges=[entry for entry in store.list_account_balance_ledger(owner) if entry.entry_kind=="consumption"]
+            assert sorted(entry.token_count for entry in charges)==[80,160],str(charges)
+            assert store.get_account_balance_summary(owner).total_consumed_micro_yuan==6000
+            assert store.get_candidate_profile(candidate,account_id=owner).preferred_cities==["北京"],"Completed tool side effects must not be presented as rolled back"
+            assert sum(t.status=="cancelled" for t in store.list_tool_call_traces(account_id=owner))==1
+            failure=browser.post("/api/chat/stream",json={**body,"message":"acceptance-failure"})
+            failure_events=list(events(failure))
+            assert failure_events[-1][0]=="error" and not any(n=="final" for n,_ in failure_events)
+            assert "private-model-error" not in failure.text
+            compat=httpx.post(web_url+"/api/chat/stream",cookies=browser.cookies,
+                json={**body,"message":"我的首选城市改为上海","use_env_llm":False},timeout=30)
+            assert compat.status_code==200 and list(events(compat))[-1][0]=="final",compat.text[:300]
+            for container,health,origin in ((web,web_url+"/api/health",gateway_url),(java,java_url+"/actuator/health",web_url)):
+                try:
+                    docker("stop","--time","1",container)
+                    failure=httpx.post(origin+"/api/chat/stream",cookies=browser.cookies,
+                        headers={"X-CSRF-Token":browser.headers["X-CSRF-Token"]},json=body,timeout=25)
+                    assert failure.status_code==503 and failure.json()["code"]=="CHAT_EXECUTION_UNCONFIRMED",failure.text[:300]
+                finally:
+                    docker("start",container)
+                    wait(health)
+            assert browser.post("/api/chat/stream",json={**body,"message":"我的首选城市改为北京","use_env_llm":False}).status_code==200
+            auth.session("logout",session_token=browser.cookies["job_agent_session"])
+            assert browser.post("/api/chat/stream",json=body).status_code==401
+    finally:
+        store.close()
+    print("==> Java SSE -> incremental Unicode-safe events -> real Agent/tool/history/160-token settlement -> disconnect drains guard/no false history/80 known tokens -> scope/CSRF/balance/outages/recovery: PASS")
+
+
 def run_profile_deletion_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
                                       worker: str, broker: str, database_url: str) -> None:
     from job_hunting_agent.config import PlatformAuthSettings
@@ -1404,6 +1517,9 @@ def main() -> None:
                                       f"http://127.0.0.1:{args.port}", token, web, java, isolated_url)
         reset_scenario_limits()
         run_chat_message_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                                      f"http://127.0.0.1:{args.port}", token, web, java, model, isolated_url)
+        reset_scenario_limits()
+        run_chat_stream_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                       f"http://127.0.0.1:{args.port}", token, web, java, model, isolated_url)
         reset_scenario_limits()
         docker("run", "-d", "--name", worker, *common, *env_args, args.ai_image,

@@ -52,6 +52,7 @@ from .job_hunting_tools import build_job_hunting_tool_registry
 from .langchain_tool_adapter import build_langchain_tools
 from .llm import extract_message_text
 from .models import AgentChatResult
+from .stream_cancellation import until_cancelled
 
 
 class JobHuntingAgentContext(TypedDict):
@@ -263,6 +264,7 @@ class JobHuntingAgent:
         auto_rag: bool = True,
         account_id: int | None = None,
         root_request_id: str | None = None,
+        cancelled=None,
     ) -> Iterator[dict[str, object]]:
         """流式执行一轮标准 LangChain Agent 对话。
 
@@ -278,6 +280,8 @@ class JobHuntingAgent:
         """
 
         turn_started_at = time.monotonic()
+        if cancelled is not None and cancelled.is_set():
+            return
         resolved_session_id = session_id or default_session_id(candidate_id, account_id)
         root_request_id = root_request_id or uuid.uuid4().hex
         if account_id is not None:
@@ -291,6 +295,8 @@ class JobHuntingAgent:
             session_id=resolved_session_id,
             root_request_id=root_request_id,
         )
+        if cancelled is not None and cancelled.is_set():
+            return
         direct_result = self._execute_direct_route(
             route_decision,
             candidate_id=candidate_id,
@@ -317,6 +323,13 @@ class JobHuntingAgent:
         streamed_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         usage_by_call: dict[tuple, dict[str, int]] = {}
         active_tool_names: set[str] = set()
+        usage = None
+
+        def settle_usage():
+            return self.model_gateway.record_chat_usage_summary(
+                self.model_gateway.new_call_context("agent_chat", account_id=account_id, candidate_id=candidate_id,
+                    session_id=resolved_session_id, root_request_id=root_request_id,
+                    call_id=f"{root_request_id}-agent_chat-stream", authorize_spend=False), streamed_usage)
 
         graph_events = None
         try:
@@ -342,12 +355,14 @@ class JobHuntingAgent:
                 },
                 stream_mode="messages",
             )
-            for stream_item in graph_events:
+            for stream_item in until_cancelled(graph_events, cancelled):
                 streamed_message = unpack_stream_message(stream_item)
                 if streamed_message is None:
                     continue
                 if isinstance(streamed_message, AIMessage):
                     merge_stream_usage(streamed_usage, usage_by_call, stream_item, streamed_message)
+                if cancelled is not None and cancelled.is_set():
+                    return
 
                 if isinstance(streamed_message, ToolMessage):
                     tool_and_final_messages.append(streamed_message)
@@ -401,21 +416,19 @@ class JobHuntingAgent:
             if reply.startswith("本轮没有生成") and streamed_reply_parts:
                 reply = "".join(streamed_reply_parts).strip()
         finally:
-            close = getattr(graph_events, "close", None)
-            if close is not None:
-                close()
-        usage = self.model_gateway.record_chat_usage_summary(
-            self.model_gateway.new_call_context(
-                "agent_chat",
-                account_id=account_id,
-                candidate_id=candidate_id,
-                session_id=resolved_session_id,
-                root_request_id=root_request_id,
-                call_id=f"{root_request_id}-agent_chat-stream",
-                authorize_spend=False,
-            ),
-            streamed_usage,
-        )
+            try:
+                close = getattr(graph_events, "close", None)
+                if close is not None:
+                    close()
+            finally:
+                # Cancellation may follow a completed provider call. Settle only known
+                # usage, once, while the execution worker still holds its account lease.
+                if streamed_usage["total_tokens"] > 0:
+                    usage = settle_usage()
+        if cancelled is not None and cancelled.is_set():
+            return
+        if usage is None:
+            usage = settle_usage()
         chat_result = AgentChatResult(
             reply=reply,
             candidate_id=candidate_id,

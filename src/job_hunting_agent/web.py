@@ -52,6 +52,8 @@ from .account_work import AccountWorkBusy, AccountWorkDenied, AccountWorkRoute, 
 from .profile_query import MAX_PROFILE_CREATE_BYTES, encode_callback, validate_creation, validate_deletion
 from .chat_session_query import MAX_CHAT_BYTES, valid_session_key, validate_chat_projection
 from .chat_reply import CHAT_UNCONFIRMED_MESSAGE, validate_reply
+from .chat_stream import ClosingStreamResponse, StreamWorker
+from .stream_cancellation import until_cancelled
 from .account_lifecycle import (
     AccountEmailSender,
     action_token_hash,
@@ -1282,7 +1284,7 @@ def create_web_app(
 
     @web_app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error: RequestValidationError):
-        if request.url.path in {"/api/profiles", "/api/chat", "/internal/v1/chat/invoke"} and request.method == "POST":
+        if request.url.path in {"/api/profiles", "/api/chat", "/api/chat/stream", "/internal/v1/chat/invoke", "/internal/v1/chat/stream"} and request.method == "POST":
             return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
         if (request.url.path in {"/internal/v1/accounts/export", "/internal/v1/profiles/query", "/internal/v1/profiles/create", "/internal/v1/profiles/delete"}
                 or request.url.path.startswith("/internal/v1/chat/sessions/")):
@@ -2256,8 +2258,64 @@ def create_web_app(
             pass
         return JSONResponse({"code": code, "detail": detail}, status_code=status, headers={"Cache-Control": "no-store"})
 
+    def internal_stream_source(payload, trace_id, cancelled):
+        resolved = backend.platform_auth_client.account("me", session_token=payload.session_token, trace_id=trace_id)
+        owner = platform_account_record(resolved["account"]).id
+        with backend.store.account_work.acquire(owner):
+            get_profile_or_404(backend, payload.candidate_id, owner)
+            key = payload.session_id or default_web_session_id(payload.candidate_id, owner)
+            validate_chat_session(owner, payload.candidate_id, key)
+            if not payload.message.strip():
+                raise HTTPException(400, "消息不能为空。")
+            if payload.use_env_llm:
+                if chat_agent is None:
+                    raise HTTPException(400, "聊天服务未就绪。")
+                backend.store.assert_account_can_spend(owner)
+            web_logger.info("Chat stream accepted request_id=%s execution_id=%s", trace_id, payload.execution_id)
+            yield sse_event("scope", {"account_id": owner, "candidate_id": payload.candidate_id,
+                "session_id": key, "execution_id": payload.execution_id})
+            source = stream_web_chat_events(backend, chat_agent, payload, payload.message.strip(), key, owner,
+                root_request_id=payload.execution_id, cancelled=cancelled, safe_errors=True)
+            try:
+                yield from until_cancelled(source, cancelled)
+            finally:
+                source.close()
+
+    @web_app.post("/internal/v1/chat/stream", include_in_schema=False)
+    async def internal_chat_stream(payload: InternalChatInvokePayload, request: Request):
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            return JSONResponse({"code": "INTERNAL_UNAUTHORIZED", "detail": "内部服务认证失败。"}, status_code=401)
+        if not chat_callbacks.acquire(blocking=False):
+            return JSONResponse({"code": "CHAT_BUSY", "detail": "当前仍有请求执行，请稍后重试。"}, status_code=409)
+        worker = StreamWorker(lambda cancelled: internal_stream_source(payload, request.headers.get("X-Trace-Id"), cancelled), chat_callbacks.release)
+        try:
+            first = await worker.ready()
+            return ClosingStreamResponse(worker.frames(first), worker.close)
+        except InsufficientBalanceError:
+            status, code, detail = 402, "INSUFFICIENT_BALANCE", "余额不足，请先充值后重试。"
+        except PlatformAuthError as error:
+            status = error.status_code if error.status_code in (401, 403) else 503
+            code, detail = ("SESSION_EXPIRED", "登录状态已过期，请重新登录。") if status == 401 else ("CHAT_SCOPE_DENIED", "账号不可用。") if status == 403 else ("CHAT_EXECUTION_UNCONFIRMED", CHAT_UNCONFIRMED_MESSAGE)
+        except (AccountWorkDenied, PermissionError):
+            status, code, detail = 403, "CHAT_SCOPE_DENIED", "账号不可用或无权访问会话。"
+        except AccountWorkBusy:
+            status, code, detail = 409, "CHAT_BUSY", "当前仍有请求执行，请稍后重试。"
+        except HTTPException as error:
+            status = error.status_code if error.status_code in (400, 404, 409) else 503
+            code, detail = {400: ("CHAT_NOT_READY", "消息为空或聊天服务未就绪。"),
+                404: ("CHAT_NOT_FOUND", "会话或档案不存在。"), 409: ("CHAT_SESSION_ARCHIVED", "该会话已经归档，请新建对话。"),
+                503: ("CHAT_EXECUTION_UNCONFIRMED", CHAT_UNCONFIRMED_MESSAGE)}[status]
+        except Exception:  # noqa: BLE001 - never expose startup errors or prompts.
+            status, code, detail = 503, "CHAT_EXECUTION_UNCONFIRMED", CHAT_UNCONFIRMED_MESSAGE
+        await worker.close()
+        return JSONResponse({"code": code, "detail": detail}, status_code=status, headers={"Cache-Control": "no-store"})
+
     @web_app.post("/api/chat/stream")
-    def chat_stream(payload: ChatPayload, request: Request) -> StreamingResponse:
+    async def chat_stream(payload: ChatInvokePayload, request: Request) -> StreamingResponse:
         """流式处理网页聊天消息。
 
         前端通过 fetch 读取 SSE 事件：
@@ -2268,6 +2326,18 @@ def create_web_app(
         - `error`：流式执行中的可读错误。
         """
 
+        if backend.platform_auth_client is not None:
+            manager = backend.platform_auth_client.chat_stream(request.cookies.get(SESSION_COOKIE_NAME),
+                trace_id=getattr(request.state, "request_id", None), **payload.model_dump())
+            try:
+                stream = await manager.__aenter__()
+                return ClosingStreamResponse(stream, lambda: manager.__aexit__(None, None, None))
+            except PlatformAuthError as error:
+                return JSONResponse({"code": error.code, "detail": str(error)}, status_code=error.status_code or 503,
+                    headers={"Cache-Control": "no-store"})
+        return await run_in_threadpool(native_chat_stream, payload, request)
+
+    def native_chat_stream(payload, request):
         account = current_account(request)
         account_id = account.id if account else None
         get_profile_or_404(backend, payload.candidate_id, account_id)
@@ -3906,6 +3976,7 @@ def stream_web_chat_events(
     user_message: str,
     session_id: str,
     account_id: int,
+    *, root_request_id: str | None = None, cancelled=None, safe_errors=False,
 ):
     """生成网页聊天 SSE 事件。
 
@@ -3913,7 +3984,7 @@ def stream_web_chat_events(
     才会把用户消息和助手展示文本写入聊天历史。
     """
 
-    root_request_id = uuid.uuid4().hex
+    root_request_id = root_request_id or uuid.uuid4().hex
     trace = new_task_trace(root_request_id=root_request_id, source="chat")
     trace_started_at = time.monotonic()
     yield sse_event("task_started", {"task_trace": serialize_user_task_trace(trace)})
@@ -3934,8 +4005,11 @@ def stream_web_chat_events(
                 auto_rag=payload.auto_rag,
                 account_id=account_id,
                 root_request_id=root_request_id,
+                **({"cancelled": cancelled} if cancelled is not None else {}),
             )
-            for event in agent_events:
+            for event in until_cancelled(agent_events, cancelled):
+                if cancelled is not None and cancelled.is_set():
+                    return
                 event_type = event.get("type")
                 if event_type == "token":
                     yield sse_event("token", {"content": event.get("content", "")})
@@ -4010,7 +4084,8 @@ def stream_web_chat_events(
                         },
                     )
         except ModelCircuitOpenError as error:
-            fail_task_trace(trace, str(error), trace_started_at)
+            detail = "模型服务暂时不可用，请稍后重试。" if safe_errors else str(error)
+            fail_task_trace(trace, detail, trace_started_at)
             persist_tool_trace(
                 backend,
                 trace,
@@ -4020,9 +4095,10 @@ def stream_web_chat_events(
                 source="chat",
             )
             yield sse_event("task_failed", {"task_trace": serialize_user_task_trace(trace)})
-            yield sse_event("error", {"detail": str(error), "retry_after": error.retry_after_seconds})
+            yield sse_event("error", {"detail": detail, "retry_after": error.retry_after_seconds})
         except RAGProviderRequestError as error:
-            fail_task_trace(trace, str(error), trace_started_at)
+            detail = "检索服务暂时不可用，请稍后重试。" if safe_errors else str(error)
+            fail_task_trace(trace, detail, trace_started_at)
             persist_tool_trace(
                 backend,
                 trace,
@@ -4032,7 +4108,7 @@ def stream_web_chat_events(
                 source="chat",
             )
             yield sse_event("task_failed", {"task_trace": serialize_user_task_trace(trace)})
-            yield sse_event("error", {"detail": str(error)})
+            yield sse_event("error", {"detail": detail})
         except Exception as error:  # noqa: BLE001 - SSE 内统一返回可读错误事件。
             web_logger.exception(
                 "agent stream failed",
@@ -4043,7 +4119,8 @@ def stream_web_chat_events(
                     "candidate_id": payload.candidate_id,
                 },
             )
-            fail_task_trace(trace, str(error), trace_started_at)
+            detail = ("余额不足，请先充值后重试。" if isinstance(error, InsufficientBalanceError) else CHAT_UNCONFIRMED_MESSAGE) if safe_errors else str(error)
+            fail_task_trace(trace, detail, trace_started_at)
             persist_tool_trace(
                 backend,
                 trace,
@@ -4053,11 +4130,25 @@ def stream_web_chat_events(
                 source="chat",
             )
             yield sse_event("task_failed", {"task_trace": serialize_user_task_trace(trace)})
-            yield sse_event("error", {"detail": str(error)})
+            yield sse_event("error", {"detail": detail})
         finally:
-            close = getattr(agent_events, "close", None)
-            if close is not None:
-                close()
+            try:
+                close = getattr(agent_events, "close", None)
+                if close is not None:
+                    close()
+            finally:
+                if cancelled is not None and cancelled.is_set() and trace["status"] == "running":
+                    detail = "连接已断开，执行已取消；已完成的更改不会回滚。"
+                    fail_task_trace(trace, detail, trace_started_at)
+                    trace["status"] = "cancelled"
+                    for step in trace["steps"]:
+                        if step.get("status") == "failed" and step.get("summary") == detail:
+                            step["status"] = "cancelled"
+                            for attempt in step.get("attempts", []):
+                                if attempt.get("summary") == detail:
+                                    attempt["status"] = "cancelled"
+                    persist_tool_trace(backend, trace, account_id=account_id, candidate_id=payload.candidate_id,
+                        session_id=session_id, source="chat")
         return
 
     try:
@@ -4071,7 +4162,8 @@ def stream_web_chat_events(
             account_id=account_id,
         )
     except RAGProviderRequestError as error:
-        fail_task_trace(trace, str(error), trace_started_at)
+        detail = "检索服务暂时不可用，请稍后重试。" if safe_errors else str(error)
+        fail_task_trace(trace, detail, trace_started_at)
         persist_tool_trace(
             backend,
             trace,
@@ -4081,9 +4173,17 @@ def stream_web_chat_events(
             source="rule_based_chat",
         )
         yield sse_event("task_failed", {"task_trace": serialize_user_task_trace(trace)})
-        yield sse_event("error", {"detail": str(error)})
+        yield sse_event("error", {"detail": detail})
         return
 
+    if cancelled is not None and cancelled.is_set():
+        complete_task_step(trace, "ingest_candidate_message", asdict(result))
+        trace["status"] = "cancelled"
+        trace["duration_ms"] = max(0, round((time.monotonic() - trace_started_at) * 1000))
+        trace["finished_at"] = trace["updated_at"] = iso_utc()
+        persist_tool_trace(backend, trace, account_id=account_id, candidate_id=payload.candidate_id,
+            session_id=session_id, source="rule_based_chat")
+        return
     tool_outputs = [{"tool_name": "ingest_conversation_message", "data": asdict(result)}]
     result_dict = asdict(result)
     display_reply = format_web_chat_reply(

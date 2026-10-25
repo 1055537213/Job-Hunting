@@ -38,6 +38,12 @@ public class ChatMessageController {
     }
     private JsonNode submit(String session, JsonNode input, HttpServletRequest request, HttpServletResponse response) {
         response.setHeader("Cache-Control", "no-store");
+        var data = validateInput(session, input);
+        long owner = accounts.current(session).account().account_id();
+        return python.invoke(session, owner, data,
+            WebSecurityFilter.requestId(request.getHeader("X-Request-ID"), request.getHeader("X-Trace-Id")));
+    }
+    static ObjectNode validateInput(String session, JsonNode input) {
         if (session == null || session.isBlank() || session.length() > 128)
             throw new AuthException("SESSION_EXPIRED", "登录状态已过期，请重新登录。", HttpStatus.UNAUTHORIZED);
         if (!input.isObject() || !Set.of("candidate_id", "message", "session_id", "use_env_llm", "auto_rag").containsAll(input.propertyNames())
@@ -50,8 +56,6 @@ public class ChatMessageController {
             if (!data.has(flag)) data.put(flag, true);
             if (!data.get(flag).isBoolean()) throw ChatSessionClient.invalid();
         }
-        long owner = accounts.current(session).account().account_id();
-        return python.invoke(session, owner, data,
-            WebSecurityFilter.requestId(request.getHeader("X-Request-ID"), request.getHeader("X-Trace-Id")));
+        return data;
     }
 }

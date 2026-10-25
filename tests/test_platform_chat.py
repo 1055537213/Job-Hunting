@@ -3,6 +3,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 import asyncio
 from threading import Event
+import json
+import time
 
 import httpx
 import pytest
@@ -15,7 +17,7 @@ from job_hunting_agent.models import CandidateProfileInput
 from job_hunting_agent.models import AgentChatResult
 from job_hunting_agent.storage import InsufficientBalanceError
 from job_hunting_agent.platform_auth import PlatformAuthClient, PlatformAuthError
-from job_hunting_agent.web import create_web_app, InternalChatInvokePayload
+from job_hunting_agent.web import create_web_app, InternalChatInvokePayload, ChatPayload, stream_web_chat_events
 
 
 @pytest.fixture
@@ -309,3 +311,143 @@ def test_disconnect_does_not_release_account_guard_before_execution_finishes(cha
     with app.state.backend.store.account_work.deletion(owners[0].id):
         pass
     assert app.state.test_agent.chat.call_count == 1
+
+
+def stream_invoke(browser, candidate, **data):
+    return browser.post("/internal/v1/chat/stream", headers={"X-Internal-Service-Token": "service-secret"},
+        json={"session_token": "session-1", "candidate_id": candidate, "message": "Hello", "auto_rag": False, **data})
+
+
+def parse_events(text):
+    events = []
+    for frame in text.split("\n\n"):
+        if frame.startswith("event: "):
+            name, value = frame.split("\ndata: ", 1)
+            events.append((name.removeprefix("event: "), json.loads(value)))
+    return events
+
+
+def install_stream_agent(app, action=None):
+    def stream(*args, **kwargs):
+        if action is not None:
+            yield from action(*args, **kwargs)
+        else:
+            yield {"type": "token", "content": "Partial"}
+            yield {"type": "final", "result": AgentChatResult(reply="Done.", candidate_id=kwargs["candidate_id"],
+                session_id=kwargs["session_id"], mode="langchain_agent")}
+    app.state.test_agent.stream_chat = Mock(side_effect=stream)
+
+
+def test_stream_callback_scope_events_history_and_preflight_rejections(chat_callback, monkeypatch):
+    app, browser, owners, candidates = chat_callback
+    install_stream_agent(app)
+    assert browser.post("/internal/v1/chat/stream", json={"session_token": "session-1", "candidate_id": candidates[0], "message": "Hello"}).status_code == 401
+    assert stream_invoke(browser, candidates[0], session_token="expired").status_code == 401
+    assert stream_invoke(browser, candidates[1]).status_code == 404
+    assert stream_invoke(browser, candidates[0], account_id=99).status_code == 422
+    response = stream_invoke(browser, candidates[0], execution_id="a" * 32)
+    assert response.status_code == 200 and response.headers["content-type"].startswith("text/event-stream"), response.text
+    events = parse_events(response.text)
+    assert events[0] == ("scope", {"account_id": owners[0].id, "candidate_id": candidates[0],
+        "session_id": f"account-{owners[0].id}-candidate-{candidates[0]}", "execution_id": "a" * 32})
+    assert [v["content"] for name, v in events if name == "token"] == ["Partial"]
+    assert sum(name == "final" for name, _ in events) == 1 and events[-1][0] == "final"
+    assert next(v for name, v in events if name == "task_started")["task_trace"]["root_request_id"] == "a" * 32
+    assert len(app.state.backend.list_chat_messages(candidates[0], events[0][1]["session_id"], account_id=owners[0].id)) == 2
+    monkeypatch.setattr(app.state.backend.store, "assert_account_can_spend", Mock(side_effect=InsufficientBalanceError()))
+    denied = stream_invoke(browser, candidates[0])
+    assert denied.status_code == 402 and denied.json()["detail"] == "余额不足，请先充值后重试。"
+    assert app.state.test_agent.stream_chat.call_count == 1
+
+
+def test_stream_errors_are_redacted_and_never_persist_success(chat_callback):
+    app, browser, owners, candidates = chat_callback
+    def failure(*args, **kwargs):
+        yield {"type": "token", "content": "Partial"}
+        raise RuntimeError("private-model-url-and-api-key")
+    install_stream_agent(app, failure)
+    response = stream_invoke(browser, candidates[0])
+    events = parse_events(response.text)
+    assert response.status_code == 200 and events[-1][0] == "error"
+    assert "private-model-url" not in response.text and not any(name == "final" for name, _ in events)
+    assert app.state.backend.list_chat_messages(candidates[0], events[0][1]["session_id"], account_id=owners[0].id) == []
+
+
+def test_stream_disconnect_drains_blocking_worker_before_unlock_and_suppresses_final(chat_callback):
+    from starlette.requests import ClientDisconnect
+    app, _, owners, candidates = chat_callback
+    entered, release, closed = Event(), Event(), Event()
+    def slow(*args, **kwargs):
+        try:
+            yield {"type": "step_started", "name": "ingest_candidate_message"}
+            yield {"type": "step_completed", "name": "ingest_candidate_message", "data": {"status": "saved"}}
+            yield {"type": "token", "content": "Partial"}
+            entered.set()
+            assert release.wait(5)
+            yield {"type": "final", "result": AgentChatResult(reply="Must not persist", candidate_id=kwargs["candidate_id"],
+                session_id=kwargs["session_id"], mode="langchain_agent")}
+        finally:
+            closed.set()
+    install_stream_agent(app, slow)
+    endpoint = next(r.endpoint for r in app.routes if getattr(r, "path", None) == "/internal/v1/chat/stream")
+    async def scenario():
+        response = await endpoint(InternalChatInvokePayload(session_token="session-1", candidate_id=candidates[0], message="Hello"),
+            SimpleNamespace(headers={"X-Internal-Service-Token": "service-secret"}))
+        async def receive():
+            await asyncio.sleep(60)
+        async def send(message):
+            if message["type"] == "http.response.body" and b"Partial" in message.get("body", b""):
+                assert await asyncio.to_thread(entered.wait, 2)
+                raise OSError("browser disconnected")
+        try:
+            with pytest.raises(ClientDisconnect):
+                await response({"type": "http", "method": "POST", "asgi": {"version": "3.0", "spec_version": "2.4"}}, receive, send)
+            with pytest.raises(AccountWorkBusy):
+                app.state.backend.store.account_work.acquire(owners[0].id, deletion=True)
+        finally:
+            release.set()
+            assert await asyncio.to_thread(closed.wait, 3)
+    asyncio.run(scenario())
+    assert app.state.backend.list_chat_messages(candidates[0], f"account-{owners[0].id}-candidate-{candidates[0]}", account_id=owners[0].id) == []
+    deadline = time.monotonic() + 3
+    while True:
+        try:
+            app.state.backend.store.account_work.acquire(owners[0].id, deletion=True).release()
+            break
+        except AccountWorkBusy:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    traces = app.state.backend.store.list_tool_call_traces(account_id=owners[0].id)
+    assert len(traces) == 1 and traces[0].status == "cancelled"
+
+
+def test_stream_compatibility_fails_closed_and_never_executes_python_agent(chat_callback, monkeypatch):
+    from contextlib import asynccontextmanager
+    app, browser, _, candidates = chat_callback
+    browser.cookies.set("job_agent_session", "session-1")
+    install_stream_agent(app)
+    @asynccontextmanager
+    async def offline(token, **kwargs):
+        raise PlatformAuthError("CHAT_EXECUTION_UNCONFIRMED", "Check history", 503)
+        yield  # pragma: no cover
+    monkeypatch.setattr(app.state.backend.platform_auth_client, "chat_stream", offline)
+    response = browser.post("/api/chat/stream", json={"candidate_id": candidates[0], "message": "Hello"})
+    assert response.status_code == 503 and app.state.test_agent.stream_chat.call_count == 0
+
+
+def test_rule_stream_cancellation_retains_completed_tool_audit_without_success_history(chat_callback, monkeypatch):
+    app, _, owners, candidates = chat_callback
+    cancelled = Event()
+    original = app.state.backend.ingest_conversation_message
+    def ingest(*args, **kwargs):
+        result = original(*args, **kwargs)
+        cancelled.set()
+        return result
+    monkeypatch.setattr(app.state.backend, "ingest_conversation_message", ingest)
+    payload = ChatPayload(candidate_id=candidates[0], message="我的首选城市改为上海", use_env_llm=False, auto_rag=False)
+    events = list(stream_web_chat_events(app.state.backend, None, payload, payload.message, "rule-session", owners[0].id,
+        cancelled=cancelled, safe_errors=True))
+    assert not any("event: final" in event for event in events)
+    traces = app.state.backend.store.list_tool_call_traces(account_id=owners[0].id)
+    assert len(traces) == 1 and traces[0].status == "cancelled"
+    assert app.state.backend.list_chat_messages(candidates[0], "rule-session", account_id=owners[0].id) == []

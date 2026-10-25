@@ -18,6 +18,7 @@ import static org.springframework.test.web.servlet.setup.MockMvcBuilders.standal
 class ChatSessionControllerTest {
     final AccountAdministrationService accounts = mock(AccountAdministrationService.class);
     final ChatSessionClient python = mock(ChatSessionClient.class);
+    final ChatStreamClient streams = mock(ChatStreamClient.class);
     final RedisRequestLimiter limiter = mock(RedisRequestLimiter.class);
     final ObjectMapper mapper = new ObjectMapper();
     final Cookie session = new Cookie("job_agent_session", "real-session");
@@ -33,7 +34,8 @@ class ChatSessionControllerTest {
             new WebSecuritySettings(true,"development",true,false,"http://localhost:8000","test:chat",60,20,120,120,240),
             mapper,new SimpleMeterRegistry(),new ClientAddressResolver(""));
         mvc = standaloneSetup(new ChatSessionController(accounts, python, new InternalTokenVerifier("service-secret"), mapper),
-                new ChatMessageController(accounts, python, new InternalTokenVerifier("service-secret")))
+                new ChatMessageController(accounts, python, new InternalTokenVerifier("service-secret")),
+                new ChatStreamController(accounts, streams, new InternalTokenVerifier("service-secret")))
             .setControllerAdvice(new PublicAuthErrorHandler()).addFilter(filter,"/api/*").build();
     }
     @Test void sessionAndCsrfAreRequiredBeforeCallingPython() throws Exception {
@@ -104,5 +106,24 @@ class ChatSessionControllerTest {
             .andExpect(status().isServiceUnavailable()).andExpect(jsonPath("$.code").value("CHAT_EXECUTION_UNCONFIRMED"))
             .andExpect(header().doesNotExist("Retry-After"));
         verify(python,times(1)).invoke(anyString(),anyLong(),any(),anyString());
+    }
+    @Test void streamUsesSameSessionCsrfAndModelLimitsAndProtectedCompatibilityEntry() throws Exception {
+        String body="{\"candidate_id\":7,\"message\":\"Hello\"}";
+        mvc.perform(post("/api/chat/stream").contentType("application/json").content(body)).andExpect(status().isUnauthorized());
+        mvc.perform(post("/api/chat/stream").cookie(session).contentType("application/json").content(body)).andExpect(status().isForbidden());
+        mvc.perform(post("/api/chat/stream").cookie(session,csrf).header("X-CSRF-Token","csrf").contentType("application/json")
+            .content("{\"candidate_id\":7,\"message\":\"Hello\",\"account_id\":99}")).andExpect(status().isUnprocessableContent());
+        verifyNoInteractions(streams);
+        mvc.perform(post("/api/chat/stream").cookie(session,csrf).header("X-CSRF-Token","csrf").header("X-Request-ID","stream-trace")
+            .contentType("application/json").content(body)).andExpect(status().isOk());
+        verify(streams).relay(eq("real-session"),eq(42L),argThat(v -> v.path("candidate_id").asLong()==7 && !v.has("account_id")),eq("stream-trace"),any());
+        String internal="{\"session_token\":\"real-session\",\"candidate_id\":7,\"message\":\"Hello\"}";
+        mvc.perform(post("/internal/v1/chat/stream").contentType("application/json").content(internal)).andExpect(status().isUnauthorized());
+        mvc.perform(post("/internal/v1/chat/stream").header("X-Internal-Service-Token","service-secret").contentType("application/json").content(internal))
+            .andExpect(status().isOk());
+        when(limiter.check(anyString(),eq("model"))).thenReturn(3L);
+        mvc.perform(post("/api/chat/stream").cookie(session,csrf).header("X-CSRF-Token","csrf").contentType("application/json").content(body))
+            .andExpect(status().isTooManyRequests());
+        verify(streams,times(2)).relay(anyString(),anyLong(),any(),anyString(),any());
     }
 }

@@ -2,7 +2,10 @@
 
 ## 当前状态
 
-现有 Python 服务是求职助手的唯一生产业务服务，负责 HTTP API、账号生命周期、Session、余额、Agent、RAG、文件分析和后台任务。第一阶段新增 Spring Boot 平台服务骨架；Java 认证迁移只在本地分支通过开关启用，不接管生产流量。
+现有线上环境仍使用独立的纯 Python 版本。本分支在本地 Docker 运行 Python+Java 混合版本：
+Java 已负责账号生命周期、Session、权限、账务、已迁移的管理查询，以及档案和聊天的公开入口；
+Python 负责 Agent、RAG、文件分析、档案/消息事实和后台任务。后文按阶段保留迁移历史，
+各阶段“当时保留在 Python”的描述不代表当前仍未迁移。混合版尚未部署到生产服务器。
 
 ## 目标边界
 
@@ -10,8 +13,9 @@
 | --- | --- | --- |
 | Agent、RAG、OCR、视觉分析、模型网关 | Python | Python AI 服务 |
 | AI 长任务 Worker | Python + Celery | Python AI 服务 |
-| 账号密码校验、权限、余额、账务、退款 | Python | Java 平台服务，分阶段迁移 |
-| 管理员后台业务接口 | Python | Java 平台服务，分阶段迁移 |
+| 账号、Session、权限、余额、账务 | Java，Python 保留兼容调用 | Java 平台服务 |
+| 管理员查询与已迁移的操作入口 | Java，Python 保留 AI/任务事实写入 | 按事实所有权通过内部接口协作 |
+| 档案与聊天公开入口、SSE 校验转发 | Java；Python 执行工具并存储事实 | Java 负责入口，Python 负责 AI 执行 |
 | PostgreSQL、Redis、MinIO | 基础设施 | 共享基础设施，按表和接口隔离 |
 
 ## 迁移规则
@@ -19,7 +23,7 @@
 1. 同一业务写入操作只能有一个服务负责执行；迁移完成后收束为一张事实表一个写入所有者。
 2. 迁移前必须先冻结 OpenAPI 契约、错误码、幂等键和 trace id 规则。
 3. Python 和 Java 不通过直接改对方表来通信。
-4. 长耗时 AI 操作使用任务 ID，平台服务不等待模型执行完成。
+4. 长耗时后台操作使用任务 ID；交互式聊天允许有界同步等待或流式转发，但不持有数据库事务等待模型。
 5. 任何新写入路径必须先有集成测试，再切换生产流量。
 
 ## 第一阶段交付
@@ -79,8 +83,8 @@ Java 故障一律失败关闭，不退回 Python Session 数据库路径。
 ## 目标入口与发布规则
 
 最终由 Java 接管对外业务 API，Python 提供内部 AI/长任务能力，保持现有前端 URL/API 兼容。
-混合部署的公网入口现在按路径分流：`/api/auth/*` 与 `/api/account/password` 由 Caddy 或
-共存 Nginx 直达 Java，其他页面与 API 仍进入 Python Web。Java 独立执行 Session、Redis
+混合部署入口现在按路径分流：认证、已迁移的账号/账务/管理/档案和聊天路径由 Caddy 或
+共存 Nginx 直达 Java，页面静态资源及其余 API 仍进入 Python Web。Java 独立执行 Session、Redis
 限流、CSRF、安全响应头和请求观测；Python 通过内部 Token 调用 Java 认证事实源处理尚未
 迁移的账号 API。两端共享 Java Session 和同一个 PostgreSQL，但只有 Java 写认证事实。
 纯 Python 分支的入口和代码不受这个混合路由影响。网关拒绝公网 `/internal/*`。
@@ -440,7 +444,7 @@ Compose 自动设置连接地址，无需新增手填配置或数据库迁移。
 ## 普通聊天入口
 
 `POST /api/chat` 在本地/生产混合 Caddy 和共存 Nginx 中按精确路径进入 Java；
-`/api/chat/stream` 暂不分流，保持 Python SSE 行为。Java 校验真实 Session、CSRF、请求字段，
+`/api/chat/stream` 的迁移见下节。Java 校验真实 Session、CSRF、请求字段，
 使用 Redis 的独立 model 限流组，按 IP 和账号分别计数。
 `JOB_AGENT_RATE_LIMIT_MODEL_REQUESTS` 沿用默认每 60 秒 60 次；窗口仍由原窗口配置控制。
 Java 鉴权结束后调用 Python `/internal/v1/chat/invoke`，不持有数据库事务等待模型。
@@ -474,6 +478,44 @@ LangChain Agent、工具、数据库、网关、Java 鉴权和结算；验证一
 验收同时修复原有整轮 Token 取最大值的问题：同一个模型执行步骤内的累计 usage 仍取最大，
 不同 LangGraph 模型步骤的用量相加，普通和 SSE 路径共享该规则。
 例如两次各 80 Token 的模型调用应按 160 Token 结算，而不是只记录 80。
+
+## 流式聊天入口
+
+`POST /api/chat/stream` 与普通聊天共用 Java 输入校验、Session、CSRF 和 model 限流组。
+Java 为每次请求生成独立 execution_id，不使用客户端追踪 ID 作为账务幂等键。
+Python 公开兼容入口只异步转发至 Java 的 `/internal/v1/chat/stream`，不在 Java 故障时本地执行。
+Java 再调用 Python 同一路径：两端均验证服务令牌，网关拒绝公网 `/internal/*`。
+
+Python 在受限执行线程中重新验证 Session、档案、会话和模型可用性，并取得账号工作锁。
+余额不足在发送流响应头之前返回 402 和统一中文提示。首个私有 scope 事件绑定真实账号、
+档案、会话和 execution_id；Java 验证后剥离它，不把账号包装或 Session 发送给浏览器。
+公开事件仍为 task_started、status、token、step_started、step_completed、
+task_completed/task_failed/approval_required、final/error。Java 校验字段白名单、轨迹根 ID 和 final 档案 ID，
+用 Spring SSE codec 解析跨网络块、CRLF、多行 data、UTF-8，而非自行拼接不完整 JSON。
+JDK 响应体直接连接有背压的订阅，避免当前 Spring JDK 连接器的 cache(0) 响应体无法及时取消的问题。
+参考 [Spring SSE reader](https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/http/codec/ServerSentEventHttpMessageReader.html)。
+
+Python 工作线程最多 8 个（与聊天回调共用准入槽），每条流只有 1 条排队事件；
+Java 也最多同时接纳 8 条 SSE，并使用单事件消费缓冲。单事件最多 4 MiB，整条流最多 8 MiB，
+最长 300 秒；Python 每 2 秒空闲时发注释心跳，Java 连续 15 秒无上游事件则中断。
+浏览器现有 180 秒总等待上限仍然有效。超限、非法事件、上游提前结束且没有 final/error 时，
+输出脱敏 error，绝不补造 final。所有流均 no-store，内部请求禁止重定向和自动重放。
+
+客户端断开后，Java 关闭响应体订阅，Python 立即停止网络投递并设置协作取消信号。
+不从另一个线程强行关闭正在 next() 的生成器；实际执行线程负责依次关闭 Web/Agent/LangGraph、
+等待 LangGraph 已运行的同步任务结束、处理已确认用量，再释放账号工作锁和槽位。
+已开始的同步模型或工具调用可能需要等到自身超时/返回；取消不是强杀，也不等于回滚工具副作用或退款。
+尚未完成的对话不追加成功聊天历史；如果取消发生在成功落库之后，应以历史记录核实结果。
+供应商已确认的累计用量按原调用标识只结算一次；未返回的 usage 不估算、不冒充准确账单。
+存在真实工具步骤的取消回合仍保留 cancelled 审计轨迹，已经完成的步骤状态和结果不会被改成未执行。
+
+Caddy 使用 SSE 的自动即时刷新，不设置会抑制断连取消的 flush_interval -1；
+共存 Nginx 关闭 buffering/cache/next-upstream 重试，保持 proxy_ignore_client_abort off。
+参考 [Caddy streaming 配置](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#streaming)。
+本地和生产网关配置同步，不新增凭据、端口或数据库迁移；本分支仍不部署服务器。
+冻结契约见 `chat-stream.openapi.yaml`。Docker 验收使用真实网关、Agent、工具、数据库和 Java 账务：
+验证 token 先于 final 到达、160 Token 正常结算、断连不新增成功历史、保留完成的工具副作用，
+只对取消前已确认的 80 Token 结算，保护锁在真实工作退出后才释放。
 
 ## Java 安全入口准备阶段（历史记录）
 

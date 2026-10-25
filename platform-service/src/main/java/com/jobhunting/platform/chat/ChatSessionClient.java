@@ -174,7 +174,7 @@ public class ChatSessionClient {
     static AuthException unavailable() { return new AuthException("CHAT_UNAVAILABLE", "会话操作结果暂未确认，请刷新会话列表核实后重试。", HttpStatus.SERVICE_UNAVAILABLE); }
     static AuthException invalid() { return new AuthException("INVALID_REQUEST", "请求参数无效。", HttpStatus.UNPROCESSABLE_CONTENT); }
     static AuthException unconfirmed() { return new AuthException("CHAT_EXECUTION_UNCONFIRMED", "对话结果暂未确认，请先查看历史记录，勿立即重复发送。", HttpStatus.SERVICE_UNAVAILABLE); }
-    private static AuthException invocationError(int status, String code) {
+    static AuthException invocationError(int status, String code) {
         String detail = switch (status + ":" + code) {
             case "402:INSUFFICIENT_BALANCE" -> "余额不足，请先充值后重试。";
             case "400:CHAT_NOT_READY" -> "消息为空或聊天服务未就绪。";
@@ -200,7 +200,7 @@ public class ChatSessionClient {
         return detail == null ? unavailable() : new AuthException(code, detail, HttpStatus.valueOf(status));
     }
 
-    private static HttpRequest.BodyPublisher singleUse(byte[] bytes) {
+    static HttpRequest.BodyPublisher singleUse(byte[] bytes) {
         var body = HttpRequest.BodyPublishers.ofByteArray(bytes); var used = new AtomicBoolean();
         return new HttpRequest.BodyPublisher() {
             @Override public long contentLength() { return bytes.length; }
@@ -230,7 +230,7 @@ public class ChatSessionClient {
         @Override public void onError(Throwable error) { if (!failed) delegate.onError(error); }
         @Override public void onComplete() { if (!failed) delegate.onComplete(); }
     }
-    private static URI endpoint(String url, String environment, String publicUrl) {
+    static URI endpoint(String url, String environment, String publicUrl) {
         try {
             var base = URI.create(url); String host = base.getHost();
             if (!("http".equals(base.getScheme()) || "https".equals(base.getScheme())) || host == null

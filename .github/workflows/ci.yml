@@ -80,6 +80,7 @@ jobs:
           tests/test_platform_password_reset.py
           tests/test_platform_sessions.py
           tests/test_platform_chat.py
+          tests/test_chat_stream_bridge.py
           tests/test_task_commands.py
           tests/test_request_observability.py
 

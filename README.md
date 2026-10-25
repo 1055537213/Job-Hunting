@@ -14,6 +14,7 @@
 
 - Python 负责其余 FastAPI Web API、Agent、RAG、文件分析、简历生成和异步 AI 任务。
 - Java Spring Boot 平台服务分阶段接管账号、Session、权限和账务等平台能力。
+- 普通和流式聊天入口经过 Java 校验，Python 继续负责 Agent、工具、RAG 和消息存储。
 - 前端仍由 Python Web 提供；混合网关将已迁移的平台 API 分流给 Java，外部 URL 保持不变。
 - master 保留纯 Python 版本；java-platform-migration 是独立的 Python+Java 版本。
 
@@ -309,7 +310,7 @@ PR 和 `master` 推送仍运行完整验收。部署门禁要求目标 SHA 的�
 | 账号 | GET /api/account/export | 导出本人数据 |
 | 档案 | GET/POST /api/profiles | 查询或创建候选人档案 |
 | 对话 | POST /api/chat | 普通 Agent 对话，混合模式由 Java 鉴权后交给 Python 执行 |
-| 对话 | POST /api/chat/stream | SSE Agent 对话 |
+| 对话 | POST /api/chat/stream | Java 鉴权与 SSE 校验转发，Python 执行 Agent |
 | 职位 | POST /api/jobs | 导入职位文本 |
 | 职位 | POST /api/jobs/screenshots | 导入职位截图 |
 | 项目 | POST /api/projects/github | 提交公开 GitHub 项目分析 |
@@ -393,7 +394,7 @@ AI、RAG、OCR 和多模态文件处理仍然依赖 Python 生态；Java 更适�
 - [x] 删除档案入口经 Java 鉴权，Python 原子删除事实/向量并持久化全版本附件清单；在途工作阻止删除，Worker 维护任务分批重试清理。
 - [x] 聊天会话列表、历史、新建、归档、删除入口经 Java 鉴权和回调，Python 保留消息与会话读写；验证历史脱敏、账号隔离、在途删除保护、依赖恢复和会话撤销。
 - [x] 普通聊天入口 `/api/chat` 经 Java Session/CSRF/模型限流进入 Python Agent；有界回包、完整调用期限、禁止命令自动重放，验证工具更新档案、历史、真实账务链路与余额不足。
-- [ ] 迁移 `/api/chat/stream` 的 Java SSE 转发入口，验证增量输出、断连取消和资源释放；模型推理仍归 Python。
+- [x] `/api/chat/stream` 经 Java 校验逐条转发，Python 使用有界缓冲与心跳；断连协作取消、保护在途工作，已确认 Token 用量只结算一次，不伪造成功历史。
 - [x] 建立渠道无关的待支付订单和签名 Webhook 结算边界。
 - [ ] 接入具体支付渠道适配、退款状态机和渠道对账。
 - [ ] 使用真实行业材料完成正式 RAG 发布集、Top-K/Top-N 和 P95 性能验收。

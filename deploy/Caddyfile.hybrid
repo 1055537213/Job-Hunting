@@ -45,7 +45,7 @@
 		reverse_proxy @chat_management platform-service:8081
 		@chat_message {
 			method POST
-			path /api/chat
+			path /api/chat /api/chat/stream
 		}
 		reverse_proxy @chat_message platform-service:8081 {
 			transport http {

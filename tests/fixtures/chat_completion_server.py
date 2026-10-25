@@ -1,6 +1,7 @@
 """Private deterministic OpenAI-compatible server for isolated Docker acceptance only."""
 
 import json
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock
 
@@ -25,7 +26,8 @@ class Handler(BaseHTTPRequestHandler):
         data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         messages = data["messages"]
         user = next(m["content"] for m in reversed(messages) if m["role"] == "user")
-        label = "update" if "acceptance-update" in user else "failure" if "acceptance-failure" in user else "other"
+        label = ("cancel" if "acceptance-cancel" in user else "update" if "acceptance-update" in user or "acceptance-stream-update" in user
+            else "failure" if "acceptance-failure" in user else "other")
         with LOCK:
             COUNTS[label] = COUNTS.get(label, 0) + 1
             call_number = COUNTS[label]
@@ -37,13 +39,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        tool = label == "update" and messages[-1]["role"] != "tool"
+        tool = label in {"update", "cancel"} and messages[-1]["role"] != "tool"
         if tool:
             delta = {"role": "assistant", "tool_calls": [{"index": 0, "id": f"acceptance-tool-{call_number}", "type": "function",
                 "function": {"name": "ingest_candidate_message", "arguments": json.dumps({
-                    "message": "我的首选城市改为上海", "auto_rag": False}, ensure_ascii=False)}}]}
+                    "message": "我的首选城市改为北京" if label == "cancel" else "我的首选城市改为上海", "auto_rag": False}, ensure_ascii=False)}}]}
         else:
-            delta = {"role": "assistant", "content": "Completed."}
+            delta = {"role": "assistant", "content": "Partial" if label == "cancel" else "Completed."}
         frames = [
             {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
             {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if tool else "stop"}]},
@@ -53,10 +55,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Connection", "close")
         self.end_headers()
-        for frame in frames:
+        for index, frame in enumerate(frames):
             frame.update(id="chatcmpl-acceptance", object="chat.completion.chunk", created=1, model="acceptance-chat")
             self.wfile.write(("data: " + json.dumps(frame, ensure_ascii=False) + "\n\n").encode())
             self.wfile.flush()
+            if index == 0 and not tool:
+                if label == "cancel":
+                    # No provider usage receipt for the incomplete second call.
+                    time.sleep(6)
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.close_connection = True
+                    return
+                if "acceptance-stream-update" in user:
+                    time.sleep(0.8)
         self.wfile.write(b"data: [DONE]\n\n")
         self.close_connection = True
 

@@ -195,7 +195,7 @@ public class WebSecurityFilter extends OncePerRequestFilter {
         String path = request.getRequestURI();
         if (path.startsWith("/api/auth/")) return "auth";
         if (path.startsWith("/api/admin/")) return "admin";
-        if (path.equals("/api/chat")) return "model";
+        if (path.equals("/api/chat") || path.equals("/api/chat/stream")) return "model";
         return SAFE.contains(request.getMethod()) ? "default" : "write";
     }
 }

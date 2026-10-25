@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
 import json
 import math
 import re
 from typing import Any
 from uuid import uuid4
+from threading import BoundedSemaphore
 
 import httpx
 
@@ -16,6 +18,7 @@ from .account_export import MAX_EXPORT_BYTES, decode_export
 from .profile_query import MAX_PROFILE_QUERY_BYTES, decode_json, validate_creation, validate_deletion, validate_projection
 from .chat_session_query import MAX_CHAT_BYTES, validate_chat_projection
 from .chat_reply import CHAT_UNCONFIRMED_MESSAGE, validate_reply
+from .chat_stream import MAX_STREAM_BYTES
 
 
 def _platform_response_error_status(response: httpx.Response) -> int:
@@ -56,6 +59,7 @@ class PlatformAuthClient:
         self.base_url = settings.base_url.rstrip("/")
         self.internal_token = settings.internal_token
         self.timeout_seconds = settings.timeout_seconds
+        self._stream_slots = BoundedSemaphore(8)
 
     def register_account(
         self,
@@ -478,6 +482,57 @@ class PlatformAuthClient:
                     return validate_reply(value, data["candidate_id"])
         except (httpx.HTTPError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
             raise PlatformAuthError("CHAT_EXECUTION_UNCONFIRMED", CHAT_UNCONFIRMED_MESSAGE, 503) from None
+
+    @asynccontextmanager
+    async def chat_stream(self, session_token: str | None, *, trace_id=None, **data):
+        if not session_token:
+            raise PlatformAuthError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
+        if not self._stream_slots.acquire(blocking=False):
+            raise PlatformAuthError("CHAT_BUSY", "当前仍有请求执行，请稍后重试。", 409)
+        try:
+            async with httpx.AsyncClient(trust_env=False, follow_redirects=False, timeout=httpx.Timeout(15, connect=1)) as client:
+                async with client.stream("POST", f"{self.base_url}/internal/v1/chat/stream",
+                    headers={"X-Internal-Service-Token": self.internal_token, "X-Trace-Id": trace_id or uuid4().hex},
+                    json={"session_token": session_token, **data}) as response:
+                    if response.status_code != 200:
+                        body = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            if len(body) + len(chunk) > 65536:
+                                raise ValueError("Oversized stream error")
+                            body.extend(chunk)
+                        value = decode_json(bytes(body))
+                        messages = {(402, "INSUFFICIENT_BALANCE"): "余额不足，请先充值后重试。",
+                            (401, "SESSION_EXPIRED"): "登录状态已过期，请重新登录。",
+                            (403, "ACCOUNT_DISABLED"): "账号已被停用，请重新登录。",
+                            (403, "CHAT_SCOPE_DENIED"): "账号不可用或无权访问会话。",
+                            (404, "CHAT_NOT_FOUND"): "会话或档案不存在。",
+                            (409, "CHAT_SESSION_ARCHIVED"): "该会话已经归档，请新建对话。",
+                            (409, "CHAT_BUSY"): "当前仍有请求执行，请稍后重试。",
+                            (400, "CHAT_NOT_READY"): "消息为空或聊天服务未就绪。",
+                            (422, "INVALID_REQUEST"): "请求参数无效。"}
+                        code = value.get("code") if isinstance(value, dict) else None
+                        detail = messages.get((response.status_code, code)) if isinstance(code, str) else None
+                        if detail is None:
+                            raise ValueError("Invalid stream error")
+                        raise PlatformAuthError(code, detail, response.status_code)
+                    if response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "text/event-stream":
+                        raise ValueError("Invalid stream content type")
+                    async def bounded():
+                        total = 0
+                        try:
+                            async for chunk in response.aiter_bytes(chunk_size=None):
+                                total += len(chunk)
+                                if total > MAX_STREAM_BYTES:
+                                    raise ValueError("Stream exceeds response budget")
+                                yield chunk
+                        except (httpx.HTTPError, ValueError):
+                            from .chat_stream import error_frame
+                            yield error_frame().encode("utf-8")
+                    yield bounded()
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, RecursionError):
+            raise PlatformAuthError("CHAT_EXECUTION_UNCONFIRMED", CHAT_UNCONFIRMED_MESSAGE, 503) from None
+        finally:
+            self._stream_slots.release()
 
     def chat_sessions(self, operation: str, session_token: str | None, *, trace_id=None, **data):
         if operation not in {"list", "create", "archive", "delete", "history"}:

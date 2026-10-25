@@ -9,6 +9,8 @@
 
 import warnings
 from types import SimpleNamespace
+from threading import Event
+from unittest.mock import Mock
 from io import BytesIO
 
 from docx import Document
@@ -63,6 +65,28 @@ def test_stream_and_nonstream_count_both_model_calls():
         assert result["type"] == "final" and result["result"].usage["total_tokens"] == 160
     finally:
         app.store.close()
+
+
+def test_cancelled_stream_closes_graph_settles_known_usage_once_and_skips_final():
+    cancelled, closed = Event(), Event()
+    def graph(*args, **kwargs):
+        try:
+            yield AIMessageChunk(content="Partial", id="first", usage_metadata={"input_tokens":60,"output_tokens":20,"total_tokens":80}), {
+                "langgraph_step":1,"langgraph_node":"model"}
+            raise AssertionError("Cancelled stream must not request another model or tool event")
+        finally:
+            closed.set()
+    gateway = SimpleNamespace(new_call_context=Mock(return_value="context"), record_chat_usage_summary=Mock(return_value={"total_tokens":80}))
+    agent = SimpleNamespace(app=SimpleNamespace(store=SimpleNamespace(assert_account_can_spend=lambda *a: None)),
+        build_turn_messages=lambda *a: [], _route_message=lambda *a, **kw: None, _execute_direct_route=lambda *a, **kw: None,
+        routing_metrics=SimpleNamespace(record_decision=lambda *a, **kw: None), tool_llm_available=False,
+        graph=SimpleNamespace(stream=graph), model_gateway=gateway)
+    stream = JobHuntingAgent.stream_chat(agent, "Hello", candidate_id=1, account_id=1, cancelled=cancelled)
+    assert next(stream)["type"] == "token"
+    cancelled.set()
+    assert list(stream) == []
+    assert closed.is_set()
+    gateway.record_chat_usage_summary.assert_called_once_with("context", {"input_tokens":60,"output_tokens":20,"total_tokens":80})
 
 
 def test_tool_message_error_status_is_preserved_for_task_audit() -> None:
