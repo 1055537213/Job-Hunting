@@ -134,4 +134,12 @@ class ChatStreamClientTest {
         assertThat(response.getContentAsString()).contains("event: error").doesNotContain("event: final");
         assertThat(disconnected.await(4,TimeUnit.SECONDS)).isTrue(); assertThat(calls.get()).isEqualTo(1);
     }
+    @Test void isolatedDevelopmentContextCanStartWithoutCallbackTokenButCannotCallIt() {
+        var isolated=new ChatStreamClient(mapper,"http://127.0.0.1:"+server.getAddress().getPort(),"","development","http://localhost:8000",300000);
+        assertThatThrownBy(() -> isolated.relay("real-session",42,input(),"stream-trace",new MockHttpServletResponse()))
+            .isInstanceOf(AuthException.class);
+        assertThat(calls.get()).isZero();
+        assertThatThrownBy(() -> new ChatStreamClient(mapper,"http://web:8000","","production","https://example.com",300000))
+            .isInstanceOf(IllegalArgumentException.class);
+    }
 }

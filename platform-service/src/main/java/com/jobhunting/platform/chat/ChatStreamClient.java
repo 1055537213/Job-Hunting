@@ -61,7 +61,7 @@ public class ChatStreamClient {
             @Value("${platform.web-security.public-base-url:http://localhost:8000}") String publicUrl,
             @Value("${platform.chat.invoke-timeout-ms:300000}") int timeoutMs) {
         endpoint = ChatSessionClient.endpoint(baseUrl, environment, publicUrl).resolve("../stream");
-        if (token.isBlank() || token.chars().anyMatch(c -> c < 33 || c > 126) || timeoutMs < 1 || timeoutMs > 300000
+        if (token.chars().anyMatch(c -> c < 33 || c > 126) || timeoutMs < 1 || timeoutMs > 300000
                 || ("production".equalsIgnoreCase(environment.strip()) && token.length() < 32))
             throw new IllegalArgumentException("Invalid stream callback settings");
         this.token = token; deadline = Duration.ofMillis(timeoutMs);
@@ -73,7 +73,7 @@ public class ChatStreamClient {
     }
 
     public void relay(String session, long owner, ObjectNode data, String requestId, HttpServletResponse response) {
-        if (!slots.tryAcquire()) throw ChatSessionClient.unconfirmed();
+        if (token.isBlank() || !slots.tryAcquire()) throw ChatSessionClient.unconfirmed();
         boolean started = false;
         CompletableFuture<HttpResponse<Flow.Publisher<List<ByteBuffer>>>> pending = null;
         var subscription = new AtomicReference<org.reactivestreams.Subscription>();
