@@ -396,3 +396,178 @@ def test_github_contract_and_both_gateway_topologies_are_aligned():
     nginx = (root / "deploy/nginx/coexist-hybrid-ip-https.conf.template").read_text(encoding="utf-8")
     block = nginx.split("location = /api/projects/github {", 1)[1].split("\n    }", 1)[0]
     assert "proxy_pass http://platform-service:8081;" in block and "proxy_next_upstream off;" in block
+
+
+def manifest(browser, candidate, **data):
+    import hashlib
+    return submit(browser, "local-manifest", **{"candidate_id": candidate, "project_name": "Local design",
+        "files": [{"relative_path": "README.md", "file_size": 9, "sha256": hashlib.sha256(b"prototype").hexdigest()}], **data})
+
+
+def test_local_manifest_resume_scope_and_cancel_receipt(projects):
+    app, browser, owners, candidates, _ = projects
+    assert manifest(browser, candidates[1]).status_code == 404
+    assert manifest(browser, candidates[0], session_token="expired").status_code == 401
+    first = manifest(browser, candidates[0])
+    assert first.status_code == 200, first.text
+    data = first.json()
+    collection = data["collection"]["id"]
+    assert "account_id" not in data["collection"]
+    assert len(data["selected_files"]) == 1 and data["resumed"] is False
+    again = manifest(browser, candidates[0])
+    assert again.status_code == 200 and again.json()["collection"]["id"] == collection
+    get = submit(browser, "local-get", collection_id=collection)
+    assert get.status_code == 200 and get.json()["files"] == data["files"]
+    assert submit(browser, "local-get", collection_id=collection, session_token="session-2").status_code == 404
+    assert submit(browser, "local-cancel", collection_id=collection, session_token="session-2").status_code == 404
+    backend = app.state.backend
+    with backend.store.account_work.acquire(owners[0]):
+        assert submit(browser, "local-get", collection_id=collection).status_code == 200
+        assert submit(browser, "local-cancel", collection_id=collection).json()["code"] == "PROJECT_BUSY"
+        assert manifest(browser, candidates[0]).json()["code"] == "PROJECT_BUSY"
+    cancelled = submit(browser, "local-cancel", collection_id=collection)
+    assert cancelled.status_code == 200 and cancelled.json()["cleanup_status"] == "completed", cancelled.text
+    assert submit(browser, "local-cancel", collection_id=collection).json() == cancelled.json()
+    assert submit(browser, "local-get", collection_id=collection).status_code == 404
+    with pytest.raises(KeyError):
+        backend.process_local_project_collection_file(collection, data["files"][0]["id"], b"prototype", account_id=owners[0])
+    fresh = manifest(browser, candidates[0])
+    assert fresh.status_code == 200 and fresh.json()["collection"]["id"] != collection
+    with backend.store.connect() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM project_collection_sessions").fetchone()["n"] == 1
+        conn.execute("UPDATE accounts SET status='disabled' WHERE id=?", (owners[0],))
+    assert submit(browser, "local-cancel", collection_id=collection).status_code == 403
+
+
+def test_local_file_policy_and_private_metadata_are_not_exposed(projects):
+    app, browser, _, candidates, _ = projects
+    response = manifest(browser, candidates[0], files=[{"relative_path": ".env", "file_size": 10, "sha256": "a"*64},
+        {"relative_path": "README.md", "file_size": 10, "sha256": "b"*64}])
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert len(data["selected_files"]) == 1 and data["selected_files"][0]["relative_path"] == "README.md"
+    with app.state.backend.store.connect() as conn:
+        conn.execute("UPDATE project_collection_files SET selection_status='failed',selection_reason=?,metadata_json=? WHERE id=?",
+            ("SECRET_PROVIDER_ERROR", json.dumps({"last_modified": 12, "storage_key": "SECRET_OBJECT", "extracted_text": "SECRET_CONTENT"}), data["selected_files"][0]["id"]))
+        conn.execute("UPDATE project_collection_sessions SET error_summary=? WHERE id=?", ("SECRET_SQL", data["collection"]["id"]))
+    get = submit(browser, "local-get", collection_id=data["collection"]["id"])
+    assert get.status_code == 200 and "SECRET" not in get.text
+    assert get.json()["files"][1]["metadata"] == {"last_modified": 12}
+    resumed = manifest(browser, candidates[0], files=[{"relative_path": "README.md", "file_size": 10, "sha256": "b"*64},
+        {"relative_path": ".env", "file_size": 10, "sha256": "a"*64}])
+    assert resumed.status_code == 200 and resumed.json()["collection"]["id"] == data["collection"]["id"]
+    assert resumed.json()["selected_files"][0]["selection_status"] == "selected"
+
+
+def test_local_cancel_manifest_atomicity_and_all_version_recovery(projects, monkeypatch):
+    from job_hunting_agent.project_deletion import cleanup, resume_pending
+    app, browser, owners, candidates, _ = projects
+    backend, owner = app.state.backend, owners[0]
+    response = manifest(browser, candidates[0]).json()
+    collection, file_id = response["collection"]["id"], response["files"][0]["id"]
+    processed = backend.process_local_project_collection_file(collection, file_id, b"prototype", account_id=owner)
+    files = [backend.resume_files.save(account_id=owner, candidate_id=candidates[0], filename="design.txt", content=b"original"+bytes([i])) for i in (1, 2)]
+    asset, version = backend.store.register_knowledge_asset(account_id=owner, candidate_id=candidates[0], asset_kind="document", title="Design",
+        original_filename="design.txt", storage_key=files[0].storage_key, media_type="text/plain", file_size=files[0].file_size, sha256=files[0].sha256)
+    backend.store.add_knowledge_asset_version(asset.id, account_id=owner, original_filename="design.txt", storage_key=files[1].storage_key,
+        media_type="text/plain", file_size=files[1].file_size, sha256=files[1].sha256)
+    queued = backend.store.create_background_task(account_id=owner, candidate_id=candidates[0], session_id=f"local-project-collection-{collection}", task_type="rag_index")
+    with backend.store.connect() as conn:
+        conn.execute("UPDATE project_collection_files SET knowledge_asset_id=?,knowledge_asset_version_id=?,storage_key=? WHERE id=?", (asset.id, version.id, files[0].storage_key, file_id))
+    original = backend.store.delete_incomplete_project_collection
+    def fail(*args, **kwargs):
+        original(*args, **kwargs)
+        raise RuntimeError("SECRET_SQL")
+    monkeypatch.setattr(backend.store, "delete_incomplete_project_collection", fail)
+    failed = submit(browser, "local-cancel", collection_id=collection)
+    assert failed.status_code == 503 and "SECRET_SQL" not in failed.text
+    assert backend.store.get_background_task(queued.task_key).status == "queued"
+    assert backend.store.get_project_collection(collection, account_id=owner).id == collection
+    monkeypatch.setattr(backend.store, "delete_incomplete_project_collection", original)
+    result = submit(browser, "local-cancel", collection_id=collection)
+    assert result.status_code == 200 and result.json()["cleanup_status"] == "pending", result.text
+    assert backend.store.get_background_task(queued.task_key).status == "cancelled"
+    assert sorted(backend.store.collect_account_deletion_storage_keys(owner)) == sorted(f.storage_key for f in files)
+    deleted_profile = backend.store.delete_candidate_profile(candidates[0], account_id=owner)
+    assert sorted(set(deleted_profile["storage_keys"])) == sorted(f.storage_key for f in files)
+    with backend.store.connect() as conn:
+        assert conn.execute("SELECT id FROM long_texts WHERE id=?", (processed.long_text_id,)).fetchone() is None
+    remove = backend.resume_files.delete
+    monkeypatch.setattr(backend.resume_files, "delete", Mock(side_effect=RuntimeError("SECRET_STORAGE")))
+    assert cleanup(backend, owner, collection, force=True, collection=True)["cleanup_status"] == "pending"
+    with backend.store.connect() as conn:
+        conn.execute("UPDATE project_collection_deletions SET next_attempt_at=now()")
+    monkeypatch.setattr(backend.resume_files, "delete", remove)
+    assert resume_pending(backend, collection=True)["project_collection_deletions_completed"] == 1
+    assert all(not backend.resume_files.path_for(f.storage_key).exists() for f in files)
+    assert submit(browser, "local-cancel", collection_id=collection).json()["cleanup_status"] == "completed"
+
+
+def test_local_cancel_rejects_ready_collection_and_running_worker(projects):
+    app, browser, owners, candidates, records = projects
+    backend = app.state.backend
+    data = manifest(browser, candidates[0]).json()
+    collection = data["collection"]["id"]
+    task = backend.store.create_background_task(account_id=owners[0], task_type="system_probe")
+    backend.store.claim_background_task(task.task_key)
+    assert submit(browser, "local-cancel", collection_id=collection).json()["code"] == "PROJECT_BUSY"
+    backend.store.complete_background_task(task.task_key, {})
+    backend.process_local_project_collection_file(collection, data["files"][0]["id"], b"prototype", account_id=owners[0])
+    backend.store.complete_project_collection(collection, account_id=owners[0], project_card_id=records[0].id)
+    assert submit(browser, "local-cancel", collection_id=collection).json()["code"] == "PROJECT_COLLECTION_CONFLICT"
+    assert manifest(browser, candidates[0]).json()["code"] == "PROJECT_COLLECTION_CONFLICT"
+
+
+@pytest.mark.parametrize("file", [{"relative_path": "../private.txt", "file_size": 1, "sha256": "a"*64},
+    {"relative_path": "README.md", "file_size": True}, {"relative_path": "README.md", "file_size": -1},
+    {"relative_path": "README.md", "file_size": 1, "content": "SECRET_CONTENT"}])
+def test_local_manifest_invalid_metadata_never_creates_collection(projects, file):
+    app, browser, _, candidates, _ = projects
+    response = manifest(browser, candidates[0], files=[file])
+    assert response.status_code in {400, 422} and "SECRET" not in response.text
+    with app.state.backend.store.connect() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM project_collection_sessions").fetchone()["n"] == 0
+
+
+@pytest.mark.parametrize("method,path,data,operation", [
+    ("POST", "/api/projects/local/manifest", {"candidate_id": 1,"project_name": "Project", "files": [{"relative_path": "README.md", "file_size": 1}]}, "local-manifest"),
+    ("GET", "/api/projects/local/1", None, "local-get"), ("DELETE", "/api/projects/local/1", None, "local-cancel")])
+def test_local_compatibility_fails_closed(projects, monkeypatch, method, path, data, operation):
+    app, browser, _, _, _ = projects
+    browser.cookies.set("job_agent_session", "session-1")
+    forward = Mock(side_effect=PlatformAuthError("PROJECT_UNAVAILABLE", "Unavailable", 503))
+    monkeypatch.setattr(app.state.backend.platform_auth_client, "projects", forward)
+    monkeypatch.setattr(app.state.backend, "create_local_project_collection", Mock(side_effect=AssertionError("fallback")))
+    monkeypatch.setattr(app.state.backend, "delete_incomplete_local_project_collection", Mock(side_effect=AssertionError("fallback")))
+    result = browser.request(method, path, **({"json": data} if data is not None else {}))
+    assert result.status_code == 503 and forward.call_args.args == (operation, "session-1")
+
+
+def test_local_large_manifest_rejected_before_creating_rows(projects):
+    app, browser, _, candidates, _ = projects
+    files = [{"relative_path": f"{i:04}-"+"p"*1000+".md", "file_size": 1, "sha256": "a"*64} for i in range(4000)]
+    response = manifest(browser, candidates[0], files=files)
+    assert response.status_code == 413, response.text[:200]
+    with app.state.backend.store.connect() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM project_collection_sessions").fetchone()["n"] == 0
+
+
+def test_local_contract_and_precise_gateway_methods():
+    from pathlib import Path
+    import yaml
+    from job_hunting_agent.local_project_entry import COLLECTION_FIELDS, FILE_FIELDS
+    root = Path(__file__).resolve().parents[1]
+    contract = yaml.safe_load((root / "platform-service/src/main/resources/local-projects.openapi.yaml").read_text(encoding="utf-8"))
+    for name, fields in (("Collection", COLLECTION_FIELDS), ("File", FILE_FIELDS)):
+        schema = contract["components"]["schemas"][name]
+        assert set(schema["required"]) == set(schema["properties"]) == fields
+        assert schema["additionalProperties"] is False
+    for name in ("Caddyfile.hybrid", "Caddyfile.hybrid.local"):
+        text = (root / "deploy" / name).read_text(encoding="utf-8")
+        assert "method POST\n\t\t\tpath /api/projects/local/manifest" in text
+        assert "method GET DELETE\n\t\t\tpath_regexp localCollection ^/api/projects/local/[0-9]+$" in text
+        assert "request_body @local_manifest" in text
+        assert "/api/projects/local/*" not in text
+    nginx = (root / "deploy/nginx/coexist-hybrid-ip-https.conf.template").read_text(encoding="utf-8")
+    assert "location = /api/projects/local/manifest" in nginx and "client_max_body_size 4m;" in nginx
+    assert "location ~ ^/api/projects/local/[0-9]+$" in nginx

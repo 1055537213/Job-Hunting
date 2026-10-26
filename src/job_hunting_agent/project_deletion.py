@@ -16,6 +16,11 @@ def projection(record_id, candidate_id, status):
             "cleanup_status": status, "rag_cleanup": "database_cascade"}
 
 
+def collection_projection(record_id, candidate_id, status):
+    return {"deleted": True, "collection_id": record_id, "candidate_id": candidate_id,
+            "cleanup_status": status, "rag_cleanup": "database_cascade"}
+
+
 def request_deletion(backend, owner, record_id):
     with backend.store.account_work.deletion(owner):
         with backend.store.connect() as conn:
@@ -51,23 +56,25 @@ def request_deletion(backend, owner, record_id):
             return projection(record_id, deleted["candidate_id"], status)
 
 
-def cleanup(backend, owner, record_id, *, force=False, batch_size=20):
+def cleanup(backend, owner, record_id, *, force=False, batch_size=20, collection=False):
     try:
-        return _cleanup(backend, owner, record_id, force=force, batch_size=batch_size)
+        return _cleanup(backend, owner, record_id, force=force, batch_size=batch_size, collection=collection)
     except Exception:  # noqa: BLE001 - object locators/SQL parameters are private.
         raise RuntimeError("Project attachment cleanup temporarily unavailable") from None
 
 
-def _cleanup(backend, owner, record_id, *, force, batch_size):
+def _cleanup(backend, owner, record_id, *, force, batch_size, collection=False):
     if not 1 <= batch_size <= 100:
         raise ValueError("Invalid cleanup batch")
     now, token = datetime.now(UTC), uuid4().hex
+    table, column, view = (("project_collection_deletions", "collection_id", collection_projection)
+        if collection else ("project_deletions", "project_card_id", projection))
     with backend.store.connect() as conn:
-        row = conn.execute("SELECT * FROM project_deletions WHERE account_id=? AND project_card_id=? FOR UPDATE SKIP LOCKED",
+        row = conn.execute(f"SELECT * FROM {table} WHERE account_id=? AND {column}=? FOR UPDATE SKIP LOCKED",
                            (owner, record_id)).fetchone()
         if row is None:
             return None
-        result = projection(record_id, row["candidate_id"], row["status"])
+        result = view(record_id, row["candidate_id"], row["status"])
         if row["status"] == "completed":
             return result
         if ((row["lease_until"] and _timestamp(row["lease_until"]) > now) or (not force and _timestamp(row["next_attempt_at"]) > now)):
@@ -75,8 +82,8 @@ def _cleanup(backend, owner, record_id, *, force, batch_size):
         keys = row["storage_keys_json"]
         keys = json.loads(keys) if isinstance(keys, str) else list(keys)
         attempts = row["attempts"] + 1
-        conn.execute("""UPDATE project_deletions SET lease_token=?,lease_until=?,attempts=?,updated_at=?
-                        WHERE account_id=? AND project_card_id=?""", (token, now + timedelta(minutes=5), attempts, now, owner, record_id))
+        conn.execute(f"""UPDATE {table} SET lease_token=?,lease_until=?,attempts=?,updated_at=?
+                        WHERE account_id=? AND {column}=?""", (token, now + timedelta(minutes=5), attempts, now, owner, record_id))
     failed = False
     for key in keys[:batch_size]:
         try:
@@ -87,21 +94,22 @@ def _cleanup(backend, owner, record_id, *, force, batch_size):
         keys.remove(key)
     status = "pending" if keys else "completed"
     with backend.store.connect() as conn:
-        updated = conn.execute("""UPDATE project_deletions SET status=?,storage_keys_json=?,lease_token=NULL,lease_until=NULL,
-            next_attempt_at=?,last_error=?,updated_at=? WHERE account_id=? AND project_card_id=? AND lease_token=?""",
+        updated = conn.execute(f"""UPDATE {table} SET status=?,storage_keys_json=?,lease_token=NULL,lease_until=NULL,
+            next_attempt_at=?,last_error=?,updated_at=? WHERE account_id=? AND {column}=? AND lease_token=?""",
             (status, json.dumps(keys), now + timedelta(seconds=min(3600, 30 * 2 ** min(attempts, 7)) if failed else 0),
              "对象清理失败，将自动重试。" if failed else None, now, owner, record_id, token))
-    return projection(record_id, row["candidate_id"], status if updated.rowcount == 1 else "pending")
+    return view(record_id, row["candidate_id"], status if updated.rowcount == 1 else "pending")
 
 
-def resume_pending(backend, limit=10):
+def resume_pending(backend, limit=10, *, collection=False):
     now = datetime.now(UTC)
+    table, column = ("project_collection_deletions", "collection_id") if collection else ("project_deletions", "project_card_id")
     with backend.store.connect() as conn:
-        rows = conn.execute("""SELECT account_id,project_card_id FROM project_deletions WHERE status='pending'
+        rows = conn.execute(f"""SELECT account_id,{column} FROM {table} WHERE status='pending'
             AND next_attempt_at<=? AND (lease_until IS NULL OR lease_until<=?)
-            ORDER BY next_attempt_at,account_id,project_card_id LIMIT ?""", (now, now, limit)).fetchall()
+            ORDER BY next_attempt_at,account_id,{column} LIMIT ?""", (now, now, limit)).fetchall()
     completed = 0
     for row in rows:
-        result = cleanup(backend, row["account_id"], row["project_card_id"])
+        result = cleanup(backend, row["account_id"], row[column], collection=collection)
         completed += result is not None and result["cleanup_status"] == "completed"
-    return {"project_deletions_completed": completed, "project_deletions_deferred": len(rows) - completed}
+    return {f"{table}_completed": completed, f"{table}_deferred": len(rows) - completed}

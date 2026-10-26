@@ -105,7 +105,7 @@ paths:
         - in: path
           name: operation
           required: true
-          schema: {enum: [list, confirm, delete, github]}
+          schema: {enum: [list, confirm, delete, github, local-manifest, local-get, local-cancel]}
       requestBody:
         required: true
         content:
@@ -122,6 +122,9 @@ paths:
                 root_request_id: {type: [string, 'null'], pattern: '^[A-Fa-f0-9]{32}$'}
                 repository_url: {type: [string, 'null'], maxLength: 512}
                 idempotency_key: {type: [string, 'null'], pattern: '^[A-Za-z0-9:_-]{16,128}$'}
+                collection_id: {type: integer, minimum: 1}
+                project_name: {type: string, minLength: 1, maxLength: 256}
+                files: {type: array, minItems: 1, maxItems: 20000, items: {$ref: './local-projects.openapi.yaml#/components/schemas/ManifestFile'}}
       responses:
         '200': {description: Public projection; Python additionally includes authenticated account_id. Only operation-specific fields are accepted.}
         '400': {description: PROJECT_CONFIRMATION_REQUIRED}

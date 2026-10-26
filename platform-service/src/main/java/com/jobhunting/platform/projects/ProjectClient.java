@@ -28,6 +28,7 @@ public class ProjectClient {
     private final ObjectMapper mapper;
     private final HttpClient http;
     private final Semaphore slots=new Semaphore(8);
+    private final Semaphore collectionSlots=new Semaphore(2);
     public ProjectClient(ObjectMapper mapper,
             @Value("${platform.projects.python-base-url:http://web:8000}") String url,
             @Value("${platform.internal-token:}") String token,
@@ -46,11 +47,16 @@ public class ProjectClient {
             .followRedirects(HttpClient.Redirect.NEVER).version(HttpClient.Version.HTTP_1_1).build();
     }
     public JsonNode execute(String operation,String session,long owner,ObjectNode input,String requestId) {
-        if (!Set.of("list","confirm","delete","github").contains(operation)) throw invalid();
-        if (token.isBlank() || !slots.tryAcquire()) throw unavailable();
+        if (!Set.of("list","confirm","delete","github","local-manifest","local-get","local-cancel").contains(operation)) throw invalid();
+        boolean local=operation.startsWith("local-");
+        if (token.isBlank()) throw unavailable();
+        if(local&&!collectionSlots.tryAcquire())throw unavailable();
+        if(!slots.tryAcquire()){if(local)collectionSlots.release();throw unavailable();}
         CompletableFuture<HttpResponse<byte[]>> pending=null;
         try {
-            var body=HttpRequest.BodyPublishers.ofByteArray(mapper.writeValueAsBytes(input.deepCopy().put("session_token",session)));
+            var bytes=mapper.writeValueAsBytes(input.deepCopy().put("session_token",session));
+            if(bytes.length>MAX_BYTES)throw new AuthException("PROJECT_TOO_LARGE","项目清单超过请求大小限制。",HttpStatus.PAYLOAD_TOO_LARGE);
+            var body=HttpRequest.BodyPublishers.ofByteArray(bytes);
             var used=new AtomicBoolean();
             // JDK may retry a failed connection: never replay a state-changing callback body.
             var once=new HttpRequest.BodyPublisher() {
@@ -62,7 +68,7 @@ public class ProjectClient {
             };
             var request=TraceHeaders.apply(HttpRequest.newBuilder(base.resolve(operation)),requestId).timeout(Duration.ofSeconds(10))
                 .header("Content-Type","application/json").header("Accept","application/json").header("X-Internal-Service-Token",token).POST(once).build();
-            pending=http.sendAsync(request,ignored->new BoundedBody());
+            pending=http.sendAsync(request,ignored->new BoundedBody(operation.startsWith("local-")?LocalCollectionProjection.MAX_BYTES:MAX_BYTES));
             var response=pending.get(10,TimeUnit.SECONDS);
             if(!response.headers().firstValue("Content-Type").orElse("").split(";",2)[0].strip().equalsIgnoreCase("application/json"))throw unavailable();
             var value=mapper.readTree(response.body());
@@ -81,7 +87,7 @@ public class ProjectClient {
         }catch(AuthException error){throw error;}
         catch(InterruptedException error){Thread.currentThread().interrupt();throw unavailable();}
         catch(Exception error){throw unavailable();}
-        finally{if(pending!=null&&!pending.isDone())pending.cancel(true);slots.release();}
+        finally{if(pending!=null&&!pending.isDone())pending.cancel(true);slots.release();if(local)collectionSlots.release();}
     }
     static boolean id(JsonNode n){return n!=null&&n.isIntegralNumber()&&n.canConvertToLong()&&n.asLong()>0;}
     static boolean fields(JsonNode n,Set<String> keys){return n!=null&&n.isObject()&&n.propertyNames().equals(keys);}
@@ -95,6 +101,8 @@ public class ProjectClient {
             case "400:PROJECT_CONFIRMATION_REQUIRED"->"确认项目经历前至少确认一组属于本人的内容。";
             case "400:PROJECT_REPOSITORY_INVALID"->"请填写有效的公开 GitHub 仓库首页链接。";
             case "409:PROJECT_SUBMISSION_CONFLICT"->"本次提交已失效或内容已变更，请重新发起项目分析。";
+            case "400:PROJECT_MANIFEST_INVALID"->"项目清单无效或没有可安全分析的文件，请重新选择目录。";
+            case "409:PROJECT_COLLECTION_CONFLICT"->"采集已完成或状态已变化，请刷新后核实；已生成的项目请通过项目列表删除。";
             case "409:PROJECT_BUSY"->"当前仍有请求或任务执行，请稍后重试。";
             case "409:PROJECT_CONFLICT"->"已确认内容与本次请求不一致，请刷新项目列表核实。";
             case "413:PROJECT_TOO_LARGE"->"项目数据超出同步查询限制。";
@@ -106,10 +114,12 @@ public class ProjectClient {
     private static final class BoundedBody implements HttpResponse.BodySubscriber<byte[]>{
         private final HttpResponse.BodySubscriber<byte[]> delegate=HttpResponse.BodySubscribers.ofByteArray();
         private Flow.Subscription subscription;private long size;private boolean failed;
+        private final int limit;
+        BoundedBody(int limit){this.limit=limit;}
         public CompletionStage<byte[]> getBody(){return delegate.getBody();}
         public void onSubscribe(Flow.Subscription s){subscription=s;delegate.onSubscribe(s);}
         public void onNext(List<ByteBuffer> buffers){if(failed)return;for(var b:buffers)size+=b.remaining();
-            if(size>MAX_BYTES){failed=true;subscription.cancel();delegate.onError(new IOException("Project response too large"));}else delegate.onNext(buffers);}
+            if(size>limit){failed=true;subscription.cancel();delegate.onError(new IOException("Project response too large"));}else delegate.onNext(buffers);}
         public void onError(Throwable e){if(!failed)delegate.onError(e);}
         public void onComplete(){if(!failed)delegate.onComplete();}
     }

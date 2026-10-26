@@ -72,4 +72,20 @@ class ProjectControllerTest {
         mvc.perform(post("/api/projects/github").cookie(session,csrf).header("X-CSRF-Token","csrf").contentType("application/json").content(data)).andExpect(status().isOk());
         verify(python).execute(eq("github"),eq("real-session"),eq(42L),argThat(v->v.path("candidate_id").asLong()==7&&v.path("idempotency_key").asText().equals("github:request-0001")),anyString());
     }
+    @Test void localManagementValidatesMetadataAndDoesNotAcceptFileContent()throws Exception{
+        String valid="{\"candidate_id\":7,\"project_name\":\"Design\",\"files\":[{\"relative_path\":\"README.md\",\"file_size\":9,\"sha256\":\""+"a".repeat(64)+"\"}]}";
+        mvc.perform(post("/api/projects/local/manifest").contentType("application/json").content(valid)).andExpect(status().isUnauthorized());
+        mvc.perform(post("/api/projects/local/manifest").cookie(session).contentType("application/json").content(valid)).andExpect(status().isForbidden());
+        mvc.perform(delete("/api/projects/local/8").cookie(session)).andExpect(status().isForbidden());
+        for(String data:new String[]{valid.replace("\"file_size\":9","\"file_size\":true"),valid.replace("\"file_size\":9","\"file_size\":-1"),
+            valid.replace("\"file_size\":9","\"content\":\"private\",\"file_size\":9"),valid.replace("\"candidate_id\":7","\"candidate_id\":7,\"account_id\":99"),valid.replace("Design"," ")})
+            mvc.perform(post("/api/projects/local/manifest").cookie(session,csrf).header("X-CSRF-Token","csrf").contentType("application/json").content(data)).andExpect(status().isUnprocessableContent());
+        mvc.perform(get("/api/projects/local/-1").cookie(session)).andExpect(status().isUnprocessableContent());
+        verifyNoInteractions(python);
+        mvc.perform(post("/api/projects/local/manifest").cookie(session,csrf).header("X-CSRF-Token","csrf").contentType("application/json").content(valid)).andExpect(status().isOk());
+        mvc.perform(get("/api/projects/local/8?account_id=99").cookie(session)).andExpect(status().isOk());
+        mvc.perform(delete("/api/projects/local/8").cookie(session,csrf).header("X-CSRF-Token","csrf")).andExpect(status().isOk());
+        verify(python).execute(eq("local-get"),eq("real-session"),eq(42L),argThat(n->n.path("collection_id").asLong()==8&&!n.has("account_id")),anyString());
+        verify(python).execute(eq("local-cancel"),eq("real-session"),eq(42L),any(),anyString());
+    }
 }

@@ -1,0 +1,138 @@
+openapi: 3.1.0
+info:
+  title: Local Project Collection Management
+  version: 1.0.0
+  description: Java public entry; Python owns manifest planning, collection facts and cancellable cleanup. Multipart files and complete remain on Python. No new page or upload mode.
+paths:
+  /api/projects/local/manifest:
+    post:
+      description: Session and CSRF required. Maximum 20000 files, 4 MiB normalized request; no file bytes. Existing candidate+canonical manifest fingerprint resumes the same incomplete collection, resetting failed files but retaining analyzed evidence. Ready collections return 409. Exclusive account-work admission prevents concurrent uploads/resume/cancel; busy returns 409. Known credential paths are skipped by Python policy. 200 is a collection plan, not completed analysis. Same metadata may be retried explicitly after timeout; no transport replay or local fallback.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [candidate_id, project_name, files]
+              properties:
+                candidate_id: {type: integer, minimum: 1, maximum: 9223372036854775807}
+                project_name: {type: string, minLength: 1, maxLength: 256}
+                files: {type: array, minItems: 1, maxItems: 20000, items: {$ref: '#/components/schemas/ManifestFile'}}
+      responses:
+        '200':
+          description: No-store, up to 16 MiB; public fields only. Two concurrent local callbacks per process, shared with collection reads/cancellations; Java callback deadline 10 seconds. Files marked selected are uploaded through the existing Python batch endpoint.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [collection, files, selected_files, resumed]
+                properties:
+                  collection: {$ref: '#/components/schemas/Collection'}
+                  files: {type: array, minItems: 1, maxItems: 20000, items: {$ref: '#/components/schemas/File'}}
+                  selected_files: {type: array, items: {$ref: '#/components/schemas/File'}, description: Exact selected subset of files.}
+                  resumed: {type: boolean}
+        '400': {description: PROJECT_MANIFEST_INVALID; no raw paths or file contents in errors.}
+        '409': {description: PROJECT_BUSY or PROJECT_COLLECTION_CONFLICT}
+        '413': {description: PROJECT_TOO_LARGE}
+        '422': {description: INVALID_REQUEST}
+        '503': {description: PROJECT_UNAVAILABLE; retain local recovery handle, do not claim success.}
+  /api/projects/local/{collection_id}:
+    parameters:
+      - {in: path, name: collection_id, required: true, schema: {type: integer, minimum: 1, maximum: 9223372036854775807}}
+    get:
+      description: Session required. Python reads owned session and files in one repeatable-read snapshot. Java validates scope, counts and field whitelist; no-store, maximum 16 MiB. No original extraction metadata, internal account ID, storage keys or raw errors.
+      responses:
+        '200':
+          description: Authoritative resumable progress, not a cached empty fallback.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [collection, files]
+                properties:
+                  collection: {$ref: '#/components/schemas/Collection'}
+                  files: {type: array, minItems: 1, maxItems: 20000, items: {$ref: '#/components/schemas/File'}}
+        '404': {description: PROJECT_NOT_FOUND, including foreign collection.}
+        '503': {description: PROJECT_UNAVAILABLE; preserve browser recovery handle.}
+    delete:
+      description: Session and CSRF required. Cannot cancel a ready collection; use project deletion. Exclusive account work plus account row lock excludes admitted HTTP uploads and Worker claims; running tasks return 409. Python cancels queued collection tasks and atomically deletes SQL evidence/vectors with a durable all-version object manifest. Maintenance leases/retries physical cleanup. Repeated cancellation reads the owned receipt, never recreates a collection. New imports have new IDs, so late uploads cannot write to cancelled sessions.
+      responses:
+        '200':
+          description: Database deletion committed; pending means physical attachment cleanup continues. Never expose object keys.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Cancellation'}
+        '404': {description: PROJECT_NOT_FOUND}
+        '409': {description: PROJECT_BUSY or PROJECT_COLLECTION_CONFLICT}
+        '503': {description: PROJECT_UNAVAILABLE; retry same collection ID after checking progress.}
+components:
+  schemas:
+    ManifestFile:
+      type: object
+      additionalProperties: false
+      required: [relative_path, file_size]
+      properties:
+        relative_path: {type: string, minLength: 1, maxLength: 2048}
+        file_size: {type: integer, minimum: 0, maximum: 281474976710656}
+        sha256: {type: [string, 'null'], pattern: '^[a-fA-F0-9]{64}$'}
+        media_type: {type: string, maxLength: 128, default: application/octet-stream}
+        last_modified: {type: [integer, 'null'], minimum: 0, maximum: 9007199254740991}
+    Collection:
+      type: object
+      additionalProperties: false
+      required: [id, candidate_id, project_card_id, project_name, source_type, manifest_fingerprint, status, file_count, selected_file_count, uploaded_file_count, total_size, selected_size, error_summary, created_at, updated_at]
+      properties:
+        id: {type: integer, minimum: 1}
+        candidate_id: {type: integer, minimum: 1}
+        project_card_id: {type: [integer, 'null'], minimum: 1}
+        project_name: {type: string}
+        source_type: {const: local_directory_collection}
+        manifest_fingerprint: {type: string, pattern: '^[a-f0-9]{64}$'}
+        status: {enum: [planned, uploading, processing, ready, failed, cancelled]}
+        file_count: {type: integer, minimum: 1, maximum: 20000}
+        selected_file_count: {type: integer, minimum: 0}
+        uploaded_file_count: {type: integer, minimum: 0}
+        total_size: {type: integer, minimum: 0}
+        selected_size: {type: integer, minimum: 0}
+        error_summary: {type: [string, 'null'], description: Fixed safe summary, never provider or SQL errors.}
+        created_at: {type: string}
+        updated_at: {type: string}
+    File:
+      type: object
+      additionalProperties: false
+      required: [id, collection_id, relative_path, file_kind, media_type, file_size, client_sha256, server_sha256, selection_status, selection_reason, extraction_method, text_length, long_text_id, metadata, created_at, updated_at]
+      properties:
+        id: {type: integer, minimum: 1}
+        collection_id: {type: integer, minimum: 1}
+        relative_path: {type: string, minLength: 1, maxLength: 2048}
+        file_kind: {type: string}
+        media_type: {type: string}
+        file_size: {type: integer, minimum: 0}
+        client_sha256: {type: [string, 'null'], pattern: '^[a-f0-9]{64}$'}
+        server_sha256: {type: [string, 'null'], pattern: '^[a-f0-9]{64}$'}
+        selection_status: {enum: [selected, skipped, uploaded, analyzed, failed]}
+        selection_reason: {type: string, description: Fixed safe reason on failed files.}
+        extraction_method: {type: [string, 'null']}
+        text_length: {type: integer, minimum: 0}
+        long_text_id: {type: [integer, 'null'], minimum: 1}
+        metadata:
+          type: object
+          additionalProperties: false
+          required: [last_modified]
+          properties:
+            last_modified: {type: [integer, 'null'], minimum: 0}
+        created_at: {type: string}
+        updated_at: {type: string}
+    Cancellation:
+      type: object
+      additionalProperties: false
+      required: [deleted, collection_id, candidate_id, cleanup_status, rag_cleanup]
+      properties:
+        deleted: {const: true}
+        collection_id: {type: integer, minimum: 1}
+        candidate_id: {type: integer, minimum: 1}
+        cleanup_status: {enum: [pending, completed]}
+        rag_cleanup: {const: database_cascade}

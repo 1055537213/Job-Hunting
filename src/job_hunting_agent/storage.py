@@ -1173,8 +1173,11 @@ class RepositoryStore:
                 UNION
                 SELECT jsonb_array_elements_text(storage_keys_json) AS storage_key
                 FROM project_deletions WHERE account_id = ? AND status='pending'
+                UNION
+                SELECT jsonb_array_elements_text(storage_keys_json) AS storage_key
+                FROM project_collection_deletions WHERE account_id = ? AND status='pending'
                 """,
-                (account_id, account_id, account_id, account_id, account_id, account_id),
+                (account_id, account_id, account_id, account_id, account_id, account_id, account_id),
             ).fetchall()
         return sorted({str(row["storage_key"]) for row in key_rows if row["storage_key"]})
 
@@ -1226,8 +1229,11 @@ class RepositoryStore:
                 UNION
                 SELECT jsonb_array_elements_text(storage_keys_json) AS storage_key
                 FROM project_deletions WHERE account_id = ? AND status='pending'
+                UNION
+                SELECT jsonb_array_elements_text(storage_keys_json) AS storage_key
+                FROM project_collection_deletions WHERE account_id = ? AND status='pending'
                 """,
-                (account_id, account_id, account_id, account_id, account_id, account_id),
+                (account_id, account_id, account_id, account_id, account_id, account_id, account_id),
             ).fetchall()
             conn.execute(
                 "UPDATE accounts SET status = 'disabled', updated_at = ? WHERE id = ?",
@@ -1315,6 +1321,7 @@ class RepositoryStore:
                 "profile_create_commands",
                 "profile_deletions",
                 "project_deletions",
+                "project_collection_deletions",
                 "candidate_profiles",
                 "auth_sessions",
                 "account_email_outbox",
@@ -4308,6 +4315,14 @@ class RepositoryStore:
                 (candidate_id, *owner_parameters),
             ).fetchall()
             # Include every version of every owned asset, not just the ZIP import's current version.
+            pending_project_keys = conn.execute(
+                f"""SELECT jsonb_array_elements_text(storage_keys_json) AS storage_key FROM project_collection_deletions
+                    WHERE candidate_id=?{owner_clause} AND status='pending'
+                    UNION
+                    SELECT jsonb_array_elements_text(storage_keys_json) AS storage_key FROM project_deletions
+                    WHERE candidate_id=?{owner_clause} AND status='pending'""",
+                (candidate_id, *owner_parameters, candidate_id, *owner_parameters),
+            ).fetchall()
             asset_rows = conn.execute(
                 """SELECT version.storage_key FROM knowledge_asset_versions AS version
                    JOIN knowledge_assets AS asset ON asset.id=version.asset_id
@@ -4392,7 +4407,7 @@ class RepositoryStore:
             "candidate_id": candidate_id,
             "storage_keys": [
                 str(row["storage_key"])
-                for row in [*artifact_rows, *archive_rows, *asset_rows, *collection_rows, *visual_rows]
+                for row in [*artifact_rows, *archive_rows, *asset_rows, *collection_rows, *visual_rows, *pending_project_keys]
             ],
             "long_text_ids": [int(row["id"]) for row in long_text_rows],
         }
@@ -5715,13 +5730,14 @@ class RepositoryStore:
         collection_id: int,
         *,
         account_id: int,
+        _connection: RepositoryConnection | None = None,
     ) -> dict[str, object]:
         """删除尚未生成项目卡片的采集会话及其文本、视觉对象和向量来源。"""
 
         session = self.get_project_collection(collection_id, account_id=account_id)
         if session.project_card_id is not None:
             raise ValueError("已生成项目卡片的采集会话必须通过项目删除功能清理。")
-        with self.connect() as conn:
+        with (self.connect() if _connection is None else nullcontext(_connection)) as conn:
             task_session_id = f"local-project-collection-{collection_id}"
             running_task = conn.execute(
                 """
@@ -5760,6 +5776,9 @@ class RepositoryStore:
                 """,
                 (collection_id,),
             ).fetchall()
+            version_keys = []
+            for asset_id in {int(row["knowledge_asset_id"]) for row in file_rows if row["knowledge_asset_id"] is not None}:
+                version_keys.extend(conn.execute("SELECT storage_key FROM knowledge_asset_versions WHERE asset_id=?", (asset_id,)).fetchall())
             long_text_ids = sorted(
                 int(row["long_text_id"])
                 for row in file_rows
@@ -5793,6 +5812,7 @@ class RepositoryStore:
                     if row["storage_key"] is not None
                 ],
                 *[str(row["storage_key"]) for row in visual_rows],
+                *[str(row["storage_key"]) for row in version_keys],
             ],
         }
 

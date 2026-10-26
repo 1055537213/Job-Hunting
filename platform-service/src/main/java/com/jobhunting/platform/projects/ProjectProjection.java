@@ -9,6 +9,7 @@ final class ProjectProjection {
     private static final Set<String> LISTS=Set.of("read_files","detected_tech_stack","detected_core_features","responsibility_draft",
         "highlight_draft","resume_expression_draft","questions_for_candidate","deferred_files");
     static void validate(JsonNode value,String operation,JsonNode input){
+        if(Set.of("local-manifest","local-get","local-cancel").contains(operation)){LocalCollectionProjection.validate(value,operation,input);return;}
         var expected=switch(operation){
             case "list"->Set.of("project_cards");case "confirm"->Set.of("project_card","task","root_request_id");
             case "delete"->Set.of("deleted","project_card_id","candidate_id","cleanup_status","rag_cleanup");

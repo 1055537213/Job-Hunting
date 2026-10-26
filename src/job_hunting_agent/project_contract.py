@@ -13,7 +13,10 @@ TASK_FIELDS = {"task_key", "task_type", "status", "progress", "attempt", "max_at
                "created_at", "started_at", "finished_at", "updated_at"}
 
 
-def validate_projection(value, operation, *, candidate_id=None, record_id=None):
+def validate_projection(value, operation, *, candidate_id=None, record_id=None, collection_id=None):
+    if operation in {"local-manifest", "local-get", "local-cancel"}:
+        from .local_project_entry import validate_collection
+        return validate_collection(value, operation, candidate_id=candidate_id, collection_id=collection_id)
     expected = {"list": {"project_cards"}, "confirm": {"project_card", "task", "root_request_id"},
                 "delete": {"deleted", "project_card_id", "candidate_id", "cleanup_status", "rag_cleanup"},
                 "github": {"task", "project_card", "processing_async", "root_request_id"}}[operation]

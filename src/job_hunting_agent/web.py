@@ -480,6 +480,9 @@ class InternalProjectPayload(BaseModel):
     root_request_id: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{32}$")
     repository_url: str | None = Field(default=None, min_length=1, max_length=512)
     idempotency_key: str | None = Field(default=None, pattern=r"^[A-Za-z0-9:_-]{16,128}$")
+    collection_id: int | None = Field(default=None, gt=0, le=2**63-1, strict=True)
+    project_name: str | None = Field(default=None, min_length=1, max_length=256)
+    files: list["LocalProjectManifestFilePayload"] | None = Field(default=None, min_length=1, max_length=MAX_MANIFEST_FILES)
 
 
 class GitHubProjectPayload(BaseModel):
@@ -494,11 +497,12 @@ class GitHubProjectPayload(BaseModel):
 class LocalProjectManifestFilePayload(BaseModel):
     """One browser-scanned file descriptor; content arrives only after selection."""
 
+    model_config = ConfigDict(extra="forbid")
     relative_path: str = Field(min_length=1, max_length=2048)
-    file_size: int = Field(ge=0)
-    sha256: str | None = Field(default=None, min_length=64, max_length=64)
+    file_size: int = Field(ge=0, le=2**48, strict=True)
+    sha256: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{64}$")
     media_type: str = Field(default="application/octet-stream", max_length=128)
-    last_modified: int | None = Field(default=None, ge=0)
+    last_modified: int | None = Field(default=None, ge=0, le=2**53-1, strict=True)
 
 
 class LocalProjectManifestPayload(BaseModel):
@@ -506,7 +510,7 @@ class LocalProjectManifestPayload(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    candidate_id: int
+    candidate_id: int = Field(gt=0, le=2**63-1, strict=True)
     project_name: str = Field(min_length=1, max_length=256)
     files: list[LocalProjectManifestFilePayload] = Field(
         min_length=1,
@@ -1298,7 +1302,7 @@ def create_web_app(
 
     @web_app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error: RequestValidationError):
-        if request.url.path in {"/api/projects", "/api/projects/github"} or re.fullmatch(r"/api/projects/[0-9]+(?:/confirm)?", request.url.path):
+        if request.url.path in {"/api/projects", "/api/projects/github", "/api/projects/local/manifest"} or re.fullmatch(r"/api/projects/(?:[0-9]+(?:/confirm)?|local/[0-9]+)", request.url.path):
             return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
         if request.url.path in {"/api/profiles", "/api/chat", "/api/chat/stream", "/internal/v1/chat/invoke", "/internal/v1/chat/stream"} and request.method == "POST":
             return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
@@ -2578,6 +2582,7 @@ def create_web_app(
         }
 
     project_callbacks = BoundedSemaphore(8)
+    collection_callbacks = BoundedSemaphore(2)
 
     def platform_project(request, operation, **data):
         try:
@@ -2592,18 +2597,50 @@ def create_web_app(
     def build_internal_project(operation, payload, trace_id):
         from .project_contract import MAX_PROJECT_BYTES, validate_projection
         from .project_deletion import request_deletion
+        from .local_project_entry import (MAX_COLLECTION_BYTES, MAX_COLLECTION_REQUEST_BYTES, CollectionConflict,
+            cancel_collection, get_collection_view, project_collection_view)
         if not project_callbacks.acquire(blocking=False):
+            raise AccountWorkBusy()
+        local = operation.startswith("local-")
+        if local and not collection_callbacks.acquire(blocking=False):
+            project_callbacks.release()
             raise AccountWorkBusy()
         try:
             resolved = backend.platform_auth_client.account("me", session_token=payload.session_token, trace_id=trace_id)
             owner = platform_account_record(resolved["account"]).id
-            if operation == "delete":
+            if operation == "local-cancel":
+                if payload.collection_id is None:
+                    raise HTTPException(422, "请求参数无效。")
+                result = cancel_collection(backend, owner, payload.collection_id)
+            elif operation == "local-manifest":
+                if payload.candidate_id is None or payload.files is None or not payload.project_name or not payload.project_name.strip():
+                    raise HTTPException(422, "请求参数无效。")
+                if len(payload.model_dump_json().encode("utf-8")) > MAX_COLLECTION_REQUEST_BYTES:
+                    raise HTTPException(413, "项目清单过大。")
+                with backend.store.account_work.acquire(owner, deletion=True):
+                    with backend.store.connect() as conn:
+                        conn.execute("SET LOCAL lock_timeout='1s'")
+                        actor = conn.execute("SELECT status,deleted_at FROM accounts WHERE id=? FOR SHARE", (owner,)).fetchone()
+                        if actor is None or actor["status"] != "active" or actor["deleted_at"] is not None:
+                            raise AccountWorkDenied()
+                        get_profile_or_404(backend, payload.candidate_id, owner)
+                        try:
+                            session, files = backend.create_local_project_collection(payload.candidate_id, payload.project_name,
+                                [ProjectManifestItem(**item.model_dump()) for item in payload.files], account_id=owner)
+                        except DuplicateResourceError:
+                            raise CollectionConflict() from None
+                        result = project_collection_view(session, files, manifest=True)
+            elif operation == "delete":
                 if payload.record_id is None:
                     raise HTTPException(422, "请求参数无效。")
                 result = request_deletion(backend, owner, payload.record_id)
             else:
                 with backend.store.account_work.acquire(owner):
-                    if operation == "github":
+                    if operation == "local-get":
+                        if payload.collection_id is None:
+                            raise HTTPException(422, "请求参数无效。")
+                        result = get_collection_view(backend, owner, payload.collection_id)
+                    elif operation == "github":
                         from .project_submission import ProjectSubmissions
                         if payload.candidate_id is None or payload.repository_url is None:
                             raise HTTPException(422, "请求参数无效。")
@@ -2642,19 +2679,22 @@ def create_web_app(
                             candidate_id=record.candidate_id, session_id=f"project-confirmation-{record.id}",
                             record=asdict(record), rag_task=task_view)
                         result = {"project_card": asdict(record), "task": task_view, "root_request_id": request_id}
-            validate_projection(result, operation, candidate_id=payload.candidate_id, record_id=payload.record_id)
+            validate_projection(result, operation, candidate_id=payload.candidate_id, record_id=payload.record_id, collection_id=payload.collection_id)
             scope = {"submission_candidate_id": payload.candidate_id} if operation == "github" else {}
             body = json.dumps({"account_id": owner, **scope, **result}, ensure_ascii=False).encode("utf-8")
-            if len(body) > MAX_PROJECT_BYTES:
+            if len(body) > (MAX_COLLECTION_BYTES if operation.startswith("local-") else MAX_PROJECT_BYTES):
                 raise HTTPException(413, "项目数据超出同步查询限制。")
             return body
         finally:
+            if local:
+                collection_callbacks.release()
             project_callbacks.release()
 
     @web_app.post("/internal/v1/projects/{operation}", include_in_schema=False)
     async def internal_projects(operation: str, payload: InternalProjectPayload, request: Request):
         from .project_contract import PROJECT_UNAVAILABLE
         from .project_submission import ProjectSubmissionConflict
+        from .local_project_entry import CollectionConflict
         client = backend.platform_auth_client
         if client is None:
             raise HTTPException(404, "接口不存在。")
@@ -2662,7 +2702,8 @@ def create_web_app(
         if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
             return JSONResponse({"code": "INTERNAL_UNAUTHORIZED", "detail": "内部服务认证失败。"}, status_code=401)
         allowed = {"list": {"candidate_id"}, "confirm": {"record_id", "confirmed_summary", "root_request_id"},
-            "delete": {"record_id"}, "github": {"candidate_id", "repository_url", "idempotency_key"}}
+            "delete": {"record_id"}, "github": {"candidate_id", "repository_url", "idempotency_key"},
+            "local-manifest": {"candidate_id", "project_name", "files"}, "local-get": {"collection_id"}, "local-cancel": {"collection_id"}}
         if operation not in allowed or payload.model_fields_set - {"session_token"} - allowed[operation]:
             return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422)
         try:
@@ -2680,6 +2721,10 @@ def create_web_app(
             status, code = 409, "PROJECT_BUSY"
         except ProjectSubmissionConflict:
             status, code = 409, "PROJECT_SUBMISSION_CONFLICT"
+        except CollectionConflict:
+            status, code = 409, "PROJECT_COLLECTION_CONFLICT"
+        except ProjectEvidenceError:
+            status, code = 400, "PROJECT_MANIFEST_INVALID"
         except GitHubRepositoryError:
             status, code = 400, "PROJECT_REPOSITORY_INVALID"
         except (AccountWorkDenied, PermissionError):
@@ -2789,6 +2834,8 @@ def create_web_app(
     ) -> dict[str, object]:
         """Accept metadata and hashes only, then return the server-side collection plan."""
 
+        if backend.platform_auth_client is not None:
+            return platform_project(request, "local-manifest", **payload.model_dump())
         account = current_account(request)
         assert account is not None
         get_profile_or_404(backend, payload.candidate_id, account.id)
@@ -2830,6 +2877,8 @@ def create_web_app(
     ) -> dict[str, object]:
         """Return resumable collection progress for the signed-in account."""
 
+        if backend.platform_auth_client is not None:
+            return platform_project(request, "local-get", collection_id=collection_id)
         account = current_account(request)
         assert account is not None
         try:
@@ -2846,6 +2895,8 @@ def create_web_app(
     ) -> dict[str, object]:
         """取消未完成的本地目录采集，释放其文本、视觉对象与派生索引。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_project(request, "local-cancel", collection_id=collection_id)
         account = current_account(request)
         assert account is not None
         try:
@@ -2870,6 +2921,10 @@ def create_web_app(
 
         account = current_account(request)
         assert account is not None
+        try:
+            backend.store.get_project_collection(collection_id, account_id=account.id)
+        except KeyError:
+            raise HTTPException(404, "本地项目采集会话不存在。") from None
         try:
             parsed_ids = json.loads(file_ids)
         except json.JSONDecodeError as error:

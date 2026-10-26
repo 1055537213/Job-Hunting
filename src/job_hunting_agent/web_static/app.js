@@ -3849,8 +3849,10 @@ if (!window.Vue) {
       /** 页面刷新后恢复未完成采集摘要，重新选择同一目录即可从剩余文件继续。 */
       async resumePendingLocalProjectCollection() {
         if (!this.currentProfileId) return;
+        const candidateId = this.currentProfileId;
+        const storageKey = this.localProjectCollectionStorageKey(candidateId);
         const collectionId = Number(
-          localStorage.getItem(this.localProjectCollectionStorageKey()) || 0
+          localStorage.getItem(storageKey) || 0
         );
         if (!collectionId) {
           this.localProjectCollectionId = 0;
@@ -3862,6 +3864,7 @@ if (!window.Vue) {
           const data = await this.requestJson(
             `/api/projects/local/${encodeURIComponent(collectionId)}`
           );
+          if (this.localProjectCollectionStorageKey() !== storageKey) return;
           const collection = data.collection || {};
           if (collection.project_card_id || collection.status === "ready") {
             this.forgetLocalProjectCollection();
@@ -3870,8 +3873,10 @@ if (!window.Vue) {
           this.localProjectCollectionId = collectionId;
           this.localProjectDirectoryName = collection.project_name || "本地项目";
           this.localProjectProgress = `上次已分析 ${Number(collection.uploaded_file_count || 0)} 个文件，重新选择同一目录可继续`;
-        } catch (_error) {
-          this.forgetLocalProjectCollection();
+        } catch (error) {
+          if (this.localProjectCollectionStorageKey() !== storageKey) return;
+          if ([401, 403, 404].includes(Number(error.status))) this.forgetLocalProjectCollection(candidateId);
+          else this.githubProjectError = error.message || "采集进度暂时无法读取，请稍后重试。";
         }
       },
 
@@ -4523,7 +4528,6 @@ if (!window.Vue) {
             "本地项目分析已完成，已生成待确认项目经历卡片。请在左侧按组确认属于你的内容。"
           );
         } catch (error) {
-          if (this.showDuplicateNotice(error, "项目已存在")) return;
           this.githubProjectError = error.message || "本地项目分析失败。";
           this.appendAssistant(this.githubProjectError, true);
         } finally {
@@ -4546,15 +4550,21 @@ if (!window.Vue) {
         if (!window.confirm("取消后会删除本次采集已保存的项目证据，确定继续吗？")) return;
         this.deletingLocalProjectCollection = true;
         this.githubProjectError = "";
+        const storageKey = this.localProjectCollectionStorageKey();
         try {
-          await this.requestJson(`/api/projects/local/${encodeURIComponent(collectionId)}`, {
+          const result = await this.requestJson(`/api/projects/local/${encodeURIComponent(collectionId)}`, {
             method: "DELETE",
           });
+          localStorage.removeItem(storageKey);
+          if (this.localProjectCollectionStorageKey() !== storageKey) return;
           this.forgetLocalProjectCollection();
           this.localProjectDirectoryName = "";
           this.localProjectProgress = "";
-          this.appendAssistant("已取消本次本地项目采集，已上传证据和索引已清理。");
+          this.appendAssistant(result.cleanup_status === "pending"
+            ? "已取消本次采集，项目证据和索引已删除，附件正在后台清理。"
+            : "已取消本次本地项目采集，已上传证据和索引已清理。");
         } catch (error) {
+          if (this.localProjectCollectionStorageKey() !== storageKey) return;
           this.githubProjectError = error.message || "取消本地项目采集失败。";
           this.appendAssistant(this.githubProjectError, true);
         } finally {

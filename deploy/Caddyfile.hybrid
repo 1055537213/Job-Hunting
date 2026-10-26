@@ -62,6 +62,19 @@
 			path /api/projects/github
 		}
 		reverse_proxy @project_github platform-service:8081
+		@local_manifest {
+			method POST
+			path /api/projects/local/manifest
+		}
+		request_body @local_manifest {
+			max_size 4194304
+		}
+		reverse_proxy @local_manifest platform-service:8081
+		@local_collection {
+			method GET DELETE
+			path_regexp localCollection ^/api/projects/local/[0-9]+$
+		}
+		reverse_proxy @local_collection platform-service:8081
 		@project_confirm {
 			method POST
 			path_regexp projectConfirm ^/api/projects/[0-9]+/confirm$

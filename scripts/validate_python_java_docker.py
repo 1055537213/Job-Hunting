@@ -1043,6 +1043,141 @@ def run_chat_stream_gateway_flow(gateway_url: str, web_url: str, java_url: str, 
     print("==> Java SSE -> incremental Unicode-safe events -> real Agent/tool/history/160-token settlement -> disconnect drains guard/no false history/80 known tokens -> scope/CSRF/balance/outages/recovery: PASS")
 
 
+def run_local_collection_management_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
+                                         web: str, java: str, worker: str, broker: str, database_url: str) -> None:
+    import hashlib
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+    from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
+    store = SQLAlchemyStore(database_url)
+    emails = [f"local-{os.urandom(10).hex()}@example.com" for _ in range(2)]
+    password = "local-collection-password"
+    owners = [auth.register_account(email=email, password=password, display_name="Local collection", email_verified=True, consents=[]).account_id for email in emails]
+    try:
+        with httpx.Client(base_url=gateway_url, timeout=20) as browser, httpx.Client(base_url=gateway_url, timeout=20) as other:
+            for client, email in zip((browser, other), emails, strict=True):
+                response = client.post("/api/auth/login", json={"email": email, "password": password})
+                assert response.status_code == 200
+                client.headers["X-CSRF-Token"] = response.json()["csrf_token"]
+            owner = owners[0]
+            candidate = browser.post("/api/profiles", json={"name": "Local collection acceptance"}).json()["candidate_id"]
+            assert browser.post("/api/me/balance/recharge", json={"amount_yuan": 1, "idempotency_key": os.urandom(16).hex()}).status_code == 200
+            manifest_path = "/api/projects/local/manifest"
+            data = {"candidate_id": candidate, "project_name": "Local design", "files": [
+                {"relative_path": "README.md", "file_size": 9, "sha256": hashlib.sha256(b"prototype").hexdigest()},
+                {"relative_path": ".env", "file_size": 1, "sha256": "a"*64}]}
+            assert httpx.post(gateway_url + manifest_path, json=data).status_code == 401
+            assert httpx.post(gateway_url + manifest_path, cookies=browser.cookies, json=data).status_code == 403
+            assert other.post(manifest_path, json=data).status_code == 404
+            assert browser.post(manifest_path, json={**data, "files": [{**data["files"][0], "content": "SECRET"}]}).status_code == 422
+            plan = browser.post(manifest_path, json=data)
+            assert plan.status_code == 200, plan.text[:300]
+            collection = plan.json()["collection"]["id"]
+            path = f"/api/projects/local/{collection}"
+            file_id = plan.json()["selected_files"][0]["id"]
+            assert len(plan.json()["selected_files"]) == 1 and "account_id" not in plan.json()["collection"]
+            assert browser.post(manifest_path, json=data).json()["collection"]["id"] == collection
+            assert browser.post("/internal/v1/projects/local-get", json={}).status_code == 404
+            for origin in (web_url, java_url):
+                assert httpx.post(origin + "/internal/v1/projects/local-get", json={"session_token": browser.cookies["job_agent_session"], "collection_id": collection}).status_code == 401
+            assert other.get(path).status_code == 404 and other.delete(path).status_code == 404
+            assert httpx.delete(gateway_url + path, cookies=browser.cookies).status_code == 403
+            assert httpx.get(web_url + path, cookies=browser.cookies).json() == browser.get(path).json()
+
+            def upload_and_wait(target, target_file):
+                uploaded = browser.post(target + "/files", data={"file_ids": json.dumps([target_file])}, files=[("files", ("README.md", b"prototype", "text/markdown"))])
+                assert uploaded.status_code == 200, uploaded.text[:300]
+                task = uploaded.json()["rag_task"]
+                assert task is not None
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    snapshot = browser.get(f"/api/tasks/{task['task_key']}").json()["task"]
+                    state = snapshot["status"]
+                    if state in {"succeeded", "failed"}:
+                        break
+                    time.sleep(0.2)
+                assert state == "succeeded", {"status": state, "error_summary": snapshot.get("error_summary")}
+
+            with store.connect() as conn:
+                baseline_texts = {row["id"] for row in conn.execute("SELECT id FROM long_texts WHERE account_id=?", (owner,)).fetchall()}
+                baseline_chunks = {row["id"] for row in conn.execute("SELECT id FROM rag_chunks WHERE account_id=?", (owner,)).fetchall()}
+            upload_and_wait(path, file_id)
+            resumed = browser.post(manifest_path, json=data)
+            assert resumed.status_code == 200 and resumed.json()["resumed"] and resumed.json()["selected_files"] == []
+            fixture = f"""
+import json
+from job_hunting_agent.app import JobHuntingApp
+a=JobHuntingApp();a.initialize()
+objects=[a.resume_files.save(account_id={owner},candidate_id={candidate},filename='design.txt',content=b'original'+bytes([i])) for i in (1,2)]
+asset,version=a.store.register_knowledge_asset(account_id={owner},candidate_id={candidate},asset_kind='document',title='Design',original_filename='design.txt',storage_key=objects[0].storage_key,media_type='text/plain',file_size=objects[0].file_size,sha256=objects[0].sha256)
+a.store.add_knowledge_asset_version(asset.id,account_id={owner},original_filename='design.txt',storage_key=objects[1].storage_key,media_type='text/plain',file_size=objects[1].file_size,sha256=objects[1].sha256)
+with a.store.connect() as c:c.execute('UPDATE project_collection_files SET knowledge_asset_id=?,knowledge_asset_version_id=?,storage_key=?,metadata_json=? WHERE id=?',(asset.id,version.id,objects[0].storage_key,json.dumps({{'last_modified':12,'extracted_text':'SECRET_CONTENT','storage_key':'SECRET_OBJECT'}}),{file_id}))
+print(json.dumps([o.storage_key for o in objects]));a.store.close()
+"""
+            keys = json.loads(docker("exec", worker, "python", "-c", fixture).splitlines()[-1])
+            queried = browser.get(path)
+            assert queried.status_code == 200 and "SECRET" not in queried.text and not any(k in queried.text for k in keys)
+            assert queried.json()["collection"]["uploaded_file_count"] == 1
+            with store.connect() as conn:
+                assert conn.execute("SELECT count(*) AS n FROM rag_chunks WHERE account_id=?", (owner,)).fetchone()["n"] > 0
+            with store.account_work.acquire(owner):
+                assert browser.delete(path).json()["code"] == "PROJECT_BUSY"
+            docker("stop", "--time", "1", worker)
+            docker("stop", "--time", "1", broker)
+            cancelled = browser.delete(path)
+            assert cancelled.status_code == 200 and cancelled.json()["cleanup_status"] == "pending", cancelled.text[:300]
+            assert not any(k in cancelled.text for k in keys)
+            assert browser.delete(path).json() == cancelled.json() and browser.get(path).status_code == 404
+            assert browser.post(path + "/files", data={"file_ids": json.dumps([file_id])}, files=[("files", ("README.md", b"prototype", "text/markdown"))]).status_code == 404
+            with store.connect() as conn:
+                assert {row["id"] for row in conn.execute("SELECT id FROM rag_chunks WHERE account_id=?", (owner,)).fetchall()} == baseline_chunks
+                assert {row["id"] for row in conn.execute("SELECT id FROM long_texts WHERE account_id=?", (owner,)).fetchall()} == baseline_texts
+            docker("start", broker)
+            docker("start", worker)
+            fail_cleanup = f"""
+from job_hunting_agent.app import JobHuntingApp
+from job_hunting_agent.project_deletion import cleanup
+a=JobHuntingApp();a.initialize()
+def fail(key):raise RuntimeError('SECRET_STORAGE')
+a.resume_files.delete=fail
+assert cleanup(a,{owner},{collection},collection=True,force=True)['cleanup_status']=='pending'
+a.store.close()
+"""
+            docker("exec", worker, "python", "-c", fail_cleanup)
+            docker("restart", "--time", "1", worker)
+            with store.connect() as conn:
+                conn.execute("UPDATE project_collection_deletions SET next_attempt_at=now() WHERE account_id=?", (owner,))
+            maintenance = "from job_hunting_agent.worker import create_worker_app; from job_hunting_agent.task_queue import STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME; print(create_worker_app().tasks[STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME].apply().get())"
+            docker("exec", worker, "python", "-c", maintenance)
+            assert browser.delete(path).json()["cleanup_status"] == "completed"
+            docker("exec", worker, "python", "-c", f"from job_hunting_agent.app import JobHuntingApp; a=JobHuntingApp(); assert all(not a.resume_files.path_for(k).exists() for k in {keys!r}); a.store.close()")
+            fresh = browser.post(manifest_path, json=data).json()
+            fresh_path = f"/api/projects/local/{fresh['collection']['id']}"
+            assert fresh["collection"]["id"] != collection
+            for container, health, origin in ((web, web_url+"/api/health",gateway_url),(java,java_url+"/actuator/health",web_url)):
+                try:
+                    docker("stop", "--time", "1", container)
+                    unavailable = httpx.get(origin + fresh_path, cookies=browser.cookies, timeout=20)
+                    assert unavailable.status_code == 503 and "files" not in unavailable.json()
+                finally:
+                    docker("start", container)
+                    wait(health)
+            upload_and_wait(fresh_path, fresh["selected_files"][0]["id"])
+            complete = browser.post(fresh_path + "/complete")
+            assert complete.status_code == 200, complete.text[:300]
+            assert browser.get(fresh_path).json()["collection"]["status"] == "ready"
+            assert browser.delete(fresh_path).json()["code"] == "PROJECT_COLLECTION_CONFLICT"
+            assert browser.post(manifest_path, json=data).json()["code"] == "PROJECT_COLLECTION_CONFLICT"
+            auth.session("logout", session_token=browser.cookies["job_agent_session"])
+            assert browser.get(fresh_path).status_code == 401
+    finally:
+        for name in (broker,worker,web,java):
+            docker("start", name)
+        store.close()
+    print("==> Java local manifest/query/cancel -> Python-owned upload/real Worker RAG -> fingerprint resume/scope/CSRF/redaction -> atomic cancellation + all-version cleanup/failure/restart -> late upload 404/ready protection/outages/revocation: PASS")
+
+
 def run_project_submission_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
                                        web: str, worker: str, broker: str, database_url: str) -> None:
     from job_hunting_agent.config import PlatformAuthSettings
@@ -1534,6 +1669,7 @@ def main() -> None:
     parser.add_argument("--ai-image", default="job-hunting-agent:hybrid-validation")
     parser.add_argument("--java-jar", type=Path, help="仅供本地离线验收：在已有 Java 21 运行镜像中挂载新构建的 jar")
     parser.add_argument("--port", type=int, default=18085)
+    parser.add_argument("--only-local-collections", action="store_true", help="Only run isolated local collection management acceptance")
     args = parser.parse_args()
     if not 1024 <= args.port <= 65534:
         raise ValueError("Invalid acceptance port")
@@ -1702,7 +1838,7 @@ def main() -> None:
             args.ai_image,
         )
         wait(f"http://127.0.0.1:{args.port + 1}/api/health")
-        admin_credentials = run_web_billing_flow(
+        admin_credentials = None if args.only_local_collections else run_web_billing_flow(
             web_url=f"http://127.0.0.1:{args.port + 1}",
             database_url=isolated_url,
             base_url=f"http://127.0.0.1:{args.port}",
@@ -1714,6 +1850,14 @@ def main() -> None:
                "--mount", f"type=bind,source={root / 'deploy/Caddyfile.hybrid.local'},target=/etc/caddy/Caddyfile,readonly",
                "caddy:2.9.1-alpine")
         wait(f"http://127.0.0.1:{args.port + 2}/api/health")
+        if args.only_local_collections:
+            docker("run", "-d", "--name", worker, *common, *env_args, args.ai_image,
+                   "job-agent-worker", "--concurrency", "1", "--log-level", "WARNING")
+            run_local_collection_management_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                                                f"http://127.0.0.1:{args.port}", token, web, java, worker, broker, isolated_url)
+            print("Docker local collection management acceptance: PASS")
+            acceptance_passed = True
+            return
         run_browser_gateway_flow(f"http://127.0.0.1:{args.port + 2}",
                                  f"http://127.0.0.1:{args.port + 1}",
                                  f"http://127.0.0.1:{args.port}", token, web, admin_credentials, isolated_url)
@@ -1737,6 +1881,9 @@ def main() -> None:
         reset_scenario_limits()
         run_project_submission_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                            f"http://127.0.0.1:{args.port}", token, web, worker, broker, isolated_url)
+        reset_scenario_limits()
+        run_local_collection_management_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                                            f"http://127.0.0.1:{args.port}", token, web, java, worker, broker, isolated_url)
         reset_scenario_limits()
         run_project_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                  f"http://127.0.0.1:{args.port}", token, web, java, worker, isolated_url)

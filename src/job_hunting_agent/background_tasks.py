@@ -1312,6 +1312,7 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
             counts.update(resume_pending(backend))
             from .project_deletion import resume_pending as resume_project_deletions
             counts.update(resume_project_deletions(backend))
+            counts.update(resume_project_deletions(backend, collection=True))
             return {"status": "succeeded", **counts}
         finally:
             backend.store.close()

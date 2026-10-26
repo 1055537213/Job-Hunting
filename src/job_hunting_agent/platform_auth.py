@@ -536,7 +536,8 @@ class PlatformAuthClient:
 
     def projects(self, operation: str, session_token: str | None, *, trace_id=None, **data):
         from .project_contract import MAX_PROJECT_BYTES, PROJECT_UNAVAILABLE, validate_projection
-        if operation not in {"list", "confirm", "delete", "github"}:
+        from .local_project_entry import MAX_COLLECTION_BYTES
+        if operation not in {"list", "confirm", "delete", "github", "local-manifest", "local-get", "local-cancel"}:
             raise ValueError("Unknown project operation")
         if not session_token:
             raise PlatformAuthError("SESSION_EXPIRED", "登录状态已过期，请重新登录。", 401)
@@ -549,14 +550,14 @@ class PlatformAuthClient:
                         raise ValueError("Invalid project content type")
                     body = bytearray()
                     for chunk in response.iter_bytes(chunk_size=65536):
-                        if len(body) + len(chunk) > MAX_PROJECT_BYTES:
+                        if len(body) + len(chunk) > (MAX_COLLECTION_BYTES if operation.startswith("local-") else MAX_PROJECT_BYTES):
                             raise ValueError("Project response exceeds limit")
                         body.extend(chunk)
                     value = decode_json(bytes(body))
                     if response.status_code != 200:
                         codes = {401: {"SESSION_EXPIRED"}, 403: {"ACCOUNT_DISABLED", "PROJECT_SCOPE_DENIED"},
-                            404: {"PROJECT_NOT_FOUND"}, 400: {"PROJECT_CONFIRMATION_REQUIRED", "PROJECT_REPOSITORY_INVALID"},
-                            409: {"PROJECT_BUSY", "PROJECT_CONFLICT", "PROJECT_SUBMISSION_CONFLICT"}, 413: {"PROJECT_TOO_LARGE"}, 422: {"INVALID_REQUEST"}}
+                            404: {"PROJECT_NOT_FOUND"}, 400: {"PROJECT_CONFIRMATION_REQUIRED", "PROJECT_REPOSITORY_INVALID", "PROJECT_MANIFEST_INVALID"},
+                            409: {"PROJECT_BUSY", "PROJECT_CONFLICT", "PROJECT_SUBMISSION_CONFLICT", "PROJECT_COLLECTION_CONFLICT"}, 413: {"PROJECT_TOO_LARGE"}, 422: {"INVALID_REQUEST"}}
                         code = value.get("code") if isinstance(value, dict) else None
                         if not isinstance(code, str) or code not in codes.get(response.status_code, set()):
                             raise ValueError("Invalid project error")
@@ -566,9 +567,11 @@ class PlatformAuthClient:
                             "PROJECT_BUSY": "当前仍有请求或任务执行，请稍后重试。", "PROJECT_CONFLICT": "已确认内容与本次请求不一致，请刷新项目列表核实。",
                             "PROJECT_TOO_LARGE": "项目数据超出同步查询限制。", "INVALID_REQUEST": "请求参数无效。",
                             "PROJECT_REPOSITORY_INVALID": "请填写有效的公开 GitHub 仓库首页链接。",
-                            "PROJECT_SUBMISSION_CONFLICT": "本次提交已失效或内容已变更，请重新发起项目分析。"}[code]
+                            "PROJECT_SUBMISSION_CONFLICT": "本次提交已失效或内容已变更，请重新发起项目分析。",
+                            "PROJECT_MANIFEST_INVALID": "项目清单无效或没有可安全分析的文件，请重新选择目录。",
+                            "PROJECT_COLLECTION_CONFLICT": "采集已完成或状态已变化，请刷新后核实；已生成的项目请通过项目列表删除。"}[code]
                         raise PlatformAuthError(code, message, response.status_code)
-                    return validate_projection(value, operation, candidate_id=data.get("candidate_id"), record_id=data.get("record_id"))
+                    return validate_projection(value, operation, candidate_id=data.get("candidate_id"), record_id=data.get("record_id"), collection_id=data.get("collection_id"))
         except (httpx.HTTPError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
             raise PlatformAuthError("PROJECT_UNAVAILABLE", PROJECT_UNAVAILABLE, 503) from None
 

@@ -69,4 +69,39 @@ class ProjectClientTest {
         projection.put("submission_candidate_id",7);task.put("result","private source");body=projection.toString();
         assertThatThrownBy(()->client.execute("github","real-session",42,input(),"trace")).isInstanceOf(AuthException.class);
     }
+    ObjectNode collectionBody(int count){
+        var c=mapper.createObjectNode().put("id",8).put("candidate_id",7).putNull("project_card_id").put("project_name","Design")
+            .put("source_type","local_directory_collection").put("manifest_fingerprint","a".repeat(64)).put("status","planned")
+            .put("file_count",count).put("selected_file_count",1).put("uploaded_file_count",0).put("total_size",count).put("selected_size",1)
+            .putNull("error_summary").put("created_at","now").put("updated_at","now");
+        var files=mapper.createArrayNode();
+        for(int i=1;i<=count;i++){
+            var f=mapper.createObjectNode().put("id",i).put("collection_id",8).put("relative_path",i+"-"+"p".repeat(100)+".txt")
+                .put("file_kind","source_text").put("media_type","text/plain").put("file_size",1).put("client_sha256","a".repeat(64))
+                .putNull("server_sha256").put("selection_status",i==1?"selected":"skipped").put("selection_reason","policy")
+                .putNull("extraction_method").put("text_length",0).putNull("long_text_id").put("created_at","now").put("updated_at","now");
+            f.set("metadata",mapper.createObjectNode().putNull("last_modified"));files.add(f);
+        }
+        var root=mapper.createObjectNode().put("account_id",42);root.set("collection",c);root.set("files",files);return root;
+    }
+    @Test void localViewsRejectWrongScopePrivateFieldsAndInvalidPlans(){
+        var data=collectionBody(1);body=data.toString();var query=mapper.createObjectNode().put("collection_id",8);
+        assertThat(client.execute("local-get","real-session",42,query,"trace").has("account_id")).isFalse();
+        ((ObjectNode)data.get("files").get(0).get("metadata")).put("storage_key","private");body=data.toString();
+        assertThatThrownBy(()->client.execute("local-get","real-session",42,query,"trace")).isInstanceOf(AuthException.class);
+        data=collectionBody(1);((ObjectNode)data.get("collection")).put("id",9);body=data.toString();
+        assertThatThrownBy(()->client.execute("local-get","real-session",42,query,"trace")).isInstanceOf(AuthException.class);
+        data=collectionBody(1);data.set("selected_files",mapper.createArrayNode());data.put("resumed",false);body=data.toString();
+        assertThatThrownBy(()->client.execute("local-manifest","real-session",42,input(),"trace")).isInstanceOf(AuthException.class);
+        data.set("selected_files",data.get("files").deepCopy());body=data.toString();
+        assertThat(client.execute("local-manifest","real-session",42,input(),"trace").path("resumed").asBoolean()).isFalse();
+    }
+    @Test void boundedLargeCollectionUsesSeparateLimitAndOversizedManifestNeverLeavesJava(){
+        body=collectionBody(10000).toString();assertThat(body.length()).isGreaterThan(ProjectClient.MAX_BYTES);
+        assertThat(client.execute("local-get","real-session",42,mapper.createObjectNode().put("collection_id",8),"trace").path("files").size()).isEqualTo(10000);
+        int before=calls.get();
+        assertThatThrownBy(()->client.execute("local-manifest","real-session",42,input().put("project_name","x".repeat(ProjectClient.MAX_BYTES)),"trace"))
+            .isInstanceOf(AuthException.class);
+        assertThat(calls.get()).isEqualTo(before);
+    }
 }

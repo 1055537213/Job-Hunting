@@ -289,6 +289,25 @@ project_deletions = sa.Table(
 )
 sa.Index("idx_project_deletions_due", project_deletions.c.status, project_deletions.c.next_attempt_at)
 
+project_collection_deletions = sa.Table(
+    "project_collection_deletions", metadata,
+    sa.Column("account_id", sa.Integer, sa.ForeignKey("accounts.id", ondelete="CASCADE"), primary_key=True),
+    sa.Column("collection_id", sa.Integer, primary_key=True),
+    sa.Column("candidate_id", sa.Integer, nullable=False),
+    sa.Column("status", sa.String(16), nullable=False),
+    sa.Column("storage_keys_json", json_type, nullable=False),
+    sa.Column("attempts", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("next_attempt_at", timestamp_type, nullable=False, server_default=sa.func.now()),
+    sa.Column("lease_token", sa.String(64)),
+    sa.Column("lease_until", timestamp_type),
+    sa.Column("last_error", sa.String(256)),
+    sa.Column("created_at", timestamp_type, nullable=False, server_default=sa.func.now()),
+    sa.Column("updated_at", timestamp_type, nullable=False, server_default=sa.func.now()),
+    sa.CheckConstraint("status IN ('pending', 'completed')", name="project_collection_deletions_status"),
+    sa.CheckConstraint("attempts >= 0", name="project_collection_deletions_attempts"),
+)
+sa.Index("idx_project_collection_deletions_due", project_collection_deletions.c.status, project_collection_deletions.c.next_attempt_at)
+
 
 jobs = sa.Table(
     "jobs",
