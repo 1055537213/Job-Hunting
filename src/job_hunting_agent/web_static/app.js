@@ -4292,15 +4292,18 @@ if (!window.Vue) {
           this.projectReviewSelections = {};
           return;
         }
+        const storageKey = this.localProjectCollectionStorageKey();
         try {
           const data = await this.requestJson(
             `/api/projects?candidate_id=${encodeURIComponent(this.currentProfileId)}`,
             signal ? { signal } : {}
           );
+          if (this.localProjectCollectionStorageKey() !== storageKey) return;
           this.projectCards = data.project_cards || [];
           this.syncProjectReviewSelections(this.projectCards);
           this.reconcileTaskApprovals();
         } catch (error) {
+          if (this.localProjectCollectionStorageKey() !== storageKey) return;
           this.projectCards = [];
           this.githubProjectError = error.message || "项目卡片加载失败。";
         }
@@ -4454,6 +4457,9 @@ if (!window.Vue) {
           this.githubProjectError = "项目文件数量不能超过 20000 个。";
           return;
         }
+        const candidateId = this.currentProfileId;
+        const storageKey = this.localProjectCollectionStorageKey(candidateId);
+        const isCurrent = () => this.localProjectCollectionStorageKey() === storageKey;
         this.submittingLocalProject = true;
         this.githubProjectError = "";
         this.localProjectDirectoryName = projectName;
@@ -4469,16 +4475,19 @@ if (!window.Vue) {
               media_type: item.file.type || "application/octet-stream",
               last_modified: item.file.lastModified || null,
             });
+            if (!isCurrent()) return;
           }
           const plan = await this.requestJson("/api/projects/local/manifest", {
             method: "POST",
             body: JSON.stringify({
-              candidate_id: this.currentProfileId,
+              candidate_id: candidateId,
               project_name: projectName,
               files: manifestFiles,
             }),
           });
-          this.rememberLocalProjectCollection(plan.collection?.id);
+          localStorage.setItem(storageKey, String(plan.collection.id));
+          if (!isCurrent()) return;
+          this.rememberLocalProjectCollection(plan.collection.id);
           const localFiles = new Map(entries.map((item) => [item.relativePath, item.file]));
           const selected = plan.selected_files || [];
           const batchSize = 3;
@@ -4501,17 +4510,18 @@ if (!window.Vue) {
               `/api/projects/local/${encodeURIComponent(plan.collection.id)}/files`,
               form
             );
+            if (!isCurrent()) return;
             uploaded += (batchResult.processed_files || []).length;
             failed += (batchResult.failed_files || []).length;
             this.trackProjectIndexTask(
               batchResult.rag_task,
               `${projectName} 文本证据`,
-              this.currentProfileId
+              candidateId
             );
             this.trackProjectIndexTask(
               batchResult.visual_task,
               `${projectName} 视觉证据`,
-              this.currentProfileId
+              candidateId
             );
             if (batchResult.visual_warning) {
               this.githubProjectError = batchResult.visual_warning;
@@ -4521,13 +4531,17 @@ if (!window.Vue) {
             `/api/projects/local/${encodeURIComponent(plan.collection.id)}/complete`,
             { method: "POST" }
           );
+          if (localStorage.getItem(storageKey) === String(plan.collection.id)) localStorage.removeItem(storageKey);
+          if (!isCurrent()) return;
           await this.loadProjectCards();
+          if (!isCurrent()) return;
           this.forgetLocalProjectCollection();
           this.localProjectProgress = `已分析 ${uploaded} 个文件${failed ? `，${failed} 个未能解析` : ""}`;
           this.appendAssistant(
             "本地项目分析已完成，已生成待确认项目经历卡片。请在左侧按组确认属于你的内容。"
           );
         } catch (error) {
+          if (!isCurrent()) return;
           this.githubProjectError = error.message || "本地项目分析失败。";
           this.appendAssistant(this.githubProjectError, true);
         } finally {

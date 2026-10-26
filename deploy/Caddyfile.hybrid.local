@@ -66,6 +66,11 @@
 			path_regexp localCollection ^/api/projects/local/[0-9]+$
 		}
 		reverse_proxy @local_collection platform-service:8081
+		@local_complete {
+			method POST
+			path_regexp localComplete ^/api/projects/local/[0-9]+/complete$
+		}
+		reverse_proxy @local_complete platform-service:8081
 		@project_confirm {
 			method POST
 			path_regexp projectConfirm ^/api/projects/[0-9]+/confirm$

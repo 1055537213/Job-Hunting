@@ -88,4 +88,23 @@ class ProjectControllerTest {
         verify(python).execute(eq("local-get"),eq("real-session"),eq(42L),argThat(n->n.path("collection_id").asLong()==8&&!n.has("account_id")),anyString());
         verify(python).execute(eq("local-cancel"),eq("real-session"),eq(42L),any(),anyString());
     }
+    @Test void localCompletionUsesOnlySessionAndPathWithCsrfAndNoInjectedInput()throws Exception{
+        String path="/api/projects/local/8/complete";
+        mvc.perform(post(path)).andExpect(status().isUnauthorized());
+        mvc.perform(post(path).cookie(session)).andExpect(status().isForbidden());
+        mvc.perform(post("/api/projects/local/-1/complete").cookie(session,csrf).header("X-CSRF-Token","csrf"))
+            .andExpect(status().isUnprocessableContent());
+        for(String body:new String[]{"[]","{\"account_id\":99}","{\"collection_id\":99}","{\"files\":[]}"})
+            mvc.perform(post(path).cookie(session,csrf).header("X-CSRF-Token","csrf").contentType("application/json").content(body))
+                .andExpect(status().isUnprocessableContent());
+        mvc.perform(post("/internal/v1/projects/local-complete").contentType("application/json")
+            .content("{\"session_token\":\"real-session\",\"collection_id\":8}")).andExpect(status().isUnauthorized());
+        verifyNoInteractions(python);
+        mvc.perform(post(path).cookie(session,csrf).header("X-CSRF-Token","csrf"))
+            .andExpect(status().isOk()).andExpect(header().string("Cache-Control","no-store"));
+        verify(python).execute(eq("local-complete"),eq("real-session"),eq(42L),argThat(n->n.propertyNames().equals(java.util.Set.of("collection_id"))&&n.path("collection_id").asLong()==8),anyString());
+        when(python.execute(anyString(),anyString(),anyLong(),any(),anyString())).thenThrow(ProjectClient.unavailable());
+        mvc.perform(post(path).cookie(session,csrf).header("X-CSRF-Token","csrf"))
+            .andExpect(status().isServiceUnavailable()).andExpect(jsonPath("$.code").value("PROJECT_UNAVAILABLE"));
+    }
 }

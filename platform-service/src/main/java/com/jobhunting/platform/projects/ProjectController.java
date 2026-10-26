@@ -58,6 +58,13 @@ public class ProjectController {
             @PathVariable("collectionId") long id,HttpServletRequest request,HttpServletResponse response){
         return submit("local-cancel",session,mapper.createObjectNode().put("collection_id",id),request,response);
     }
+    @PostMapping("/api/projects/local/{collectionId}/complete")
+    public JsonNode completeCollection(@CookieValue(name="job_agent_session",required=false) String session,
+            @PathVariable("collectionId") long id,@RequestBody(required=false) JsonNode body,
+            HttpServletRequest request,HttpServletResponse response){
+        if(body!=null&&(!body.isObject()||!body.isEmpty()))throw ProjectClient.invalid();
+        return submit("local-complete",session,mapper.createObjectNode().put("collection_id",id),request,response);
+    }
     @PostMapping("/internal/v1/projects/{operation}")
     public JsonNode internal(@PathVariable("operation") String operation, @RequestBody JsonNode body,
             @RequestHeader(name="X-Internal-Service-Token",required=false) String token,
@@ -76,12 +83,12 @@ public class ProjectController {
             case "delete" -> Set.of("record_id");
             case "github" -> Set.of("candidate_id","repository_url","idempotency_key");
             case "local-manifest" -> Set.of("candidate_id","project_name","files");
-            case "local-get","local-cancel" -> Set.of("collection_id");
+            case "local-get","local-cancel","local-complete" -> Set.of("collection_id");
             default -> throw ProjectClient.invalid();
         };
         if (!input.isObject() || !fields.containsAll(input.propertyNames())
                 || !ProjectClient.id(input.get(Set.of("list","github","local-manifest").contains(operation)?"candidate_id":
-                    Set.of("local-get","local-cancel").contains(operation)?"collection_id":"record_id"))) throw ProjectClient.invalid();
+                    Set.of("local-get","local-cancel","local-complete").contains(operation)?"collection_id":"record_id"))) throw ProjectClient.invalid();
         if("local-manifest".equals(operation))LocalCollectionProjection.manifest(input);
         if ("github".equals(operation)) {
             if (!input.path("repository_url").isTextual() || input.get("repository_url").asText().length()>512) throw ProjectClient.invalid();

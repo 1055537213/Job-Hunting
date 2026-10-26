@@ -4552,6 +4552,8 @@ class RepositoryStore:
         candidate_id: int,
         card: ProjectExperienceCard,
         account_id: int | None = None,
+        *,
+        _connection: RepositoryConnection | None = None,
     ) -> ProjectExperienceRecord:
         """保存一张待确认项目经历卡片。
 
@@ -4560,17 +4562,18 @@ class RepositoryStore:
         """
 
         fingerprint = project_card_content_fingerprint(card)
-        if self.find_project_card_by_content_fingerprint(account_id, candidate_id, fingerprint) is not None:
+        if self.find_project_card_by_content_fingerprint(account_id, candidate_id, fingerprint, _connection=_connection) is not None:
             raise DuplicateResourceError("项目")
         now = now_iso()
         try:
-            with self.connect() as conn:
+            with (self.connect() if _connection is None else nullcontext(_connection)) as conn:
                 cursor = conn.execute(
                     """
                     INSERT INTO project_experience_cards (
                         account_id, candidate_id, status, project_name, card_json,
                         confirmed_summary, created_at, confirmed_at, content_fingerprint
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT ON CONSTRAINT uq_project_cards_candidate_content_fingerprint DO NOTHING
                     """,
                     (
                         account_id,
@@ -4584,22 +4587,26 @@ class RepositoryStore:
                         fingerprint,
                     ),
                 )
+                if cursor.lastrowid is None:
+                    raise DuplicateResourceError("项目")
                 record_id = int(cursor.lastrowid)
         except Exception as error:
             if is_unique_constraint_violation(error, "uq_project_cards_candidate_content_fingerprint"):
                 raise DuplicateResourceError("项目") from error
             raise
-        return self.get_project_card(record_id)
+        return self.get_project_card(record_id, account_id=account_id, _connection=_connection)
 
     def find_project_card_by_content_fingerprint(
         self,
         account_id: int | None,
         candidate_id: int,
         fingerprint: str,
+        *,
+        _connection: RepositoryConnection | None = None,
     ) -> ProjectExperienceRecord | None:
         """查找同一候选人的相同项目卡片，并兼容迁移前未记录指纹的卡片。"""
 
-        with self.connect() as conn:
+        with (self.connect() if _connection is None else nullcontext(_connection)) as conn:
             if account_id is None:
                 row = conn.execute(
                     """
@@ -4642,10 +4649,12 @@ class RepositoryStore:
         self,
         record_id: int,
         account_id: int | None = None,
+        *,
+        _connection: RepositoryConnection | None = None,
     ) -> ProjectExperienceRecord:
         """按 ID 读取一张项目经历卡片记录。"""
 
-        with self.connect() as conn:
+        with (self.connect() if _connection is None else nullcontext(_connection)) as conn:
             if account_id is None:
                 row = conn.execute(
                     "SELECT * FROM project_experience_cards WHERE id = ?",
@@ -5680,14 +5689,15 @@ class RepositoryStore:
         *,
         account_id: int,
         project_card_id: int,
+        _connection: RepositoryConnection | None = None,
     ) -> ProjectCollectionSessionRecord:
         """Attach the aggregate project card after every selected file was handled."""
 
         session = self.get_project_collection(collection_id, account_id=account_id)
-        card = self.get_project_card(project_card_id, account_id=account_id)
+        card = self.get_project_card(project_card_id, account_id=account_id, _connection=_connection)
         if card.candidate_id != session.candidate_id:
             raise ValueError("项目卡片与本地采集会话不属于同一候选人。")
-        with self.connect() as conn:
+        with (self.connect() if _connection is None else nullcontext(_connection)) as conn:
             pending = conn.execute(
                 """
                 SELECT COUNT(*) AS count
@@ -5723,7 +5733,8 @@ class RepositoryStore:
                     account_id,
                 ),
             )
-        return self.get_project_collection(collection_id, account_id=account_id)
+            row = conn.execute("SELECT * FROM project_collection_sessions WHERE id=? AND account_id=?", (collection_id, account_id)).fetchone()
+            return self._project_collection_session_from_row(row)
 
     def delete_incomplete_project_collection(
         self,

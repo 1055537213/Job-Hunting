@@ -104,4 +104,28 @@ class ProjectClientTest {
             .isInstanceOf(AuthException.class);
         assertThat(calls.get()).isEqualTo(before);
     }
+    @Test void completionBindsCollectionStripsEnvelopeAndRejectsFalseSuccess(){
+        var card=mapper.createObjectNode().put("card_type","project").put("project_name","Design").put("source_type","local_directory_collection")
+            .putNull("source_url").put("source_ref","a".repeat(64));
+        for(String key:new String[]{"read_files","detected_tech_stack","detected_core_features","responsibility_draft","highlight_draft",
+                "resume_expression_draft","questions_for_candidate","deferred_files"})card.set(key,mapper.createArrayNode());
+        card.set("skipped_summary",mapper.createObjectNode());card.set("discovered_file_kinds",mapper.createObjectNode());
+        var record=mapper.createObjectNode().put("id",9).put("candidate_id",7).put("status","待确认").putNull("confirmed_summary")
+            .put("created_at","now").putNull("confirmed_at");record.set("card",card);
+        var data=mapper.createObjectNode().put("account_id",42).put("completion_collection_id",8).put("processing_async",false);
+        data.set("project_card",record);body=data.toString();var input=mapper.createObjectNode().put("collection_id",8);
+        var result=client.execute("local-complete","real-session",42,input,"trace");
+        assertThat(result.propertyNames()).containsExactlyInAnyOrder("project_card","processing_async");
+        for(var invalid:new ObjectNode[]{data.deepCopy().put("completion_collection_id",99),data.deepCopy().put("account_id",99),
+                data.deepCopy().put("private","SECRET"),data.deepCopy().put("processing_async",true),data.deepCopy().putNull("project_card")}){
+            body=invalid.toString();
+            assertThatThrownBy(()->client.execute("local-complete","real-session",42,input,"trace")).isInstanceOf(AuthException.class);
+        }
+        data.remove("completion_collection_id");body=data.toString();
+        assertThatThrownBy(()->client.execute("local-complete","real-session",42,input,"trace")).isInstanceOf(AuthException.class);
+        int before=calls.get();status=409;body="{\"code\":\"PROJECT_COLLECTION_INCOMPLETE\",\"detail\":\"SECRET_PROVIDER\"}";
+        assertThatThrownBy(()->client.execute("local-complete","real-session",42,input,"trace")).isInstanceOf(AuthException.class)
+            .hasMessageNotContaining("SECRET");
+        assertThat(calls.get()).isEqualTo(before+1);
+    }
 }

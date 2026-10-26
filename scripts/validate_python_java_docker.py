@@ -1084,6 +1084,15 @@ def run_local_collection_management_flow(gateway_url: str, web_url: str, java_ur
             assert other.get(path).status_code == 404 and other.delete(path).status_code == 404
             assert httpx.delete(gateway_url + path, cookies=browser.cookies).status_code == 403
             assert httpx.get(web_url + path, cookies=browser.cookies).json() == browser.get(path).json()
+            completion_path = path + "/complete"
+            assert httpx.post(gateway_url + completion_path).status_code == 401
+            assert httpx.post(gateway_url + completion_path, cookies=browser.cookies).status_code == 403
+            assert other.post(completion_path).status_code == 404
+            assert browser.post(completion_path, json={"account_id": owners[1]}).status_code == 422
+            assert browser.post(completion_path).json()["code"] == "PROJECT_COLLECTION_INCOMPLETE"
+            assert store.list_project_cards(candidate, account_id=owner) == []
+            for origin in (web_url, java_url):
+                assert httpx.post(origin + "/internal/v1/projects/local-complete", json={"session_token": browser.cookies["job_agent_session"], "collection_id": collection}).status_code == 401
 
             def upload_and_wait(target, target_file):
                 uploaded = browser.post(target + "/files", data={"file_ids": json.dumps([target_file])}, files=[("files", ("README.md", b"prototype", "text/markdown"))])
@@ -1160,22 +1169,30 @@ a.store.close()
                     docker("stop", "--time", "1", container)
                     unavailable = httpx.get(origin + fresh_path, cookies=browser.cookies, timeout=20)
                     assert unavailable.status_code == 503 and "files" not in unavailable.json()
+                    completion_unavailable = httpx.post(origin + fresh_path + "/complete", cookies=browser.cookies,
+                        headers={"X-CSRF-Token": browser.headers["X-CSRF-Token"]}, timeout=20)
+                    assert completion_unavailable.status_code == 503 and "project_card" not in completion_unavailable.json()
                 finally:
                     docker("start", container)
                     wait(health)
             upload_and_wait(fresh_path, fresh["selected_files"][0]["id"])
             complete = browser.post(fresh_path + "/complete")
             assert complete.status_code == 200, complete.text[:300]
+            assert set(complete.json()) == {"project_card", "processing_async"} and complete.json()["processing_async"] is False
+            assert browser.post(fresh_path + "/complete").json() == complete.json()
+            assert httpx.post(web_url + fresh_path + "/complete", cookies=browser.cookies, timeout=20).json() == complete.json()
+            assert len(store.list_project_cards(candidate, account_id=owner)) == 1
             assert browser.get(fresh_path).json()["collection"]["status"] == "ready"
             assert browser.delete(fresh_path).json()["code"] == "PROJECT_COLLECTION_CONFLICT"
             assert browser.post(manifest_path, json=data).json()["code"] == "PROJECT_COLLECTION_CONFLICT"
             auth.session("logout", session_token=browser.cookies["job_agent_session"])
             assert browser.get(fresh_path).status_code == 401
+            assert browser.post(fresh_path + "/complete").status_code == 401
     finally:
         for name in (broker,worker,web,java):
             docker("start", name)
         store.close()
-    print("==> Java local manifest/query/cancel -> Python-owned upload/real Worker RAG -> fingerprint resume/scope/CSRF/redaction -> atomic cancellation + all-version cleanup/failure/restart -> late upload 404/ready protection/outages/revocation: PASS")
+    print("==> Java local manifest/query/cancel/complete -> Python-owned upload/real Worker RAG -> fingerprint resume/scope/CSRF/redaction -> atomic cancellation + all-version cleanup/failure/restart -> idempotent atomic completion/late upload 404/ready protection/outages/revocation: PASS")
 
 
 def run_project_submission_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,

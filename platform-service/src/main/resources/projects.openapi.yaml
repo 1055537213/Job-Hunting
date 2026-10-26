@@ -100,12 +100,12 @@ paths:
               schema: {$ref: '#/components/schemas/Receipt'}
   /internal/v1/projects/{operation}:
     post:
-      description: Private adapter on both services, hidden by gateways. Requires X-Internal-Service-Token and real session_token. Java verifies account, Python revalidates the same Session. Python adds account_id and, for github, submission_candidate_id solely for Java scope checking; never exposed publicly. 8 callbacks, 10-second Java deadline, 4 MiB response. Development contexts may start without callback token but cannot call; production requires a strong token and internal origin.
+      description: Private adapter on both services, hidden by gateways. Requires X-Internal-Service-Token and real session_token. Java verifies account, Python revalidates the same Session. Python adds account_id plus submission_candidate_id for github or completion_collection_id for local-complete solely for Java scope checking; never exposed publicly. 8 callbacks, 10-second Java deadline, 4 MiB response (local manifest/query/cancel have a separate 16 MiB limit). Development contexts may start without callback token but cannot call; production requires a strong token and internal origin.
       parameters:
         - in: path
           name: operation
           required: true
-          schema: {enum: [list, confirm, delete, github, local-manifest, local-get, local-cancel]}
+          schema: {enum: [list, confirm, delete, github, local-manifest, local-get, local-cancel, local-complete]}
       requestBody:
         required: true
         content:

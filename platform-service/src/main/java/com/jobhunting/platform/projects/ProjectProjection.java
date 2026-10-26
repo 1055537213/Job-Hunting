@@ -14,6 +14,7 @@ final class ProjectProjection {
             case "list"->Set.of("project_cards");case "confirm"->Set.of("project_card","task","root_request_id");
             case "delete"->Set.of("deleted","project_card_id","candidate_id","cleanup_status","rag_cleanup");
             case "github"->Set.of("task","project_card","processing_async","root_request_id");
+            case "local-complete"->Set.of("project_card","processing_async");
             default->throw ProjectClient.unavailable();
         };
         require(ProjectClient.fields(value,expected));
@@ -27,7 +28,10 @@ final class ProjectProjection {
                 && ProjectClient.id(value.get("candidate_id"))&&value.get("cleanup_status").isTextual()
                 &&Set.of("pending","completed").contains(value.get("cleanup_status").asText())&&"database_cascade".equals(value.get("rag_cleanup").asText()));return;
         }
-        if("list".equals(operation)){
+        if("local-complete".equals(operation)){
+            record(value.get("project_card"));
+            require(value.get("processing_async").isBoolean()&&!value.get("processing_async").asBoolean());
+        }else if("list".equals(operation)){
             require(value.get("project_cards").isArray());var seen=new HashSet<Long>();
             for(var row:value.get("project_cards")){record(row);require(row.get("candidate_id").asLong()==input.get("candidate_id").asLong()&&seen.add(row.get("id").asLong()));}
         }else{

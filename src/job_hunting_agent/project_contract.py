@@ -19,7 +19,8 @@ def validate_projection(value, operation, *, candidate_id=None, record_id=None, 
         return validate_collection(value, operation, candidate_id=candidate_id, collection_id=collection_id)
     expected = {"list": {"project_cards"}, "confirm": {"project_card", "task", "root_request_id"},
                 "delete": {"deleted", "project_card_id", "candidate_id", "cleanup_status", "rag_cleanup"},
-                "github": {"task", "project_card", "processing_async", "root_request_id"}}[operation]
+                "github": {"task", "project_card", "processing_async", "root_request_id"},
+                "local-complete": {"project_card", "processing_async"}}[operation]
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError("Invalid project fields")
     if operation == "github":
@@ -54,6 +55,9 @@ def validate_projection(value, operation, *, candidate_id=None, record_id=None, 
                 or any(not isinstance(card[k], dict) or any(type(n) is not int or n < 0 for n in card[k].values())
                        for k in ("skipped_summary", "discovered_file_kinds"))):
             raise ValueError("Invalid project card")
+    if operation == "local-complete":
+        if value["processing_async"] is not False:
+            raise ValueError("Invalid local completion")
     if operation == "confirm":
         task = value["task"]
         if (records[0]["status"] != "已确认" or not records[0]["confirmed_summary"] or not isinstance(records[0]["confirmed_at"], str)

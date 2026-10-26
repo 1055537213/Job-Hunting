@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: Local Project Collection Management
-  version: 1.0.0
-  description: Java public entry; Python owns manifest planning, collection facts and cancellable cleanup. Multipart files and complete remain on Python. No new page or upload mode.
+  version: 1.1.0
+  description: Java public entry; Python owns manifest planning, collection facts, atomic completion and cancellable cleanup. Multipart files remain on Python. No new page or upload mode.
 paths:
   /api/projects/local/manifest:
     post:
@@ -68,6 +68,30 @@ paths:
         '404': {description: PROJECT_NOT_FOUND}
         '409': {description: PROJECT_BUSY or PROJECT_COLLECTION_CONFLICT}
         '503': {description: PROJECT_UNAVAILABLE; retry same collection ID after checking progress.}
+  /api/projects/local/{collection_id}/complete:
+    parameters:
+      - {in: path, name: collection_id, required: true, schema: {type: integer, minimum: 1, maximum: 9223372036854775807}}
+    post:
+      description: Session and CSRF required, no body (empty JSON object also accepted). Java revalidates the session; Python admits exclusive account work and locks the active account. Pending selected files or no usable analyzed text return 409 before any card write. Failed files may be deferred with a fixed public reason. Card deduplication and collection ready/link commit in the same transaction. Repeated completion returns the linked card, even after confirmation; no new facts, model call or RAG task. Files remain on the Python multipart route. No callback replay or fallback on timeout; query progress and explicitly retry the same collection ID. Internal account_id and completion_collection_id are validated and stripped by Java.
+      responses:
+        '200':
+          description: No-store, maximum 4 MiB; completion is not confirmation of profile facts or completion of earlier RAG tasks. 10-second callback deadline; shares two local callback slots per process.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [project_card, processing_async]
+                properties:
+                  project_card: {$ref: './projects.openapi.yaml#/components/schemas/Record'}
+                  processing_async: {const: false}
+        '401': {description: SESSION_EXPIRED}
+        '403': {description: CSRF_REJECTED or PROJECT_SCOPE_DENIED}
+        '404': {description: PROJECT_NOT_FOUND, including foreign or deleted collection.}
+        '409': {description: PROJECT_BUSY, PROJECT_COLLECTION_INCOMPLETE or PROJECT_COLLECTION_CONFLICT; no partial card committed.}
+        '422': {description: INVALID_REQUEST}
+        '429': {description: RATE_LIMITED}
+        '503': {description: PROJECT_UNAVAILABLE; preserve browser recovery ID. No fake completion.}
 components:
   schemas:
     ManifestFile:

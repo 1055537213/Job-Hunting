@@ -20,6 +20,10 @@ class CollectionConflict(ValueError):
     pass
 
 
+class CollectionIncomplete(ValueError):
+    pass
+
+
 def validate_collection(value, operation, *, candidate_id=None, collection_id=None):
     if operation == "local-cancel":
         if (not isinstance(value, dict) or set(value) != {"deleted", "collection_id", "candidate_id", "cleanup_status", "rag_cleanup"}

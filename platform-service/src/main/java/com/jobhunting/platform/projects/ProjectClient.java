@@ -47,7 +47,7 @@ public class ProjectClient {
             .followRedirects(HttpClient.Redirect.NEVER).version(HttpClient.Version.HTTP_1_1).build();
     }
     public JsonNode execute(String operation,String session,long owner,ObjectNode input,String requestId) {
-        if (!Set.of("list","confirm","delete","github","local-manifest","local-get","local-cancel").contains(operation)) throw invalid();
+        if (!Set.of("list","confirm","delete","github","local-manifest","local-get","local-cancel","local-complete").contains(operation)) throw invalid();
         boolean local=operation.startsWith("local-");
         if (token.isBlank()) throw unavailable();
         if(local&&!collectionSlots.tryAcquire())throw unavailable();
@@ -68,7 +68,7 @@ public class ProjectClient {
             };
             var request=TraceHeaders.apply(HttpRequest.newBuilder(base.resolve(operation)),requestId).timeout(Duration.ofSeconds(10))
                 .header("Content-Type","application/json").header("Accept","application/json").header("X-Internal-Service-Token",token).POST(once).build();
-            pending=http.sendAsync(request,ignored->new BoundedBody(operation.startsWith("local-")?LocalCollectionProjection.MAX_BYTES:MAX_BYTES));
+            pending=http.sendAsync(request,ignored->new BoundedBody(Set.of("local-manifest","local-get","local-cancel").contains(operation)?LocalCollectionProjection.MAX_BYTES:MAX_BYTES));
             var response=pending.get(10,TimeUnit.SECONDS);
             if(!response.headers().firstValue("Content-Type").orElse("").split(";",2)[0].strip().equalsIgnoreCase("application/json"))throw unavailable();
             var value=mapper.readTree(response.body());
@@ -81,6 +81,10 @@ public class ProjectClient {
             if("github".equals(operation)) {
                 if(!id(result.get("submission_candidate_id")) || result.get("submission_candidate_id").asLong()!=input.path("candidate_id").asLong())throw unavailable();
                 result.remove("submission_candidate_id");
+            }
+            if("local-complete".equals(operation)){
+                if(!id(result.get("completion_collection_id")) || result.get("completion_collection_id").asLong()!=input.path("collection_id").asLong())throw unavailable();
+                result.remove("completion_collection_id");
             }
             ProjectProjection.validate(result,operation,input);
             return result;
@@ -103,6 +107,7 @@ public class ProjectClient {
             case "409:PROJECT_SUBMISSION_CONFLICT"->"本次提交已失效或内容已变更，请重新发起项目分析。";
             case "400:PROJECT_MANIFEST_INVALID"->"项目清单无效或没有可安全分析的文件，请重新选择目录。";
             case "409:PROJECT_COLLECTION_CONFLICT"->"采集已完成或状态已变化，请刷新后核实；已生成的项目请通过项目列表删除。";
+            case "409:PROJECT_COLLECTION_INCOMPLETE"->"项目文件尚未全部处理，或没有成功提取的内容，请检查采集进度后重试。";
             case "409:PROJECT_BUSY"->"当前仍有请求或任务执行，请稍后重试。";
             case "409:PROJECT_CONFLICT"->"已确认内容与本次请求不一致，请刷新项目列表核实。";
             case "413:PROJECT_TOO_LARGE"->"项目数据超出同步查询限制。";

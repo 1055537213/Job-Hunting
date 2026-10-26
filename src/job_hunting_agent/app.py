@@ -15,6 +15,7 @@ from pathlib import Path
 
 from langchain_core.embeddings import Embeddings
 
+from .account_work import AccountWorkDenied
 from .auth import AuthService
 from .business_cache import BusinessCache, build_business_cache
 from .concurrency_control import (
@@ -1336,10 +1337,26 @@ class JobHuntingApp:
     ) -> ProjectExperienceRecord:
         """Aggregate extracted file evidence into one pending project experience card."""
 
+        with self.store.account_work.deletion(account_id):
+            with self.store.connect() as conn:
+                conn.execute("SET LOCAL lock_timeout='1s'")
+                conn.execute("SET LOCAL statement_timeout='5s'")
+                account = conn.execute("SELECT status,deleted_at FROM accounts WHERE id=? FOR UPDATE", (account_id,)).fetchone()
+                if account is None or account["status"] != "active" or account["deleted_at"] is not None:
+                    raise AccountWorkDenied()
+                return self._complete_local_project_collection(collection_id, account_id=account_id, connection=conn)
+
+    def _complete_local_project_collection(self, collection_id, *, account_id, connection):
+        from .local_project_entry import CollectionConflict, CollectionIncomplete
+
         session = self.store.get_project_collection(collection_id, account_id=account_id)
         if session.project_card_id is not None:
-            return self.store.get_project_card(session.project_card_id, account_id=account_id)
+            return self.store.get_project_card(session.project_card_id, account_id=account_id, _connection=connection)
+        if session.status in {"ready", "cancelled"}:
+            raise CollectionConflict()
         files = self.store.list_project_collection_files(collection_id, account_id=account_id)
+        if any(item.selection_status == "selected" for item in files):
+            raise CollectionIncomplete()
         analyzed = [item for item in files if item.selection_status == "analyzed" and item.long_text_id]
         long_texts = self.store.get_long_texts_by_ids(
             [int(item.long_text_id) for item in analyzed if item.long_text_id is not None],
@@ -1351,13 +1368,14 @@ class JobHuntingApp:
             for item in analyzed
             if item.long_text_id is not None and int(item.long_text_id) in text_by_id
         ]
-        if not selected_text:
-            raise ValueError("没有项目文件成功完成分析。")
+        if not selected_text or len(selected_text) != len(analyzed):
+            raise CollectionIncomplete()
         card = build_project_experience_card(
             project_name=session.project_name,
             selected_files=selected_text,
             skipped_summary=Counter(
-                item.selection_reason for item in files if item.selection_status != "analyzed"
+                "file_processing_failed" if item.selection_status == "failed" else item.selection_reason
+                for item in files if item.selection_status != "analyzed"
             ),
             source_type=session.source_type,
             source_ref=session.manifest_fingerprint,
@@ -1374,12 +1392,14 @@ class JobHuntingApp:
                 session.candidate_id,
                 card,
                 account_id=account_id,
+                _connection=connection,
             )
         except DuplicateResourceError:
             saved = self.store.find_project_card_by_content_fingerprint(
                 account_id,
                 session.candidate_id,
                 project_card_content_fingerprint(card),
+                _connection=connection,
             )
             if saved is None:
                 raise
@@ -1387,6 +1407,7 @@ class JobHuntingApp:
             collection_id,
             account_id=account_id,
             project_card_id=saved.id,
+            _connection=connection,
         )
         return saved
 

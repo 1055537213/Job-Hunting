@@ -103,15 +103,16 @@ Java 与 Python 统一使用 W3C `traceparent` 传播上下文，同时保留现
 日常推送只运行快速 CI；提交说明包含 `[full ci]` 或手动触发完整 CI，通过后才发布相同提交的 `-ai` 和 `-platform` 两个版本镜像，审批部署通过 `Deploy Python Java`
 工作流执行；生产只填环境配置，不需要修改代码/Compose。此分支不自动部署服务器。
 
-后续继续迁移本地项目分批文件上传/完成分析、职位和简历等外部入口；不搬运 Python AI 算法。所有 GitHub 推送必须确认对应提交的快速 CI 通过；
+后续继续迁移本地项目分批文件上传、职位和简历等外部入口；不搬运 Python AI 算法。所有 GitHub 推送必须确认对应提交的快速 CI 通过；
 发布里程碑则必须确认完整 CI 和双镜像发布均成功。
 
 ## 项目公开入口
 
 ### 本地清单与采集会话管理
 
-`POST /api/projects/local/manifest`、`GET/DELETE /api/projects/local/{collection_id}` 精确分流至 Java；
-`/{collection_id}/files` 和 `/complete` 仍在 Python，文件内容不经 Java，也不新增工作台入口。
+`POST /api/projects/local/manifest`、`GET/DELETE /api/projects/local/{collection_id}` 及
+`POST /api/projects/local/{collection_id}/complete` 精确分流至 Java；
+`/{collection_id}/files` 仍在 Python，文件内容不经 Java，也不新增工作台入口。
 Java 负责 Session、CSRF、共享限流、元数据类型/字段校验和有界回包；私有 `local-manifest/local-get/local-cancel`
 回调重新核实真实会话。Python 继续独占清单筛选、安全策略、文件提取及采集事实写入。
 
@@ -130,9 +131,18 @@ Java 负责 Session、CSRF、共享限流、元数据类型/字段校验和有�
 `cleanup_status=pending` 仅表示数据库已删、附件仍在后台清理，不虚报物理删除成功。
 新导入使用新会话 ID；已完成的项目仍通过项目删除入口清理。
 
-浏览器遇到临时 503/429 保留本地恢复 ID，恢复/取消操作在切换档案后的迟到响应不覆盖新档案进度。
+完成入口仍为同步、无模型调用的证据聚合，不是新建一套任务。Python 在独占账号在途保护和有效账号行锁内，
+先验证选中文件均已处理且存在可用证据，再把卡片保存/内容去重、采集卡片关联和 ready 状态在同一事务提交。
+异常全部回滚；重复点击或超时后显式重试原采集 ID 返回关联的原卡片，不再生成第二张卡片。
+正在上传/取消/恢复清单时返回 409；未上传完或无可用文本返回固定的 `PROJECT_COLLECTION_INCOMPLETE`，
+允许已失败文件作为待补充材料，但其内部解析错误不会进入公开卡片。完成不修改档案技能，也不重复触发早先的 RAG 任务。
+回调重新核实 Session，Java 校验并移除 `account_id` 与 `completion_collection_id`，沿用 10 秒超时、
+最多两个本地回调和 4 MiB 卡片回包限制，不扩大清单查询之外的响应上限。
+
+浏览器遇到临时 503/429 保留本地恢复 ID。预扫描、上传、完成与项目列表刷新绑定发起时的账号/档案，
+切换档案后的迟到响应不覆盖新档案进度；完成已确认时仅清除原采集的恢复 ID，不影响另一档案或新采集。
 沿用现有 migrate、Worker/Beat、内部凭据与部署命令，无新增手填配置；只进行本地隔离 Docker 验收，不部署服务器。
-契约见 `local-projects.openapi.yaml`，它不代表上传和完成入口已迁移。
+契约见 `local-projects.openapi.yaml`，它不代表 multipart 上传入口已迁移。
 
 ### GitHub 分析任务提交
 

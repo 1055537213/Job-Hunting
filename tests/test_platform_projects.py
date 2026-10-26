@@ -404,6 +404,180 @@ def manifest(browser, candidate, **data):
         "files": [{"relative_path": "README.md", "file_size": 9, "sha256": hashlib.sha256(b"prototype").hexdigest()}], **data})
 
 
+def completion_collection(projects, *, pending=False):
+    import hashlib
+    from job_hunting_agent.project_evidence import ProjectManifestItem
+    app, _, owners, candidates, _ = projects
+    backend = app.state.backend
+    entries = [ProjectManifestItem("README.md", 9, hashlib.sha256(b"prototype").hexdigest())]
+    if pending:
+        entries.append(ProjectManifestItem("notes.txt", 9, hashlib.sha256(b"prototype").hexdigest()))
+    collection, files = backend.create_local_project_collection(candidates[0], "Completion", entries, account_id=owners[0])
+    backend.process_local_project_collection_file(collection.id, files[0].id, b"prototype", account_id=owners[0])
+    return backend, owners[0], collection
+
+
+def test_local_completion_does_not_leave_card_when_uploads_are_pending(projects):
+    backend, owner, collection = completion_collection(projects, pending=True)
+    before = backend.store.list_project_cards(collection.candidate_id, account_id=owner)
+    with pytest.raises(ValueError):
+        backend.complete_local_project_collection(collection.id, account_id=owner)
+    assert backend.store.list_project_cards(collection.candidate_id, account_id=owner) == before
+    assert backend.store.get_project_collection(collection.id, account_id=owner).project_card_id is None
+
+
+def test_local_completion_rolls_back_card_and_collection_together(projects, monkeypatch):
+    backend, owner, collection = completion_collection(projects)
+    before = backend.store.list_project_cards(collection.candidate_id, account_id=owner)
+    original = backend.store.complete_project_collection
+    def interrupted(*args, **kwargs):
+        original(*args, **kwargs)
+        raise RuntimeError("SECRET_SQL_AFTER_FINALIZE")
+    monkeypatch.setattr(backend.store, "complete_project_collection", interrupted)
+    with pytest.raises(RuntimeError, match="SECRET_SQL_AFTER_FINALIZE"):
+        backend.complete_local_project_collection(collection.id, account_id=owner)
+    assert backend.store.list_project_cards(collection.candidate_id, account_id=owner) == before
+    assert backend.store.get_project_collection(collection.id, account_id=owner).project_card_id is None
+
+
+def test_local_completion_callback_scope_replay_and_confirmed_card(projects):
+    backend, owner, collection = completion_collection(projects)
+    browser = projects[1]
+    assert submit(browser, "local-complete", collection_id=collection.id, session_token="session-2").status_code == 404
+    assert submit(browser, "local-complete", collection_id=collection.id, session_token="expired").status_code == 401
+    first = submit(browser, "local-complete", collection_id=collection.id)
+    assert first.status_code == 200, first.text
+    data = first.json()
+    assert set(data) == {"account_id", "completion_collection_id", "project_card", "processing_async"}
+    assert data["account_id"] == owner and data["completion_collection_id"] == collection.id
+    assert data["processing_async"] is False
+    card_id = data["project_card"]["id"]
+    assert submit(browser, "local-complete", collection_id=collection.id).json() == data
+    backend.store.confirm_project_card(card_id, "My verified work", account_id=owner)
+    replay = submit(browser, "local-complete", collection_id=collection.id)
+    assert replay.status_code == 200 and replay.json()["project_card"]["id"] == card_id
+    assert replay.json()["project_card"]["status"] == "已确认"
+    assert len(backend.store.list_project_cards(collection.candidate_id, account_id=owner)) == 2
+    assert backend.get_candidate_profile(collection.candidate_id, account_id=owner).skills == {}
+    assert submit(browser, "delete", record_id=card_id).status_code == 200
+    assert submit(browser, "local-complete", collection_id=collection.id).status_code == 404
+
+
+def test_local_completion_pending_empty_failed_and_disabled_are_not_success(projects):
+    backend, owner, collection = completion_collection(projects, pending=True)
+    browser = projects[1]
+    response = submit(browser, "local-complete", collection_id=collection.id)
+    assert response.status_code == 409 and response.json()["code"] == "PROJECT_COLLECTION_INCOMPLETE"
+    with backend.store.connect() as conn:
+        conn.execute("UPDATE project_collection_files SET selection_status='failed',selection_reason='SECRET_PARSER' WHERE collection_id=? AND selection_status='selected'", (collection.id,))
+    completed = submit(browser, "local-complete", collection_id=collection.id)
+    assert completed.status_code == 200 and completed.json()["project_card"]["card"]["deferred_files"]
+    # Raw parser errors must never be copied into a project card's public skipped_summary.
+    assert "SECRET_PARSER" not in completed.text
+    with backend.store.connect() as conn:
+        conn.execute("UPDATE accounts SET status='disabled' WHERE id=?", (owner,))
+    assert submit(browser, "local-complete", collection_id=collection.id).status_code == 403
+
+
+def test_local_completion_excludes_upload_cancel_resume_and_other_completion(projects, monkeypatch):
+    from threading import Event
+    backend, owner, collection = completion_collection(projects)
+    browser = projects[1]
+    entered, finish = Event(), Event()
+    original = backend._complete_local_project_collection
+    def held(*args, **kwargs):
+        entered.set()
+        assert finish.wait(10)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(backend, "_complete_local_project_collection", held)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(submit, browser, "local-complete", collection_id=collection.id)
+        try:
+            assert entered.wait(10)
+            assert submit(browser, "local-complete", collection_id=collection.id).json()["code"] == "PROJECT_BUSY"
+            assert submit(browser, "local-cancel", collection_id=collection.id).json()["code"] == "PROJECT_BUSY"
+            assert manifest(browser, collection.candidate_id).json()["code"] == "PROJECT_BUSY"
+            from job_hunting_agent.account_work import AccountWorkBusy
+            with pytest.raises(AccountWorkBusy):
+                backend.store.account_work.acquire(owner)
+        finally:
+            finish.set()
+        assert future.result(timeout=10).status_code == 200
+
+
+def test_local_completion_callback_redacts_failure_and_recovers_after_retry(projects, monkeypatch):
+    backend, owner, collection = completion_collection(projects)
+    browser = projects[1]
+    original = backend.store.complete_project_collection
+    def interrupted(*args, **kwargs):
+        original(*args, **kwargs)
+        raise RuntimeError("SECRET_SQL_AFTER_FINALIZE")
+    monkeypatch.setattr(backend.store, "complete_project_collection", interrupted)
+    failed = submit(browser, "local-complete", collection_id=collection.id)
+    assert failed.status_code == 503 and "SECRET_SQL" not in failed.text
+    assert backend.store.get_project_collection(collection.id, account_id=owner).project_card_id is None
+    assert len(backend.store.list_project_cards(collection.candidate_id, account_id=owner)) == 1
+    monkeypatch.setattr(backend.store, "complete_project_collection", original)
+    assert submit(browser, "local-complete", collection_id=collection.id).status_code == 200
+
+
+@pytest.mark.parametrize("data", [{"collection_id": True}, {"collection_id": -1}, {"collection_id": 1, "account_id": 9}, {"collection_id": 1, "candidate_id": 9}])
+def test_local_completion_rejects_spoofed_locators(projects, data):
+    assert submit(projects[1], "local-complete", **data).status_code == 422
+
+
+def test_local_completion_empty_evidence_rejected_before_writing(projects):
+    app, browser, owners, candidates, _ = projects
+    backend = app.state.backend
+    collection = manifest(browser, candidates[0]).json()["collection"]["id"]
+    with backend.store.connect() as conn:
+        conn.execute("UPDATE project_collection_files SET selection_status='failed',selection_reason='SECRET_PARSER' WHERE collection_id=?", (collection,))
+    response = submit(browser, "local-complete", collection_id=collection)
+    assert response.status_code == 409 and response.json()["code"] == "PROJECT_COLLECTION_INCOMPLETE"
+    assert len(backend.store.list_project_cards(candidates[0], account_id=owners[0])) == 1
+
+
+def test_local_completion_handles_unique_race_without_aborting_parent_transaction(projects, monkeypatch):
+    backend, owner, collection = completion_collection(projects)
+    original = backend.complete_local_project_collection(collection.id, account_id=owner)
+    with backend.store.connect() as conn:
+        conn.execute("UPDATE project_collection_sessions SET project_card_id=NULL,status='uploading' WHERE id=?", (collection.id,))
+    find = backend.store.find_project_card_by_content_fingerprint
+    calls = []
+    def missed_then_visible(*args, **kwargs):
+        calls.append(1)
+        return None if len(calls) == 1 else find(*args, **kwargs)
+    monkeypatch.setattr(backend.store, "find_project_card_by_content_fingerprint", missed_then_visible)
+    replay = backend.complete_local_project_collection(collection.id, account_id=owner)
+    assert replay.id == original.id
+    assert backend.store.get_project_collection(collection.id, account_id=owner).project_card_id == original.id
+    assert len(backend.store.list_project_cards(collection.candidate_id, account_id=owner)) == 2
+
+
+def test_local_completion_python_compatibility_validates_public_projection(projects, monkeypatch):
+    _, _, _, _, records = projects
+    state = {"status": 200, "value": {"project_card": asdict(records[0]), "processing_async": False}}
+    real = httpx.Client
+    def respond(request):
+        assert request.url.path == "/internal/v1/projects/local-complete"
+        assert json.loads(request.content) == {"session_token": "session-1", "collection_id": 8}
+        return httpx.Response(state["status"], json=state["value"])
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: real(transport=httpx.MockTransport(respond), **kwargs))
+    client = PlatformAuthClient(PlatformAuthSettings(True, "http://java", "secret", 5))
+    assert client.projects("local-complete", "session-1", collection_id=8) == state["value"]
+    for value in ({"project_card": None, "processing_async": False},
+                  {"project_card": asdict(records[0]), "processing_async": True},
+                  {**state["value"], "account_id": 1}):
+        state["value"] = value
+        with pytest.raises(PlatformAuthError) as error:
+            client.projects("local-complete", "session-1", collection_id=8)
+        assert error.value.status_code == 503
+    state.update(status=409, value={"code": "PROJECT_COLLECTION_INCOMPLETE", "detail": "SECRET_PARSER"})
+    with pytest.raises(PlatformAuthError) as error:
+        client.projects("local-complete", "session-1", collection_id=8)
+    assert error.value.status_code == 409 and "SECRET" not in str(error.value)
+
+
 def test_local_manifest_resume_scope_and_cancel_receipt(projects):
     app, browser, owners, candidates, _ = projects
     assert manifest(browser, candidates[1]).status_code == 404
@@ -531,7 +705,8 @@ def test_local_manifest_invalid_metadata_never_creates_collection(projects, file
 
 @pytest.mark.parametrize("method,path,data,operation", [
     ("POST", "/api/projects/local/manifest", {"candidate_id": 1,"project_name": "Project", "files": [{"relative_path": "README.md", "file_size": 1}]}, "local-manifest"),
-    ("GET", "/api/projects/local/1", None, "local-get"), ("DELETE", "/api/projects/local/1", None, "local-cancel")])
+    ("GET", "/api/projects/local/1", None, "local-get"), ("DELETE", "/api/projects/local/1", None, "local-cancel"),
+    ("POST", "/api/projects/local/1/complete", None, "local-complete")])
 def test_local_compatibility_fails_closed(projects, monkeypatch, method, path, data, operation):
     app, browser, _, _, _ = projects
     browser.cookies.set("job_agent_session", "session-1")
@@ -539,6 +714,7 @@ def test_local_compatibility_fails_closed(projects, monkeypatch, method, path, d
     monkeypatch.setattr(app.state.backend.platform_auth_client, "projects", forward)
     monkeypatch.setattr(app.state.backend, "create_local_project_collection", Mock(side_effect=AssertionError("fallback")))
     monkeypatch.setattr(app.state.backend, "delete_incomplete_local_project_collection", Mock(side_effect=AssertionError("fallback")))
+    monkeypatch.setattr(app.state.backend, "complete_local_project_collection", Mock(side_effect=AssertionError("fallback")))
     result = browser.request(method, path, **({"json": data} if data is not None else {}))
     assert result.status_code == 503 and forward.call_args.args == (operation, "session-1")
 
@@ -567,7 +743,14 @@ def test_local_contract_and_precise_gateway_methods():
         assert "method POST\n\t\t\tpath /api/projects/local/manifest" in text
         assert "method GET DELETE\n\t\t\tpath_regexp localCollection ^/api/projects/local/[0-9]+$" in text
         assert "request_body @local_manifest" in text
+        assert "method POST\n\t\t\tpath_regexp localComplete ^/api/projects/local/[0-9]+/complete$" in text
+        assert "reverse_proxy @local_complete platform-service:8081" in text
         assert "/api/projects/local/*" not in text
     nginx = (root / "deploy/nginx/coexist-hybrid-ip-https.conf.template").read_text(encoding="utf-8")
     assert "location = /api/projects/local/manifest" in nginx and "client_max_body_size 4m;" in nginx
     assert "location ~ ^/api/projects/local/[0-9]+$" in nginx
+    complete = nginx.split("location ~ ^/api/projects/local/[0-9]+/complete$ {", 1)[1].split("\n    }", 1)[0]
+    assert "proxy_pass http://platform-service:8081;" in complete and "proxy_next_upstream off;" in complete
+    schema = contract["paths"]["/api/projects/local/{collection_id}/complete"]["post"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert set(schema["required"]) == set(schema["properties"]) == {"project_card", "processing_async"}
+    assert schema["additionalProperties"] is False and schema["properties"]["processing_async"]["const"] is False

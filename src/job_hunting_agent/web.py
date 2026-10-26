@@ -1302,7 +1302,7 @@ def create_web_app(
 
     @web_app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error: RequestValidationError):
-        if request.url.path in {"/api/projects", "/api/projects/github", "/api/projects/local/manifest"} or re.fullmatch(r"/api/projects/(?:[0-9]+(?:/confirm)?|local/[0-9]+)", request.url.path):
+        if request.url.path in {"/api/projects", "/api/projects/github", "/api/projects/local/manifest"} or re.fullmatch(r"/api/projects/(?:[0-9]+(?:/confirm)?|local/[0-9]+(?:/complete)?)", request.url.path):
             return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
         if request.url.path in {"/api/profiles", "/api/chat", "/api/chat/stream", "/internal/v1/chat/invoke", "/internal/v1/chat/stream"} and request.method == "POST":
             return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
@@ -2612,6 +2612,11 @@ def create_web_app(
                 if payload.collection_id is None:
                     raise HTTPException(422, "请求参数无效。")
                 result = cancel_collection(backend, owner, payload.collection_id)
+            elif operation == "local-complete":
+                if payload.collection_id is None:
+                    raise HTTPException(422, "请求参数无效。")
+                card = backend.complete_local_project_collection(payload.collection_id, account_id=owner)
+                result = {"project_card": asdict(card), "processing_async": False}
             elif operation == "local-manifest":
                 if payload.candidate_id is None or payload.files is None or not payload.project_name or not payload.project_name.strip():
                     raise HTTPException(422, "请求参数无效。")
@@ -2680,9 +2685,10 @@ def create_web_app(
                             record=asdict(record), rag_task=task_view)
                         result = {"project_card": asdict(record), "task": task_view, "root_request_id": request_id}
             validate_projection(result, operation, candidate_id=payload.candidate_id, record_id=payload.record_id, collection_id=payload.collection_id)
-            scope = {"submission_candidate_id": payload.candidate_id} if operation == "github" else {}
+            scope = {"submission_candidate_id": payload.candidate_id} if operation == "github" else (
+                {"completion_collection_id": payload.collection_id} if operation == "local-complete" else {})
             body = json.dumps({"account_id": owner, **scope, **result}, ensure_ascii=False).encode("utf-8")
-            if len(body) > (MAX_COLLECTION_BYTES if operation.startswith("local-") else MAX_PROJECT_BYTES):
+            if len(body) > (MAX_COLLECTION_BYTES if operation in {"local-manifest", "local-get", "local-cancel"} else MAX_PROJECT_BYTES):
                 raise HTTPException(413, "项目数据超出同步查询限制。")
             return body
         finally:
@@ -2694,7 +2700,7 @@ def create_web_app(
     async def internal_projects(operation: str, payload: InternalProjectPayload, request: Request):
         from .project_contract import PROJECT_UNAVAILABLE
         from .project_submission import ProjectSubmissionConflict
-        from .local_project_entry import CollectionConflict
+        from .local_project_entry import CollectionConflict, CollectionIncomplete
         client = backend.platform_auth_client
         if client is None:
             raise HTTPException(404, "接口不存在。")
@@ -2703,7 +2709,8 @@ def create_web_app(
             return JSONResponse({"code": "INTERNAL_UNAUTHORIZED", "detail": "内部服务认证失败。"}, status_code=401)
         allowed = {"list": {"candidate_id"}, "confirm": {"record_id", "confirmed_summary", "root_request_id"},
             "delete": {"record_id"}, "github": {"candidate_id", "repository_url", "idempotency_key"},
-            "local-manifest": {"candidate_id", "project_name", "files"}, "local-get": {"collection_id"}, "local-cancel": {"collection_id"}}
+            "local-manifest": {"candidate_id", "project_name", "files"}, "local-get": {"collection_id"}, "local-cancel": {"collection_id"},
+            "local-complete": {"collection_id"}}
         if operation not in allowed or payload.model_fields_set - {"session_token"} - allowed[operation]:
             return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422)
         try:
@@ -2723,6 +2730,8 @@ def create_web_app(
             status, code = 409, "PROJECT_SUBMISSION_CONFLICT"
         except CollectionConflict:
             status, code = 409, "PROJECT_COLLECTION_CONFLICT"
+        except CollectionIncomplete:
+            status, code = 409, "PROJECT_COLLECTION_INCOMPLETE"
         except ProjectEvidenceError:
             status, code = 400, "PROJECT_MANIFEST_INVALID"
         except GitHubRepositoryError:
@@ -3051,7 +3060,9 @@ def create_web_app(
     ) -> dict[str, object]:
         """Create the pending project card after the planned batches finish."""
 
-        account = current_account(request)
+        if backend.platform_auth_client is not None:
+            return platform_project(request, "local-complete", collection_id=collection_id)
+        account = current_account(request, protect=False)
         assert account is not None
         try:
             project_card = backend.complete_local_project_collection(
@@ -3060,8 +3071,12 @@ def create_web_app(
             )
         except KeyError as error:
             raise HTTPException(status_code=404, detail="本地项目采集会话不存在。") from error
-        except ValueError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
+        except AccountWorkBusy:
+            raise HTTPException(409, "当前仍有请求或任务执行，请稍后重试。") from None
+        except AccountWorkDenied:
+            raise HTTPException(403, "账号不可用或无权访问项目。") from None
+        except ValueError:
+            raise HTTPException(409, "项目文件尚未全部处理，或没有成功提取的内容，请检查采集进度后重试。") from None
         return {"project_card": asdict(project_card), "processing_async": False}
 
     @web_app.post("/api/projects/{record_id}/confirm")
