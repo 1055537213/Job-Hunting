@@ -46,7 +46,7 @@ public class ProjectClient {
             .followRedirects(HttpClient.Redirect.NEVER).version(HttpClient.Version.HTTP_1_1).build();
     }
     public JsonNode execute(String operation,String session,long owner,ObjectNode input,String requestId) {
-        if (!Set.of("list","confirm","delete").contains(operation)) throw invalid();
+        if (!Set.of("list","confirm","delete","github").contains(operation)) throw invalid();
         if (token.isBlank() || !slots.tryAcquire()) throw unavailable();
         CompletableFuture<HttpResponse<byte[]>> pending=null;
         try {
@@ -72,6 +72,10 @@ public class ProjectClient {
             }
             if(value==null || !value.isObject() || !id(value.get("account_id")) || value.get("account_id").asLong()!=owner)throw unavailable();
             var result=(ObjectNode)value.deepCopy();result.remove("account_id");
+            if("github".equals(operation)) {
+                if(!id(result.get("submission_candidate_id")) || result.get("submission_candidate_id").asLong()!=input.path("candidate_id").asLong())throw unavailable();
+                result.remove("submission_candidate_id");
+            }
             ProjectProjection.validate(result,operation,input);
             return result;
         }catch(AuthException error){throw error;}
@@ -89,6 +93,8 @@ public class ProjectClient {
             case "403:PROJECT_SCOPE_DENIED"->"账号不可用或无权访问项目。";
             case "404:PROJECT_NOT_FOUND"->"项目或档案不存在。";
             case "400:PROJECT_CONFIRMATION_REQUIRED"->"确认项目经历前至少确认一组属于本人的内容。";
+            case "400:PROJECT_REPOSITORY_INVALID"->"请填写有效的公开 GitHub 仓库首页链接。";
+            case "409:PROJECT_SUBMISSION_CONFLICT"->"本次提交已失效或内容已变更，请重新发起项目分析。";
             case "409:PROJECT_BUSY"->"当前仍有请求或任务执行，请稍后重试。";
             case "409:PROJECT_CONFLICT"->"已确认内容与本次请求不一致，请刷新项目列表核实。";
             case "413:PROJECT_TOO_LARGE"->"项目数据超出同步查询限制。";

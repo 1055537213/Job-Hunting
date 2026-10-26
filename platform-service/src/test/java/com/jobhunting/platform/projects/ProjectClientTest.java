@@ -55,4 +55,18 @@ class ProjectClientTest {
         for(String url:new String[]{"https://public.example.com","http://web:8000/path","http://secret@web:8000","http://web:0"})
             assertThatThrownBy(()->new ProjectClient(mapper,url,"x".repeat(32),"production","https://public.example.com")).isInstanceOf(IllegalArgumentException.class);
     }
+    @Test void githubProjectionBindsOwnerCandidateAndNeverLeaksTaskResult(){
+        var task=mapper.createObjectNode().put("task_key","abc").put("task_type","github_project_analysis").put("status","queued")
+            .put("progress",0).put("attempt",0).put("max_attempts",3).putNull("result").putNull("error_summary")
+            .put("created_at","now").put("updated_at","now").putNull("started_at").putNull("finished_at");
+        var projection=mapper.createObjectNode().put("account_id",42).put("submission_candidate_id",7).putNull("project_card")
+            .put("processing_async",true).put("root_request_id","a".repeat(32));projection.set("task",task);
+        body=projection.toString();
+        var result=client.execute("github","real-session",42,input(),"trace");
+        assertThat(result.has("account_id")).isFalse();assertThat(result.has("submission_candidate_id")).isFalse();
+        projection.put("submission_candidate_id",8);body=projection.toString();
+        assertThatThrownBy(()->client.execute("github","real-session",42,input(),"trace")).isInstanceOf(AuthException.class);
+        projection.put("submission_candidate_id",7);task.put("result","private source");body=projection.toString();
+        assertThatThrownBy(()->client.execute("github","real-session",42,input(),"trace")).isInstanceOf(AuthException.class);
+    }
 }

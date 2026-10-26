@@ -1043,6 +1043,101 @@ def run_chat_stream_gateway_flow(gateway_url: str, web_url: str, java_url: str, 
     print("==> Java SSE -> incremental Unicode-safe events -> real Agent/tool/history/160-token settlement -> disconnect drains guard/no false history/80 known tokens -> scope/CSRF/balance/outages/recovery: PASS")
 
 
+def run_project_submission_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
+                                       web: str, worker: str, broker: str, database_url: str) -> None:
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+    from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
+    email = f"submit-{os.urandom(10).hex()}@example.com"
+    password = "project-submit-password"
+    owner = auth.register_account(email=email, password=password, display_name="Submission", email_verified=True, consents=[]).account_id
+    store = SQLAlchemyStore(database_url)
+    try:
+        with httpx.Client(base_url=gateway_url, timeout=20) as browser:
+            login = browser.post("/api/auth/login", json={"email": email, "password": password})
+            assert login.status_code == 200
+            browser.headers["X-CSRF-Token"] = login.json()["csrf_token"]
+            candidate = browser.post("/api/profiles", json={"name": "GitHub submission"}).json()["candidate_id"]
+            assert browser.post("/api/me/balance/recharge", json={"amount_yuan": 1, "idempotency_key": os.urandom(16).hex()}).status_code == 200
+            data = {"candidate_id": candidate, "repository_url": "https://github.com/example/submission-fixture",
+                    "idempotency_key": f"github:{os.urandom(16).hex()}"}
+            path = "/api/projects/github"
+            assert httpx.post(gateway_url + path, cookies=browser.cookies, json=data).status_code == 403
+            assert httpx.post(gateway_url + path, json=data).status_code == 401
+            assert browser.post("/internal/v1/projects/github", json=data).status_code == 404
+            for origin in (web_url, java_url):
+                assert httpx.post(origin + "/internal/v1/projects/github", json={"session_token": browser.cookies["job_agent_session"], **data}).status_code == 401
+            assert browser.post(path, json={**data, "repository_url": "https://github.com@evil.test/a/b"}).status_code == 400
+            # Keep network input deterministic: no production worker, credentials or public GitHub traffic.
+            docker("stop", "--time", "1", worker)
+            docker("stop", "--time", "1", broker)
+            pending = browser.post(path, json=data)
+            assert pending.status_code == 503 and "task" not in pending.json(), pending.text[:300]
+            with store.connect() as conn:
+                receipt = conn.execute("SELECT * FROM project_submissions WHERE account_id=?", (owner,)).fetchone()
+                assert receipt["status"] == "pending" and receipt["attempts"] == 1
+                assert conn.execute("SELECT status FROM background_tasks WHERE task_key=?", (receipt["task_key"],)).fetchone()["status"] == "queued"
+                conn.execute("UPDATE project_submissions SET next_dispatch_at=now() WHERE account_id=?", (owner,))
+            docker("start", broker)
+            maintenance = "from job_hunting_agent.worker import create_worker_app; from job_hunting_agent.task_queue import STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME; print(create_worker_app().tasks[STALE_BACKGROUND_TASK_RECOVERY_TASK_NAME].apply().get())"
+            docker("exec", web, "python", "-c", maintenance)
+            response = browser.post(path, json=data)
+            assert response.status_code == 200 and response.json()["task"]["task_key"] == receipt["task_key"], response.text[:300]
+            assert not {"account_id", "submission_candidate_id"} & response.json().keys()
+            assert httpx.post(web_url + path, cookies=browser.cookies, json=data, timeout=20).json() == response.json()
+            assert browser.post(path, json={**data, "repository_url": "https://github.com/example/other"}).status_code == 409
+            # Exercise the registered Worker entry and full archive pipeline; only GitHub byte fetching is replaced.
+            execute = f"""
+from io import BytesIO
+from zipfile import ZipFile
+from job_hunting_agent import app as module
+from job_hunting_agent.github_project import FetchedGitHubRepository,normalize_public_github_repository_url
+from job_hunting_agent.worker import create_worker_app
+from job_hunting_agent.task_queue import BACKGROUND_TASK_NAME
+b=BytesIO()
+with ZipFile(b,'w') as z:
+    z.writestr('submission-main/README.md','Public design project using Python and FastAPI. Project evidence and acceptance criteria.')
+    z.writestr('submission-main/main.py','def run(): return 1')
+module.fetch_public_github_repository_archive=lambda url: FetchedGitHubRepository(normalize_public_github_repository_url(url),'main','a'*40,b.getvalue())
+task=create_worker_app().tasks[BACKGROUND_TASK_NAME]
+first=task.apply(args=[{receipt['task_key']!r}]).get(propagate=True)
+assert first['status']=='succeeded',first
+second=task.apply(args=[{receipt['task_key']!r}]).get(propagate=True)
+assert second['status']=='succeeded'
+print('Controlled snapshot Worker execution: PASS')
+"""
+            docker("exec", web, "python", "-c", execute)
+            replay = browser.post(path, json=data)
+            assert replay.status_code == 200 and replay.json()["task"]["status"] == "succeeded"
+            assert replay.json()["task"]["result"] is None
+            with store.connect() as conn:
+                assert conn.execute("SELECT count(*) AS n FROM background_tasks WHERE account_id=? AND task_type='github_project_analysis'", (owner,)).fetchone()["n"] == 1
+                assert conn.execute("SELECT count(*) AS n FROM project_experience_cards WHERE account_id=?", (owner,)).fetchone()["n"] == 1
+                assert conn.execute("SELECT attempt FROM background_tasks WHERE task_key=?", (receipt["task_key"],)).fetchone()["attempt"] == 1
+                card_id = conn.execute("SELECT id FROM project_experience_cards WHERE account_id=?", (owner,)).fetchone()["id"]
+            cancelled_data = {**data, "idempotency_key": f"github:{os.urandom(16).hex()}"}
+            docker("stop", "--time", "1", broker)
+            assert browser.post(path, json=cancelled_data).status_code == 503
+            deleted = browser.delete(f"/api/projects/{card_id}")
+            assert deleted.status_code == 200, deleted.text[:300]
+            docker("start", broker)
+            with store.connect() as conn:
+                conn.execute("UPDATE project_submissions SET next_dispatch_at=now() WHERE account_id=?", (owner,))
+            docker("exec", web, "python", "-c", maintenance)
+            assert browser.post(path, json=cancelled_data).json()["code"] == "PROJECT_SUBMISSION_CONFLICT"
+            with store.connect() as conn:
+                assert conn.execute("SELECT count(*) AS n FROM background_tasks WHERE account_id=? AND status='queued'", (owner,)).fetchone()["n"] == 0
+            # Broker's original duplicate delivery cannot run the already-completed analysis again.
+            docker("start", worker)
+            assert browser.get(f"/api/tasks/{receipt['task_key']}").json()["task"]["status"] == "succeeded"
+    finally:
+        docker("start", broker)
+        docker("start", worker)
+        store.close()
+    print("==> Java GitHub submit -> durable SQL intent -> Redis outage/maintenance recovery -> real Worker entry + controlled archive pipeline -> replay/conflict/CSRF/private scope: PASS")
+
+
 def run_project_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
                              web: str, java: str, worker: str, database_url: str) -> None:
     from job_hunting_agent.config import PlatformAuthSettings
@@ -1639,6 +1734,9 @@ def main() -> None:
                "job-agent-worker", "--concurrency", "1", "--log-level", "WARNING")
         run_task_command_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                               f"http://127.0.0.1:{args.port}", token, admin_credentials, isolated_url, worker, broker)
+        reset_scenario_limits()
+        run_project_submission_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                                           f"http://127.0.0.1:{args.port}", token, web, worker, broker, isolated_url)
         reset_scenario_limits()
         run_project_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                  f"http://127.0.0.1:{args.port}", token, web, java, worker, isolated_url)

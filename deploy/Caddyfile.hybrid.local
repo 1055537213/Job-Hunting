@@ -48,6 +48,11 @@
 			path /api/projects
 		}
 		reverse_proxy @project_list platform-service:8081
+		@project_github {
+			method POST
+			path /api/projects/github
+		}
+		reverse_proxy @project_github platform-service:8081
 		@project_confirm {
 			method POST
 			path_regexp projectConfirm ^/api/projects/[0-9]+/confirm$

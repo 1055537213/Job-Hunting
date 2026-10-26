@@ -38,6 +38,11 @@ public class ProjectController {
             @PathVariable("recordId") long record, HttpServletRequest request, HttpServletResponse response) {
         return submit("delete",session,mapper.createObjectNode().put("record_id",record),request,response);
     }
+    @PostMapping("/api/projects/github")
+    public JsonNode github(@CookieValue(name="job_agent_session",required=false) String session,
+            @RequestBody JsonNode body, HttpServletRequest request, HttpServletResponse response) {
+        return submit("github",session,body,request,response);
+    }
     @PostMapping("/internal/v1/projects/{operation}")
     public JsonNode internal(@PathVariable("operation") String operation, @RequestBody JsonNode body,
             @RequestHeader(name="X-Internal-Service-Token",required=false) String token,
@@ -54,10 +59,18 @@ public class ProjectController {
             case "list" -> Set.of("candidate_id");
             case "confirm" -> Set.of("record_id","confirmed_summary","root_request_id");
             case "delete" -> Set.of("record_id");
+            case "github" -> Set.of("candidate_id","repository_url","idempotency_key");
             default -> throw ProjectClient.invalid();
         };
         if (!input.isObject() || !fields.containsAll(input.propertyNames())
-                || !ProjectClient.id(input.get("list".equals(operation)?"candidate_id":"record_id"))) throw ProjectClient.invalid();
+                || !ProjectClient.id(input.get(Set.of("list","github").contains(operation)?"candidate_id":"record_id"))) throw ProjectClient.invalid();
+        if ("github".equals(operation)) {
+            if (!input.path("repository_url").isTextual() || input.get("repository_url").asText().length()>512) throw ProjectClient.invalid();
+            if (!input.get("repository_url").asText().strip().matches("(?i)https://(?:www\\.)?github\\.com/[a-z0-9][a-z0-9._-]{0,99}/[a-z0-9][a-z0-9._-]{0,103}/?"))
+                throw new com.jobhunting.platform.auth.AuthException("PROJECT_REPOSITORY_INVALID","请填写有效的公开 GitHub 仓库首页链接。",org.springframework.http.HttpStatus.BAD_REQUEST);
+            if(input.hasNonNull("idempotency_key") && (!input.get("idempotency_key").isTextual()
+                || !input.get("idempotency_key").asText().matches("[A-Za-z0-9:_-]{16,128}"))) throw ProjectClient.invalid();
+        }
         if (input.hasNonNull("confirmed_summary") && (!input.get("confirmed_summary").isTextual()
                 || input.get("confirmed_summary").asText().codePointCount(0,input.get("confirmed_summary").asText().length())>20000)) throw ProjectClient.invalid();
         if (input.hasNonNull("root_request_id") && (!input.get("root_request_id").isTextual()

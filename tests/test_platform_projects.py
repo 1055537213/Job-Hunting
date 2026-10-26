@@ -158,6 +158,10 @@ def test_all_versions_manifest_survives_storage_failure_and_is_collected_for_acc
         storage_key=files[1].storage_key, media_type="application/zip", file_size=files[1].file_size, sha256=files[1].sha256)
     with backend.store.connect() as conn:
         conn.execute("UPDATE project_archive_imports SET project_card_id=? WHERE id=?", (record.id, imported.id))
+    evidence_task = backend.store.create_background_task(account_id=owner, candidate_id=candidate, task_type="rag_index",
+        idempotency_key=f"project-archive-evidence-rag:{imported.id}")
+    visual_task = backend.store.create_background_task(account_id=owner, candidate_id=candidate, task_type="visual_index",
+        idempotency_key=f"project-archive-visual:{imported.id}")
     assert submit(browser, "confirm", record_id=record.id, confirmed_summary="My industrial project").status_code == 200
     text = backend.store.get_long_text_for_entity("project_experience_card", record.id, source_label="confirmed", account_id=owner)
     with backend.store.connect() as conn:
@@ -167,6 +171,8 @@ def test_all_versions_manifest_survives_storage_failure_and_is_collected_for_acc
             (owner, candidate, text.id, record.id, "0"*64))
     result = submit(browser, "delete", record_id=record.id)
     assert result.status_code == 200 and result.json()["cleanup_status"] == "pending", result.text
+    assert backend.store.get_background_task(evidence_task.task_key).status == "cancelled"
+    assert backend.store.get_background_task(visual_task.task_key).status == "cancelled"
     assert "storage_keys" not in result.text
     assert sorted(backend.store.collect_account_deletion_storage_keys(owner)) == sorted(f.storage_key for f in files)
     original = backend.resume_files.delete
@@ -193,7 +199,8 @@ def test_invalid_callbacks_are_redacted(projects, operation, data):
 
 
 @pytest.mark.parametrize("method,path,data,operation", [("GET", "/api/projects?candidate_id=1", None, "list"),
-    ("POST", "/api/projects/1/confirm", {"confirmed_summary": "Mine"}, "confirm"), ("DELETE", "/api/projects/1", None, "delete")])
+    ("POST", "/api/projects/1/confirm", {"confirmed_summary": "Mine"}, "confirm"), ("DELETE", "/api/projects/1", None, "delete"),
+    ("POST", "/api/projects/github", {"candidate_id": 1, "repository_url": "https://github.com/example/repo"}, "github")])
 def test_compatibility_only_forwards_and_never_falls_back(projects, monkeypatch, method, path, data, operation):
     app, browser, _, _, _ = projects
     browser.cookies.set("job_agent_session", "session-1")
@@ -221,3 +228,171 @@ def test_platform_client_bounds_and_validates_projection(monkeypatch):
         with pytest.raises(PlatformAuthError) as error:
             client.projects("list", "session", candidate_id=1)
         assert error.value.status_code == 503 and "private credential" not in str(error.value)
+
+
+def github_submit(browser, candidate, **data):
+    return submit(browser, "github", candidate_id=candidate, repository_url="https://github.com/example/project", **data)
+
+
+def test_github_submission_scope_replay_canonicalization_and_conflict(projects):
+    app, browser, owners, candidates, _ = projects
+    calls = []
+    app.state.backend.task_queue = SimpleNamespace(enqueue=calls.append)
+    assert github_submit(browser, candidates[1]).status_code == 404
+    assert github_submit(browser, candidates[0], session_token="expired").status_code == 401
+    key = "github:request-0001"
+    first = github_submit(browser, candidates[0], idempotency_key=key)
+    assert first.status_code == 200, first.text
+    payload = first.json()
+    again = submit(browser, "github", candidate_id=candidates[0], repository_url="https://www.github.com/EXAMPLE/Project.git/", idempotency_key=key)
+    assert again.status_code == 200 and again.json() == payload
+    implicit = github_submit(browser, candidates[0])
+    assert implicit.status_code == 200 and implicit.json() == payload
+    assert calls == [payload["task"]["task_key"]]
+    conflict = submit(browser, "github", candidate_id=candidates[0], repository_url="https://github.com/example/other", idempotency_key=key)
+    assert conflict.status_code == 409 and conflict.json()["code"] == "PROJECT_SUBMISSION_CONFLICT"
+    task = app.state.backend.store.get_background_task(calls[0], account_id=owners[0])
+    assert task.payload["repository_url"] == "https://github.com/example/project"
+    assert payload["root_request_id"] == task.payload["root_request_id"]
+    assert payload["task"]["result"] is None and payload["processing_async"] is True and payload["project_card"] is None
+    with app.state.backend.store.connect() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM background_tasks").fetchone()["n"] == 1
+        assert conn.execute("SELECT key_hash FROM project_submissions WHERE key_hash IS NOT NULL").fetchone()["key_hash"] != key
+
+
+def test_github_dispatch_failure_survives_restart_and_unknown_ack_does_not_duplicate_work(projects):
+    from job_hunting_agent.project_submission import ProjectSubmissions
+    app, browser, owners, candidates, _ = projects
+    backend = app.state.backend
+    calls = []
+    def lost_ack(task_key):
+        calls.append(task_key)
+        raise TaskQueueError("private broker credentials")
+    backend.task_queue = SimpleNamespace(enqueue=lost_ack)
+    first = github_submit(browser, candidates[0], idempotency_key="github:restart-test")
+    assert first.status_code == 503 and "private broker" not in first.text
+    with backend.store.connect() as conn:
+        row = conn.execute("SELECT * FROM project_submissions").fetchone()
+        assert row["status"] == "pending" and row["attempts"] == 1
+        assert conn.execute("SELECT status FROM background_tasks").fetchone()["status"] == "queued"
+        conn.execute("UPDATE project_submissions SET next_dispatch_at=now()")
+    # A new object represents a new Web/maintenance process using only persisted state.
+    resumed = ProjectSubmissions(backend.store, SimpleNamespace(enqueue=calls.append))
+    assert resumed.dispatch_pending()["dispatched_projects"] == 1
+    assert calls == [row["task_key"], row["task_key"]]
+    assert backend.store.claim_background_task(row["task_key"]) is not None
+    assert backend.store.claim_background_task(row["task_key"]) is None
+    backend.store.complete_background_task(row["task_key"], {"project_card_id": 1, "private": "hidden"})
+    backend.task_queue = SimpleNamespace(enqueue=calls.append)
+    replay = github_submit(browser, candidates[0], idempotency_key="github:restart-test")
+    assert replay.status_code == 200 and replay.json()["task"]["status"] == "succeeded"
+    assert replay.json()["task"]["result"] is None
+    assert len(calls) == 2
+    # A deliberate new submission has a new key; old receipts remain immutable.
+    fresh = github_submit(browser, candidates[0], idempotency_key="github:deliberate-new")
+    assert fresh.status_code == 200 and fresh.json()["task"]["task_key"] != row["task_key"]
+    assert backend.store.get_background_task(row["task_key"], account_id=owners[0]).status == "succeeded"
+
+
+def test_github_submission_is_atomic_and_rejects_missing_queue(projects, monkeypatch):
+    from contextlib import contextmanager
+    app, browser, _, candidates, _ = projects
+    backend = app.state.backend
+    assert github_submit(browser, candidates[0]).status_code == 503
+    calls = []
+    backend.task_queue = SimpleNamespace(enqueue=calls.append)
+    connect = backend.store.connect
+    @contextmanager
+    def broken_receipt():
+        with connect() as conn:
+            execute = conn.execute
+            def fail(query, *args, **kwargs):
+                if "INSERT INTO project_submissions" in query:
+                    raise RuntimeError("private database failure")
+                return execute(query, *args, **kwargs)
+            conn.execute = fail
+            yield conn
+    monkeypatch.setattr(backend.store, "connect", broken_receipt)
+    response = github_submit(browser, candidates[0])
+    assert response.status_code == 503 and "private database" not in response.text
+    with connect() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM background_tasks").fetchone()["n"] == 0
+        assert conn.execute("SELECT count(*) AS n FROM project_submissions").fetchone()["n"] == 0
+    assert calls == []
+
+
+def test_concurrent_github_submissions_share_one_task(projects):
+    app, browser, _, candidates, _ = projects
+    calls = []
+    app.state.backend.task_queue = SimpleNamespace(enqueue=calls.append)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        responses = list(pool.map(lambda i: github_submit(browser, candidates[0], idempotency_key=f"github:concurrent-{i}"), range(4)))
+    assert [r.status_code for r in responses] == [200]*4, [r.text for r in responses]
+    assert len({r.json()["task"]["task_key"] for r in responses}) == 1
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("cancel", ["delete", "disable"])
+def test_pending_github_dispatch_cannot_revive_deleted_or_disabled_work(projects, cancel):
+    from job_hunting_agent.project_submission import ProjectSubmissions
+    app, browser, owners, candidates, records = projects
+    backend = app.state.backend
+    backend.task_queue = SimpleNamespace(enqueue=Mock(side_effect=TaskQueueError("offline")))
+    assert github_submit(browser, candidates[0], idempotency_key="github:pending-cancel").status_code == 503
+    with backend.store.connect() as conn:
+        row = conn.execute("SELECT * FROM project_submissions").fetchone()
+        if cancel == "delete":
+            card = asdict(records[0].card)
+            card["source_url"] = "https://github.com/Example/Project"
+            conn.execute("UPDATE project_experience_cards SET card_json=? WHERE id=?", (json.dumps(card), records[0].id))
+        else:
+            conn.execute("UPDATE accounts SET status='disabled' WHERE id=?", (owners[0],))
+        conn.execute("UPDATE project_submissions SET next_dispatch_at=now()")
+    if cancel == "delete":
+        assert submit(browser, "delete", record_id=records[0].id).status_code == 200
+    calls = []
+    assert ProjectSubmissions(backend.store, SimpleNamespace(enqueue=calls.append)).dispatch_pending()["dispatched_projects"] == 0
+    assert calls == []
+    assert backend.store.get_background_task(row["task_key"]).status == "cancelled"
+    with backend.store.connect() as conn:
+        assert conn.execute("SELECT status FROM project_submissions").fetchone()["status"] == "superseded"
+
+
+@pytest.mark.parametrize("url", ["https://gitlab.com/a/b", "https://github.com@evil.test/a/b", "https://github.com/a/b?token=private", "https://github.com/a/b/tree/main"])
+def test_github_invalid_repository_never_creates_task(projects, url):
+    app, browser, _, candidates, _ = projects
+    app.state.backend.task_queue = SimpleNamespace(enqueue=Mock())
+    response = submit(browser, "github", candidate_id=candidates[0], repository_url=url)
+    assert response.status_code == 400 and response.json()["code"] == "PROJECT_REPOSITORY_INVALID"
+    assert "token=private" not in response.text
+    with app.state.backend.store.connect() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM background_tasks").fetchone()["n"] == 0
+
+
+@pytest.mark.parametrize("fields", [{"candidate_id": True}, {"idempotency_key": "short"},
+    {"root_request_id": "a"*32}, {"account_id": 99}, {"repository_url": "x"*513}])
+def test_github_callback_strictly_rejects_extra_and_unsafe_fields(projects, fields):
+    _, browser, _, candidates, _ = projects
+    data = {"candidate_id": candidates[0], "repository_url": "https://github.com/example/project", **fields}
+    response = submit(browser, "github", **data)
+    assert response.status_code == 422 and response.json()["code"] == "INVALID_REQUEST"
+    assert "x"*100 not in response.text
+
+
+def test_github_contract_and_both_gateway_topologies_are_aligned():
+    from pathlib import Path
+    import yaml
+    from job_hunting_agent.project_contract import TASK_FIELDS
+    root = Path(__file__).resolve().parents[1]
+    contract = yaml.safe_load((root / "platform-service/src/main/resources/projects.openapi.yaml").read_text(encoding="utf-8"))
+    schema = contract["components"]["schemas"]["GitHubTask"]
+    assert set(schema["required"]) == set(schema["properties"]) == TASK_FIELDS
+    assert schema["additionalProperties"] is False
+    assert contract["paths"]["/api/projects/github"]["post"]["requestBody"]["content"]["application/json"]["schema"]["additionalProperties"] is False
+    for name in ("Caddyfile.hybrid", "Caddyfile.hybrid.local"):
+        text = (root / "deploy" / name).read_text(encoding="utf-8")
+        assert "@project_github {\n\t\t\tmethod POST\n\t\t\tpath /api/projects/github" in text
+        assert "reverse_proxy @project_github platform-service:8081" in text
+    nginx = (root / "deploy/nginx/coexist-hybrid-ip-https.conf.template").read_text(encoding="utf-8")
+    block = nginx.split("location = /api/projects/github {", 1)[1].split("\n    }", 1)[0]
+    assert "proxy_pass http://platform-service:8081;" in block and "proxy_next_upstream off;" in block

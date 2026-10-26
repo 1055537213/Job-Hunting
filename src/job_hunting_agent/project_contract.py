@@ -15,9 +15,16 @@ TASK_FIELDS = {"task_key", "task_type", "status", "progress", "attempt", "max_at
 
 def validate_projection(value, operation, *, candidate_id=None, record_id=None):
     expected = {"list": {"project_cards"}, "confirm": {"project_card", "task", "root_request_id"},
-                "delete": {"deleted", "project_card_id", "candidate_id", "cleanup_status", "rag_cleanup"}}[operation]
+                "delete": {"deleted", "project_card_id", "candidate_id", "cleanup_status", "rag_cleanup"},
+                "github": {"task", "project_card", "processing_async", "root_request_id"}}[operation]
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError("Invalid project fields")
+    if operation == "github":
+        if (value["project_card"] is not None or value["processing_async"] is not True
+                or not isinstance(value["root_request_id"], str) or re.fullmatch(r"[a-f0-9]{32}", value["root_request_id"]) is None):
+            raise ValueError("Invalid project submission")
+        validate_task(value["task"], "github_project_analysis")
+        return value
     if operation == "delete":
         if (value["deleted"] is not True or not positive_id(value["project_card_id"]) or value["project_card_id"] != record_id or not positive_id(value["candidate_id"])
                 or value["cleanup_status"] not in {"pending", "completed"} or value["rag_cleanup"] != "database_cascade"):
@@ -59,3 +66,14 @@ def validate_projection(value, operation, *, candidate_id=None, record_id=None):
                     or any(task[k] is not None and not isinstance(task[k], str) for k in ("started_at", "finished_at", "error_summary"))))):
             raise ValueError("Invalid confirmation")
     return value
+
+
+def validate_task(task, task_type):
+    if (not isinstance(task, dict) or set(task) != TASK_FIELDS
+            or not isinstance(task["task_key"], str) or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", task["task_key"]) is None
+            or task["task_type"] != task_type or task["status"] not in {"queued", "running", "succeeded", "failed", "cancelled"}
+            or task["result"] is not None or type(task["progress"]) is not int or not 0 <= task["progress"] <= 100
+            or type(task["attempt"]) is not int or task["attempt"] < 0 or not positive_id(task["max_attempts"])
+            or not all(isinstance(task[k], str) for k in ("created_at", "updated_at"))
+            or any(task[k] is not None and not isinstance(task[k], str) for k in ("started_at", "finished_at", "error_summary"))):
+        raise ValueError("Invalid project task")

@@ -1304,6 +1304,8 @@ def register_background_tasks(celery_app: Any, env_path: str | Path = DEFAULT_EN
             counts = recover_stale_background_tasks(backend)
             from .task_commands import TaskCommands
             counts.update(TaskCommands(backend.store, backend.task_queue).dispatch_pending())
+            from .project_submission import ProjectSubmissions
+            counts.update(ProjectSubmissions(backend.store, backend.task_queue).dispatch_pending())
             from .account_deletion import dispatch_account_deletions
             counts.update(dispatch_account_deletions(backend))
             from .profile_deletion import resume_pending

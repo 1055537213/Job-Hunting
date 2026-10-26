@@ -478,13 +478,17 @@ class InternalProjectPayload(BaseModel):
     record_id: int | None = Field(default=None, gt=0, le=2**63-1, strict=True)
     confirmed_summary: str | None = Field(default=None, max_length=20_000)
     root_request_id: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{32}$")
+    repository_url: str | None = Field(default=None, min_length=1, max_length=512)
+    idempotency_key: str | None = Field(default=None, pattern=r"^[A-Za-z0-9:_-]{16,128}$")
 
 
 class GitHubProjectPayload(BaseModel):
     """网页提交公开 GitHub 项目分析时需要的归属和仓库链接。"""
 
-    candidate_id: int
-    repository_url: str
+    model_config = ConfigDict(extra="forbid")
+    candidate_id: int = Field(gt=0, le=2**63-1, strict=True)
+    repository_url: str = Field(min_length=1, max_length=512)
+    idempotency_key: str | None = Field(default=None, pattern=r"^[A-Za-z0-9:_-]{16,128}$")
 
 
 class LocalProjectManifestFilePayload(BaseModel):
@@ -1294,7 +1298,7 @@ def create_web_app(
 
     @web_app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error: RequestValidationError):
-        if request.url.path == "/api/projects" or re.fullmatch(r"/api/projects/[0-9]+(?:/confirm)?", request.url.path):
+        if request.url.path in {"/api/projects", "/api/projects/github"} or re.fullmatch(r"/api/projects/[0-9]+(?:/confirm)?", request.url.path):
             return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
         if request.url.path in {"/api/profiles", "/api/chat", "/api/chat/stream", "/internal/v1/chat/invoke", "/internal/v1/chat/stream"} and request.method == "POST":
             return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422, headers={"Cache-Control": "no-store"})
@@ -2599,7 +2603,18 @@ def create_web_app(
                 result = request_deletion(backend, owner, payload.record_id)
             else:
                 with backend.store.account_work.acquire(owner):
-                    if operation == "list":
+                    if operation == "github":
+                        from .project_submission import ProjectSubmissions
+                        if payload.candidate_id is None or payload.repository_url is None:
+                            raise HTTPException(422, "请求参数无效。")
+                        task = ProjectSubmissions(backend.store, backend.task_queue).submit(owner, payload.candidate_id,
+                            payload.repository_url, payload.idempotency_key)
+                        task_view = serialize_background_task(task)
+                        task_view["result"] = None
+                        task_view["error_summary"] = "项目分析未完成，请查看任务状态。" if task.error_summary else None
+                        result = {"task": task_view, "project_card": None, "processing_async": True,
+                            "root_request_id": task.payload["root_request_id"]}
+                    elif operation == "list":
                         if payload.candidate_id is None:
                             raise HTTPException(422, "请求参数无效。")
                         get_profile_or_404(backend, payload.candidate_id, owner)
@@ -2628,7 +2643,8 @@ def create_web_app(
                             record=asdict(record), rag_task=task_view)
                         result = {"project_card": asdict(record), "task": task_view, "root_request_id": request_id}
             validate_projection(result, operation, candidate_id=payload.candidate_id, record_id=payload.record_id)
-            body = json.dumps({"account_id": owner, **result}, ensure_ascii=False).encode("utf-8")
+            scope = {"submission_candidate_id": payload.candidate_id} if operation == "github" else {}
+            body = json.dumps({"account_id": owner, **scope, **result}, ensure_ascii=False).encode("utf-8")
             if len(body) > MAX_PROJECT_BYTES:
                 raise HTTPException(413, "项目数据超出同步查询限制。")
             return body
@@ -2638,13 +2654,15 @@ def create_web_app(
     @web_app.post("/internal/v1/projects/{operation}", include_in_schema=False)
     async def internal_projects(operation: str, payload: InternalProjectPayload, request: Request):
         from .project_contract import PROJECT_UNAVAILABLE
+        from .project_submission import ProjectSubmissionConflict
         client = backend.platform_auth_client
         if client is None:
             raise HTTPException(404, "接口不存在。")
         token = request.headers.get("X-Internal-Service-Token", "")
         if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
             return JSONResponse({"code": "INTERNAL_UNAUTHORIZED", "detail": "内部服务认证失败。"}, status_code=401)
-        allowed = {"list": {"candidate_id"}, "confirm": {"record_id", "confirmed_summary", "root_request_id"}, "delete": {"record_id"}}
+        allowed = {"list": {"candidate_id"}, "confirm": {"record_id", "confirmed_summary", "root_request_id"},
+            "delete": {"record_id"}, "github": {"candidate_id", "repository_url", "idempotency_key"}}
         if operation not in allowed or payload.model_fields_set - {"session_token"} - allowed[operation]:
             return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422)
         try:
@@ -2660,6 +2678,10 @@ def create_web_app(
             status, code = 404, "PROJECT_NOT_FOUND"
         except AccountWorkBusy:
             status, code = 409, "PROJECT_BUSY"
+        except ProjectSubmissionConflict:
+            status, code = 409, "PROJECT_SUBMISSION_CONFLICT"
+        except GitHubRepositoryError:
+            status, code = 400, "PROJECT_REPOSITORY_INVALID"
         except (AccountWorkDenied, PermissionError):
             status, code = 403, "PROJECT_SCOPE_DENIED"
         except Exception:  # noqa: BLE001 - never expose source content, SQL or object keys.
@@ -2710,6 +2732,8 @@ def create_web_app(
     ) -> dict[str, object]:
         """登记公开 GitHub 仓库分析，并优先交由后台 Worker 处理。"""
 
+        if backend.platform_auth_client is not None:
+            return platform_project(request, "github", **payload.model_dump(exclude_none=True))
         account = current_account(request)
         assert account is not None
         account_id = account.id

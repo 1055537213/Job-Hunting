@@ -57,4 +57,19 @@ class ProjectControllerTest {
         mvc.perform(delete("/api/projects/9").cookie(session,csrf).header("X-CSRF-Token","csrf"))
             .andExpect(status().isServiceUnavailable()).andExpect(jsonPath("$.code").value("PROJECT_UNAVAILABLE"));
     }
+    @Test void githubSubmissionRequiresSessionCsrfAndStrictPublicRepositoryInput()throws Exception{
+        String data="{\"candidate_id\":7,\"repository_url\":\"https://github.com/example/project\",\"idempotency_key\":\"github:request-0001\"}";
+        mvc.perform(post("/api/projects/github").contentType("application/json").content(data)).andExpect(status().isUnauthorized());
+        mvc.perform(post("/api/projects/github").cookie(session).contentType("application/json").content(data)).andExpect(status().isForbidden());
+        for(String url:new String[]{"https://gitlab.com/a/b","https://github.com@evil.test/a/b","https://github.com/a/b?token=private","https://github.com/a/b/tree/main"})
+            mvc.perform(post("/api/projects/github").cookie(session,csrf).header("X-CSRF-Token","csrf").contentType("application/json")
+                .content(mapper.writeValueAsString(mapper.createObjectNode().put("candidate_id",7).put("repository_url",url))))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("PROJECT_REPOSITORY_INVALID"));
+        for(String invalid:new String[]{"{\"candidate_id\":true,\"repository_url\":\"https://github.com/a/b\"}",data.replace("7,","7,\"account_id\":99,"),data.replace("github:request-0001","short")})
+            mvc.perform(post("/api/projects/github").cookie(session,csrf).header("X-CSRF-Token","csrf").contentType("application/json").content(invalid))
+                .andExpect(status().isUnprocessableContent());
+        verifyNoInteractions(python);
+        mvc.perform(post("/api/projects/github").cookie(session,csrf).header("X-CSRF-Token","csrf").contentType("application/json").content(data)).andExpect(status().isOk());
+        verify(python).execute(eq("github"),eq("real-session"),eq(42L),argThat(v->v.path("candidate_id").asLong()==7&&v.path("idempotency_key").asText().equals("github:request-0001")),anyString());
+    }
 }

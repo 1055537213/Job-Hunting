@@ -35,9 +35,13 @@ def request_deletion(backend, owner, record_id):
                 WHERE account_id=? AND candidate_id=? AND status='queued' AND (
                     (task_type='rag_index' AND idempotency_key=?) OR
                     (task_type='github_project_analysis' AND lower(CAST(payload_json AS jsonb)->>'repository_url')=lower(?)) OR
+                    (task_type IN ('rag_index','visual_index') AND idempotency_key IN (
+                        SELECT 'project-archive-evidence-rag:' || CAST(id AS text) FROM project_archive_imports WHERE account_id=? AND project_card_id=?
+                        UNION ALL
+                        SELECT 'project-archive-visual:' || CAST(id AS text) FROM project_archive_imports WHERE account_id=? AND project_card_id=?)) OR
                     (task_type='project_archive_analysis' AND CAST(payload_json AS jsonb)->>'project_archive_id' IN
                         (SELECT CAST(id AS text) FROM project_archive_imports WHERE account_id=? AND project_card_id=?)))""",
-                (owner, record.candidate_id, f"project-rag:{record_id}", record.card.source_url, owner, record_id))
+                (owner, record.candidate_id, f"project-rag:{record_id}", record.card.source_url, owner, record_id, owner, record_id, owner, record_id))
             deleted = backend.store.delete_project_card(record_id, account_id=owner, _connection=conn)
             keys = sorted(set(deleted["storage_keys"]))
             status = "pending" if keys else "completed"

@@ -272,6 +272,7 @@ if (!window.Vue) {
         projectReviewSelections: {},
         projectImportMode: "github",
         githubProjectUrl: "",
+        githubProjectSubmission: null,
         localProjectDirectoryName: "",
         localProjectProgress: "",
         localProjectCollectionId: 0,
@@ -4312,20 +4313,27 @@ if (!window.Vue) {
 
         this.submittingGitHubProject = true;
         this.githubProjectError = "";
+        const scope = `${this.currentProfileId}:${repositoryUrl.toLowerCase()}`;
+        if (this.githubProjectSubmission?.scope !== scope) {
+          this.githubProjectSubmission = { scope, key: this.newIdempotencyKey("github-project") };
+        }
+        const candidateId = this.currentProfileId;
         try {
           const data = await this.requestJson("/api/projects/github", {
             method: "POST",
             body: JSON.stringify({
-              candidate_id: this.currentProfileId,
+              candidate_id: candidateId,
               repository_url: repositoryUrl,
+              idempotency_key: this.githubProjectSubmission.key,
             }),
           });
+          this.githubProjectSubmission = null;
           this.githubProjectUrl = "";
           if (data.task?.task_key) {
             this.backgroundTasks[data.task.task_key] = data.task;
             this.rememberProjectTask(data.task.task_key);
             this.appendAssistant("GitHub 项目分析任务已排队，完成后会生成待确认项目经历卡片。");
-            this.pollGitHubProjectTask(data.task.task_key, this.currentProfileId);
+            this.pollGitHubProjectTask(data.task.task_key, candidateId);
           } else {
             await this.loadProjectCards();
             this.appendAssistant(
@@ -4333,9 +4341,7 @@ if (!window.Vue) {
             );
           }
         } catch (error) {
-          if (this.showDuplicateNotice(error, "项目已存在")) {
-            return;
-          }
+          if (error.code === "PROJECT_SUBMISSION_CONFLICT") this.githubProjectSubmission = null;
           this.githubProjectError = error.message || "GitHub 项目分析提交失败。";
           this.appendAssistant(this.githubProjectError, true);
         } finally {

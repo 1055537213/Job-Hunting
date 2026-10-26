@@ -1,9 +1,46 @@
 openapi: 3.1.0
 info:
   title: Project Lifecycle Entry
-  version: 1.0.0
+  version: 1.1.0
   description: Java validates the real Session; Python owns project facts, confirmation and deletion. No automatic callback replay or local fallback.
 paths:
+  /api/projects/github:
+    post:
+      description: Requires Session and CSRF. Java validates input; Python atomically registers the owned task and submission intent, then attempts bounded dispatch. Same key and canonical repository replays the original task, a changed payload returns 409. Concurrent submissions of the same candidate/repository share an active task. A fresh key after a terminal task explicitly starts a new analysis; Worker retains immutable snapshot/content deduplication. A 200 response confirms dispatch, NOT completed analysis. On 503 retry the same key; maintenance recovers pending dispatch every 60 seconds with backoff. Result and raw errors are omitted; poll the existing task endpoint for completion.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [candidate_id, repository_url]
+              properties:
+                candidate_id: {type: integer, minimum: 1, maximum: 9223372036854775807}
+                repository_url: {type: string, minLength: 1, maxLength: 512, description: Public HTTPS GitHub repository homepage only; no credentials, query, fragment or arbitrary ports.}
+                idempotency_key: {type: [string, 'null'], pattern: '^[A-Za-z0-9:_-]{16,128}$', description: Browser-generated intent key retained on uncertain responses; only its hash is stored.}
+      responses:
+        '200':
+          description: Dispatch confirmed, no-store; root_request_id belongs to the original task, never a caller-supplied trace.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [task, project_card, processing_async, root_request_id]
+                properties:
+                  task: {$ref: '#/components/schemas/GitHubTask'}
+                  project_card: {type: 'null'}
+                  processing_async: {const: true}
+                  root_request_id: {type: string, pattern: '^[a-f0-9]{32}$'}
+        '400': {description: PROJECT_REPOSITORY_INVALID}
+        '401': {description: SESSION_EXPIRED}
+        '403': {description: CSRF_REJECTED or PROJECT_SCOPE_DENIED}
+        '404': {description: PROJECT_NOT_FOUND}
+        '409': {description: PROJECT_BUSY or PROJECT_SUBMISSION_CONFLICT; cancelled receipt requires a fresh explicit submission.}
+        '422': {description: INVALID_REQUEST}
+        '429': {description: RATE_LIMITED}
+        '503': {description: PROJECT_UNAVAILABLE; no fake success, retry same intent.}
   /api/projects:
     get:
       parameters:
@@ -63,12 +100,12 @@ paths:
               schema: {$ref: '#/components/schemas/Receipt'}
   /internal/v1/projects/{operation}:
     post:
-      description: Private adapter on both services, hidden by gateways. Requires X-Internal-Service-Token and real session_token. Java verifies account, Python revalidates the same Session. Python adds account_id solely for Java scope checking; never exposed publicly. 8 callbacks, 10-second Java deadline, 4 MiB response. Development contexts may start without callback token but cannot call; production requires a strong token and internal origin.
+      description: Private adapter on both services, hidden by gateways. Requires X-Internal-Service-Token and real session_token. Java verifies account, Python revalidates the same Session. Python adds account_id and, for github, submission_candidate_id solely for Java scope checking; never exposed publicly. 8 callbacks, 10-second Java deadline, 4 MiB response. Development contexts may start without callback token but cannot call; production requires a strong token and internal origin.
       parameters:
         - in: path
           name: operation
           required: true
-          schema: {enum: [list, confirm, delete]}
+          schema: {enum: [list, confirm, delete, github]}
       requestBody:
         required: true
         content:
@@ -83,6 +120,8 @@ paths:
                 record_id: {type: integer, minimum: 1}
                 confirmed_summary: {type: [string, 'null'], maxLength: 20000}
                 root_request_id: {type: [string, 'null'], pattern: '^[A-Fa-f0-9]{32}$'}
+                repository_url: {type: [string, 'null'], maxLength: 512}
+                idempotency_key: {type: [string, 'null'], pattern: '^[A-Za-z0-9:_-]{16,128}$'}
       responses:
         '200': {description: Public projection; Python additionally includes authenticated account_id. Only operation-specific fields are accepted.}
         '400': {description: PROJECT_CONFIRMATION_REQUIRED}
@@ -97,6 +136,23 @@ components:
   parameters:
     RecordId: {in: path, name: record_id, required: true, schema: {type: integer, minimum: 1, maximum: 9223372036854775807}}
   schemas:
+    GitHubTask:
+      type: object
+      additionalProperties: false
+      required: [task_key, task_type, status, progress, attempt, max_attempts, result, error_summary, created_at, updated_at, started_at, finished_at]
+      properties:
+        task_key: {type: string, pattern: '^[A-Za-z0-9_-]{1,64}$'}
+        task_type: {const: github_project_analysis}
+        status: {enum: [queued, running, succeeded, failed, cancelled]}
+        progress: {type: integer, minimum: 0, maximum: 100}
+        attempt: {type: integer, minimum: 0}
+        max_attempts: {type: integer, minimum: 1}
+        result: {type: 'null'}
+        error_summary: {type: [string, 'null']}
+        created_at: {type: string}
+        updated_at: {type: string}
+        started_at: {type: [string, 'null']}
+        finished_at: {type: [string, 'null']}
     Record:
       type: object
       additionalProperties: false

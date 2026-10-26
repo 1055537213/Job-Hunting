@@ -1371,6 +1371,27 @@ task_commands = sa.Table(
 sa.Index("idx_task_commands_pending", task_commands.c.status, task_commands.c.id)
 sa.Index("idx_task_commands_task", task_commands.c.task_key, task_commands.c.id)
 
+project_submissions = sa.Table(
+    "project_submissions", metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column("command_id", sa.String(64), nullable=False, unique=True),
+    sa.Column("account_id", sa.Integer, sa.ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("candidate_id", sa.Integer, sa.ForeignKey("candidate_profiles.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("key_hash", sa.String(64)),
+    sa.Column("payload_hash", sa.String(64), nullable=False),
+    sa.Column("task_key", sa.String(64), sa.ForeignKey("background_tasks.task_key", ondelete="CASCADE"), nullable=False),
+    sa.Column("status", sa.String(16), nullable=False),
+    sa.Column("attempts", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("next_dispatch_at", timestamp_type, nullable=False),
+    sa.Column("created_at", timestamp_type, nullable=False),
+    sa.Column("updated_at", timestamp_type, nullable=False),
+    sa.UniqueConstraint("account_id", "key_hash", name="uq_project_submission_key"),
+    sa.CheckConstraint("status IN ('pending','dispatched','superseded')", name="project_submission_status"),
+    sa.CheckConstraint("attempts >= 0", name="project_submission_attempts"),
+)
+sa.Index("idx_project_submissions_due", project_submissions.c.status, project_submissions.c.next_dispatch_at, project_submissions.c.id)
+sa.Index("idx_project_submissions_task", project_submissions.c.task_key)
+
 
 # RAG 分块是 long_texts 的派生索引。2560 维正式模型使用迁移维护的
 # halfvec 表达式 HNSW 索引；这里保留无 typmod 的原始 vector 列，以便重建期间兼容旧模型空间。

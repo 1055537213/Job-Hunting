@@ -103,13 +103,36 @@ Java 与 Python 统一使用 W3C `traceparent` 传播上下文，同时保留现
 日常推送只运行快速 CI；提交说明包含 `[full ci]` 或手动触发完整 CI，通过后才发布相同提交的 `-ai` 和 `-platform` 两个版本镜像，审批部署通过 `Deploy Python Java`
 工作流执行；生产只填环境配置，不需要修改代码/Compose。此分支不自动部署服务器。
 
-后续继续迁移项目分析提交、本地分批上传、职位和简历等外部入口；不搬运 Python AI 算法。所有 GitHub 推送必须确认对应提交的快速 CI 通过；
+后续继续迁移本地项目分批上传、职位和简历等外部入口；不搬运 Python AI 算法。所有 GitHub 推送必须确认对应提交的快速 CI 通过；
 发布里程碑则必须确认完整 CI 和双镜像发布均成功。
 
-## 项目列表、确认与删除入口
+## 项目公开入口
+
+### GitHub 分析任务提交
+
+`POST /api/projects/github` 经本地/生产 Caddy 或共存 Nginx 直达 Java，仍使用原有页面与 URL。
+Java 执行 Session、CSRF、共享限流、严格字段与公开 GitHub 首页链接检查；Python 私有 `github` 回调
+再次验证真实 Session 和档案归属。Python 回包附带私有账号/档案范围，Java 校验后剥离，不暴露任务 payload 或原始异常。
+
+Python 所有的 `project_submissions`（迁移 `20261026_0029`）与 `background_tasks` 同事务提交。
+回执只保存幂等键哈希、请求内容哈希、任务引用和投递状态，不保存 Session、仓库正文或凭据。
+相同键和规范化仓库复用原任务及原 root_request_id，键复用于不同内容返回 409；同档案同仓库并发请求复用活动任务。
+一次新分析使用新键，终态旧回执不重置；项目快照/内容去重仍由既有 Python 分析管线负责。
+旧客户端不传键时只对活动任务去重；需要跨终态精确重放的调用方必须携带幂等键。
+
+数据库提交后使用单次有界 Redis 投递，不在 HTTP 回调内执行项目下载或模型分析。
+投递未确认返回 503，网页保留键供显式重试；每 60 秒的既有维护任务按到期时间补投，失败指数退避，上限一小时。
+这不是跨 PostgreSQL/Redis 的 exactly-once 事务：消息可能重复，但 Worker 原子认领同一 task_key，避免并发重复执行。
+账号行锁与删除/Worker 认领顺序一致，取消或停用后的 pending 回执转为 superseded，不会重新投递或重置已完成任务。
+
+200 仅表示任务投递已确认，不代表项目分析或 RAG 完成；前端继续通过现有 Java 任务查询入口轮询。
+新接口不调用旧 Python 直接投递路径；纯 Python 模式和 Agent 工具暂保留原路径，不冒充已经全部迁移。
+数据库变更由现有 migrate 执行，无新手填环境变量；本分支仅隔离 Docker 验收，不部署服务器。
+
+### 列表、确认和删除
 
 `GET /api/projects`、`POST /api/projects/{record_id}/confirm`、`DELETE /api/projects/{record_id}`
-由本地/生产 Caddy 和共存 Nginx 精确分流至 Java；GitHub 分析和本地采集上传仍留在 Python，
+由本地/生产 Caddy 和共存 Nginx 精确分流至 Java；GitHub 下载/分析执行和本地采集上传仍留在 Python，
 不会被宽泛的项目路径规则误转发。接口契约见 `projects.openapi.yaml`。
 
 Java 校验 Session、CSRF、限流、请求字段和有界回包；Python 的私有回调只接收真实 Session 与资源定位，
