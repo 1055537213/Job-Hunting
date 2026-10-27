@@ -27,6 +27,11 @@ spring:
           max-wait: 1s
       repositories:
         enabled: false
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 160MB
+      file-size-threshold: 1MB
 
 server:
   forward-headers-strategy: none

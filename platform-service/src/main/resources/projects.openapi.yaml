@@ -150,7 +150,7 @@ components:
         progress: {type: integer, minimum: 0, maximum: 100}
         attempt: {type: integer, minimum: 0}
         max_attempts: {type: integer, minimum: 1}
-        result: {type: 'null'}
+        result: {oneOf: [{type: 'null'}, {type: object, additionalProperties: false, maxProperties: 0}]}
         error_summary: {type: [string, 'null']}
         created_at: {type: string}
         updated_at: {type: string}
@@ -199,7 +199,7 @@ components:
         progress: {type: integer, minimum: 0, maximum: 100}
         attempt: {type: integer, minimum: 0}
         max_attempts: {type: integer, minimum: 1}
-        result: {type: 'null'}
+        result: {oneOf: [{type: 'null'}, {type: object, additionalProperties: false, maxProperties: 0}]}
         error_summary: {type: [string, 'null']}
         created_at: {type: string}
         started_at: {type: [string, 'null']}

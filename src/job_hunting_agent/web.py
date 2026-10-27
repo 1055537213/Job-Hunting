@@ -2919,19 +2919,18 @@ def create_web_app(
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {"deleted": True, **result}
 
-    @web_app.post("/api/projects/local/{collection_id}/files")
-    async def upload_local_project_files(
+    async def process_local_project_files(
         collection_id: int,
-        request: Request,
-        file_ids: str = Form(...),
-        files: list[UploadFile] = File(...),  # noqa: B008 - FastAPI multipart declaration.
+        account_id: int,
+        file_ids: str,
+        files: list[UploadFile],
+        *,
+        safe_projection: bool = False,
     ) -> dict[str, object]:
-        """Verify and process one browser batch, then enqueue its incremental RAG update."""
+        """Process one bounded multipart batch; all parsers and writes remain Python-owned."""
 
-        account = current_account(request)
-        assert account is not None
         try:
-            backend.store.get_project_collection(collection_id, account_id=account.id)
+            backend.store.get_project_collection(collection_id, account_id=account_id)
         except KeyError:
             raise HTTPException(404, "本地项目采集会话不存在。") from None
         try:
@@ -2951,7 +2950,7 @@ def create_web_app(
                 planned = backend.store.get_project_collection_file(
                     file_id,
                     collection_id=collection_id,
-                    account_id=account.id,
+                    account_id=account_id,
                 )
                 content = await upload.read(planned.file_size + 1)
                 await upload.close()
@@ -2962,7 +2961,7 @@ def create_web_app(
                     collection_id,
                     file_id,
                     content,
-                    account_id=account.id,
+                    account_id=account_id,
                 )
                 processed.append(result)
             except FileScannerUnavailableError as error:
@@ -2976,7 +2975,7 @@ def create_web_app(
                     failed = backend.store.fail_project_collection_file(
                         int(raw_id),
                         collection_id=collection_id,
-                        account_id=account.id,
+                        account_id=account_id,
                         reason=str(error),
                     )
                     failures.append(asdict(failed))
@@ -2986,10 +2985,10 @@ def create_web_app(
         long_text_ids = [int(item.long_text_id) for item in processed if item.long_text_id]
         collection = backend.store.get_project_collection(
             collection_id,
-            account_id=account.id,
+            account_id=account_id,
         )
         visual_items = backend.store.list_visual_knowledge_items(
-            account_id=account.id,
+            account_id=account_id,
             project_collection_file_ids=[item.id for item in processed],
         )
         rag_task = None
@@ -3001,7 +3000,7 @@ def create_web_app(
                 id_source = ",".join(str(item.id) for item in processed)
                 rag_task = backend.enqueue_rag_index_task(
                     long_text_ids=long_text_ids,
-                    account_id=account.id,
+                    account_id=account_id,
                     candidate_id=collection.candidate_id,
                     session_id=f"local-project-collection-{collection_id}",
                     root_request_id=uuid.uuid4().hex,
@@ -3011,13 +3010,13 @@ def create_web_app(
                     ),
                 )
             else:
-                backend.index_rag_long_texts(long_text_ids, account_id=account.id)
+                backend.index_rag_long_texts(long_text_ids, account_id=account_id)
         if visual_items and backend.visual_embedding_enabled:
             visual_id_source = ",".join(str(item.id) for item in visual_items)
             if backend.task_queue_enabled:
                 visual_task = backend.enqueue_visual_index_task(
                     visual_item_ids=[item.id for item in visual_items],
-                    account_id=account.id,
+                    account_id=account_id,
                     candidate_id=collection.candidate_id,
                     session_id=f"local-project-collection-{collection_id}",
                     root_request_id=uuid.uuid4().hex,
@@ -3031,7 +3030,7 @@ def create_web_app(
                     visual_index = asdict(
                         backend.index_visual_knowledge_items(
                             [item.id for item in visual_items],
-                            account_id=account.id,
+                            account_id=account_id,
                             candidate_id=collection.candidate_id,
                             session_id=f"local-project-collection-{collection_id}",
                         )
@@ -3040,8 +3039,21 @@ def create_web_app(
                     visual_warning = f"项目证据已保存，但视觉索引失败：{error}"
         elif visual_items:
             visual_warning = "项目视觉副本已保存；配置多模态 Embedding 后可建立图片向量。"
+        processed_view = [asdict(item) for item in processed]
+        if safe_projection:
+            processed_view = [
+                {key: row[key] for key in (
+                    "id", "collection_id", "relative_path", "file_size", "selection_status",
+                    "selection_reason", "extraction_method", "text_length", "created_at", "updated_at",
+                )}
+                for row in processed_view
+            ]
+            failures = [
+                {"id": row.get("id"), "selection_reason": "file_processing_failed"}
+                for row in failures
+            ]
         return {
-            "processed_files": [asdict(item) for item in processed],
+            "processed_files": processed_view,
             "failed_files": failures,
             "rag_task": serialize_background_task(rag_task) if rag_task is not None else None,
             "visual_task": (
@@ -3049,9 +3061,58 @@ def create_web_app(
                 if visual_task is not None
                 else None
             ),
-            "visual_index": visual_index,
+            "visual_index": {"indexed": True} if safe_projection and visual_index is not None else visual_index,
             "visual_warning": visual_warning,
         }
+
+    @web_app.post("/internal/v1/projects/local/{collection_id}/files", include_in_schema=False)
+    async def internal_upload_local_project_files(
+        collection_id: int,
+        request: Request,
+        session_token: str = Form(...),
+        file_ids: str = Form(...),
+        files: list[UploadFile] = File(...),  # noqa: B008 - internal multipart relay.
+    ) -> dict[str, object]:
+        """Private Java callback; Java validates the outer request, Python owns file processing."""
+
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            raise HTTPException(401, "内部服务认证失败。")
+        try:
+            resolved = client.account("me", session_token=session_token, trace_id=request.headers.get("X-Trace-Id"))
+            owner = platform_account_record(resolved["account"]).id
+            with backend.store.account_work.acquire(owner):
+                result = await process_local_project_files(collection_id, owner, file_ids, files, safe_projection=True)
+                return {"account_id": owner, **result}
+        except PlatformAuthError as error:
+            raise HTTPException(401 if error.status_code == 401 else 503, "项目上传认证暂时不可用。") from None
+        except AccountWorkBusy:
+            return JSONResponse({"code": "PROJECT_BUSY", "detail": "当前仍有请求或任务执行，请稍后重试。"}, status_code=409)
+        except AccountWorkDenied:
+            return JSONResponse({"code": "PROJECT_SCOPE_DENIED", "detail": "账号不可用或无权访问项目。"}, status_code=403)
+        except HTTPException as error:
+            code = {400: "PROJECT_UPLOAD_INVALID", 404: "PROJECT_NOT_FOUND", 503: "PROJECT_UNAVAILABLE"}.get(error.status_code, "PROJECT_UNAVAILABLE")
+            return JSONResponse({"code": code, "detail": "项目文件批次无法处理，请检查采集进度后重试。"}, status_code=error.status_code)
+        except Exception:  # noqa: BLE001 - never expose parser, SQL or scanner details.
+            return JSONResponse({"code": "PROJECT_UNAVAILABLE", "detail": "项目上传服务暂时不可用，请稍后重试。"}, status_code=503)
+
+    @web_app.post("/api/projects/local/{collection_id}/files")
+    async def upload_local_project_files(
+        collection_id: int,
+        request: Request,
+        file_ids: str = Form(...),
+        files: list[UploadFile] = File(...),  # noqa: B008 - FastAPI multipart declaration.
+    ) -> dict[str, object]:
+        """Verify and process one browser batch, then enqueue its incremental RAG update."""
+
+        if backend.platform_auth_client is not None:
+            raise HTTPException(503, "项目上传入口暂时不可用，请通过统一入口重试。", headers={"Retry-After": "3"})
+        account = current_account(request)
+        assert account is not None
+        return await process_local_project_files(collection_id, account.id, file_ids, files)
 
     @web_app.post("/api/projects/local/{collection_id}/complete")
     def complete_local_project_collection(

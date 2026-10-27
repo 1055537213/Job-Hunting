@@ -7,6 +7,7 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import jakarta.servlet.http.Cookie;
 import org.junit.jupiter.api.*;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.mock.web.MockMultipartFile;
 import tools.jackson.databind.ObjectMapper;
 import static org.mockito.Mockito.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
@@ -106,5 +107,21 @@ class ProjectControllerTest {
         when(python.execute(anyString(),anyString(),anyLong(),any(),anyString())).thenThrow(ProjectClient.unavailable());
         mvc.perform(post(path).cookie(session,csrf).header("X-CSRF-Token","csrf"))
             .andExpect(status().isServiceUnavailable()).andExpect(jsonPath("$.code").value("PROJECT_UNAVAILABLE"));
+    }
+
+    @Test void localMultipartUploadRequiresCsrfAndForwardsOnlyBatchMetadata(){
+        var file=new MockMultipartFile("files","README.md","text/markdown","prototype".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        try{
+            mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart("/api/projects/local/8/files")
+                .file(file).param("file_ids","[1]").cookie(session,csrf).header("X-CSRF-Token","csrf"))
+                .andExpect(status().isOk());
+            verify(python).executeMultipart(eq("real-session"),eq(42L),eq(8L),eq(java.util.List.of(1L)),anyList(),anyString());
+            mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart("/api/projects/local/8/files")
+                .file(file).param("file_ids","[1,1]").cookie(session,csrf).header("X-CSRF-Token","csrf"))
+                .andExpect(status().isUnprocessableContent());
+            mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart("/api/projects/local/8/files")
+                .file(file).param("file_ids","[1]").cookie(session))
+                .andExpect(status().isForbidden());
+        }catch(Exception error){throw new RuntimeException(error);}
     }
 }

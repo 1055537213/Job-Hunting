@@ -526,6 +526,39 @@ def test_local_completion_rejects_spoofed_locators(projects, data):
     assert submit(projects[1], "local-complete", **data).status_code == 422
 
 
+def test_local_upload_internal_callback_reuses_python_policy_and_redacts_metadata(projects):
+    app, browser, owners, candidates, _ = projects
+    data = manifest(browser, candidates[0]).json()
+    collection = data["collection"]["id"]
+    file_id = data["selected_files"][0]["id"]
+    response = browser.post(
+        f"/internal/v1/projects/local/{collection}/files",
+        headers={"X-Internal-Service-Token": "service-secret"},
+        data={"session_token": "session-1", "file_ids": json.dumps([file_id])},
+        files=[("files", ("README.md", b"prototype", "text/markdown"))],
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["account_id"] == owners[0]
+    assert body["processed_files"][0]["selection_status"] == "analyzed"
+    assert "long_text_id" not in body["processed_files"][0]
+    assert "metadata" not in body["processed_files"][0]
+    assert "storage_key" not in response.text
+    assert "SECRET" not in response.text
+
+
+def test_local_upload_internal_callback_rejects_wrong_token_and_batch_shape(projects):
+    app, browser, _, candidates, _ = projects
+    data = manifest(browser, candidates[0]).json()
+    path = f"/internal/v1/projects/local/{data['collection']['id']}/files"
+    file_id = data["selected_files"][0]["id"]
+    assert browser.post(path, data={"session_token": "session-1", "file_ids": json.dumps([file_id])},
+                        files=[("files", ("README.md", b"prototype", "text/markdown"))]).status_code == 401
+    assert browser.post(path, headers={"X-Internal-Service-Token": "service-secret"},
+                        data={"session_token": "session-1", "file_ids": json.dumps([file_id, file_id])},
+                        files=[("files", ("README.md", b"prototype", "text/markdown"))]).status_code == 400
+
+
 def test_local_completion_empty_evidence_rejected_before_writing(projects):
     app, browser, owners, candidates, _ = projects
     backend = app.state.backend
@@ -738,6 +771,10 @@ def test_local_contract_and_precise_gateway_methods():
         schema = contract["components"]["schemas"][name]
         assert set(schema["required"]) == set(schema["properties"]) == fields
         assert schema["additionalProperties"] is False
+    upload = contract["paths"]["/api/projects/local/{collection_id}/files"]["post"]
+    assert upload["requestBody"]["content"]["multipart/form-data"]["schema"]["required"] == ["file_ids", "files"]
+    result = contract["components"]["schemas"]["UploadResult"]
+    assert set(result["required"]) == set(result["properties"]) and result["additionalProperties"] is False
     for name in ("Caddyfile.hybrid", "Caddyfile.hybrid.local"):
         text = (root / "deploy" / name).read_text(encoding="utf-8")
         assert "method POST\n\t\t\tpath /api/projects/local/manifest" in text
@@ -745,6 +782,9 @@ def test_local_contract_and_precise_gateway_methods():
         assert "request_body @local_manifest" in text
         assert "method POST\n\t\t\tpath_regexp localComplete ^/api/projects/local/[0-9]+/complete$" in text
         assert "reverse_proxy @local_complete platform-service:8081" in text
+        assert "method POST\n\t\t\tpath_regexp localFiles ^/api/projects/local/[0-9]+/files$" in text
+        assert "request_body @local_files" in text and "max_size 167772160" in text
+        assert "reverse_proxy @local_files platform-service:8081" in text
         assert "/api/projects/local/*" not in text
     nginx = (root / "deploy/nginx/coexist-hybrid-ip-https.conf.template").read_text(encoding="utf-8")
     assert "location = /api/projects/local/manifest" in nginx and "client_max_body_size 4m;" in nginx
@@ -754,3 +794,5 @@ def test_local_contract_and_precise_gateway_methods():
     schema = contract["paths"]["/api/projects/local/{collection_id}/complete"]["post"]["responses"]["200"]["content"]["application/json"]["schema"]
     assert set(schema["required"]) == set(schema["properties"]) == {"project_card", "processing_async"}
     assert schema["additionalProperties"] is False and schema["properties"]["processing_async"]["const"] is False
+    upload = nginx.split("location ~ ^/api/projects/local/[0-9]+/files$ {", 1)[1].split("\n    }", 1)[0]
+    assert "client_max_body_size 160m;" in upload and "proxy_request_buffering off;" in upload

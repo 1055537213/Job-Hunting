@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Local Project Collection Management
   version: 1.1.0
-  description: Java public entry; Python owns manifest planning, collection facts, atomic completion and cancellable cleanup. Multipart files remain on Python. No new page or upload mode.
+  description: Java public entry; Python owns manifest planning, file scanning/parsing, collection facts, atomic completion and cancellable cleanup. Java relays one bounded multipart batch without automatic replay. No new page or upload mode.
 paths:
   /api/projects/local/manifest:
     post:
@@ -92,6 +92,36 @@ paths:
         '422': {description: INVALID_REQUEST}
         '429': {description: RATE_LIMITED}
         '503': {description: PROJECT_UNAVAILABLE; preserve browser recovery ID. No fake completion.}
+  /api/projects/local/{collection_id}/files:
+    parameters:
+      - {in: path, name: collection_id, required: true, schema: {type: integer, minimum: 1, maximum: 9223372036854775807}}
+    post:
+      description: Session and CSRF required. Java validates 1-5 unique positive file IDs, multipart cardinality, 50 MiB per part and 160 MiB per batch, then forwards the body once to Python. The body is never replayed after an uncertain connection. Python rechecks ownership, planned file IDs, exact byte length and SHA-256 before ClamAV, extraction, visual artifact persistence and incremental RAG/visual indexing. Parser and infected-file failures become per-file failed entries; scanner outage is 503. No object keys, extracted metadata or raw parser errors are returned.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [file_ids, files]
+              properties:
+                file_ids: {type: string, description: JSON array of unique file IDs in the same order as files.}
+                files: {type: array, minItems: 1, maxItems: 5, items: {type: string, format: binary}}
+      responses:
+        '200':
+          description: No-store, safe processed/failed file summaries and bounded background task receipts.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UploadResult'}
+        '400': {description: PROJECT_UPLOAD_INVALID}
+        '401': {description: SESSION_EXPIRED}
+        '403': {description: CSRF_REJECTED or PROJECT_SCOPE_DENIED}
+        '404': {description: PROJECT_NOT_FOUND}
+        '409': {description: PROJECT_BUSY}
+        '413': {description: PROJECT_UPLOAD_TOO_LARGE}
+        '422': {description: INVALID_REQUEST}
+        '503': {description: PROJECT_UNAVAILABLE; retry the same batch only after checking collection progress.}
 components:
   schemas:
     ManifestFile:
@@ -104,6 +134,56 @@ components:
         sha256: {type: [string, 'null'], pattern: '^[a-fA-F0-9]{64}$'}
         media_type: {type: string, maxLength: 128, default: application/octet-stream}
         last_modified: {type: [integer, 'null'], minimum: 0, maximum: 9007199254740991}
+    UploadFile:
+      type: object
+      additionalProperties: false
+      required: [id, collection_id, relative_path, file_size, selection_status, selection_reason, extraction_method, text_length, created_at, updated_at]
+      properties:
+        id: {type: integer, minimum: 1}
+        collection_id: {type: integer, minimum: 1}
+        relative_path: {type: string, minLength: 1, maxLength: 2048}
+        file_size: {type: integer, minimum: 0}
+        selection_status: {type: string, enum: [analyzed]}
+        selection_reason: {type: string, maxLength: 256}
+        extraction_method: {type: [string, 'null'], maxLength: 128}
+        text_length: {type: integer, minimum: 0}
+        created_at: {type: string}
+        updated_at: {type: string}
+    UploadFailure:
+      type: object
+      additionalProperties: false
+      required: [id, selection_reason]
+      properties:
+        id: {type: [integer, string]}
+        selection_reason: {type: string, const: file_processing_failed}
+    UploadResult:
+      type: object
+      additionalProperties: false
+      required: [processed_files, failed_files, rag_task, visual_task, visual_index, visual_warning]
+      properties:
+        processed_files: {type: array, items: {$ref: '#/components/schemas/UploadFile'}}
+        failed_files: {type: array, items: {$ref: '#/components/schemas/UploadFailure'}}
+        rag_task: {oneOf: [{$ref: '#/components/schemas/UploadTask'}, {type: 'null'}]}
+        visual_task: {oneOf: [{$ref: '#/components/schemas/UploadTask'}, {type: 'null'}]}
+        visual_index: {oneOf: [{type: object, additionalProperties: false, required: [indexed], properties: {indexed: {const: true}}}, {type: 'null'}]}
+        visual_warning: {type: [string, 'null'], maxLength: 512}
+    UploadTask:
+      type: object
+      additionalProperties: false
+      required: [task_key, task_type, status, progress, attempt, max_attempts, result, error_summary, created_at, started_at, finished_at, updated_at]
+      properties:
+        task_key: {type: string, pattern: '^[A-Za-z0-9_-]{1,64}$'}
+        task_type: {enum: [rag_index, visual_index]}
+        status: {enum: [queued, running, succeeded, failed, cancelled]}
+        progress: {type: integer, minimum: 0, maximum: 100}
+        attempt: {type: integer, minimum: 0}
+        max_attempts: {type: integer, minimum: 1}
+        result: {oneOf: [{type: 'null'}, {type: object, additionalProperties: false, maxProperties: 0}]}
+        error_summary: {type: [string, 'null']}
+        created_at: {type: string}
+        started_at: {type: [string, 'null']}
+        finished_at: {type: [string, 'null']}
+        updated_at: {type: string}
     Collection:
       type: object
       additionalProperties: false

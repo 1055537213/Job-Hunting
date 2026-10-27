@@ -3,11 +3,13 @@ package com.jobhunting.platform.projects;
 import com.sun.net.httpserver.HttpServer;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import com.jobhunting.platform.auth.AuthException;
 import org.junit.jupiter.api.*;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
+import org.springframework.mock.web.MockMultipartFile;
 import static org.assertj.core.api.Assertions.*;
 
 class ProjectClientTest {
@@ -17,10 +19,13 @@ class ProjectClientTest {
     String body="{\"account_id\":42,\"project_cards\":[]}";int status=200;String mime="application/json";
     @BeforeEach void setup()throws Exception{
         server=HttpServer.create(new InetSocketAddress("127.0.0.1",0),0);
-        server.createContext("/internal/v1/projects/",exchange->{
-            calls.incrementAndGet();var data=mapper.readTree(exchange.getRequestBody().readAllBytes());
-            assertThat(data.get("session_token").asText()).isEqualTo("real-session");
-            assertThat(data.has("account_id")).isFalse();
+            server.createContext("/internal/v1/projects/",exchange->{
+            calls.incrementAndGet();byte[] request=exchange.getRequestBody().readAllBytes();
+            boolean multipart=exchange.getRequestHeaders().getFirst("Content-Type").startsWith("multipart/");
+            var data=multipart?null:mapper.readTree(request);
+            if(!multipart) assertThat(data.get("session_token").asText()).isEqualTo("real-session");
+            if(!multipart) assertThat(data.has("account_id")).isFalse();
+            if(multipart){String payload=new String(request,StandardCharsets.UTF_8);assertThat(payload).contains("session_token","file_ids","prototype");}
             assertThat(exchange.getRequestHeaders().getFirst("X-Internal-Service-Token")).isEqualTo("secret");
             byte[] bytes=body.getBytes(StandardCharsets.UTF_8);exchange.getResponseHeaders().set("Content-Type",mime);
             exchange.sendResponseHeaders(status,bytes.length);exchange.getResponseBody().write(bytes);exchange.close();
@@ -127,5 +132,18 @@ class ProjectClientTest {
         assertThatThrownBy(()->client.execute("local-complete","real-session",42,input,"trace")).isInstanceOf(AuthException.class)
             .hasMessageNotContaining("SECRET");
         assertThat(calls.get()).isEqualTo(before+1);
+    }
+
+    @Test void multipartUploadUsesSingleNonReplayableBodyAndStripsPrivateEnvelope(){
+        body="{\"account_id\":42,\"processed_files\":[{\"id\":1,\"collection_id\":8,\"relative_path\":\"README.md\",\"file_size\":9,\"selection_status\":\"analyzed\",\"selection_reason\":\"supported_and_within_policy\",\"extraction_method\":\"text\",\"text_length\":9,\"created_at\":\"now\",\"updated_at\":\"now\"}],\"failed_files\":[],\"rag_task\":null,\"visual_task\":null,\"visual_index\":null,\"visual_warning\":null}";
+        var file=new MockMultipartFile("files","README.md","text/markdown","prototype".getBytes(StandardCharsets.UTF_8));
+        var result=client.executeMultipart("real-session",42,8,List.of(1L),List.of(file),"trace");
+        assertThat(result.has("account_id")).isFalse();assertThat(result.path("processed_files").size()).isEqualTo(1);
+        assertThat(calls.get()).isEqualTo(1);
+        status=413;body="{\"code\":\"PROJECT_UPLOAD_TOO_LARGE\",\"detail\":\"private detail\"}";
+        assertThatThrownBy(()->client.executeMultipart("real-session",42,8,List.of(1L),List.of(file),"trace"))
+            .isInstanceOf(AuthException.class).hasMessageNotContaining("private");
+        assertThatThrownBy(()->client.executeMultipart("real-session",42,8,List.of(1L,1L),List.of(file),"trace"))
+            .isInstanceOf(AuthException.class);
     }
 }

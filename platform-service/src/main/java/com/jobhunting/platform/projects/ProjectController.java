@@ -1,5 +1,8 @@
 package com.jobhunting.platform.projects;
 
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import com.jobhunting.platform.auth.AccountAdministrationService;
 import com.jobhunting.platform.billing.InternalTokenVerifier;
@@ -8,6 +11,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
@@ -65,6 +69,12 @@ public class ProjectController {
         if(body!=null&&(!body.isObject()||!body.isEmpty()))throw ProjectClient.invalid();
         return submit("local-complete",session,mapper.createObjectNode().put("collection_id",id),request,response);
     }
+    @PostMapping(value="/api/projects/local/{collectionId}/files", consumes="multipart/form-data")
+    public JsonNode files(@CookieValue(name="job_agent_session",required=false) String session,
+            @PathVariable("collectionId") long id,@RequestParam("file_ids") String rawIds,
+            @RequestPart("files") List<MultipartFile> files,HttpServletRequest request,HttpServletResponse response){
+        return submitFiles(session,id,rawIds,files,request,response);
+    }
     @PostMapping("/internal/v1/projects/{operation}")
     public JsonNode internal(@PathVariable("operation") String operation, @RequestBody JsonNode body,
             @RequestHeader(name="X-Internal-Service-Token",required=false) String token,
@@ -73,6 +83,30 @@ public class ProjectController {
         if (!body.isObject() || !body.path("session_token").isTextual()) throw ProjectClient.invalid();
         var data=(ObjectNode)body.deepCopy(); String session=data.remove("session_token").asText();
         return submit(operation,session,data,request,response);
+    }
+
+    @PostMapping(value="/internal/v1/projects/local/{collectionId}/files", consumes="multipart/form-data")
+    public JsonNode internalFiles(@PathVariable("collectionId") long id,@RequestParam("session_token") String session,
+            @RequestParam("file_ids") String rawIds,@RequestPart("files") List<MultipartFile> files,
+            @RequestHeader(name="X-Internal-Service-Token",required=false) String token,
+            HttpServletRequest request,HttpServletResponse response){
+        tokens.verify(token);
+        return submitFiles(session,id,rawIds,files,request,response);
+    }
+
+    private JsonNode submitFiles(String session,long collectionId,String rawIds,List<MultipartFile> files,
+            HttpServletRequest request,HttpServletResponse response){
+        response.setHeader("Cache-Control","no-store");
+        if(session==null||session.isBlank()||session.length()>128||collectionId<=0||files==null||files.isEmpty()||files.size()>5)throw ProjectClient.invalid();
+        try{
+            var parsed=mapper.readTree(rawIds);
+            if(!parsed.isArray()||parsed.size()!=files.size())throw ProjectClient.invalid();
+            var ids=new ArrayList<Long>();var seen=new HashSet<Long>();
+            for(var node:parsed){if(!node.isIntegralNumber()||!node.canConvertToLong()||node.asLong()<=0||!seen.add(node.asLong()))throw ProjectClient.invalid();ids.add(node.asLong());}
+            long owner=accounts.current(session).account().account_id();
+            return python.executeMultipart(session,owner,collectionId,ids,files,
+                WebSecurityFilter.requestId(request.getHeader("X-Request-ID"),request.getHeader("X-Trace-Id")));
+        }catch(tools.jackson.core.JacksonException error){throw ProjectClient.invalid();}
     }
     private JsonNode submit(String operation,String session,JsonNode input,HttpServletRequest request,HttpServletResponse response) {
         response.setHeader("Cache-Control","no-store");

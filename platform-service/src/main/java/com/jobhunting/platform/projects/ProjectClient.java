@@ -1,10 +1,15 @@
 package com.jobhunting.platform.projects;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.net.URI;
 import java.net.ProxySelector;
 import java.net.http.*;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
@@ -15,6 +20,9 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
+import org.springframework.web.multipart.MultipartFile;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import tools.jackson.core.StreamReadFeature;
 import tools.jackson.databind.*;
 import tools.jackson.databind.node.ObjectNode;
@@ -22,7 +30,10 @@ import tools.jackson.databind.node.ObjectNode;
 @Component
 @ConditionalOnProperty(name="platform.auth.enabled",havingValue="true")
 public class ProjectClient {
+    private static final Logger LOG=LoggerFactory.getLogger(ProjectClient.class);
     static final int MAX_BYTES=4*1024*1024;
+    static final long MAX_UPLOAD_FILE_BYTES=50L*1024*1024;
+    static final long MAX_UPLOAD_BATCH_BYTES=160L*1024*1024;
     private final URI base;
     private final String token;
     private final ObjectMapper mapper;
@@ -93,7 +104,99 @@ public class ProjectClient {
         catch(Exception error){throw unavailable();}
         finally{if(pending!=null&&!pending.isDone())pending.cancel(true);slots.release();if(local)collectionSlots.release();}
     }
+
+    public JsonNode executeMultipart(String session,long owner,long collectionId,List<Long> fileIds,
+            List<MultipartFile> files,String requestId) {
+        if (token.isBlank() || fileIds==null || files==null || fileIds.size()<1 || fileIds.size()>5 || fileIds.size()!=files.size()) throw invalid();
+        long total=0;
+        for (int i=0;i<fileIds.size();i++) {
+            if (!id(mapper.valueToTree(fileIds.get(i)))) throw invalid();
+            long size=files.get(i).getSize();
+            if (size<0 || size>MAX_UPLOAD_FILE_BYTES) throw new AuthException("PROJECT_UPLOAD_TOO_LARGE","项目文件批次超过上传限制。",HttpStatus.PAYLOAD_TOO_LARGE);
+            total=Math.addExact(total,size);
+        }
+        if (total>MAX_UPLOAD_BATCH_BYTES) throw new AuthException("PROJECT_UPLOAD_TOO_LARGE","项目文件批次超过上传限制。",HttpStatus.PAYLOAD_TOO_LARGE);
+        if(!collectionSlots.tryAcquire())throw unavailable();
+        if(!slots.tryAcquire()){collectionSlots.release();throw unavailable();}
+        CompletableFuture<HttpResponse<byte[]>> pending=null;
+        try {
+            String boundary="jobagent-"+UUID.randomUUID().toString().replace("-","");
+            String ids=mapper.writeValueAsString(fileIds);
+            var body=MultipartBody.publisher(boundary,session,ids,fileIds,files);
+            var request=TraceHeaders.apply(HttpRequest.newBuilder(base.resolve("local/"+collectionId+"/files")),requestId)
+                .timeout(Duration.ofSeconds(300)).header("Content-Type","multipart/form-data; boundary="+boundary)
+                .header("Accept","application/json").header("X-Internal-Service-Token",token).POST(body).build();
+            pending=http.sendAsync(request,ignored->new BoundedBody(4*1024*1024));
+            var response=pending.get(300,TimeUnit.SECONDS);
+            if(!response.headers().firstValue("Content-Type").orElse("").split(";",2)[0].strip().equalsIgnoreCase("application/json"))throw unavailable();
+            var value=mapper.readTree(response.body());
+            if(response.statusCode()!=200){
+                if(!fields(value,Set.of("code","detail"))||!value.path("code").isTextual()||!value.path("detail").isTextual())throw unavailable();
+                throw safeError(response.statusCode(),value.get("code").asText());
+            }
+            if(value==null||!value.isObject()||!id(value.get("account_id"))||value.get("account_id").asLong()!=owner)throw unavailable();
+            var result=(ObjectNode)value.deepCopy();result.remove("account_id");
+            validateUploadProjection(result);
+            return result;
+        }catch(AuthException error){LOG.warn("Project multipart callback rejected code={}",error.code());throw error;}
+        catch(InterruptedException error){Thread.currentThread().interrupt();throw unavailable();}
+        catch(Exception error){LOG.warn("Project multipart callback failed type={}",error.getClass().getSimpleName());throw unavailable();}
+        finally{if(pending!=null&&!pending.isDone())pending.cancel(true);slots.release();collectionSlots.release();}
+    }
+
+    private static void validateUploadProjection(JsonNode value){
+        require(fields(value,Set.of("processed_files","failed_files","rag_task","visual_task","visual_index","visual_warning")));
+        require(value.get("processed_files").isArray()&&value.get("failed_files").isArray());
+        for(var file:value.get("processed_files")){
+            require(fields(file,Set.of("id","collection_id","relative_path","file_size","selection_status","selection_reason","extraction_method","text_length","created_at","updated_at"))
+                &&id(file.get("id"))&&id(file.get("collection_id"))&&file.get("relative_path").isTextual()
+                &&file.get("file_size").isIntegralNumber()&&file.get("file_size").asLong()>=0&&file.get("text_length").isIntegralNumber()
+                &&file.get("text_length").asLong()>=0&&file.get("selection_status").isTextual()&&file.get("selection_reason").isTextual()
+                &&(file.get("extraction_method").isNull()||file.get("extraction_method").isTextual())&&file.get("created_at").isTextual()&&file.get("updated_at").isTextual());
+        }
+        for(var failed:value.get("failed_files"))require(fields(failed,Set.of("id","selection_reason"))&&(failed.get("id").isIntegralNumber()||failed.get("id").isTextual())&&failed.get("selection_reason").isTextual());
+        for(var key:Set.of("rag_task","visual_task")){
+            var task=value.get(key);
+            if(task.isNull())continue;
+            require(fields(task,Set.of("task_key","task_type","status","progress","attempt","max_attempts","result","error_summary","created_at","started_at","finished_at","updated_at"))
+                &&task.get("task_key").isTextual()&&task.get("task_key").asText().matches("[A-Za-z0-9_-]{1,64}")
+                &&task.get("task_type").isTextual()&&Set.of("rag_index","visual_index").contains(task.get("task_type").asText())
+                &&task.get("status").isTextual()&&Set.of("queued","running","succeeded","failed","cancelled").contains(task.get("status").asText())
+                &&task.get("progress").isIntegralNumber()&&task.get("progress").asInt()>=0&&task.get("progress").asInt()<=100
+                &&task.get("attempt").isIntegralNumber()&&task.get("attempt").asLong()>=0&&id(task.get("max_attempts"))
+                &&(task.get("result").isNull()||(task.get("result").isObject()&&task.get("result").size()==0))
+                &&task.get("created_at").isTextual()&&task.get("updated_at").isTextual());
+        }
+        var visual=value.get("visual_index");
+        require(visual.isNull()||(fields(visual,Set.of("indexed"))&&visual.get("indexed").isBoolean()));
+        require(value.get("visual_warning").isNull()||value.get("visual_warning").isTextual()&&value.get("visual_warning").asText().length()<=512);
+    }
+
+    private static final class MultipartBody {
+        private record Part(byte[] prefix, MultipartFile file, byte[] suffix){}
+        static HttpRequest.BodyPublisher publisher(String boundary,String session,String fileIds,List<Long> ids,List<MultipartFile> files){
+            byte[] field=("--"+boundary+"\r\nContent-Disposition: form-data; name=\"session_token\"\r\n\r\n"+session+"\r\n"
+                +"--"+boundary+"\r\nContent-Disposition: form-data; name=\"file_ids\"\r\nContent-Type: application/json\r\n\r\n"+fileIds+"\r\n").getBytes(StandardCharsets.UTF_8);
+            List<Part> parts=new ArrayList<>();long length=field.length;
+            for(int i=0;i<files.size();i++){
+                String header="--"+boundary+"\r\nContent-Disposition: form-data; name=\"files\"; filename=\"file-"+ids.get(i)+"\"\r\nContent-Type: application/octet-stream\r\n\r\n";
+                byte[] prefix=header.getBytes(StandardCharsets.UTF_8),suffix="\r\n".getBytes(StandardCharsets.UTF_8);parts.add(new Part(prefix,files.get(i),suffix));length+=prefix.length+files.get(i).getSize()+suffix.length;
+            }
+            byte[] end=("--"+boundary+"--\r\n").getBytes(StandardCharsets.UTF_8);length+=end.length;
+            final long totalLength=length;
+            return new HttpRequest.BodyPublisher(){
+                public long contentLength(){return totalLength;}
+                public void subscribe(Flow.Subscriber<? super ByteBuffer> subscriber){
+                    List<InputStream> streams=new ArrayList<>();streams.add(new java.io.ByteArrayInputStream(field));
+                    try{for(var part:parts){streams.add(new java.io.ByteArrayInputStream(part.prefix()));streams.add(part.file().getInputStream());streams.add(new java.io.ByteArrayInputStream(part.suffix()));}streams.add(new java.io.ByteArrayInputStream(end));
+                        HttpRequest.BodyPublishers.ofInputStream(()->new java.io.SequenceInputStream(Collections.enumeration(streams))).subscribe(subscriber);
+                    }catch(IOException error){subscriber.onSubscribe(new Flow.Subscription(){public void request(long n){}public void cancel(){}});subscriber.onError(new UncheckedIOException(error));}
+                }
+            };
+        }
+    }
     static boolean id(JsonNode n){return n!=null&&n.isIntegralNumber()&&n.canConvertToLong()&&n.asLong()>0;}
+    private static void require(boolean condition){if(!condition)throw unavailable();}
     static boolean fields(JsonNode n,Set<String> keys){return n!=null&&n.isObject()&&n.propertyNames().equals(keys);}
     static AuthException unavailable(){return new AuthException("PROJECT_UNAVAILABLE","项目操作结果暂未确认，请刷新项目列表核实后重试。",HttpStatus.SERVICE_UNAVAILABLE);}
     static AuthException invalid(){return new AuthException("INVALID_REQUEST","请求参数无效。",HttpStatus.UNPROCESSABLE_CONTENT);}
@@ -108,6 +211,8 @@ public class ProjectClient {
             case "400:PROJECT_MANIFEST_INVALID"->"项目清单无效或没有可安全分析的文件，请重新选择目录。";
             case "409:PROJECT_COLLECTION_CONFLICT"->"采集已完成或状态已变化，请刷新后核实；已生成的项目请通过项目列表删除。";
             case "409:PROJECT_COLLECTION_INCOMPLETE"->"项目文件尚未全部处理，或没有成功提取的内容，请检查采集进度后重试。";
+            case "400:PROJECT_UPLOAD_INVALID"->"项目文件批次无效，请刷新采集进度后重试。";
+            case "413:PROJECT_UPLOAD_TOO_LARGE"->"项目文件批次超过上传限制。";
             case "409:PROJECT_BUSY"->"当前仍有请求或任务执行，请稍后重试。";
             case "409:PROJECT_CONFLICT"->"已确认内容与本次请求不一致，请刷新项目列表核实。";
             case "413:PROJECT_TOO_LARGE"->"项目数据超出同步查询限制。";

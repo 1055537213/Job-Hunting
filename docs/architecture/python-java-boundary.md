@@ -110,9 +110,10 @@ Java 与 Python 统一使用 W3C `traceparent` 传播上下文，同时保留现
 
 ### 本地清单与采集会话管理
 
-`POST /api/projects/local/manifest`、`GET/DELETE /api/projects/local/{collection_id}` 及
-`POST /api/projects/local/{collection_id}/complete` 精确分流至 Java；
-`/{collection_id}/files` 仍在 Python，文件内容不经 Java，也不新增工作台入口。
+`POST /api/projects/local/manifest`、`GET/DELETE /api/projects/local/{collection_id}`、
+`POST /api/projects/local/{collection_id}/files` 及 `POST /api/projects/local/{collection_id}/complete`
+精确分流至 Java。Java 接收 multipart 后只做批次结构、唯一 ID、单文件 50 MiB、批次 160 MiB 校验，
+以不可重放的单次流转发至 Python；Python 内部回调重新核实 Session 和账号在途锁。
 Java 负责 Session、CSRF、共享限流、元数据类型/字段校验和有界回包；私有 `local-manifest/local-get/local-cancel`
 回调重新核实真实会话。Python 继续独占清单筛选、安全策略、文件提取及采集事实写入。
 
@@ -130,6 +131,11 @@ Java 负责 Session、CSRF、共享限流、元数据类型/字段校验和有�
 存储故障或 Worker 重启不丢附件。账号注销也收集该清单；重复取消读取原归属回执，GET 旧会话及迟到上传均返回 404。
 `cleanup_status=pending` 仅表示数据库已删、附件仍在后台清理，不虚报物理删除成功。
 新导入使用新会话 ID；已完成的项目仍通过项目删除入口清理。
+
+上传入口不把原始文件写入 Java 数据库或对象存储。Python 在账号在途保护内重新读取采集计划，
+逐文件检查归属、顺序、精确字节数和 SHA-256，然后执行 ClamAV、类型解析、OCR/多模态视觉副本保存，
+并按原有规则投递文本/视觉 RAG 任务。解析或感染失败只标记单文件失败，不泄露对象键、提取元数据或原始错误；
+扫描器不可用时整个批次返回 503，浏览器保留采集 ID。Java 回包只允许安全文件摘要和受限任务回执，禁止内部长文本 ID、存储键和私有 metadata。
 
 完成入口仍为同步、无模型调用的证据聚合，不是新建一套任务。Python 在独占账号在途保护和有效账号行锁内，
 先验证选中文件均已处理且存在可用证据，再把卡片保存/内容去重、采集卡片关联和 ready 状态在同一事务提交。

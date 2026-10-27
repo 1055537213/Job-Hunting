@@ -75,6 +75,18 @@
 			path_regexp localCollection ^/api/projects/local/[0-9]+$
 		}
 		reverse_proxy @local_collection platform-service:8081
+		@local_files {
+			method POST
+			path_regexp localFiles ^/api/projects/local/[0-9]+/files$
+		}
+		request_body @local_files {
+			max_size 167772160
+		}
+		reverse_proxy @local_files platform-service:8081 {
+			transport http {
+				response_header_timeout 300s
+			}
+		}
 		@local_complete {
 			method POST
 			path_regexp localComplete ^/api/projects/local/[0-9]+/complete$
