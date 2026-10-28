@@ -104,6 +104,15 @@ Java 与 Python 统一使用 W3C `traceparent` 传播上下文，同时保留现
 工作流执行；生产只填环境配置，不需要修改代码/Compose。此分支不自动部署服务器。
 
 后续继续迁移本地项目分批文件上传、职位和简历等外部入口；不搬运 Python AI 算法。所有 GitHub 推送必须确认对应提交的快速 CI 通过；
+
+### 简历上传入口
+
+`POST /api/resumes/upload` 已由本地/生产 Caddy 和共存 Nginx 精确分流至 Java。Java 校验真实 Session、CSRF、候选人参数、单文件非空和 20 MiB 上限，
+通过不可重放的单文件 multipart 回调转发到 Python；Java 不写简历原件、正文或对象存储。Python 私有回调再次用真实 Session 校验账号和候选人归属，
+继续独占 ClamAV、安全扫描、DOCX/PDF 解析、扫描版 PDF OCR、对象存储、长文本登记、RAG 增量索引和后台任务投递。
+
+Java 只允许返回已存在的简历安全投影和受限任务回执：不返回 storage key、提取正文、任务 payload、RAG 存储目录或扫描引擎内部原因。
+超时不自动重放；503 时浏览器应刷新简历列表确认结果，再决定是否重试。契约见 `platform-service/src/main/resources/resumes-upload.openapi.yaml`。
 发布里程碑则必须确认完整 CI 和双镜像发布均成功。
 
 ## 项目公开入口
@@ -144,6 +153,14 @@ Java 负责 Session、CSRF、共享限流、元数据类型/字段校验和有�
 允许已失败文件作为待补充材料，但其内部解析错误不会进入公开卡片。完成不修改档案技能，也不重复触发早先的 RAG 任务。
 回调重新核实 Session，Java 校验并移除 `account_id` 与 `completion_collection_id`，沿用 10 秒超时、
 最多两个本地回调和 4 MiB 卡片回包限制，不扩大清单查询之外的响应上限。
+
+### 职位截图上传入口
+
+`POST /api/jobs/screenshots` 已由本地/生产 Caddy 和共存 Nginx 精确分流至 Java。Java 校验真实 Session、CSRF、1-4 张图片、
+单张 8 MiB、总计 20 MiB 和可选来源地址，然后通过不可重放的 multipart 回调转发到 Python；Java 不保存图片原件。
+Python 私有回调再次校验真实 Session 和账号，继续负责 PNG/JPEG/WebP 类型与像素校验、ClamAV、并发租约、多模态职位识别、
+结构化职位保存和重复判断。识别结果返回既有职位公开字段和截图数量，不返回图片字节、内部账号字段或模型原始错误。
+契约见 `platform-service/src/main/resources/job-screenshots-upload.openapi.yaml`。
 
 浏览器遇到临时 503/429 保留本地恢复 ID。预扫描、上传、完成与项目列表刷新绑定发起时的账号/档案，
 切换档案后的迟到响应不覆盖新档案进度；完成已确认时仅清除原采集的恢复 ID，不影响另一档案或新采集。

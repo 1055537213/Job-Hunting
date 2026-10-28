@@ -62,6 +62,30 @@
 			path /api/projects/github
 		}
 		reverse_proxy @project_github platform-service:8081
+		@resume_upload {
+			method POST
+			path /api/resumes/upload
+		}
+		request_body @resume_upload {
+			max_size 20MB
+		}
+		reverse_proxy @resume_upload platform-service:8081 {
+			transport http {
+				response_header_timeout 300s
+			}
+		}
+		@job_screenshot_upload {
+			method POST
+			path /api/jobs/screenshots
+		}
+		request_body @job_screenshot_upload {
+			max_size 20MB
+		}
+		reverse_proxy @job_screenshot_upload platform-service:8081 {
+			transport http {
+				response_header_timeout 300s
+			}
+		}
 		@local_manifest {
 			method POST
 			path /api/projects/local/manifest

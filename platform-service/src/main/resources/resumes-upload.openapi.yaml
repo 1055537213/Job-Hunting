@@ -1,0 +1,47 @@
+openapi: 3.1.0
+info:
+  title: Resume Upload Entry
+  version: 1.0.0
+  description: Java owns the public multipart boundary; Python owns ClamAV, DOCX/PDF extraction, OCR, object storage and RAG/task processing.
+paths:
+  /api/resumes/upload:
+    post:
+      description: Requires Session and CSRF. Java accepts one non-empty DOCX/PDF file up to 20 MiB, validates the candidate identifier and forwards the body once to Python. Python revalidates the real Session and candidate ownership before scanning and persistence. The callback is never replayed after an uncertain connection.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [candidate_id, file]
+              properties:
+                candidate_id: {type: integer, minimum: 1, maximum: 9223372036854775807}
+                file: {type: string, format: binary, description: DOCX or PDF, maximum 20 MiB}
+      responses:
+        '200':
+          description: Safe artifact metadata and an optional bounded task receipt. No storage key, extracted text, payload or scanner internals.
+        '400': {description: RESUME_INVALID}
+        '401': {description: SESSION_EXPIRED}
+        '403': {description: CSRF_REJECTED or RESUME_SCOPE_DENIED}
+        '404': {description: PROFILE_NOT_FOUND}
+        '409': {description: DUPLICATE_RESUME or RESUME_BUSY}
+        '413': {description: RESUME_UPLOAD_TOO_LARGE}
+        '422': {description: FILE_INFECTED or INVALID_REQUEST}
+        '429': {description: RATE_LIMITED}
+        '503': {description: FILE_SCANNER_UNAVAILABLE or RESUME_UNAVAILABLE; retry only after checking the resume list.}
+  /internal/v1/resumes/upload:
+    post:
+      description: Private Java-to-Python callback. Requires X-Internal-Service-Token, a real session_token and the same candidate_id/file. It is not exposed by Caddy or Nginx.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [session_token, candidate_id, file]
+              properties:
+                session_token: {type: string, minLength: 1, maxLength: 128}
+                candidate_id: {type: integer, minimum: 1}
+                file: {type: string, format: binary}

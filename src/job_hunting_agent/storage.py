@@ -7209,12 +7209,20 @@ class RepositoryStore:
             captured_at=row.get("captured_at"),
             title=row["title"],
             city=row["city"],
-            salary_min_k=row["salary_min_k"],
-            salary_max_k=row["salary_max_k"],
-            salary_months=row["salary_months"],
+            salary_min_k=int(row["salary_min_k"]) if row["salary_min_k"] is not None else None,
+            salary_max_k=int(row["salary_max_k"]) if row["salary_max_k"] is not None else None,
+            salary_months=int(row["salary_months"]) if row["salary_months"] is not None else None,
             salary_unit=row["salary_unit"],
-            experience_min_years=row["experience_min_years"],
-            experience_max_years=row["experience_max_years"],
+            experience_min_years=(
+                float(row["experience_min_years"])
+                if row["experience_min_years"] is not None
+                else None
+            ),
+            experience_max_years=(
+                float(row["experience_max_years"])
+                if row["experience_max_years"] is not None
+                else None
+            ),
             experience_label=row["experience_label"],
             education=row["education"],
             company_name=row["company_name"],

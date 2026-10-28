@@ -71,6 +71,10 @@ platform:
     python-base-url: ${PLATFORM_TASKS_PYTHON_BASE_URL:http://web:8000}
     connect-timeout-ms: ${PLATFORM_TASKS_CONNECT_TIMEOUT_MS:1000}
     read-timeout-ms: ${PLATFORM_TASKS_READ_TIMEOUT_MS:5000}
+  resumes:
+    python-base-url: ${PLATFORM_RESUMES_PYTHON_BASE_URL:http://web:8000}
+  jobs:
+    python-base-url: ${PLATFORM_JOBS_PYTHON_BASE_URL:http://web:8000}
   web-security:
     enabled: ${PLATFORM_WEB_SECURITY_ENABLED:false}
     environment: ${JOB_AGENT_ENVIRONMENT:development}

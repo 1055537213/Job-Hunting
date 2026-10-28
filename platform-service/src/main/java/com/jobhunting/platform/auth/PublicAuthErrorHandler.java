@@ -19,6 +19,8 @@ import com.jobhunting.platform.chat.ChatSessionController;
 import com.jobhunting.platform.chat.ChatMessageController;
 import com.jobhunting.platform.chat.ChatStreamController;
 import com.jobhunting.platform.projects.ProjectController;
+import com.jobhunting.platform.resumes.ResumeController;
+import com.jobhunting.platform.jobs.JobController;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
@@ -38,7 +40,8 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
         AdminUsageController.class, AdminToolTraceController.class, TaskReadController.class, TaskCommandController.class,
         AdminObservabilityController.class, PublicAccountProfileController.class, PublicAccountExportController.class,
         InternalAccountExportController.class, AccountDeletionController.class, ProfileReadController.class, ProfileCreateController.class, ProfileDeleteController.class,
-        PaymentWebhookController.class, ChatSessionController.class, ChatMessageController.class, ChatStreamController.class, ProjectController.class})
+        PaymentWebhookController.class, ChatSessionController.class, ChatMessageController.class, ChatStreamController.class,
+        ProjectController.class, ResumeController.class, JobController.class})
 public class PublicAuthErrorHandler {
     @ExceptionHandler(AuthException.class)
     public ResponseEntity<Map<String, Object>> auth(AuthException error, HttpServletRequest request) {
@@ -48,7 +51,9 @@ public class PublicAuthErrorHandler {
                 || "PROFILE_QUERY_UNAVAILABLE".equals(error.code()) || "PROFILE_CREATE_UNAVAILABLE".equals(error.code())
                 || "PROFILE_DELETE_UNAVAILABLE".equals(error.code()) || "PROFILE_DELETE_BUSY".equals(error.code())
                 || "CHAT_UNAVAILABLE".equals(error.code()) || "CHAT_BUSY".equals(error.code())
-                || "PROJECT_UNAVAILABLE".equals(error.code()) || "PROJECT_BUSY".equals(error.code())) response.header("Retry-After", "3");
+                || "PROJECT_UNAVAILABLE".equals(error.code()) || "PROJECT_BUSY".equals(error.code())
+                || "RESUME_UNAVAILABLE".equals(error.code()) || "RESUME_BUSY".equals(error.code())
+                || "JOB_SCREENSHOT_UNAVAILABLE".equals(error.code()) || "JOB_BUSY".equals(error.code())) response.header("Retry-After", "3");
         return response.body(Map.of("code", error.code(), "detail", error.getMessage(),
                 "message", error.getMessage(), "request_id", id, "trace_id", id));
     }

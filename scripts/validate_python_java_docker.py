@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -1195,6 +1196,115 @@ a.store.close()
     print("==> Java local manifest/query/cancel/complete -> Python-owned upload/real Worker RAG -> fingerprint resume/scope/CSRF/redaction -> atomic cancellation + all-version cleanup/failure/restart -> idempotent atomic completion/late upload 404/ready protection/outages/revocation: PASS")
 
 
+def run_resume_upload_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
+                                  web: str, database_url: str) -> None:
+    """Exercise the Java multipart boundary and Python-owned resume pipeline."""
+    from io import BytesIO
+    from docx import Document
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
+    email = f"resume-{os.urandom(10).hex()}@example.com"
+    password = "resume-upload-password"
+    auth.register_account(email=email, password=password, display_name="Resume upload",
+                          email_verified=True, consents=[])
+    document = Document()
+    document.add_paragraph("Python and Java backend project experience.")
+    content = BytesIO()
+    document.save(content)
+    resume = content.getvalue()
+
+    with httpx.Client(base_url=gateway_url, timeout=30) as browser:
+        login = browser.post("/api/auth/login", json={"email": email, "password": password})
+        assert login.status_code == 200, login.text[:300]
+        browser.headers["X-CSRF-Token"] = login.json()["csrf_token"]
+        candidate = browser.post("/api/profiles", json={"name": "Resume upload acceptance"}).json()["candidate_id"]
+        path = "/api/resumes/upload"
+        multipart = {"file": ("resume.docx", resume,
+                               "application/vnd.openxmlformats-officedocument.wordprocessingml.document")}
+        assert httpx.post(gateway_url + path, files=multipart, data={"candidate_id": candidate}).status_code == 401
+        assert httpx.post(gateway_url + path, cookies=browser.cookies, files=multipart,
+                          data={"candidate_id": candidate}).status_code == 403
+        uploaded = browser.post(path, data={"candidate_id": str(candidate)}, files=multipart)
+        assert uploaded.status_code == 200, uploaded.text[:500]
+        artifact = uploaded.json()["artifact"]
+        assert artifact["candidate_id"] == candidate
+        assert artifact["extraction_method"] == "docx"
+        assert "storage_key" not in uploaded.text and "account_id" not in uploaded.text
+        duplicate = browser.post(path, data={"candidate_id": str(candidate)}, files=multipart)
+        assert duplicate.status_code == 409, duplicate.text[:300]
+        direct = httpx.post(web_url + path, cookies=browser.cookies, files=multipart,
+                            data={"candidate_id": candidate})
+        assert direct.status_code == 503 and "artifact" not in direct.json()
+        assert httpx.post(gateway_url + "/internal/v1/resumes/upload",
+                          headers={"X-Internal-Service-Token": internal_token}, files=multipart,
+                          data={"session_token": browser.cookies["job_agent_session"], "candidate_id": candidate}).status_code == 404
+        docker("stop", "--time", "1", web)
+        try:
+            unavailable = browser.post(path, data={"candidate_id": str(candidate)}, files=multipart)
+            assert unavailable.status_code == 503 and "artifact" not in unavailable.json()
+        finally:
+            docker("start", web)
+            wait(web_url + "/api/health")
+    print("==> Java resume multipart -> Python ClamAV/parser/RAG boundary -> duplicate/scope/outage/hidden-internal checks: PASS")
+
+
+def run_job_screenshot_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
+                                   web: str) -> None:
+    """Exercise the Java multipart boundary and Python-owned vision import pipeline."""
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
+    email = f"job-screenshot-{os.urandom(10).hex()}@example.com"
+    password = "job-screenshot-password"
+    auth.register_account(email=email, password=password, display_name="Job screenshot", email_verified=True, consents=[])
+    # A valid 1x1 PNG is enough for the deterministic model fixture; the Python
+    # image validator still executes the real Pillow format and pixel checks.
+    screenshot = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    path = "/api/jobs/screenshots"
+
+    def files():
+        return {"screenshots": ("job.png", screenshot, "image/png")}
+
+    with httpx.Client(base_url=gateway_url, timeout=30) as browser:
+        login = browser.post("/api/auth/login", json={"email": email, "password": password})
+        assert login.status_code == 200, login.text[:300]
+        browser.headers["X-CSRF-Token"] = login.json()["csrf_token"]
+        recharge = browser.post("/api/me/balance/recharge", json={
+            "amount_yuan": 1,
+            "idempotency_key": f"screenshot:{os.urandom(16).hex()}",
+        })
+        assert recharge.status_code == 200, recharge.text[:300]
+        assert httpx.post(gateway_url + path, files=files()).status_code == 401
+        assert httpx.post(gateway_url + path, cookies=browser.cookies, files=files()).status_code == 403
+        uploaded = browser.post(path, data={"source_url": "https://www.zhipin.com/job_detail/acceptance"}, files=files())
+        assert uploaded.status_code == 200, uploaded.text[:500]
+        payload = uploaded.json()
+        assert payload["job"]["import_method"] == "screenshot"
+        assert payload["job"]["title"] == "Python 后端开发工程师"
+        assert payload["extraction"] == {"source": "screenshot", "screenshot_count": 1}
+        assert "account_id" not in uploaded.text and "storage_key" not in uploaded.text
+        duplicate = browser.post(path, data={"source_url": "https://www.zhipin.com/job_detail/acceptance"}, files=files())
+        assert duplicate.status_code == 409, duplicate.text[:300]
+        direct = httpx.post(web_url + path, cookies=browser.cookies, files=files(), timeout=20)
+        assert direct.status_code == 503 and "统一入口" in direct.text
+        assert httpx.post(gateway_url + "/internal/v1/jobs/screenshots",
+                          headers={"X-Internal-Service-Token": internal_token}, files=files(),
+                          data={"session_token": browser.cookies["job_agent_session"]}).status_code == 404
+        docker("stop", "--time", "1", web)
+        try:
+            unavailable = browser.post(path, files=files())
+            assert unavailable.status_code == 503 and "job" not in unavailable.json()
+        finally:
+            docker("start", web)
+            wait(web_url + "/api/health")
+    print("==> Java job screenshot multipart -> Python Pillow/vision/import boundary -> duplicate/scope/outage/hidden-internal checks: PASS")
+
+
 def run_project_submission_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
                                        web: str, worker: str, broker: str, database_url: str) -> None:
     from job_hunting_agent.config import PlatformAuthSettings
@@ -1901,6 +2011,12 @@ def main() -> None:
         reset_scenario_limits()
         run_local_collection_management_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                             f"http://127.0.0.1:{args.port}", token, web, java, worker, broker, isolated_url)
+        reset_scenario_limits()
+        run_resume_upload_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                                       f"http://127.0.0.1:{args.port}", token, web, isolated_url)
+        reset_scenario_limits()
+        run_job_screenshot_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                                        f"http://127.0.0.1:{args.port}", token, web)
         reset_scenario_limits()
         run_project_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                  f"http://127.0.0.1:{args.port}", token, web, java, worker, isolated_url)

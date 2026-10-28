@@ -41,6 +41,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.encoders import jsonable_encoder
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
@@ -2433,6 +2434,8 @@ def create_web_app(
     ) -> dict[str, object]:
         """识别用户主动上传的可见职位截图，不访问来源链接。"""
 
+        if backend.platform_auth_client is not None and not getattr(request.state, "job_screenshot_internal_callback", False):
+            raise HTTPException(503, "职位截图入口暂时不可用，请通过统一入口重试。", headers={"Retry-After": "3"})
         account = current_account(request)
         assert account is not None
         if len(screenshots) > MAX_JOB_SCREENSHOT_FILES:
@@ -2512,6 +2515,75 @@ def create_web_app(
                 "screenshot_count": len(uploaded_screenshots),
             },
         }
+
+    @web_app.post("/internal/v1/jobs/screenshots", include_in_schema=False, response_model=None)
+    async def internal_import_job_screenshots(
+        request: Request,
+        screenshots: list[UploadFile] = File(...),
+        session_token: str = Form(...),
+        source_url: str | None = Form(default=None),
+    ) -> dict[str, object] | JSONResponse:
+        """Java callback; Python owns image validation, scanning, vision and job persistence."""
+
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            return JSONResponse({"code": "INTERNAL_UNAUTHORIZED", "detail": "内部服务认证失败。"}, status_code=401,
+                                headers={"Cache-Control": "no-store"})
+        if not session_token or len(session_token) > 128 or any(ord(char) < 33 or ord(char) > 126 for char in session_token):
+            return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422,
+                                headers={"Cache-Control": "no-store"})
+        request.scope["headers"] = [
+            (name, value) for name, value in request.scope["headers"] if name.lower() != b"cookie"
+        ] + [(b"cookie", f"{SESSION_COOKIE_NAME}={session_token}".encode("ascii"))]
+        for name in ("_headers", "_cookies"):
+            if hasattr(request, name):
+                delattr(request, name)
+        for name in ("platform_session_result", "platform_session_error", "platform_account", "account"):
+            if hasattr(request.state, name):
+                delattr(request.state, name)
+        request.state.job_screenshot_internal_callback = True
+        try:
+            result = await import_job_screenshots(request, screenshots, source_url)
+            return JSONResponse(
+                jsonable_encoder({"account_id": request.state.account.id, **result}),
+                headers={"Cache-Control": "no-store"},
+            )
+        except HTTPException as error:
+            status = error.status_code
+            retry_after = (error.headers or {}).get("Retry-After")
+            if status == 401:
+                code, detail = "SESSION_EXPIRED", "登录状态已过期，请重新登录。"
+            elif status == 409:
+                code, detail = "DUPLICATE_RESOURCE", "相同职位已经导入，请勿重复提交。"
+            elif status == 422:
+                code, detail = "FILE_INFECTED", "文件未通过安全扫描，请更换文件后重试。"
+            elif status == 429:
+                code, detail = "RATE_LIMITED", "请求过于频繁，请稍后重试。"
+            elif status == 502:
+                code, detail = "JOB_SCREENSHOT_MODEL_ERROR", "职位截图识别服务返回异常，请稍后重试。"
+            elif status == 503 and retry_after == "1":
+                code, detail = "JOB_BUSY", "当前仍有请求执行，请稍后重试。"
+            elif status == 503 and retry_after == "10":
+                code, detail = "FILE_SCANNER_UNAVAILABLE", "文件安全扫描暂时不可用，请稍后重试。"
+            elif status == 400:
+                code, detail = "JOB_SCREENSHOT_INVALID", "职位截图无效，请更换图片后重试。"
+            else:
+                status, code, detail = 503, "JOB_SCREENSHOT_UNAVAILABLE", "职位截图识别结果暂未确认，请稍后重试。"
+            headers = {"Cache-Control": "no-store"}
+            if retry_after:
+                headers["Retry-After"] = retry_after
+            return JSONResponse({"code": code, "detail": detail}, status_code=status, headers=headers)
+        except Exception as error:  # noqa: BLE001 - never expose model, scanner, SQL or storage details.
+            web_logger.exception(
+                "job screenshot internal callback failed type=%s message=%s",
+                type(error).__name__,
+                str(error),
+            )
+            return JSONResponse({"code": "JOB_SCREENSHOT_UNAVAILABLE", "detail": "职位截图识别结果暂未确认，请稍后重试。"}, status_code=503,
+                                headers={"Cache-Control": "no-store", "Retry-After": "3"})
 
     @web_app.get("/api/jobs")
     def list_jobs(request: Request) -> dict[str, object]:
@@ -3199,6 +3271,8 @@ def create_web_app(
     ) -> dict[str, object]:
         """上传简历，并按文件类型安排同步解析、OCR 或 RAG 增量索引。"""
 
+        if backend.platform_auth_client is not None and not getattr(request.state, "resume_internal_callback", False):
+            raise HTTPException(503, "简历上传入口暂时不可用，请通过统一入口重试。", headers={"Retry-After": "3"})
         account = current_account(request)
         assert account is not None
         account_id = account.id
@@ -3309,6 +3383,77 @@ def create_web_app(
             "indexing_async": workflow == "rag" and background_task is not None,
             "root_request_id": root_request_id if background_task is not None or rag_update is not None else None,
         }
+
+    @web_app.post("/internal/v1/resumes/upload", include_in_schema=False, response_model=None)
+    async def internal_upload_resume(
+        request: Request,
+        candidate_id: int = Form(...),
+        session_token: str = Form(...),
+        file: UploadFile = File(...),  # noqa: B008 - internal multipart relay.
+    ) -> dict[str, object] | JSONResponse:
+        """Java callback; reuse the Python-owned resume pipeline after token verification."""
+
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            return JSONResponse({"code": "INTERNAL_UNAUTHORIZED", "detail": "内部服务认证失败。"}, status_code=401,
+                                headers={"Cache-Control": "no-store"})
+        if not session_token or len(session_token) > 128 or any(ord(char) < 33 or ord(char) > 126 for char in session_token):
+            return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422,
+                                headers={"Cache-Control": "no-store"})
+        # The shared public handler already performs profile ownership, scan,
+        # parsing, storage and task/RAG handling. Rebuild only the request
+        # cookie after clearing middleware's unauthenticated cached state.
+        request.scope["headers"] = [
+            (name, value) for name, value in request.scope["headers"] if name.lower() != b"cookie"
+        ] + [(b"cookie", f"{SESSION_COOKIE_NAME}={session_token}".encode("ascii"))]
+        for name in ("_headers", "_cookies"):
+            if hasattr(request, name):
+                delattr(request, name)
+        for name in ("platform_session_result", "platform_session_error", "platform_account", "account"):
+            if hasattr(request.state, name):
+                delattr(request.state, name)
+        request.state.resume_internal_callback = True
+        try:
+            result = await upload_resume(request, candidate_id, file)
+            if result.get("rag_update") is not None:
+                result["rag_update"] = {
+                    key: result["rag_update"][key]
+                    for key in ("document_count", "chunk_count", "mode")
+                    if key in result["rag_update"]
+                }
+            if result.get("warning") is not None:
+                result["warning"] = "简历已保存，但后续处理暂未完成，请查看任务状态或稍后重试。"
+            if result.get("task") is not None:
+                result["task"] = {**result["task"], "result": None,
+                                   "error_summary": "后台任务未完成，请查看任务状态。" if result["task"].get("error_summary") else None}
+            result["artifact"] = {**result["artifact"], "scan_engine": None, "scan_reason": None}
+            return JSONResponse({"account_id": request.state.account.id, **result}, headers={"Cache-Control": "no-store"})
+        except DuplicateResourceError:
+            return JSONResponse({"code": "DUPLICATE_RESUME", "detail": "相同简历已经上传，请勿重复提交。"}, status_code=409)
+        except FileInfectedError:
+            return JSONResponse({"code": "FILE_INFECTED", "detail": "文件未通过安全扫描，请更换文件后重试。"}, status_code=422)
+        except FileScannerUnavailableError:
+            return JSONResponse({"code": "FILE_SCANNER_UNAVAILABLE", "detail": "文件安全扫描暂时不可用，请稍后重试。"}, status_code=503,
+                                headers={"Cache-Control": "no-store", "Retry-After": "10"})
+        except ResumeDocumentError:
+            return JSONResponse({"code": "RESUME_INVALID", "detail": "简历文件无效或格式不受支持。"}, status_code=400)
+        except HTTPException as error:
+            status = error.status_code
+            scanner_failure = status == 503 and error.headers and error.headers.get("Retry-After") == "10"
+            status, code, detail = (401, "SESSION_EXPIRED", "登录状态已过期，请重新登录。") if status == 401 else (
+                403, "RESUME_SCOPE_DENIED", "账号不可用或无权访问该档案。") if status == 403 else (
+                404, "PROFILE_NOT_FOUND", "候选人档案不存在。") if status == 404 else (
+                409, "DUPLICATE_RESUME", "相同简历已经上传，请勿重复提交。") if status == 409 else (
+                503, "FILE_SCANNER_UNAVAILABLE", "文件安全扫描暂时不可用，请稍后重试。") if scanner_failure else (
+                400, "RESUME_INVALID", "简历文件无效或格式不受支持。") if status == 400 else (
+                503, "RESUME_UNAVAILABLE", "简历上传服务暂时不可用，请稍后重试。")
+            return JSONResponse({"code": code, "detail": detail}, status_code=status, headers={"Cache-Control": "no-store"})
+        except Exception:  # noqa: BLE001 - never expose parser, SQL, scanner or storage details.
+            return JSONResponse({"code": "RESUME_UNAVAILABLE", "detail": "简历上传服务暂时不可用，请稍后重试。"}, status_code=503,
+                                headers={"Cache-Control": "no-store", "Retry-After": "3"})
 
     @web_app.get("/api/resumes")
     def list_resumes(
