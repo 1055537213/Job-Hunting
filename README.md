@@ -311,7 +311,7 @@ PR 和 `master` 推送仍运行完整验收。部署门禁要求目标 SHA 的�
 | 档案 | GET/POST /api/profiles | 查询或创建候选人档案 |
 | 对话 | POST /api/chat | 普通 Agent 对话，混合模式由 Java 鉴权后交给 Python 执行 |
 | 对话 | POST /api/chat/stream | Java 鉴权与 SSE 校验转发，Python 执行 Agent |
-| 职位 | POST /api/jobs | 导入职位文本 |
+| 职位 | POST /api/jobs | Java 校验 Session/CSRF、请求大小和非重放 JSON 转发；Python 执行职位规则审核、标准化解析、保存和去重 |
 | 职位 | POST /api/jobs/screenshots | Java 校验 Session/CSRF、4 张图片、单张 8 MiB 和总计 20 MiB 后单次转发；Python 执行 ClamAV、多模态识别、职位保存和去重 |
 | 项目 | POST /api/projects/github | Java 校验入口，Python 事务登记分析任务与提交回执，支持幂等与后台补投 |
 | 项目 | POST /api/projects/local/manifest | Java 校验清单入口，Python 筛选文件并恢复同一采集会话 |
@@ -404,6 +404,7 @@ AI、RAG、OCR 和多模态文件处理仍然依赖 Python 生态；Java 更适�
 - [x] 本地项目清单、采集查询、取消、分批上传及完成入口经 Java；Python 保留筛选、ClamAV、解析/视觉写入、RAG/视觉索引和事实写入。multipart 批次最多 5 个文件、单文件 50 MiB、批次 160 MiB，Java 禁止自动重放，Python 再校验计划、大小和 SHA-256；失败文件按项返回固定原因，内部元数据与原始错误不出接口。取消与在途上传互斥，SQL/向量和全版本附件清单同事务提交，维护 Worker 可恢复物理清理；完成时卡片与采集关联同事务提交，重复请求复用原卡片，未上传完不产生孤立卡片。
 - [x] 简历上传入口 `/api/resumes/upload` 经 Java 接管 multipart、Session/CSRF、候选人边界、20 MiB 限制和不可重放转发；Python 保留候选人归属复核、ClamAV、DOCX/PDF/OCR、对象存储、RAG 和后台任务。Java 只返回安全文件元数据和受限任务回执，不暴露提取正文、存储键、任务 payload 或扫描器内部信息。
 - [x] 职位截图入口 `/api/jobs/screenshots` 经 Java 接管 multipart、Session/CSRF、图片数量和大小限制及不可重放转发；Python 保留 PNG/JPEG/WebP 校验、ClamAV、多模态识别、职位保存和重复判断。Java 不保存图片原件，不暴露模型原始错误或内部账号字段。
+- [x] 普通职位文本入口 `/api/jobs` 经 Java 接管 JSON、Session/CSRF、请求大小和不可重放转发；Python 保留职位文本审核、字段解析、保存和重复判断。Java 不直接读取职位数据库。
 - [x] 建立渠道无关的待支付订单和签名 Webhook 结算边界。
 - [ ] 接入具体支付渠道适配、退款状态机和渠道对账。
 - [ ] 使用真实行业材料完成正式 RAG 发布集、Top-K/Top-N 和 P95 性能验收。

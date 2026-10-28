@@ -53,7 +53,8 @@ public class PublicAuthErrorHandler {
                 || "CHAT_UNAVAILABLE".equals(error.code()) || "CHAT_BUSY".equals(error.code())
                 || "PROJECT_UNAVAILABLE".equals(error.code()) || "PROJECT_BUSY".equals(error.code())
                 || "RESUME_UNAVAILABLE".equals(error.code()) || "RESUME_BUSY".equals(error.code())
-                || "JOB_SCREENSHOT_UNAVAILABLE".equals(error.code()) || "JOB_BUSY".equals(error.code())) response.header("Retry-After", "3");
+                || "JOB_SCREENSHOT_UNAVAILABLE".equals(error.code()) || "JOB_TEXT_UNAVAILABLE".equals(error.code())
+                || "JOB_BUSY".equals(error.code())) response.header("Retry-After", "3");
         return response.body(Map.of("code", error.code(), "detail", error.getMessage(),
                 "message", error.getMessage(), "request_id", id, "trace_id", id));
     }

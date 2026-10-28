@@ -162,6 +162,12 @@ Python 私有回调再次校验真实 Session 和账号，继续负责 PNG/JPEG/
 结构化职位保存和重复判断。识别结果返回既有职位公开字段和截图数量，不返回图片字节、内部账号字段或模型原始错误。
 契约见 `platform-service/src/main/resources/job-screenshots-upload.openapi.yaml`。
 
+### 普通职位文本入口
+
+`POST /api/jobs` 已由本地/生产 Caddy 和共存 Nginx 精确分流至 Java。Java 校验真实 Session、CSRF、65,536 字符职位文本、2,048 字符来源地址，并通过一次不可重放的 JSON 回调把真实 Session 传给 Python。Python 继续负责职位文本审核、结构化解析、职位保存和内容指纹去重；Python 公网同一路由在混合模式下 fail closed。
+
+Java 只接受 Python 返回的白名单职位投影，不直接访问职位表。内部回调为 `POST /internal/v1/jobs/text`，只允许内部服务令牌和真实 Session 组合访问。契约见 `platform-service/src/main/resources/job-text-import.openapi.yaml`。
+
 浏览器遇到临时 503/429 保留本地恢复 ID。预扫描、上传、完成与项目列表刷新绑定发起时的账号/档案，
 切换档案后的迟到响应不覆盖新档案进度；完成已确认时仅清除原采集的恢复 ID，不影响另一档案或新采集。
 沿用现有 migrate、Worker/Beat、内部凭据与部署命令，无新增手填配置；只进行本地隔离 Docker 验收，不部署服务器。

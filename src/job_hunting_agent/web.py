@@ -339,8 +339,15 @@ class InternalChatInvokePayload(ChatInvokePayload):
 class JobPayload(BaseModel):
     """网页导入职位文本时提交的数据。"""
 
-    raw_text: str
-    source_url: str | None = None
+    model_config = ConfigDict(extra="forbid")
+    raw_text: str = Field(min_length=1, max_length=65536, repr=False)
+    source_url: str | None = Field(default=None, max_length=2048)
+
+
+class InternalJobPayload(JobPayload):
+    """Java 回调职位文本导入时携带的真实 Session。"""
+
+    session_token: str = Field(min_length=1, max_length=128, repr=False)
 
 
 class JobSkillRequirementPayload(BaseModel):
@@ -2408,6 +2415,8 @@ def create_web_app(
     def import_job(payload: JobPayload, request: Request) -> dict[str, object]:
         """保存候选人从 BOSS 页面主动复制回来的职位文本。"""
 
+        if backend.platform_auth_client is not None and not getattr(request.state, "job_text_internal_callback", False):
+            raise HTTPException(503, "职位文本入口暂时不可用，请通过统一入口重试。", headers={"Retry-After": "3"})
         account = current_account(request)
         if not payload.raw_text.strip():
             raise HTTPException(status_code=400, detail="职位文本不能为空。")
@@ -2425,6 +2434,64 @@ def create_web_app(
         except DuplicateResourceError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {"job": asdict(job)}
+
+    @web_app.post("/internal/v1/jobs/text", include_in_schema=False, response_model=None)
+    async def internal_import_job_text(
+        payload: InternalJobPayload,
+        request: Request,
+    ) -> dict[str, object] | JSONResponse:
+        """Java callback; Python owns text validation, parsing, persistence and deduplication."""
+
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            return JSONResponse({"code": "INTERNAL_UNAUTHORIZED", "detail": "内部服务认证失败。"}, status_code=401,
+                                headers={"Cache-Control": "no-store"})
+        if any(ord(char) < 33 or ord(char) > 126 for char in payload.session_token):
+            return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422,
+                                headers={"Cache-Control": "no-store"})
+        request.scope["headers"] = [
+            (name, value) for name, value in request.scope["headers"] if name.lower() != b"cookie"
+        ] + [(b"cookie", f"{SESSION_COOKIE_NAME}={payload.session_token}".encode("ascii"))]
+        for name in ("_headers", "_cookies"):
+            if hasattr(request, name):
+                delattr(request, name)
+        for name in ("platform_session_result", "platform_session_error", "platform_account", "account"):
+            if hasattr(request.state, name):
+                delattr(request.state, name)
+        request.state.job_text_internal_callback = True
+        try:
+            result = import_job(JobPayload(raw_text=payload.raw_text, source_url=payload.source_url), request)
+            return JSONResponse(
+                jsonable_encoder({"account_id": request.state.account.id, **result}),
+                headers={"Cache-Control": "no-store"},
+            )
+        except InvalidJobTextError:
+            return JSONResponse({"code": "JOB_TEXT_INVALID", "detail": "职位文本无效，请补充完整招聘信息。"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        except DuplicateResourceError:
+            return JSONResponse({"code": "DUPLICATE_RESOURCE", "detail": "相同职位已经导入，请勿重复提交。"}, status_code=409,
+                                headers={"Cache-Control": "no-store"})
+        except HTTPException as error:
+            status = error.status_code
+            if status == 401:
+                code, detail = "SESSION_EXPIRED", "登录状态已过期，请重新登录。"
+            elif status == 403:
+                code, detail = "JOB_SCOPE_DENIED", "账号不可用或无权访问该职位。"
+            elif status == 409:
+                code, detail = "DUPLICATE_RESOURCE", "相同职位已经导入，请勿重复提交。"
+            elif status == 400:
+                code, detail = "JOB_TEXT_INVALID", "职位文本无效，请补充完整招聘信息。"
+            else:
+                status, code, detail = 503, "JOB_TEXT_UNAVAILABLE", "职位文本导入结果暂未确认，请稍后重试。"
+            return JSONResponse({"code": code, "detail": detail}, status_code=status,
+                                headers={"Cache-Control": "no-store"})
+        except Exception as error:  # noqa: BLE001 - never expose parser, SQL or storage details.
+            web_logger.exception("job text internal callback failed type=%s message=%s", type(error).__name__, str(error))
+            return JSONResponse({"code": "JOB_TEXT_UNAVAILABLE", "detail": "职位文本导入结果暂未确认，请稍后重试。"}, status_code=503,
+                                headers={"Cache-Control": "no-store", "Retry-After": "3"})
 
     @web_app.post("/api/jobs/screenshots")
     async def import_job_screenshots(

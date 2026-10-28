@@ -1,0 +1,31 @@
+openapi: 3.1.0
+info:
+  title: Job Text Import Entry
+  version: 1.0.0
+  description: Java owns the public JSON boundary; Python owns job text validation, parsing, persistence and deduplication.
+paths:
+  /api/jobs:
+    post:
+      description: Requires Session and CSRF. Java limits the JSON body and forwards one non-replayable callback to Python. Python validates the text as a complete recruitment posting and stores the normalized job.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [raw_text]
+              properties:
+                raw_text: {type: string, minLength: 1, maxLength: 65536}
+                source_url: {type: [string, 'null'], maxLength: 2048}
+      responses:
+        '200': {description: Imported normalized job.}
+        '400': {description: JOB_TEXT_INVALID}
+        '401': {description: SESSION_EXPIRED}
+        '403': {description: CSRF_REJECTED}
+        '409': {description: DUPLICATE_RESOURCE}
+        '413': {description: Request body too large.}
+        '503': {description: JOB_TEXT_UNAVAILABLE}
+  /internal/v1/jobs/text:
+    post:
+      description: Private Java-to-Python callback. Requires X-Internal-Service-Token and the real session_token. It is not exposed by Caddy or Nginx.

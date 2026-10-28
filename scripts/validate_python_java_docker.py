@@ -1305,6 +1305,52 @@ def run_job_screenshot_gateway_flow(gateway_url: str, web_url: str, java_url: st
     print("==> Java job screenshot multipart -> Python Pillow/vision/import boundary -> duplicate/scope/outage/hidden-internal checks: PASS")
 
 
+def run_job_text_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
+                              web: str) -> None:
+    """Exercise the Java JSON boundary and Python-owned text job import pipeline."""
+    from job_hunting_agent.config import PlatformAuthSettings
+    from job_hunting_agent.platform_auth import PlatformAuthClient
+
+    auth = PlatformAuthClient(PlatformAuthSettings(True, java_url, internal_token, 10))
+    email = f"job-text-{os.urandom(10).hex()}@example.com"
+    password = "job-text-password"
+    auth.register_account(email=email, password=password, display_name="Job text", email_verified=True, consents=[])
+    payload = {
+        "raw_text": "Python 后端开发工程师\n15-20K\n杭州\n1-3年\n本科\n"
+                    "职位描述：负责 Python 和 FastAPI 后端开发。",
+        "source_url": "https://www.zhipin.com/job_detail/text-acceptance",
+    }
+    path = "/api/jobs"
+    with httpx.Client(base_url=gateway_url, timeout=30) as browser:
+        login = browser.post("/api/auth/login", json={"email": email, "password": password})
+        assert login.status_code == 200, login.text[:300]
+        browser.headers["X-CSRF-Token"] = login.json()["csrf_token"]
+        assert httpx.post(gateway_url + path, json=payload).status_code == 401
+        assert httpx.post(gateway_url + path, cookies=browser.cookies, json=payload).status_code == 403
+        imported = browser.post(path, json=payload)
+        assert imported.status_code == 200, imported.text[:500]
+        assert imported.json()["job"]["import_method"] == "text"
+        assert imported.json()["job"]["title"] == "Python 后端开发工程师"
+        duplicate = browser.post(path, json=payload)
+        assert duplicate.status_code == 409, duplicate.text[:300]
+        invalid = browser.post(path, json={"raw_text": "普通聊天内容"})
+        assert invalid.status_code == 400, invalid.text[:300]
+        direct = httpx.post(web_url + path, cookies=browser.cookies, json=payload, timeout=20)
+        assert direct.status_code == 503 and "统一入口" in direct.text
+        assert httpx.post(gateway_url + "/internal/v1/jobs/text",
+                          headers={"X-Internal-Service-Token": internal_token}, json={
+                              "session_token": browser.cookies["job_agent_session"], **payload,
+                          }).status_code == 404
+        docker("stop", "--time", "1", web)
+        try:
+            unavailable = browser.post(path, json=payload)
+            assert unavailable.status_code == 503 and "job" not in unavailable.json()
+        finally:
+            docker("start", web)
+            wait(web_url + "/api/health")
+    print("==> Java job text JSON -> Python parser/import boundary -> duplicate/invalid/scope/outage/hidden-internal checks: PASS")
+
+
 def run_project_submission_gateway_flow(gateway_url: str, web_url: str, java_url: str, internal_token: str,
                                        web: str, worker: str, broker: str, database_url: str) -> None:
     from job_hunting_agent.config import PlatformAuthSettings
@@ -2017,6 +2063,9 @@ def main() -> None:
         reset_scenario_limits()
         run_job_screenshot_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                         f"http://127.0.0.1:{args.port}", token, web)
+        reset_scenario_limits()
+        run_job_text_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
+                                  f"http://127.0.0.1:{args.port}", token, web)
         reset_scenario_limits()
         run_project_gateway_flow(f"http://127.0.0.1:{args.port + 2}", f"http://127.0.0.1:{args.port + 1}",
                                  f"http://127.0.0.1:{args.port}", token, web, java, worker, isolated_url)

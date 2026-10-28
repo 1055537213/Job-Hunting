@@ -16,7 +16,20 @@ final class JobProjection {
 
     static void validate(JsonNode value) {
         require(value != null && value.isObject() && value.propertyNames().equals(Set.of("job", "extraction")));
-        JsonNode job = value.get("job");
+        validateJob(value.get("job"));
+        JsonNode extraction = value.get("extraction");
+        require(extraction.isObject() && extraction.propertyNames().equals(Set.of("source", "screenshot_count"))
+                && extraction.get("source").isTextual() && extraction.get("source").asText().equals("screenshot")
+                && extraction.get("screenshot_count").isIntegralNumber() && extraction.get("screenshot_count").asInt() >= 1
+                && extraction.get("screenshot_count").asInt() <= 4);
+    }
+
+    static void validateText(JsonNode value) {
+        require(value != null && value.isObject() && value.propertyNames().equals(Set.of("job")));
+        validateJob(value.get("job"));
+    }
+
+    private static void validateJob(JsonNode job) {
         require(job != null && job.isObject() && job.propertyNames().equals(JOB_FIELDS)
                 && id(job.get("id")) && text(job, "raw_text") && text(job, "title")
                 && text(job, "salary_unit") && text(job, "import_method")
@@ -35,11 +48,6 @@ final class JobProjection {
                     && requirement.get("confidence").isNumber() && requirement.get("confidence").asDouble() >= 0
                     && requirement.get("confidence").asDouble() <= 1 && textOrNull(requirement.get("evidence")));
         }
-        JsonNode extraction = value.get("extraction");
-        require(extraction.isObject() && extraction.propertyNames().equals(Set.of("source", "screenshot_count"))
-                && extraction.get("source").isTextual() && extraction.get("source").asText().equals("screenshot")
-                && extraction.get("screenshot_count").isIntegralNumber() && extraction.get("screenshot_count").asInt() >= 1
-                && extraction.get("screenshot_count").asInt() <= 4);
     }
 
     private static boolean id(JsonNode value) { return value != null && value.isIntegralNumber() && value.canConvertToLong() && value.asLong() > 0; }

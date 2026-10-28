@@ -62,6 +62,14 @@
 			path /api/projects/github
 		}
 		reverse_proxy @project_github platform-service:8081
+		@job_text_import {
+			method POST
+			path /api/jobs
+		}
+		request_body @job_text_import {
+			max_size 256KB
+		}
+		reverse_proxy @job_text_import platform-service:8081
 		@resume_upload {
 			method POST
 			path /api/resumes/upload
