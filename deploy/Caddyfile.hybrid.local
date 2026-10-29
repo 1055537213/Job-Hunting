@@ -61,6 +61,21 @@
 			max_size 256KB
 		}
 		reverse_proxy @job_text_import platform-service:8081
+		@job_list {
+			method GET
+			path /api/jobs
+		}
+		reverse_proxy @job_list platform-service:8081
+		@job_skill_update {
+			method PUT
+			path_regexp jobSkillUpdate ^/api/jobs/[0-9]+/skill-requirements$
+		}
+		reverse_proxy @job_skill_update platform-service:8081
+		@job_delete {
+			method DELETE
+			path_regexp jobDelete ^/api/jobs/[0-9]+$
+		}
+		reverse_proxy @job_delete platform-service:8081
 		@resume_upload {
 			method POST
 			path /api/resumes/upload

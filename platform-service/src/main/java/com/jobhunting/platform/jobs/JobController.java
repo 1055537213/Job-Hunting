@@ -8,7 +8,11 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.web.bind.annotation.CookieValue;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -16,6 +20,7 @@ import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 
 @RestController
 @ConditionalOnProperty(name = "platform.auth.enabled", havingValue = "true")
@@ -23,13 +28,18 @@ public class JobController {
     private final AccountAdministrationService accounts;
     private final JobClient python;
     private final JobTextClient text;
+    private final JobManagementClient management;
     private final InternalTokenVerifier tokens;
+    private final ObjectMapper mapper;
 
-    public JobController(AccountAdministrationService accounts, JobClient python, JobTextClient text, InternalTokenVerifier tokens) {
+    public JobController(AccountAdministrationService accounts, JobClient python, JobTextClient text,
+            JobManagementClient management, InternalTokenVerifier tokens, ObjectMapper mapper) {
         this.accounts = accounts;
         this.python = python;
         this.text = text;
+        this.management = management;
         this.tokens = tokens;
+        this.mapper = mapper;
     }
 
     @PostMapping(value = "/api/jobs", consumes = "application/json")
@@ -62,6 +72,51 @@ public class JobController {
         return submit(session, files, sourceUrl, request, response);
     }
 
+    @GetMapping("/api/jobs")
+    public JsonNode listJobs(@CookieValue(name = "job_agent_session", required = false) String session,
+            HttpServletRequest request, HttpServletResponse response) {
+        return list(session, request, response);
+    }
+
+    @PostMapping(value = "/internal/v1/jobs/list", consumes = "application/json")
+    public JsonNode internalListJobs(@RequestBody InternalJobListRequest payload,
+            @RequestHeader(name = "X-Internal-Service-Token", required = false) String token,
+            HttpServletRequest request, HttpServletResponse response) {
+        tokens.verify(token);
+        return list(payload.session_token(), request, response);
+    }
+
+    @PutMapping(value = "/api/jobs/{jobId}/skill-requirements", consumes = "application/json")
+    public JsonNode updateSkillRequirements(@PathVariable long jobId,
+            @CookieValue(name = "job_agent_session", required = false) String session,
+            @RequestBody JobSkillRequirementsRequest payload, HttpServletRequest request,
+            HttpServletResponse response) {
+        return updateSkills(session, jobId, payload == null ? null : payload.requirements(), request, response);
+    }
+
+    @PostMapping(value = "/internal/v1/jobs/skill-requirements", consumes = "application/json")
+    public JsonNode internalUpdateSkillRequirements(@RequestBody InternalJobSkillRequirementsRequest payload,
+            @RequestHeader(name = "X-Internal-Service-Token", required = false) String token,
+            HttpServletRequest request, HttpServletResponse response) {
+        tokens.verify(token);
+        return updateSkills(payload.session_token(), payload.job_id(), payload.requirements(), request, response);
+    }
+
+    @DeleteMapping("/api/jobs/{jobId}")
+    public JsonNode deleteJob(@PathVariable long jobId,
+            @CookieValue(name = "job_agent_session", required = false) String session,
+            HttpServletRequest request, HttpServletResponse response) {
+        return delete(session, jobId, request, response);
+    }
+
+    @PostMapping(value = "/internal/v1/jobs/delete", consumes = "application/json")
+    public JsonNode internalDeleteJob(@RequestBody InternalJobDeleteRequest payload,
+            @RequestHeader(name = "X-Internal-Service-Token", required = false) String token,
+            HttpServletRequest request, HttpServletResponse response) {
+        tokens.verify(token);
+        return delete(payload.session_token(), payload.job_id(), request, response);
+    }
+
     private JsonNode submit(String session, List<MultipartFile> files, String sourceUrl,
             HttpServletRequest request, HttpServletResponse response) {
         response.setHeader("Cache-Control", "no-store");
@@ -83,6 +138,41 @@ public class JobController {
                 WebSecurityFilter.requestId(request.getHeader("X-Request-ID"), request.getHeader("X-Trace-Id")));
     }
 
+    private JsonNode list(String session, HttpServletRequest request, HttpServletResponse response) {
+        response.setHeader("Cache-Control", "no-store");
+        long owner = accounts.current(session).account().account_id();
+        return management.list(session, owner,
+                WebSecurityFilter.requestId(request.getHeader("X-Request-ID"), request.getHeader("X-Trace-Id")));
+    }
+
+    private JsonNode updateSkills(String session, long jobId, List<JobSkillRequirementRequest> requirements,
+            HttpServletRequest request, HttpServletResponse response) {
+        response.setHeader("Cache-Control", "no-store");
+        if (session == null || session.isBlank() || session.length() > 128 || jobId <= 0 || requirements == null) {
+            throw JobManagementClient.invalid();
+        }
+        long owner = accounts.current(session).account().account_id();
+        JsonNode value = mapper.valueToTree(requirements);
+        return management.updateSkillRequirements(session, owner, jobId, value,
+                WebSecurityFilter.requestId(request.getHeader("X-Request-ID"), request.getHeader("X-Trace-Id")));
+    }
+
+    private JsonNode delete(String session, long jobId, HttpServletRequest request, HttpServletResponse response) {
+        response.setHeader("Cache-Control", "no-store");
+        if (session == null || session.isBlank() || session.length() > 128 || jobId <= 0) {
+            throw JobManagementClient.invalid();
+        }
+        long owner = accounts.current(session).account().account_id();
+        return management.delete(session, owner, jobId,
+                WebSecurityFilter.requestId(request.getHeader("X-Request-ID"), request.getHeader("X-Trace-Id")));
+    }
+
     public record JobTextRequest(String raw_text, String source_url) {}
     public record InternalJobTextRequest(String session_token, String raw_text, String source_url) {}
+    public record JobSkillRequirementRequest(String name, String category, Double confidence, String evidence) {}
+    public record JobSkillRequirementsRequest(List<JobSkillRequirementRequest> requirements) {}
+    public record InternalJobListRequest(String session_token) {}
+    public record InternalJobSkillRequirementsRequest(String session_token, long job_id,
+            List<JobSkillRequirementRequest> requirements) {}
+    public record InternalJobDeleteRequest(String session_token, long job_id) {}
 }

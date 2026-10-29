@@ -168,6 +168,11 @@ Python 私有回调再次校验真实 Session 和账号，继续负责 PNG/JPEG/
 
 Java 只接受 Python 返回的白名单职位投影，不直接访问职位表。内部回调为 `POST /internal/v1/jobs/text`，只允许内部服务令牌和真实 Session 组合访问。契约见 `platform-service/src/main/resources/job-text-import.openapi.yaml`。
 
+职位管理的 `GET /api/jobs`、`PUT /api/jobs/{job_id}/skill-requirements` 和 `DELETE /api/jobs/{job_id}` 也由 Java 统一承接，
+分别回调 Python 的 `POST /internal/v1/jobs/list`、`POST /internal/v1/jobs/skill-requirements` 和 `POST /internal/v1/jobs/delete`。
+Java 在公开边界校验 Session、CSRF、请求字段和账号归属；Python 负责职位查询、技能分类校验、级联删除和对象存储清理。
+删除回调只返回 `deleted` 与 `job_id`，不会把对象存储键或长文本 ID 传回 Java。列表和更新结果使用与导入相同的职位白名单投影。
+
 浏览器遇到临时 503/429 保留本地恢复 ID。预扫描、上传、完成与项目列表刷新绑定发起时的账号/档案，
 切换档案后的迟到响应不覆盖新档案进度；完成已确认时仅清除原采集的恢复 ID，不影响另一档案或新采集。
 沿用现有 migrate、Worker/Beat、内部凭据与部署命令，无新增手填配置；只进行本地隔离 Docker 验收，不部署服务器。

@@ -1,0 +1,65 @@
+openapi: 3.1.0
+info:
+  title: Job Management Boundary
+  version: 1.0.0
+  description: Java owns the public job management boundary; Python owns the job records and cleanup.
+paths:
+  /api/jobs:
+    get:
+      description: Requires a valid Session. Java returns Python's scoped, allowlisted job list.
+      responses:
+        '200': {description: Imported jobs.}
+        '401': {description: SESSION_EXPIRED}
+        '503': {description: JOB_MANAGEMENT_UNAVAILABLE}
+  /api/jobs/{job_id}/skill-requirements:
+    put:
+      description: Requires Session and CSRF. Updates categories for skills already present in the imported job.
+      parameters:
+        - {name: job_id, in: path, required: true, schema: {type: integer, minimum: 1}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [requirements]
+              properties:
+                requirements:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [name, category, confidence, evidence]
+                    properties:
+                      name: {type: string}
+                      category: {type: string, enum: [core, general, bonus, uncertain]}
+                      confidence: {type: number, minimum: 0, maximum: 1}
+                      evidence: {type: string}
+      responses:
+        '200': {description: Updated normalized job.}
+        '400': {description: JOB_SKILL_REQUIREMENTS_INVALID}
+        '401': {description: SESSION_EXPIRED}
+        '403': {description: CSRF_REJECTED}
+        '404': {description: JOB_NOT_FOUND}
+        '503': {description: JOB_MANAGEMENT_UNAVAILABLE}
+  /api/jobs/{job_id}:
+    delete:
+      description: Requires Session and CSRF. Deletes the job and its owned dependent artifacts through Python.
+      parameters:
+        - {name: job_id, in: path, required: true, schema: {type: integer, minimum: 1}}
+      responses:
+        '200': {description: Job deleted.}
+        '401': {description: SESSION_EXPIRED}
+        '403': {description: CSRF_REJECTED}
+        '404': {description: JOB_NOT_FOUND}
+        '503': {description: JOB_MANAGEMENT_UNAVAILABLE}
+  /internal/v1/jobs/list:
+    post:
+      description: Private Java-to-Python callback; requires X-Internal-Service-Token and session_token.
+  /internal/v1/jobs/skill-requirements:
+    post:
+      description: Private Java-to-Python callback; requires X-Internal-Service-Token and session_token.
+  /internal/v1/jobs/delete:
+    post:
+      description: Private Java-to-Python callback; returns only deleted and job_id.

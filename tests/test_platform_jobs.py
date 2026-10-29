@@ -126,6 +126,69 @@ def test_hybrid_python_public_job_text_route_fails_closed(jobs):
     assert "统一入口" in response.text
 
 
+def test_hybrid_python_public_job_management_routes_fail_closed(jobs):
+    _, browser = jobs
+    browser.cookies.set("job_agent_session", "session-1")
+    assert browser.get("/api/jobs").status_code == 503
+    assert browser.put("/api/jobs/7/skill-requirements", json={"requirements": []}).status_code == 503
+    assert browser.delete("/api/jobs/7").status_code == 503
+
+
+def test_internal_job_management_callbacks_return_safe_scoped_projections(jobs, monkeypatch):
+    app, browser = jobs
+    backend = app.state.backend
+    monkeypatch.setattr(backend, "list_jobs", Mock(return_value=[]))
+    assert browser.post(
+        "/internal/v1/jobs/list",
+        headers={"X-Internal-Service-Token": "wrong"},
+        json={"session_token": "session-1"},
+    ).status_code == 401
+    assert browser.post(
+        "/internal/v1/jobs/list",
+        headers={"X-Internal-Service-Token": "service-secret"},
+        json={"session_token": "expired"},
+    ).status_code == 401
+    response = browser.post(
+        "/internal/v1/jobs/list",
+        headers={"X-Internal-Service-Token": "service-secret"},
+        json={"session_token": "session-1"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"account_id": 1, "jobs": []}
+
+    job = ImportedJob(
+        id=7, raw_text="Python backend engineer", source_url="https://example.com/job",
+        title="Python backend engineer", city="杭州", salary_min_k=15, salary_max_k=25,
+        salary_months=12, salary_unit="月薪", experience_min_years=1, experience_max_years=3,
+        experience_label="1-3年", education="本科", company_name="Example", industry="Software",
+        company_size="100-499", skills=["Python"], description_text="负责后端接口开发。",
+        field_confidence={"title": 0.9}, uncertainty_notes=[], skill_requirements=[],
+        import_method="text", captured_at="now",
+    )
+    monkeypatch.setattr(backend, "update_job_skill_requirements", Mock(return_value=job))
+    response = browser.post(
+        "/internal/v1/jobs/skill-requirements",
+        headers={"X-Internal-Service-Token": "service-secret"},
+        json={"session_token": "session-1", "job_id": 7,
+              "requirements": [{"name": "Python", "category": "core", "confidence": 0.9, "evidence": "backend"}]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["account_id"] == 1
+    assert "private" not in response.text
+
+    monkeypatch.setattr(backend, "delete_job", Mock(return_value={
+        "job_id": 7, "storage_keys": ["private/object"], "long_text_ids": [9],
+    }))
+    response = browser.post(
+        "/internal/v1/jobs/delete",
+        headers={"X-Internal-Service-Token": "service-secret"},
+        json={"session_token": "session-1", "job_id": 7},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"account_id": 1, "deleted": True, "job_id": 7}
+    assert "storage_keys" not in response.text and "long_text_ids" not in response.text
+
+
 def test_job_screenshot_contract_and_gateway_routes():
     import yaml
 
@@ -161,3 +224,14 @@ def test_job_screenshot_contract_and_gateway_routes():
     text_route = nginx_text.split("location = /api/jobs {", 1)[1].split("\n    }", 1)[0]
     assert "client_max_body_size 256k;" in text_route
     assert "proxy_next_upstream off;" in text_route
+
+    for name in ("Caddyfile.hybrid", "Caddyfile.hybrid.local"):
+        text = (root / "deploy" / name).read_text(encoding="utf-8")
+        assert "method GET" in text and "path /api/jobs" in text
+        assert "path_regexp jobSkillUpdate ^/api/jobs/[0-9]+/skill-requirements$" in text
+        assert "path_regexp jobDelete ^/api/jobs/[0-9]+$" in text
+    nginx = (root / "deploy/nginx/coexist-hybrid-ip-https.conf.template").read_text(encoding="utf-8")
+    job_route = nginx.split("location = /api/jobs {", 1)[1].split("\n    }", 1)[0]
+    assert "^(GET|POST)$" in job_route
+    assert "location ~ ^/api/jobs/[0-9]+/skill-requirements$" in nginx
+    assert "location ~ ^/api/jobs/[0-9]+$" in nginx

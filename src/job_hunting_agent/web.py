@@ -350,6 +350,21 @@ class InternalJobPayload(JobPayload):
     session_token: str = Field(min_length=1, max_length=128, repr=False)
 
 
+class InternalJobListPayload(BaseModel):
+    """Java 回调职位列表时携带的真实 Session。"""
+
+    model_config = ConfigDict(extra="forbid")
+    session_token: str = Field(min_length=1, max_length=128, repr=False)
+
+
+class InternalJobDeletePayload(BaseModel):
+    """Java 回调删除职位时携带的真实 Session 和职位 ID。"""
+
+    model_config = ConfigDict(extra="forbid")
+    session_token: str = Field(min_length=1, max_length=128, repr=False)
+    job_id: int = Field(strict=True, gt=0, le=2**63 - 1)
+
+
 class JobSkillRequirementPayload(BaseModel):
     """职位已有技能的人工分类输入。"""
 
@@ -363,6 +378,13 @@ class JobSkillRequirementsPayload(BaseModel):
     """批量保存一个职位的技能分类。"""
 
     requirements: list[JobSkillRequirementPayload] = Field(default_factory=list)
+
+
+class InternalJobSkillRequirementsPayload(JobSkillRequirementsPayload):
+    """Java 回调职位技能修正时携带的真实 Session 和职位 ID。"""
+
+    session_token: str = Field(min_length=1, max_length=128, repr=False)
+    job_id: int = Field(strict=True, gt=0, le=2**63 - 1)
 
 
 class RegisterPayload(BaseModel):
@@ -2652,12 +2674,78 @@ def create_web_app(
             return JSONResponse({"code": "JOB_SCREENSHOT_UNAVAILABLE", "detail": "职位截图识别结果暂未确认，请稍后重试。"}, status_code=503,
                                 headers={"Cache-Control": "no-store", "Retry-After": "3"})
 
+    def _prepare_internal_job_callback(request: Request, session_token: str, callback_name: str):
+        """验证 Java->Python 职位回调，并让现有账号鉴权读取真实 Session。"""
+
+        client = backend.platform_auth_client
+        if client is None:
+            raise HTTPException(404, "接口不存在。")
+        token = request.headers.get("X-Internal-Service-Token", "")
+        if not token or not token.isascii() or not secrets.compare_digest(token, client.internal_token):
+            return JSONResponse({"code": "INTERNAL_UNAUTHORIZED", "detail": "内部服务认证失败。"}, status_code=401,
+                                headers={"Cache-Control": "no-store"})
+        if not session_token or len(session_token) > 128 or any(ord(char) < 33 or ord(char) > 126 for char in session_token):
+            return JSONResponse({"code": "INVALID_REQUEST", "detail": "请求参数无效。"}, status_code=422,
+                                headers={"Cache-Control": "no-store"})
+        request.scope["headers"] = [
+            (name, value) for name, value in request.scope["headers"] if name.lower() != b"cookie"
+        ] + [(b"cookie", f"{SESSION_COOKIE_NAME}={session_token}".encode("ascii"))]
+        for name in ("_headers", "_cookies"):
+            if hasattr(request, name):
+                delattr(request, name)
+        for name in ("platform_session_result", "platform_session_error", "platform_account", "account"):
+            if hasattr(request.state, name):
+                delattr(request.state, name)
+        request.state.job_management_internal_callback = callback_name
+        return None
+
+    def _internal_job_error(error: Exception, operation: str) -> JSONResponse:
+        if isinstance(error, HTTPException):
+            status = error.status_code
+        elif isinstance(error, KeyError):
+            status = 404
+        elif isinstance(error, ValueError):
+            status = 400
+        else:
+            status = 503
+        if status == 401:
+            code, detail = "SESSION_EXPIRED", "登录状态已过期，请重新登录。"
+        elif status == 403:
+            code, detail = "JOB_SCOPE_DENIED", "账号不可用或无权访问该职位。"
+        elif status == 404:
+            code, detail = "JOB_NOT_FOUND", "职位不存在。"
+        elif status == 400 and operation == "skill-requirements":
+            code, detail = "JOB_SKILL_REQUIREMENTS_INVALID", "职位技能分类无效，请检查后重试。"
+        elif status == 422:
+            code, detail = "INVALID_REQUEST", "请求参数无效。"
+        else:
+            status, code, detail = 503, "JOB_MANAGEMENT_UNAVAILABLE", "职位管理结果暂未确认，请稍后重试。"
+        return JSONResponse({"code": code, "detail": detail}, status_code=status,
+                            headers={"Cache-Control": "no-store", **({"Retry-After": "3"} if status == 503 else {})})
+
     @web_app.get("/api/jobs")
     def list_jobs(request: Request) -> dict[str, object]:
         """列出已经导入的职位。"""
 
+        if backend.platform_auth_client is not None and not getattr(request.state, "job_management_internal_callback", False):
+            raise HTTPException(503, "职位管理入口暂时不可用，请通过统一入口重试。", headers={"Retry-After": "3"})
         account = current_account(request)
         return {"jobs": [asdict(job) for job in backend.list_jobs(account_id=account.id if account else None)]}
+
+    @web_app.post("/internal/v1/jobs/list", include_in_schema=False, response_model=None)
+    def internal_list_jobs(payload: InternalJobListPayload, request: Request) -> dict[str, object] | JSONResponse:
+        """Java callback; Python owns the job query and account scoping."""
+
+        prepared = _prepare_internal_job_callback(request, payload.session_token, "list")
+        if prepared is not None:
+            return prepared
+        try:
+            result = list_jobs(request)
+            return JSONResponse(jsonable_encoder({"account_id": request.state.account.id, **result}),
+                                headers={"Cache-Control": "no-store"})
+        except Exception as error:  # noqa: BLE001 - never expose SQL or account details.
+            web_logger.exception("job list internal callback failed type=%s", type(error).__name__)
+            return _internal_job_error(error, "list")
 
     @web_app.put("/api/jobs/{job_id}/skill-requirements")
     def update_job_skill_requirements(
@@ -2667,6 +2755,8 @@ def create_web_app(
     ) -> dict[str, object]:
         """保存职位技能分类的人工校正，并返回更新后的职位。"""
 
+        if backend.platform_auth_client is not None and not getattr(request.state, "job_management_internal_callback", False):
+            raise HTTPException(503, "职位管理入口暂时不可用，请通过统一入口重试。", headers={"Retry-After": "3"})
         account = current_account(request)
         requirements = [
             SkillRequirement(
@@ -2689,10 +2779,30 @@ def create_web_app(
             raise HTTPException(status_code=400, detail=str(error)) from error
         return {"job": asdict(job)}
 
+    @web_app.post("/internal/v1/jobs/skill-requirements", include_in_schema=False, response_model=None)
+    def internal_update_job_skill_requirements(
+        payload: InternalJobSkillRequirementsPayload,
+        request: Request,
+    ) -> dict[str, object] | JSONResponse:
+        """Java callback; Python owns skill validation and persistence."""
+
+        prepared = _prepare_internal_job_callback(request, payload.session_token, "skill-requirements")
+        if prepared is not None:
+            return prepared
+        try:
+            result = update_job_skill_requirements(payload.job_id, payload, request)
+            return JSONResponse(jsonable_encoder({"account_id": request.state.account.id, **result}),
+                                headers={"Cache-Control": "no-store"})
+        except Exception as error:  # noqa: BLE001 - never expose parser or SQL details.
+            web_logger.exception("job skill update internal callback failed type=%s", type(error).__name__)
+            return _internal_job_error(error, "skill-requirements")
+
     @web_app.delete("/api/jobs/{job_id}")
     def delete_job(job_id: int, request: Request) -> dict[str, object]:
         """删除当前账号导入的职位及其职位相关文件。"""
 
+        if backend.platform_auth_client is not None and not getattr(request.state, "job_management_internal_callback", False):
+            raise HTTPException(503, "职位管理入口暂时不可用，请通过统一入口重试。", headers={"Retry-After": "3"})
         account = current_account(request)
         try:
             result = backend.delete_job(
@@ -2702,6 +2812,25 @@ def create_web_app(
         except KeyError as error:
             raise HTTPException(status_code=404, detail="职位不存在。") from error
         return {"deleted": True, **result}
+
+    @web_app.post("/internal/v1/jobs/delete", include_in_schema=False, response_model=None)
+    def internal_delete_job(payload: InternalJobDeletePayload, request: Request) -> dict[str, object] | JSONResponse:
+        """Java callback; Python owns cascading deletion and storage cleanup."""
+
+        prepared = _prepare_internal_job_callback(request, payload.session_token, "delete")
+        if prepared is not None:
+            return prepared
+        try:
+            result = delete_job(payload.job_id, request)
+            # storage_keys/long_text_ids are cleanup internals and never cross the Java boundary.
+            return JSONResponse({
+                "account_id": request.state.account.id,
+                "deleted": True,
+                "job_id": result["job_id"],
+            }, headers={"Cache-Control": "no-store"})
+        except Exception as error:  # noqa: BLE001 - never expose SQL or storage details.
+            web_logger.exception("job delete internal callback failed type=%s", type(error).__name__)
+            return _internal_job_error(error, "delete")
 
     @web_app.get("/api/matches/{candidate_id}")
     def list_matches(candidate_id: int, request: Request) -> dict[str, object]:

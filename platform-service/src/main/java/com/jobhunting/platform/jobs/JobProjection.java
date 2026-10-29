@@ -29,6 +29,23 @@ final class JobProjection {
         validateJob(value.get("job"));
     }
 
+    static void validateList(JsonNode value) {
+        require(value != null && value.isObject() && value.propertyNames().equals(Set.of("jobs"))
+                && value.get("jobs").isArray());
+        for (JsonNode job : value.get("jobs")) validateJob(job);
+    }
+
+    static void validateSkillUpdate(JsonNode value) {
+        require(value != null && value.isObject() && value.propertyNames().equals(Set.of("job")));
+        validateJob(value.get("job"));
+    }
+
+    static void validateDelete(JsonNode value) {
+        require(value != null && value.isObject() && value.propertyNames().equals(Set.of("deleted", "job_id"))
+                && value.get("deleted").isBoolean() && value.get("deleted").asBoolean()
+                && id(value.get("job_id")));
+    }
+
     private static void validateJob(JsonNode job) {
         require(job != null && job.isObject() && job.propertyNames().equals(JOB_FIELDS)
                 && id(job.get("id")) && text(job, "raw_text") && text(job, "title")

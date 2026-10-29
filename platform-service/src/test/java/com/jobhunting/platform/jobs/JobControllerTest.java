@@ -18,7 +18,10 @@ import tools.jackson.databind.ObjectMapper;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 import static org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup;
 
@@ -26,6 +29,7 @@ class JobControllerTest {
     final AccountAdministrationService accounts = mock(AccountAdministrationService.class);
     final JobClient python = mock(JobClient.class);
     final JobTextClient text = mock(JobTextClient.class);
+    final JobManagementClient management = mock(JobManagementClient.class);
     final RedisRequestLimiter limiter = mock(RedisRequestLimiter.class);
     final ObjectMapper mapper = new ObjectMapper();
     final Cookie session = new Cookie("job_agent_session", "real-session");
@@ -40,7 +44,8 @@ class JobControllerTest {
         var filter = new WebSecurityFilter(accounts, limiter,
             new WebSecuritySettings(true, "development", true, false, "http://localhost:8000", "test:job", 60, 20, 120, 120, 240),
             mapper, new SimpleMeterRegistry(), new ClientAddressResolver(""));
-        mvc = standaloneSetup(new JobController(accounts, python, text, new InternalTokenVerifier("secret")))
+        mvc = standaloneSetup(new JobController(accounts, python, text, management,
+                new InternalTokenVerifier("secret"), mapper))
             .setControllerAdvice(new PublicAuthErrorHandler()).addFilter(filter, "/api/*").build();
     }
 
@@ -95,5 +100,42 @@ class JobControllerTest {
                 .header("X-Internal-Service-Token", "secret").header("X-Trace-Id", "text-callback"))
             .andExpect(status().isOk());
         verify(text).importText(eq("real-session"), eq(42L), eq("Python backend engineer"), isNull(), eq("text-callback"));
+    }
+
+    @Test void publicJobManagementRequiresExpectedAuthAndForwardsOwner() throws Exception {
+        when(management.list(eq("real-session"), eq(42L), anyString()))
+                .thenReturn(mapper.readTree("{\"jobs\":[]}"));
+        when(management.updateSkillRequirements(eq("real-session"), eq(42L), eq(7L), any(), anyString()))
+                .thenReturn(mapper.readTree("{\"job\":{}}"));
+        when(management.delete(eq("real-session"), eq(42L), eq(7L), anyString()))
+                .thenReturn(mapper.readTree("{\"deleted\":true,\"job_id\":7}"));
+
+        mvc.perform(get("/api/jobs")).andExpect(status().isUnauthorized());
+        mvc.perform(get("/api/jobs").cookie(session)).andExpect(status().isOk());
+        mvc.perform(put("/api/jobs/7/skill-requirements").contentType(MediaType.APPLICATION_JSON)
+                .content("{\"requirements\":[]}").cookie(session)).andExpect(status().isForbidden());
+        mvc.perform(put("/api/jobs/7/skill-requirements").contentType(MediaType.APPLICATION_JSON)
+                .content("{\"requirements\":[]}").cookie(session, csrf).header("X-CSRF-Token", "csrf"))
+                .andExpect(status().isOk());
+        mvc.perform(delete("/api/jobs/7").cookie(session)).andExpect(status().isForbidden());
+        mvc.perform(delete("/api/jobs/7").cookie(session, csrf).header("X-CSRF-Token", "csrf"))
+                .andExpect(status().isOk());
+
+        verify(management).list(eq("real-session"), eq(42L), anyString());
+        verify(management).updateSkillRequirements(eq("real-session"), eq(42L), eq(7L), any(), anyString());
+        verify(management).delete(eq("real-session"), eq(42L), eq(7L), anyString());
+    }
+
+    @Test void internalJobManagementRequiresServiceToken() throws Exception {
+        when(management.list(eq("real-session"), eq(42L), anyString()))
+                .thenReturn(mapper.readTree("{\"jobs\":[]}"));
+        mvc.perform(post("/internal/v1/jobs/list").contentType(MediaType.APPLICATION_JSON)
+                .content("{\"session_token\":\"real-session\"}"))
+                .andExpect(status().isUnauthorized());
+        mvc.perform(post("/internal/v1/jobs/list").contentType(MediaType.APPLICATION_JSON)
+                .content("{\"session_token\":\"real-session\"}")
+                .header("X-Internal-Service-Token", "secret").header("X-Trace-Id", "job-list-callback"))
+                .andExpect(status().isOk());
+        verify(management).list(eq("real-session"), eq(42L), eq("job-list-callback"));
     }
 }
