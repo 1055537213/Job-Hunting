@@ -514,6 +514,17 @@ def run_java_security_flow(base_url: str, internal_token: str, admin: tuple[str,
         }).status_code == 401
         admin_login = client.post("/api/auth/login", json={"email": admin[0], "password": admin[1]})
         assert admin_login.status_code == 200
+        changed_admin_password = f"{admin[1]}-changed"
+        changed = client.post(
+            "/api/account/password",
+            headers={"X-CSRF-Token": admin_login.json()["csrf_token"]},
+            json={"current_password": admin[1], "new_password": changed_admin_password},
+        )
+        assert changed.status_code == 200, f"Initial administrator password change failed: {changed.text}"
+        admin_login = client.post(
+            "/api/auth/login", json={"email": admin[0], "password": changed_admin_password}
+        )
+        assert admin_login.status_code == 200, "Administrator could not log in after changing the bootstrap password"
         admin_status = client.get("/api/admin/security")
         assert admin_status.status_code == 200 and admin_status.json()["rate_limit_backend"] == "redis"
         assert client.post("/api/auth/logout", headers={"X-CSRF-Token": admin_login.json()["csrf_token"]}).status_code == 200

@@ -49,8 +49,12 @@ class WebSecurityFilterTest {
     }
 
     void account(String role) {
+        account(role, false);
+    }
+
+    void account(String role, boolean mustChangePassword) {
         when(accounts.current("test-session")).thenReturn(new AccountAdministrationService.AccountResponse(
-                new AccountAdministrationService.AccountView(2, "u@example.com", null, role, "active", false,
+                new AccountAdministrationService.AccountView(2, "u@example.com", null, role, "active", mustChangePassword,
                         "2026-10-12T00:00:00Z", null, "2026-10-12T00:00:00Z", "2026-10-12T00:00:00Z")));
     }
 
@@ -109,6 +113,27 @@ class WebSecurityFilterTest {
         when(accounts.current(anyString())).thenThrow(new AuthException("SESSION_EXPIRED", "expired", HttpStatus.UNAUTHORIZED));
         assertThat(request("/api/account/password", "POST", true, true).getStatus()).isEqualTo(401);
         assertThat(called).isFalse();
+    }
+
+    @Test void initialAdminPasswordMustBeChangedBeforeProtectedOperations() throws Exception {
+        account("admin", true);
+
+        var blocked = request("/api/admin/accounts", "GET", true, false);
+        assertThat(blocked.getStatus()).isEqualTo(403);
+        assertThat(blocked.getContentAsString()).contains("PASSWORD_CHANGE_REQUIRED");
+        assertThat(called).isFalse();
+
+        called = false;
+        assertThat(request("/api/account/password", "POST", true, true).getStatus()).isEqualTo(200);
+        assertThat(called).isTrue();
+
+        called = false;
+        assertThat(request("/api/auth/me", "GET", true, false).getStatus()).isEqualTo(200);
+        assertThat(called).isTrue();
+
+        called = false;
+        assertThat(request("/api/auth/logout", "POST", true, true).getStatus()).isEqualTo(200);
+        assertThat(called).isTrue();
     }
 
     @Test void adminCreditAndQueriesRequireAdminCsrfAndAdminRateLimit() throws Exception {

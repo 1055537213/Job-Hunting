@@ -119,6 +119,12 @@ public class WebSecurityFilter extends OncePerRequestFilter {
                 reject(response, 403, "ADMIN_REQUIRED", "需要管理员权限。", id, 0);
                 return;
             }
+            if (account != null && account.must_change_password()
+                    && !allowedBeforePasswordChange(path, request.getMethod())) {
+                outcome = "password_change_required";
+                reject(response, 403, "PASSWORD_CHANGE_REQUIRED", "请先修改初始密码后再继续操作。", id, 0);
+                return;
+            }
             if (settings.csrfEnabled() && !webhook && token != null && !SAFE.contains(request.getMethod())
                     && !path.equals("/api/auth/login") && !path.equals("/api/auth/register")
                     && !validCsrf(request)) {
@@ -156,6 +162,13 @@ public class WebSecurityFilter extends OncePerRequestFilter {
         String header = request.getHeader("X-CSRF-Token");
         return cookie != null && header != null && !cookie.isBlank() && cookie.length() <= 128 && header.length() <= 128
                 && MessageDigest.isEqual(cookie.getBytes(StandardCharsets.UTF_8), header.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static boolean allowedBeforePasswordChange(String path, String method) {
+        return ("GET".equals(method) && "/api/auth/me".equals(path))
+                || ("POST".equals(method) && "/api/auth/logout".equals(path))
+                || ("POST".equals(method) && "/api/auth/logout-all".equals(path))
+                || ("POST".equals(method) && "/api/account/password".equals(path));
     }
 
     private void reject(HttpServletResponse response, int status, String code, String detail, String id, long retry)

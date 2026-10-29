@@ -786,6 +786,9 @@ def test_local_contract_and_precise_gateway_methods():
         assert "request_body @local_files" in text and "max_size 167772160" in text
         assert "reverse_proxy @local_files platform-service:8081" in text
         assert "/api/projects/local/*" not in text
+    hybrid = (root / "deploy/Caddyfile.hybrid").read_text(encoding="utf-8")
+    assert "max_size 25MB" not in hybrid
+    assert "max_size 167772160" in hybrid
     nginx = (root / "deploy/nginx/coexist-hybrid-ip-https.conf.template").read_text(encoding="utf-8")
     assert "location = /api/projects/local/manifest" in nginx and "client_max_body_size 4m;" in nginx
     assert "location ~ ^/api/projects/local/[0-9]+$" in nginx

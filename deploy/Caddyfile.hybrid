@@ -5,7 +5,9 @@
 {$JOB_AGENT_DOMAIN} {
 	encode gzip
 	request_body {
-		max_size 25MB
+		# Keep the site-wide ceiling aligned with the local project file upload
+		# contract. Smaller upload endpoints below retain their own limits.
+		max_size 167772160
 	}
 	route {
 		@internal path /internal/*

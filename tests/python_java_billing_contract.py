@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from job_hunting_agent.config import PlatformBillingSettings  # noqa: E402
-from job_hunting_agent.platform_billing import PlatformBillingClient  # noqa: E402
+from job_hunting_agent.platform_billing import PlatformBillingClient, PlatformBillingError  # noqa: E402
 from job_hunting_agent.sqlalchemy_store import SQLAlchemyStore  # noqa: E402
 
 
@@ -60,6 +60,18 @@ def main() -> None:
         before = client.get_balance(account.id)
         assert before.balance_micro_yuan == 10_000_000, before
 
+        unauthorized = PlatformBillingClient(
+            PlatformBillingSettings(True, base_url, f"{internal_token}-wrong", 5)
+        )
+        try:
+            unauthorized.get_balance(account.id, trace_id=f"contract-auth-{suffix}")
+        except PlatformBillingError as error:
+            assert error.code == "INTERNAL_UNAUTHORIZED", error
+            assert error.status_code == 401, error
+        else:
+            raise AssertionError("Java billing accepted an invalid internal service token")
+        print("Python -> Java billing authentication rejection: PASS")
+
         first = client.consume(
             account_id=account.id,
             amount_micro_yuan=2_000_000,
@@ -74,6 +86,35 @@ def main() -> None:
             source_reference=source_reference,
             description="Python-Java 账务联调扣费重试",
         )
+        try:
+            client.consume(
+                account_id=account.id,
+                amount_micro_yuan=1_000_000,
+                token_count=40_000,
+                source_reference=source_reference,
+                description="Python-Java 幂等键冲突",
+            )
+        except PlatformBillingError as error:
+            assert error.code == "IDEMPOTENCY_CONFLICT", error
+            assert error.status_code == 409, error
+        else:
+            raise AssertionError("Java billing accepted a conflicting idempotency replay")
+
+        try:
+            client.consume(
+                account_id=account.id,
+                amount_micro_yuan=9_000_000,
+                token_count=360_000,
+                source_reference=f"insufficient-{suffix}",
+                description="Python-Java 余额不足",
+            )
+        except PlatformBillingError as error:
+            assert error.code == "INSUFFICIENT_BALANCE", error
+            assert error.status_code == 409, error
+            assert str(error) == "余额不足，请先充值后重试", error
+        else:
+            raise AssertionError("Java billing accepted a charge larger than the balance")
+
         after = client.get_balance(account.id)
         local_projection = store.get_account_balance_summary(account.id)
 
@@ -83,6 +124,7 @@ def main() -> None:
         assert after.balance_micro_yuan == 8_000_000, after
         assert local_projection.balance_micro_yuan == 8_000_000, local_projection
         assert local_projection.ledger_entry_count == 2, local_projection
+        print("Python -> Java billing failure mapping and idempotency conflict: PASS")
         print(
             "Python-Java billing contract passed: "
             f"account={account.id}, ledger={first.ledger_entry_id}, "
