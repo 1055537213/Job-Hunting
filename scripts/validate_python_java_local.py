@@ -245,6 +245,57 @@ def run_web_billing_flow(
         if logged_in.status_code != 200:
             raise RuntimeError(f"Web login failed: {logged_in.status_code} {logged_in.text[:300]}")
 
+        csrf = logged_in.json()["csrf_token"]
+        profile = client.post(
+            "/api/profiles",
+            headers={"X-CSRF-Token": csrf, "X-Request-ID": f"profile-contract-{suffix}"},
+            json={
+                "name": "Python Java contract candidate",
+                "status": "Seeking",
+                "education": "Bachelor",
+                "experience_years": 3,
+                "skills": {"Python": "proficient", "Java": "learning"},
+                "preferred_cities": ["Hangzhou"],
+                "acceptable_cities": ["Shanghai"],
+                "salary_floor_k": 18,
+                "expected_salary_k": 25,
+                "target_directions": ["Backend development"],
+                "unacceptable": ["Long-term travel"],
+            },
+        )
+        if profile.status_code != 200 or not isinstance(profile.json().get("candidate_id"), int):
+            raise RuntimeError(f"Java -> Python profile creation failed: {profile.status_code} {profile.text[:300]}")
+        candidate_id = profile.json()["candidate_id"]
+        profiles = client.get("/api/profiles")
+        if profiles.status_code != 200 or not any(
+            row.get("id") == candidate_id for row in profiles.json().get("profiles", [])
+        ):
+            raise RuntimeError(f"Java -> Python profile query failed: {profiles.status_code} {profiles.text[:300]}")
+
+        created_chat = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf, "X-Request-ID": f"chat-contract-{suffix}"},
+            json={"candidate_id": candidate_id, "title": "Python Java contract chat"},
+        )
+        if created_chat.status_code != 200:
+            raise RuntimeError(f"Java -> Python chat creation failed: {created_chat.status_code} {created_chat.text[:300]}")
+        session_id = created_chat.json().get("session", {}).get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise RuntimeError("Java -> Python chat creation returned an invalid session projection")
+        chat_list = client.get(f"/api/chat/sessions?candidate_id={candidate_id}")
+        history = client.get(f"/api/chat/history?candidate_id={candidate_id}&session_id={session_id}")
+        if chat_list.status_code != 200 or history.status_code != 200:
+            raise RuntimeError(
+                f"Java -> Python chat reads failed: list={chat_list.status_code}, history={history.status_code}"
+            )
+        archived = client.post(
+            f"/api/chat/sessions/{session_id}/archive",
+            headers={"X-CSRF-Token": csrf, "X-Request-ID": f"chat-archive-{suffix}"},
+        )
+        if archived.status_code != 200 or archived.json().get("session", {}).get("status") != "archived":
+            raise RuntimeError(f"Java -> Python chat archive failed: {archived.status_code} {archived.text[:300]}")
+        print("==> Java -> Python profile/chat lifecycle projections: PASS")
+
         with httpx.Client(base_url=web_url, timeout=10, follow_redirects=True) as admin_client:
             admin_login = admin_client.post(
                 "/api/auth/login", json={"email": admin_email, "password": admin_password}

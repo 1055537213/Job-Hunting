@@ -101,7 +101,7 @@ public class ProjectClient {
             return result;
         }catch(AuthException error){throw error;}
         catch(InterruptedException error){Thread.currentThread().interrupt();throw unavailable();}
-        catch(Exception error){throw unavailable();}
+        catch(Exception error){LOG.warn("Project callback failed operation={} error_type={}",operation,error.getClass().getSimpleName());throw unavailable();}
         finally{if(pending!=null&&!pending.isDone())pending.cancel(true);slots.release();if(local)collectionSlots.release();}
     }
 

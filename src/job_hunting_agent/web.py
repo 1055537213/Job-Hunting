@@ -3006,7 +3006,12 @@ def create_web_app(
             status, code = 400, "PROJECT_REPOSITORY_INVALID"
         except (AccountWorkDenied, PermissionError):
             status, code = 403, "PROJECT_SCOPE_DENIED"
-        except Exception:  # noqa: BLE001 - never expose source content, SQL or object keys.
+        except Exception as error:  # noqa: BLE001 - never expose source content, SQL or object keys.
+            web_logger.error(
+                "platform project callback failed operation=%s error_type=%s",
+                operation,
+                type(error).__name__,
+            )
             status, code = 503, "PROJECT_UNAVAILABLE"
         return JSONResponse({"code": code, "detail": PROJECT_UNAVAILABLE}, status_code=status,
             headers={"Cache-Control": "no-store", **({"Retry-After": "3"} if status in (409, 503) else {})})
