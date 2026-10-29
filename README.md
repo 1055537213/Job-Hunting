@@ -1,425 +1,212 @@
-# Job-Hunting Agent Workbench
+# AI 求职准备工作台
 
-[![CI](https://github.com/1055537213/Job-Hunting/actions/workflows/ci.yml/badge.svg)](https://github.com/1055537213/Job-Hunting/actions/workflows/ci.yml)
+Python + Java 多账号 AI 工作台，用于整理候选人档案、职位信息、项目证据、简历材料和对话记忆，并通过 Agent、RAG 与后台任务生成可追溯的求职辅助结果。
 
-一个面向求职准备场景的多账号 AI 工作台。系统把候选人档案、职位、项目证据、简历材料和对话记忆组织成可追溯的数据链路，再通过 Agent、RAG 和后台任务完成资料整理、职位匹配与简历生成。
-
-系统只处理候选人主动提供或授权的内容，不登录招聘平台、不抓取隐藏接口、不自动投递，也不自动向招聘方发送消息。
+系统只处理用户主动提供或明确授权的内容，不登录招聘平台、不抓取隐藏接口、不自动投递，也不自动向招聘方发送消息。
 
 ## 1. 项目简介
 
-### 项目是什么
+本项目采用 Java Spring Boot 与 Python FastAPI 协同架构：
 
-这是一个 Python + Java 的企业化演进项目：
+- Java 负责账号、Session、权限、CSRF、账务边界和公开 API 网关。
+- Python 负责 Agent、RAG、文件分析、职位解析、简历生成和后台任务。
+- PostgreSQL/pgvector 保存结构化事实、任务、账务、审计、用量和向量。
+- Redis 负责任务队列、共享限流、并发租约和可重建缓存。
+- MinIO/S3 保存简历、导出文件、项目原件和视觉派生对象。
+- Caddy 或 Nginx 按公开路径分流 Java 与 Python 服务。
 
-- Python 负责其余 FastAPI Web API、Agent、RAG、文件分析、简历生成和异步 AI 任务。
-- Java Spring Boot 平台服务分阶段接管账号、Session、权限和账务等平台能力。
-- 普通和流式聊天入口经过 Java 校验，Python 继续负责 Agent、工具、RAG 和消息存储。
-- 前端仍由 Python Web 提供；混合网关将已迁移的平台 API 分流给 Java，外部 URL 保持不变。
-- master 保留纯 Python 版本；java-platform-migration 是独立的 Python+Java 版本。
+项目重点解决求职资料分散、来源难追踪、事实容易污染和长任务难恢复等问题。
 
-### 解决的问题
+## 2. 在线预览 / 效果范围
 
-求职资料往往分散在简历、职位描述、项目代码、PDF、图片和聊天记录中。项目通过结构化事实、来源定位、用户确认和账号隔离，减少自动生成中的事实污染与不可追溯问题。
-
-## 2. 在线演示 / 效果截图
-
-当前没有公开演示站点，也不提交用户数据或未脱敏运行截图。启动本地环境后可访问：
+当前提供本地 Docker 运行方式，不在文档中绑定具体公网地址、账号或运行数据。
 
 | 页面 | 地址 | 内容 |
 | --- | --- | --- |
-| 登录/注册 | http://127.0.0.1:8000/login | 登录、注册、邮箱验证、邮箱变更和密码找回 |
+| 登录/注册 | http://127.0.0.1:8000/login | 注册、登录、邮箱验证和密码找回 |
 | 工作台 | http://127.0.0.1:8000/ | 档案、职位、项目、对话和简历 |
 | 个人中心 | http://127.0.0.1:8000/profile | 余额、演示充值、消费流水和账号安全 |
 | 管理后台 | http://127.0.0.1:8000/admin | 账号、用量、请求观测、审计和工具轨迹 |
-| API 文档 | http://127.0.0.1:8000/docs | Swagger 文档 |
+| API 文档 | http://127.0.0.1:8000/docs | Swagger/OpenAPI 文档 |
 | 健康检查 | http://127.0.0.1:8000/api/health | 数据库、队列、对象存储和模型状态 |
-
-生产共存拓扑使用 https://<公网IP>:8443，不占用同机旧项目的 80/443。真实演示地址、截图和运行数据应在脱敏并获得授权后再补充。
 
 ## 3. 功能清单
 
-### 账号与安全
-
-- 多账号隔离、HttpOnly Session Cookie、CSRF、防重放、限流和安全响应头。
-- 注册、登录、邮箱验证、密码重置、修改密码、全部设备退出和账号注销。
-- 登录后可发起邮箱变更；新邮箱确认成功后会撤销旧登录会话，并要求重新登录。
-- 混合模式下，个人中心显示名修改和邮箱变更申请直接进入 Java；Python 不重复写账号或登记邮件，SMTP 投递仍由 Python Worker 负责。
-- Argon2id 密码哈希，Java 兼容现有 Python 哈希格式。
-- 账号导出、可恢复删除任务和管理员启用/停用账号。
-- 混合模式下账号导出从 Java 进入，Python 按真实会话整理业务数据；仅能导出本人数据，下载禁用缓存，单次同步下载上限 16 MiB。
-- 混合模式下注销申请直达 Java，停用账号、撤销会话和持久化清理意图在同一事务完成；Python Worker/Beat 负责补建任务、补投队列和文件/业务数据清理，故障不依赖用户再次登录恢复。
-
-### 候选人档案与 Agent
-
-- 管理学历、工作经历、技能熟练度、求职方向、城市偏好和薪资要求。
-- 通过对话修改档案，技能支持大小写和同义词规范化去重。
-- 对话历史、摘要记忆、SSE 流式回复和会话恢复。
-- 高风险、多步骤和不确定请求回退到主 Agent，并保留工具审计。
-
-### 职位与匹配
-
-- 粘贴职位文本或上传职位截图。
-- 解析职位名称、城市、薪资、经验、学历、公司和技能要求。
-- 按账号检测重复职位，并支持用户删除职位。
-- 根据学历、经验、技能、城市、薪资和硬性限制生成可解释匹配结果。
-
-### 项目证据与知识库
-
-- 只读分析公开 GitHub 项目，固定提交和哈希后再处理。
-- 本地项目采用文件清单/哈希预扫描和按需分批传输。
-- 分流处理代码、文本、PDF、图片、表格、DOCX 和 PPTX。
-- 分析结果先生成待确认项目卡片，用户确认后才写入候选人事实和 RAG。
-- 文本向量、视觉向量、关键词、数值和否定条件共同参与检索后处理。
-- 删除项目时清理数据库、长文本、视觉项、对象存储对象和向量索引。
-
-### 简历与后台任务
-
-- 导入 DOCX、文字 PDF 和扫描 PDF 简历。
-- OCR、项目分析、RAG 索引和简历导出由 Worker 执行。
-- 任务具备幂等键、原子认领、进度、有限重试、错误摘要和失联回收。
-- 管理员可以查看失败任务并重新投递，重试动作写入审计。
-- 混合模式下，任务查询、管理员重试/探针的公开入口由 Java 负责；Python 负责持久化命令、可靠投递、状态写入与执行。
-
-### 计费与管理
-
-- 按实际 Token 用量记录消费并从余额扣减。
-- 个人中心支持受限的演示充值；真实支付渠道尚未接入，但已建立待支付订单和签名 Webhook 结算边界。
-- 管理员可以为账号人工补款，保存原因和审计记录；Java 账务模式下由 Java 校验会话并原子写入余额、流水和审计。
-- 管理后台展示余额、Token 明细、工具调用、请求观测、邮件投递和管理员审计。
-- 余额、Token 和工具记录采用分页查询与保留规则清理。
-
-### 运维与可观测性
-
-- Prometheus 请求指标和 Web 不可用、5xx、慢响应、安全拦截、高并发告警规则。
-- Java 支持显式可信代理、独立监控令牌和 Prometheus DNS 抓取；混合网关仅转发已迁移的公开 API，不开放 Java 内部指标路径。
-- 后台请求观测由 Java 汇总两端对外 API，内部调用单列；可按服务切换，缺失数据标为不可用，刷新失败保留旧快照并提示过期。
-- Alertmanager、SMTP、Loki、Alloy、Tempo、OpenTelemetry 和 Grafana 配置。
-- PostgreSQL/对象存储备份、恢复演练、Worker 恢复和 ClamAV 上传扫描验收脚本。
+- 多账号隔离、Session Cookie、CSRF、限流、安全响应头和管理员审计。
+- 候选人档案、对话记忆、SSE 流式回复和 Agent 工具调用。
+- 职位文本/截图导入、标准化解析、重复检测、技能要求修正和删除。
+- GitHub 项目分析、本地项目清单预扫描、分批上传、用户确认和知识库索引。
+- PDF、图片、表格、DOCX、PPTX、OCR、视觉分析和来源定位。
+- 简历导入、简历生成、项目经历表达和后台任务处理。
+- Token 用量、余额、演示充值、管理员补款、账务流水和分页明细。
+- Prometheus、Alertmanager、Grafana、Loki、Tempo、OpenTelemetry 和 ClamAV 配置。
+- PostgreSQL、对象存储、Worker 恢复、备份和安全验收脚本。
 
 ## 4. 技术栈
 
 ### 后端
 
-- Python 3.12、FastAPI、Uvicorn、SQLAlchemy、Alembic。
-- LangChain Agent、LangGraph Checkpointer、OpenAI-compatible 模型网关。
-- Celery、Redis、PostgreSQL 16、pgvector、MinIO/S3。
-- Java 21、Spring Boot 4、Spring JDBC、Maven。
+Python 3.12、FastAPI、Uvicorn、SQLAlchemy、Alembic、LangChain、LangGraph、Celery、Redis、PostgreSQL 16、pgvector、MinIO/S3、Java 21、Spring Boot 4、Spring JDBC、Maven。
 
 ### 前端
 
-- Vue 3 Global Build、原生 HTML/CSS/JavaScript。
-- SSE 流式对话。
-- 路径视图：/login、/、/profile、/admin。
+Vue 3 Global Build、HTML/CSS/JavaScript、SSE。页面路径为 /login、/、/profile、/admin。
 
-### 数据库与基础设施
+### 运维与质量
 
-- PostgreSQL：结构化事实、账号、任务、账务、审计、用量和向量。
-- Redis：Celery Broker、共享限流、并发租约和 Cache-Aside 业务缓存。
-- MinIO/S3：简历、导出文件、项目原件和视觉派生对象。
-- ClamAV：上传文件病毒扫描。
-- Prometheus/Alertmanager/Grafana/Loki/Tempo：指标、告警、日志、Trace 和可视化。
-- Docker Compose：开发、生产、混合、共存、恢复和验收拓扑。
-- Caddy 或共存 Nginx：HTTPS 入口；已迁移的平台 API 到 Java，其余页面/API 到 Python。
-
-### 质量与安全
-
-- Pytest、Ruff、compileall、Node 前端回归测试和 Maven 测试。
-- pip-audit、OSV Scanner、Trivy 和 CycloneDX SBOM。
-- GitHub Actions CI、不可变 GHCR 镜像和人工批准部署工作流。
+Docker Compose、Caddy/Nginx、Prometheus、Alertmanager、Grafana、Loki、Tempo、OpenTelemetry、Pytest、Ruff、Node 前端测试、Maven 测试、Trivy、OSV Scanner 和 SBOM。
 
 ## 5. 项目亮点
 
-1. **事实与推断分离**：模型生成的项目摘要和简历表达必须经过候选人确认，不能自动伪造经历。
-2. **Python + Java 渐进迁移**：Java 迁移不覆盖纯 Python 分支，外部 Python API 契约保持稳定。
-3. **账号隔离贯穿全链路**：数据库、对象键、RAG、任务、余额和审计都校验账号归属。
-4. **可恢复、可幂等**：任务、充值和扣费使用幂等键，避免重复执行和重复扣费。
-5. **多模态证据链**：PDF、图片、表格和项目文件保留来源定位，不只保存孤立文字。
-6. **RAG 检索漏斗**：Retriever 先取 Top-K，再由 Reranker 取 Top-N；当前默认 K=10、N=5。
-7. **缓存不改变事实**：Redis 只保存可重建结果，故障时回源 PostgreSQL、配置或模型服务。
-8. **低敏可观测性**：记录 trace、状态和耗时，不采集 Cookie、API Key、提示词和用户文件原文。
-9. **可回滚发布**：CI 通过后发布精确提交镜像，部署前备份，失败时恢复上一组 Python+Java 镜像。
+1. 事实与推断分离，项目摘要和简历表达经过用户确认后才进入正式事实链路。
+2. Java 承载稳定平台边界，Python 承载 AI、RAG、解析和异步业务。
+3. 数据库、对象键、RAG、任务、余额和审计全链路校验账号归属。
+4. 任务、充值和扣费使用幂等键，支持有限重试、恢复和回滚。
+5. PDF、图片、表格和项目文件保留来源定位，支持多模态证据链。
+6. Retriever 先取 Top-K，再由 Reranker 取 Top-N；当前默认 K=10、N=5。
+7. Redis 只保存可重建结果，业务事实保存在 PostgreSQL。
+8. 日志和指标避免记录 Cookie、API Key、提示词和用户文件原文。
+9. CI 通过后发布精确提交镜像，支持人工批准和失败回滚。
 
 ## 6. 目录结构说明
 
-~~~text
-.
-├─ src/job_hunting_agent/       # Python Web、Agent、RAG、存储、任务和安全模块
-│  ├─ web.py                    # FastAPI 页面、API、SSE、认证和管理接口
-│  ├─ agent.py                  # Agent、记忆和编排
-│  ├─ app.py                    # 业务门面和模块组合
-│  ├─ tool_registry.py          # 工具目录、校验、执行和统一结果
-│  ├─ storage.py                # 仓储、事务、任务、账务和审计
-│  ├─ platform_auth.py          # Python 到 Java 认证边界客户端
-│  ├─ platform_billing.py       # Python 到 Java 账务边界客户端
-│  ├─ pgvector_rag.py           # 文本检索、重排和删除
-│  ├─ pgvector_visual.py        # 视觉知识项向量
-│  ├─ project_*.py              # GitHub、本地项目和证据分析
-│  ├─ resume_*.py               # 简历解析、写作和导出
-│  ├─ background_tasks.py       # Celery 任务、重试和回收
-│  └─ web_static/               # Vue 页面、脚本、样式和运行时
-├─ platform-service/            # Spring Boot Java 平台服务
-│  ├─ src/main/java/            # 账号、Session、账务和系统接口
-│  ├─ src/main/resources/       # 配置和内部 OpenAPI 契约
-│  └─ Dockerfile                # Java 镜像构建文件
-├─ alembic/                     # 数据库迁移
-├─ tests/                       # Python、Java 契约和前端回归测试
-├─ evals/rag/                   # RAG 黄金集、困难负样本和评测清单
-├─ scripts/                    # 本地、生产、恢复、安全和验收脚本
-├─ deploy/                     # HTTPS、Prometheus、日志、Trace 和告警配置
-├─ docs/                       # ADR、架构、部署、恢复和安全文档
-├─ compose.yaml                # 基础开发拓扑
-├─ compose.dev.yaml            # 源码挂载和热更新覆盖
-├─ compose.platform.yaml       # Java 本地联调覆盖
-├─ compose.prod.yaml           # 单机生产覆盖
-├─ compose.coexist.yaml        # 同机共存覆盖
-├─ compose.hybrid.prod.yaml    # Python+Java 生产覆盖
-├─ Dockerfile                  # Python Web/Worker/Beat/Migrate 镜像
-├─ platform-service/pom.xml    # Java Maven 依赖和测试配置
-└─ .env.example                # 脱敏配置模板
-~~~
+    src/job_hunting_agent/       Python Web、Agent、RAG、存储和任务
+    platform-service/            Spring Boot Java 平台服务
+    alembic/                     数据库迁移
+    tests/                       Python、Java 契约和前端回归测试
+    evals/rag/                   RAG 评测集和困难负样本
+    scripts/                     本地、生产、恢复和安全验收脚本
+    deploy/                      HTTPS、指标、日志、Trace 和告警配置
+    docs/                        架构、部署、恢复和安全文档
+    compose.yaml                 基础开发拓扑
+    compose.platform.yaml        Java 本地联调覆盖
+    compose.prod.yaml            单机生产覆盖
+    compose.hybrid.prod.yaml     Python + Java 生产覆盖
+    Dockerfile                   Python Web/Worker/Beat/Migrate 镜像
+    platform-service/pom.xml     Java Maven 依赖和测试配置
+    .env.example                 脱敏配置模板
 
 ## 7. 运行步骤
 
 ### 环境要求
 
-- Docker Desktop 或 Docker Engine + Compose v2。
-- Python 3.12、Node.js 22、JDK 21、Maven 3.9+。
-- OpenAI-compatible Chat、Embedding，及可选 Rerank/视觉模型。
+Docker Desktop 或 Docker Engine + Compose v2、Python 3.12、Node.js 22、JDK 21、Maven 3.9+，以及 OpenAI-compatible Chat/Embedding 模型。
 
 ### 获取代码和配置
 
-~~~powershell
-git clone https://github.com/1055537213/Job-Hunting.git
-Set-Location Job-Hunting
-git switch java-platform-migration
-Copy-Item .env.example .env
-~~~
+    git clone <repository-url>
+    Set-Location <project-directory>
+    Copy-Item .env.example .env
 
-至少填写模型、对象存储、Redis 和平台服务密钥。混合模式还需要：
+在 .env 中填写模型、对象存储、Redis、数据库和平台服务配置。混合模式至少需要：
 
-~~~dotenv
-JOB_AGENT_PLATFORM_INTERNAL_TOKEN=至少32字符的随机服务密钥
-JOB_AGENT_JAVA_AUTH_ENABLED=true
-JOB_AGENT_JAVA_BILLING_ENABLED=false
-~~~
+    JOB_AGENT_PLATFORM_INTERNAL_TOKEN=<随机生成的服务密钥，至少32字符>
+    JOB_AGENT_JAVA_AUTH_ENABLED=true
+    JOB_AGENT_JAVA_BILLING_ENABLED=false
 
-不要把 .env、生产密钥、邮箱密码、模型 API Key、数据库导出或备份提交到 Git。
+不要提交 .env、生产密钥、邮箱密码、模型 API Key、数据库导出或备份。
 
-### 运行纯 Python 开发拓扑
+### 启动本地拓扑
 
-先在 .env 中将 JOB_AGENT_JAVA_AUTH_ENABLED 和 JOB_AGENT_JAVA_BILLING_ENABLED 都设为 false；不要在未启动 Java 服务时开启迁移开关。
+    docker compose -f compose.yaml -f compose.platform.yaml up -d --build
+    docker compose -f compose.yaml -f compose.platform.yaml ps
 
-~~~powershell
-docker compose -f compose.yaml -f compose.dev.yaml up -d --build
-docker compose -f compose.yaml -f compose.dev.yaml ps
-~~~
+默认访问 http://127.0.0.1:8000/。本地浏览器分流可使用 hybrid-local profile：
 
-访问 http://127.0.0.1:8000/。停止服务但保留数据卷：
+    $env:JOB_AGENT_BROWSER_BASE_URL = 'http://localhost:18082'
+    docker compose -f compose.yaml -f compose.platform.yaml --profile hybrid-local up -d --build
 
-~~~powershell
-docker compose -f compose.yaml -f compose.dev.yaml down
-~~~
+停止服务但保留数据卷：
 
-### 运行 Python + Java 本地拓扑
+    docker compose -f compose.yaml -f compose.platform.yaml down
 
-确保 .env 已填写 JOB_AGENT_PLATFORM_INTERNAL_TOKEN，并将 JOB_AGENT_JAVA_AUTH_ENABLED 设为 true；若同时启用 Java 账务，再将 JOB_AGENT_JAVA_BILLING_ENABLED 设为 true。Compose 会把同一个内部密钥传给两个服务，然后执行：
+### 质量检查
 
-~~~powershell
-docker compose -f compose.yaml -f compose.platform.yaml up -d --build
-docker compose -f compose.yaml -f compose.platform.yaml ps
-.\scripts\validate_python_java_local.ps1
-~~~
+    ruff check src tests alembic
+    python -m compileall -q src tests alembic
+    python -m pytest -q
+    Get-ChildItem tests -Filter 'frontend_*.mjs' | ForEach-Object { node $_.FullName }
+    Set-Location platform-service
+    mvn -B -ntp test
 
-默认页面位于 http://127.0.0.1:8000 。要在本地验收与生产一致的浏览器分流，
-将 `.env` 的 `JOB_AGENT_BROWSER_BASE_URL` 设为 `http://localhost:18082`，再运行
-`docker compose -f compose.yaml -f compose.platform.yaml --profile hybrid-local up -d --build`，
-从 http://127.0.0.1:18082/login 进入。联调脚本使用随机 PostgreSQL schema，验证注册、
-邮箱验证、登录、密码重置、Session 撤销、管理员账号操作、演示充值和扣费，结束后
-删除临时 schema，不清理现有用户数据。当前 Java+Python 分支不自动部署服务器。
-
-### 本地质量检查
-
-~~~powershell
-ruff check src tests alembic
-python -m compileall -q src tests alembic
-python -m pytest -q
-Get-ChildItem tests -Filter 'frontend_*.mjs' | ForEach-Object { node $_.FullName }
-Set-Location platform-service
-mvn -B -ntp test
-~~~
-
-Compose 配置检查（以下均为占位测试值，不用于生产部署）：
-
-~~~powershell
-$env:JOB_AGENT_REDIS_PASSWORD = 'ci-redis-password'
-$env:JOB_AGENT_PLATFORM_INTERNAL_TOKEN = 'ci-platform-shared-internal-token'
-$env:JOB_AGENT_PLATFORM_METRICS_TOKEN = 'ci-independent-platform-metrics-token'
-$env:JOB_AGENT_POSTGRES_PASSWORD = 'ci-postgres-password'
-$env:JOB_AGENT_RUNTIME_ENV_FILE = '.env.example'
-$env:JOB_AGENT_IMAGE = 'ghcr.io/example/job-hunting-ai:sha-0123456789ab'
-$env:JOB_AGENT_PLATFORM_IMAGE = 'ghcr.io/example/job-hunting-platform:sha-0123456789ab'
-$env:JOB_AGENT_ACCOUNT_ACTION_SECRET = 'ci-account-action-secret-at-least-32-characters'
-$env:JOB_AGENT_DOMAIN = 'agent.example.com'
-$env:JOB_AGENT_PUBLIC_BASE_URL = 'https://203.0.113.10:8443'
-$env:JOB_AGENT_PUBLIC_IP = '203.0.113.10'
-$env:JOB_AGENT_TLS_EMAIL = 'ops@example.com'
-$env:JOB_AGENT_GRAFANA_ADMIN_PASSWORD = 'ci-grafana-password'
-docker compose --env-file .env.example -f compose.yaml config --quiet
-docker compose --env-file .env.example -f compose.yaml -f compose.platform.yaml config --quiet
-docker compose --env-file .env.example -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml -f compose.hybrid.prod.yaml config --quiet
-docker compose --env-file .env.example -f compose.yaml -f compose.prod.yaml -f compose.coexist.yaml -f compose.hybrid.prod.yaml -f compose.hybrid.coexist.yaml config --quiet
-~~~
-
-### CI/CD
-
-推送到 `java-platform-migration` 后，CI 只运行聚焦的 Python 测试、前端回归、Java 单元测试、
-Ruff 和工作流语法检查；此时不会构建或发布镜像。完成一个迁移里程碑后，在推送的最后一条
-提交说明中加入 `[full ci]`，即可触发完整验收。完整验收包含全部
-Python/Java 测试、PostgreSQL 联调、Compose、安全扫描和容器连接测试；通过后才发布同一提交的：
-
-~~~text
-ghcr.io/1055537213/job-hunting-ai:sha-<提交前12位>
-ghcr.io/1055537213/job-hunting-platform:sha-<提交前12位>
-~~~
-
-也可以用空提交主动触发：`git commit --allow-empty -m "ci: full acceptance [full ci]"`，
-然后执行 `git push origin java-platform-migration`。工作流同时保留 `workflow_dispatch`；
-网页 `Run workflow` 按钮需要默认分支也配置该触发器，当前可直接使用上述提交方式。
-
-PR 和 `master` 推送仍运行完整验收。部署门禁要求目标 SHA 的完整验收及双镜像发布均成功，
-快速检查通过不代表可部署。本分支当前以本地验收为主；未来部署使用完整提交 SHA、人工批准和 `compose.hybrid.prod.yaml`
-（共存时再加 `compose.hybrid.coexist.yaml`）。服务器仍需预先准备生产环境变量、证书和部署权限，
-但无需临时修改应用代码。操作步骤见 [Python + Java 部署指南](docs/learning/python-java-deployment.md)。
+生产 Compose 应使用受限环境变量文件和不可变镜像，并在部署前完成备份、人工批准和健康检查。具体步骤见 docs/learning/python-java-deployment.md。
 
 ## 8. 接口文档
 
-启动 Web 后，以 /docs 和 /redoc 生成的接口为准。常用接口：
+启动 Web 后，以 /docs 和 /redoc 为准。常用接口：
 
 | 模块 | 方法与路径 | 说明 |
 | --- | --- | --- |
 | 认证 | POST /api/auth/register | 注册账号 |
 | 认证 | POST /api/auth/login | 登录并设置 Session |
 | 认证 | POST /api/auth/verify-email | 消费邮箱验证令牌 |
-| 认证 | POST /api/auth/change-email/confirm | 消费邮箱变更令牌并撤销旧会话 |
 | 账号 | GET /api/auth/me | 当前账号与余额摘要 |
-| 账号 | PATCH /api/account/email | 发起邮箱变更确认邮件 |
-| 账号 | PATCH /api/account/profile | 修改当前账号显示名称 |
-| 账号 | GET /api/account/export | 导出本人结构化数据，不包含密码哈希、会话凭据和向量 |
-| 账号 | POST /api/account/delete | 校验密码和确认文本，202 表示注销已受理，后台清理尚未完成 |
+| 账号 | PATCH /api/account/profile | 修改账号显示名称 |
 | 账号 | GET /api/account/export | 导出本人数据 |
-| 档案 | GET/POST /api/profiles | 查询或创建候选人档案 |
-| 对话 | POST /api/chat | 普通 Agent 对话，混合模式由 Java 鉴权后交给 Python 执行 |
-| 对话 | POST /api/chat/stream | Java 鉴权与 SSE 校验转发，Python 执行 Agent |
-| 职位 | POST /api/jobs | Java 校验 Session/CSRF、请求大小和非重放 JSON 转发；Python 执行职位规则审核、标准化解析、保存和去重 |
-| 职位 | POST /api/jobs/screenshots | Java 校验 Session/CSRF、4 张图片、单张 8 MiB 和总计 20 MiB 后单次转发；Python 执行 ClamAV、多模态识别、职位保存和去重 |
-| 项目 | POST /api/projects/github | Java 校验入口，Python 事务登记分析任务与提交回执，支持幂等与后台补投 |
-| 项目 | POST /api/projects/local/manifest | Java 校验清单入口，Python 筛选文件并恢复同一采集会话 |
-| 项目 | GET /api/projects/local/{collection_id} / DELETE /api/projects/local/{collection_id} | Java 校验归属；查询采集进度或原子取消，并后台重试附件清理 |
-| 项目 | POST /api/projects/local/{collection_id}/complete | Java 校验入口；Python 原子保存卡片并结束采集，重复请求复用原卡片 |
-| 项目 | POST /api/projects/local/{collection_id}/files | Java 校验并单次转发 multipart 批次；Python 执行 ClamAV、解析、视觉保存和 RAG/视觉索引 |
-| 简历 | POST /api/resumes/upload | Java 校验 Session/CSRF、候选人参数和 20 MiB 单文件限制并单次转发；Python 执行 ClamAV、DOCX/PDF 解析、OCR、存储和 RAG/任务处理 |
-| 项目 | POST /api/projects/{record_id}/confirm | 确认项目经历卡片 |
-| 项目 | GET /api/projects / DELETE /api/projects/{record_id} | Java 校验入口，Python 查询/删除项目与关联知识 |
+| 账号 | POST /api/account/delete | 发起账号注销 |
+| 档案 | GET/POST/DELETE /api/profiles | 查询、创建和删除档案 |
+| 对话 | POST /api/chat | 普通 Agent 对话 |
+| 对话 | POST /api/chat/stream | SSE 流式对话 |
+| 职位 | POST/GET /api/jobs | 导入和查询职位 |
+| 职位 | PUT /api/jobs/{id}/skill-requirements | 修正职位技能分类 |
+| 职位 | DELETE /api/jobs/{id} | 删除职位 |
+| 项目 | GET /api/projects | 查询项目卡片 |
+| 项目 | POST /api/projects/{id}/confirm | 确认项目卡片 |
+| 项目 | DELETE /api/projects/{id} | 删除项目及关联知识 |
+| 简历 | POST /api/resumes/upload | 上传和解析简历 |
 | 任务 | GET /api/tasks/{task_key} | 查询后台任务 |
 | 计费 | GET /api/me/balance | 查询余额和消费摘要 |
 | RAG | GET /api/rag/search | 账号隔离检索 |
 | 运维 | GET /api/health | 应用健康检查 |
-| 运维 | GET /api/admin/observability/requests | 管理员读取两端 API/内部调用快照与邮件投递状态 |
-| 运维 | GET /internal/metrics | Prometheus 内部指标 |
+| 监控 | GET /internal/metrics | Prometheus 内部指标 |
 
-已登录的写操作需要同源 Cookie 和 X-CSRF-Token；管理接口需要管理员角色；资源接口校验账号归属；/internal/metrics 不应暴露到公网。
-
-Java 内部接口不面向浏览器开放，使用 X-Internal-Service-Token 和 X-Trace-Id。账号资料读取契约位于 platform-service/src/main/resources/auth-internal.openapi.yaml 的 POST /internal/v1/auth/accounts/me。
-请求观测的两端快照、不可用状态和邮件投递字段见 [观测接口契约](platform-service/src/main/resources/observability.openapi.yaml)。
-个人中心账号资料与邮箱变更入口见 [账号资料接口契约](platform-service/src/main/resources/account-profile.openapi.yaml)。
-账号导出边界、错误码和同步下载限制见 [账号导出接口契约](platform-service/src/main/resources/account-export.openapi.yaml)。
-账号注销准入、异步恢复与错误码见 [账号注销接口契约](platform-service/src/main/resources/account-deletion.openapi.yaml)。
+写操作需要同源 Cookie 和 X-CSRF-Token；管理接口需要管理员角色；内部接口不应暴露到公网。
 
 ## 9. 常见问题（FAQ）
 
-### 为什么优先保留 Python + Java，而不是直接全量改成 Java？
+### Java 和 Python 如何分工？
 
-AI、RAG、OCR 和多模态文件处理仍然依赖 Python 生态；Java 更适合承载账号、权限、账务和稳定平台边界。分阶段迁移可以降低一次性重写风险，同时保持现有前端和业务能力。
+Java 承载账号、Session、权限、CSRF、账务和公开边界；Python 承载 Agent、RAG、文件解析、多模态处理、简历生成、工具执行和后台任务。两端通过服务令牌和真实 Session 的内部回调通信。
 
-### Java 服务是否已经替代 Python 全部代码？
+### Java 服务不可用时会绕过权限吗？
 
-没有。当前已迁移账号注册、Session、邮箱验证、邮箱变更、密码重置、管理员账号操作、当前账号资料读取、显示名称写入，以及余额查询、演示充值、模型扣费、管理员人工补款、模拟退款和充值对账的可选 Java 账务路径。浏览器认证、个人中心账务、管理员账务、账号列表/启停、审计、用量、工具轨迹、后台任务查询/管理操作和请求观测入口经网关直达 Java；Python 仍处理工具执行与轨迹写入、任务可靠投递/重试/状态写入、进程指标采集、其余 Web API、兼容适配、Agent、RAG、文件分析、简历生成和 Worker。真实微信/支付宝支付渠道仍未接入。
-
-账号导出入口和注销准入/完成确认也已由 Java 接管；Python 负责导出业务数据、等待在途请求与后台任务排空，以及清理文件和 RAG 数据。
-
-工作台档案 GET、创建 POST、删除 DELETE 入口已迁移到 Java，内部回调由 Python 按真实会话归属处理；实际档案读写、AI 更新和业务缓存仍由 Python 负责。创建使用事务幂等，删除使用持久化清理清单；附件未清完返回 202，完成后返回 200，重复删除可查询进度。契约见 [档案查询](platform-service/src/main/resources/profile-query.openapi.yaml)、[档案创建](platform-service/src/main/resources/profile-create.openapi.yaml) 和 [档案删除](platform-service/src/main/resources/profile-delete.openapi.yaml)。
-
-### Java 服务不可用时会不会偷偷回退到 Python？
-
-不会。混合认证和 Java 账务路径会失败关闭，返回 503，避免出现双事实源、旧余额或绕过 Java 权限校验。
-请求观测在管理员鉴权成功后允许依赖服务部分不可用，缺失指标返回 null；这不是认证或业务写入回退。
+不会。需要 Java 认证或账务的入口会失败关闭，避免权限绕过、双事实源或旧余额。
 
 ### RAG 默认 Top-K 和 Top-N 是多少？
 
-当前默认 Retriever Top-K=10，Reranker Top-N=5。先从知识库召回候选，再重排并把最终证据交给 Agent；正式上线前应使用真实发布集、困难负样本和 P95 延迟重新校准。
+Retriever Top-K=10，Reranker Top-N=5。正式上线前应使用真实业务评测集、困难负样本和 P95 延迟重新校准。
 
 ### 模拟充值是真实支付吗？
 
-不是。它只用于本地演示和测试。当前还没有接入具体支付渠道、退款状态机和渠道对账；签名 Webhook 结算核心已在 Java 平台服务中具备。
+不是。模拟充值用于本地演示和测试。具体支付渠道、退款状态机和渠道对账需要单独接入并验收。
 
-### Redis 故障会不会导致业务事实丢失？
+### Redis 故障会导致事实丢失吗？
 
-不会。Redis 只承担队列、限流、并发租约和可重建缓存；账号、任务、账务和审计事实保存在 PostgreSQL。缓存不可用时应用回源或按失败策略处理。
-
-### 删除项目后为什么可能不能立即重新导入？
-
-项目删除包含数据库、对象存储、长文本和向量索引的清理；如果分析任务仍在运行，后台任务会先完成或被回收。不能复用已取消任务的临时状态。
+不会。账号、任务、账务和审计事实保存在 PostgreSQL；Redis 负责队列、限流、并发租约和可重建缓存。
 
 ### 项目会自动登录招聘平台或自动投递吗？
 
-不会。项目只处理候选人主动带回的职位和材料，不运行招聘平台自动化，也不发送未经确认的招聘消息。
+不会。项目只处理用户主动提供的职位和材料，不运行招聘平台自动化，也不发送未经确认的招聘消息。
 
 ## 10. TODO / 未来计划
 
-- [x] 建立 Python + Java 本地联调、内部契约、CI 和独立分支发布流程。
-- [x] 迁移 Java 注册、Session、邮箱验证、邮箱变更、密码重置、管理员账号操作、当前账号资料读取、显示名称写入和账号注销闭环。
-- [x] 将浏览器认证公开路径由混合网关分流到 Java，其余页面/API 仍由 Python 提供。
-- [x] 补齐 Java Web 的 Session/管理员权限、Redis 分布式限流、CSRF、安全响应头、请求 ID 和低基数指标；生产弱配置拒绝启动。
-- [x] 接入 Java 余额查询、演示充值和模型调用扣费的可选路径。
-- [x] 接入 Java 管理员人工补款，验证真实会话、幂等重试、并发扣费和账务/审计事务回滚。
-- [x] 个人中心余额、消费流水和充值订单查询直达 Java，保留前端契约并验证账号隔离、分页及 Python Web 暂停后的独立查询。
-- [x] 个人中心演示充值入口直达 Java，统一会话、CSRF、额度和幂等校验，验证并发额度限制及失败回滚。
-- [x] 管理员余额流水、订单和支付事件查询、人工补款公开入口直达 Java，验证权限、分页、审计回滚及交叉补款加锁顺序。
-- [x] 管理员账号列表、启用/停用及审计查询公开入口直达 Java，保留安全字段、分页和会话撤销语义。
-- [x] 后台用量汇总及 Token 明细查询直达 Java，统一只读快照和每账号 500 条窗口，Python 继续写入与清理。
-- [x] 工具调用列表与详情查询直达 Java，按需读取低敏轨迹，保留步骤/重试/结果和失败原因，旧链接不能绕过保留窗口。
-- [x] 管理员任务列表和个人进度查询直达 Java，按真实账号隔离、只读快照分页，不暴露任务输入或删除执行记录；Python 保留任务写入。
-- [x] 管理员重试/探针入口迁移到 Java；Python 以同事务命令、任务和审计实现幂等，投递未确认返回 503，Beat 补投未完成命令。
-- [x] 接入邮箱变更验证流程；显示名称写入已由 Java 统一负责。
-- [x] 注销清理等待已受理的 Python 请求、SSE 和上传完成，完成后重新收集文件并删除；混合模式的等待不消耗清理失败预算。
-- [x] 工作台档案列表/详情查询经网关直达 Java；Python 保留数据所有权，验证账号隔离、摘要更新、依赖故障和恢复，无本地查询回退。
-- [x] 创建档案入口经 Java 校验 Session/CSRF，Python 原子提交档案和幂等凭据；同请求重放不重复创建，旧请求不复活已删除档案。
-- [x] 删除档案入口经 Java 鉴权，Python 原子删除事实/向量并持久化全版本附件清单；在途工作阻止删除，Worker 维护任务分批重试清理。
-- [x] 聊天会话列表、历史、新建、归档、删除入口经 Java 鉴权和回调，Python 保留消息与会话读写；验证历史脱敏、账号隔离、在途删除保护、依赖恢复和会话撤销。
-- [x] 普通聊天入口 `/api/chat` 经 Java Session/CSRF/模型限流进入 Python Agent；有界回包、完整调用期限、禁止命令自动重放，验证工具更新档案、历史、真实账务链路与余额不足。
-- [x] `/api/chat/stream` 经 Java 校验逐条转发，Python 使用有界缓冲与心跳；断连协作取消、保护在途工作，已确认 Token 用量只结算一次，不伪造成功历史。
-- [x] 项目列表、确认和删除公开入口经 Java；Python 保留项目事实与 RAG 写入。重复确认复用索引任务，冲突摘要返回 409；删除与在途工作互斥，SQL/向量与全版本附件清单同事务提交，Worker 可恢复清理原件。
-- [x] GitHub 项目分析提交经 Java Session/CSRF/限流与受控回调；Python 在同一事务登记任务和提交回执。网页保留未确认请求的幂等键，重复提交复用任务；投递失败返回 503，由维护任务退避补投，删除/停用不会复活旧任务。
-- [x] 本地项目清单、采集查询、取消、分批上传及完成入口经 Java；Python 保留筛选、ClamAV、解析/视觉写入、RAG/视觉索引和事实写入。multipart 批次最多 5 个文件、单文件 50 MiB、批次 160 MiB，Java 禁止自动重放，Python 再校验计划、大小和 SHA-256；失败文件按项返回固定原因，内部元数据与原始错误不出接口。取消与在途上传互斥，SQL/向量和全版本附件清单同事务提交，维护 Worker 可恢复物理清理；完成时卡片与采集关联同事务提交，重复请求复用原卡片，未上传完不产生孤立卡片。
-- [x] 简历上传入口 `/api/resumes/upload` 经 Java 接管 multipart、Session/CSRF、候选人边界、20 MiB 限制和不可重放转发；Python 保留候选人归属复核、ClamAV、DOCX/PDF/OCR、对象存储、RAG 和后台任务。Java 只返回安全文件元数据和受限任务回执，不暴露提取正文、存储键、任务 payload 或扫描器内部信息。
-- [x] 职位截图入口 `/api/jobs/screenshots` 经 Java 接管 multipart、Session/CSRF、图片数量和大小限制及不可重放转发；Python 保留 PNG/JPEG/WebP 校验、ClamAV、多模态识别、职位保存和重复判断。Java 不保存图片原件，不暴露模型原始错误或内部账号字段。
-- [x] 普通职位文本入口 `/api/jobs` 经 Java 接管 JSON、Session/CSRF、请求大小和不可重放转发；Python 保留职位文本审核、字段解析、保存和重复判断。Java 不直接读取职位数据库。
-- [x] 建立渠道无关的待支付订单和签名 Webhook 结算边界。
-- [ ] 接入具体支付渠道适配、退款状态机和渠道对账。
-- [ ] 使用真实行业材料完成正式 RAG 发布集、Top-K/Top-N 和 P95 性能验收。
-- [ ] 增加工业 PDF 表格/图注坐标、父子 Chunk、数值范围检索和 CAD 解析能力。
-- [ ] 在有明确外部调用方后，为 MCP adapter 增加认证、授权和 Server 生命周期。
-- [ ] 持续执行生产恢复演练、密钥轮换、渗透测试和容量基线复测。
-- [ ] 根据资源预算决定是否把 Python+Java 分支部署到真实服务器。
+- [x] Python + Java 本地联调、内部契约、CI 和镜像发布流程。
+- [x] 账号、Session、权限、账务、审计、用量和请求观测边界。
+- [x] 档案、聊天、项目、简历和职位入口的 Java 网关接入。
+- [x] 任务可靠投递、幂等、重试、回收和账号删除清理链路。
+- [x] ClamAV、备份恢复、Prometheus、日志和 Trace 配置及验收脚本。
+- [ ] 接入具体支付渠道、签名 Webhook、退款状态机和渠道对账。
+- [ ] 使用真实行业材料完成 RAG 发布集、Top-K/Top-N 和 P95 性能验收。
+- [ ] 增强工业 PDF 表格/图注坐标、父子 Chunk、数值范围检索和 CAD 解析能力。
+- [ ] 完成目标服务器的首次生产部署、HTTPS 验收、恢复演练和容量基线。
+- [ ] 持续执行密钥轮换、依赖升级、渗透测试和故障演练。
 
 ## 11. 联系方式 / 声明
 
-- GitHub：<https://github.com/1055537213/Job-Hunting>
-- Issues：<https://github.com/1055537213/Job-Hunting/issues>
-- 架构边界：[CONTEXT.md](CONTEXT.md)
-- 架构决策：[docs/architecture/python-java-boundary.md](docs/architecture/python-java-boundary.md)
-- 发布与恢复：[docs/learning/production-release.md](docs/learning/production-release.md)
-- Python + Java 联调：[scripts/validate_python_java_local.py](scripts/validate_python_java_local.py)
+- 项目问题：请通过项目托管平台的 Issue 页面反馈。
+- 架构边界：docs/architecture/python-java-boundary.md
+- 部署指南：docs/learning/python-java-deployment.md
+- 发布与恢复：docs/learning/production-release.md
+- 本地联调：scripts/validate_python_java_local.py
 
-本项目仅提供求职准备、信息整理和材料生成辅助，不保证职位匹配、面试或录用结果。候选人应对提交给招聘平台的内容、真实性、隐私授权和最终发送行为负责。
+本项目用于求职准备、信息整理和材料生成辅助，不保证职位匹配、面试或录用结果。用户应对提交内容的真实性、隐私授权和最终发送行为负责。
