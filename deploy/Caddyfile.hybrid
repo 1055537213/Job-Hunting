@@ -196,6 +196,11 @@
 			path_regexp adminAccountStatus ^/api/admin/accounts/[0-9]+/status$
 		}
 		reverse_proxy @admin_account_status platform-service:8081
+		@admin_security {
+			method GET
+			path /api/admin/security
+		}
+		reverse_proxy @admin_security platform-service:8081
 		@admin_usage {
 			method GET
 			path /api/admin/usage/summary /api/admin/usage/events

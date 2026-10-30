@@ -614,6 +614,8 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
         assert "path /api/admin/accounts /api/admin/audit/events" in edge
         assert "method PATCH" in edge
         assert "reverse_proxy @admin_account_status platform-service:8081" in edge
+        assert "path /api/admin/security" in edge
+        assert "reverse_proxy @admin_security platform-service:8081" in edge
         assert "path /api/admin/usage/summary /api/admin/usage/events" in edge
         assert "reverse_proxy @admin_usage platform-service:8081" in edge
         assert "path /api/admin/observability/requests" in edge
@@ -650,6 +652,7 @@ def test_hybrid_browser_auth_routes_and_release_assets_are_connected():
     assert "location ~ ^/api/admin/(balance/events|recharge/orders|recharge/orders/[0-9]+/events|recharge/reconciliation|accounts/[0-9]+/balance/credit)$" in nginx
     assert "location ~ ^/api/admin/(accounts|audit/events|accounts/[0-9]+/status)$" in nginx
     assert "location ~ ^/api/admin/usage/(summary|events)$" in nginx
+    assert "location = /api/admin/security" in nginx
     assert "location = /api/admin/observability/requests" in nginx
     assert "location ~ ^/api/admin/tools/traces(/[^/]+)?$" in nginx
     assert "location ~ ^/api/(admin/tasks|tasks/[^/]+)$" in nginx

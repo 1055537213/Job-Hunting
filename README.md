@@ -151,6 +151,10 @@ Docker Desktop 或 Docker Engine + Compose v2、Python 3.12、Node.js 22、JDK 2
 | 职位 | PUT /api/jobs/{id}/skill-requirements | 修正职位技能分类 |
 | 职位 | DELETE /api/jobs/{id} | 删除职位 |
 | 项目 | GET /api/projects | 查询项目卡片 |
+| 项目 | POST /api/projects/github | 提交公开 GitHub 项目分析 |
+| 项目 | POST/GET/DELETE /api/projects/local/* | 本地项目清单、进度和取消采集 |
+| 项目 | POST /api/projects/local/{id}/files | 分批上传本地项目文件 |
+| 项目 | POST /api/projects/local/{id}/complete | 完成本地项目采集 |
 | 项目 | POST /api/projects/{id}/confirm | 确认项目卡片 |
 | 项目 | DELETE /api/projects/{id} | 删除项目及关联知识 |
 | 简历 | POST /api/resumes/upload | 上传和解析简历 |
@@ -158,6 +162,7 @@ Docker Desktop 或 Docker Engine + Compose v2、Python 3.12、Node.js 22、JDK 2
 | 计费 | GET /api/me/balance | 查询余额和消费摘要 |
 | RAG | GET /api/rag/search | 账号隔离检索 |
 | 运维 | GET /api/health | 应用健康检查 |
+| 运维 | GET /api/admin/security | 管理员安全状态 |
 | 监控 | GET /internal/metrics | Prometheus 内部指标 |
 
 写操作需要同源 Cookie 和 X-CSRF-Token；管理接口需要管理员角色；内部接口不应暴露到公网。
