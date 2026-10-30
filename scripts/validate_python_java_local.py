@@ -272,6 +272,10 @@ def run_web_billing_flow(
         ):
             raise RuntimeError(f"Java -> Python profile query failed: {profiles.status_code} {profiles.text[:300]}")
 
+        projects = client.get(f"/api/projects?candidate_id={candidate_id}")
+        if projects.status_code != 200 or projects.json().get("project_cards") != []:
+            raise RuntimeError(f"Java -> Python project list failed: {projects.status_code} {projects.text[:300]}")
+
         created_chat = client.post(
             "/api/chat/sessions",
             headers={"X-CSRF-Token": csrf, "X-Request-ID": f"chat-contract-{suffix}"},
@@ -715,6 +719,7 @@ def main() -> int:
                 "PLATFORM_ACCOUNT_EXPORT_PYTHON_BASE_URL": f"http://127.0.0.1:{args.port + 1}",
                 "PLATFORM_PROFILES_PYTHON_BASE_URL": f"http://127.0.0.1:{args.port + 1}",
                 "PLATFORM_CHAT_PYTHON_BASE_URL": f"http://127.0.0.1:{args.port + 1}",
+                "PLATFORM_PROJECTS_PYTHON_BASE_URL": f"http://127.0.0.1:{args.port + 1}",
                 "SPRING_DATASOURCE_URL": jdbc_url,
                 "SPRING_DATASOURCE_USERNAME": jdbc_username,
                 "SPRING_DATASOURCE_PASSWORD": jdbc_password,
