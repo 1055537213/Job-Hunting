@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -272,9 +274,105 @@ def run_web_billing_flow(
         ):
             raise RuntimeError(f"Java -> Python profile query failed: {profiles.status_code} {profiles.text[:300]}")
 
-        projects = client.get(f"/api/projects?candidate_id={candidate_id}")
+        # Project routes are served by the Java public gateway in hybrid mode;
+        # keep the Python client for profile/chat routes that self-forward.
+        project_api = httpx.Client(base_url=base_url, cookies=client.cookies, timeout=20, follow_redirects=True)
+        projects = project_api.get(f"/api/projects?candidate_id={candidate_id}")
         if projects.status_code != 200 or projects.json().get("project_cards") != []:
             raise RuntimeError(f"Java -> Python project list failed: {projects.status_code} {projects.text[:300]}")
+
+        local_content = b"# Python Java local project\n\nA bounded local project import acceptance fixture.\n"
+        local_file_sha256 = hashlib.sha256(local_content).hexdigest()
+        manifest = project_api.post(
+            "/api/projects/local/manifest",
+            headers={"X-CSRF-Token": csrf, "X-Request-ID": f"project-manifest-{suffix}"},
+            json={
+                "candidate_id": candidate_id,
+                "project_name": "Python Java local import",
+                "files": [{
+                    "relative_path": "README.md",
+                    "file_size": len(local_content),
+                    "sha256": local_file_sha256,
+                    "media_type": "text/markdown",
+                    "last_modified": 1,
+                }],
+            },
+        )
+        if manifest.status_code != 200:
+            raise RuntimeError(f"Java -> Python local manifest failed: {manifest.status_code} {manifest.text[:300]}")
+        manifest_payload = manifest.json()
+        collection_id = manifest_payload.get("collection", {}).get("id")
+        selected_files = [
+            row for row in manifest_payload.get("files", []) if row.get("selection_status") == "selected"
+        ]
+        if not isinstance(collection_id, int) or len(selected_files) != 1:
+            raise RuntimeError("Local manifest did not return one selected file")
+        file_id = selected_files[0].get("id")
+        upload = project_api.post(
+            f"/api/projects/local/{collection_id}/files",
+            headers={"X-CSRF-Token": csrf, "X-Request-ID": f"project-upload-{suffix}"},
+            data={"file_ids": json.dumps([file_id])},
+            files=[("files", ("README.md", local_content, "text/markdown"))],
+        )
+        if upload.status_code != 200 or len(upload.json().get("processed_files", [])) != 1:
+            raise RuntimeError(f"Java -> Python local upload failed: {upload.status_code} {upload.text[:300]}")
+        progress = project_api.get(f"/api/projects/local/{collection_id}")
+        if progress.status_code != 200 or progress.json().get("files", [{}])[0].get("selection_status") != "analyzed":
+            raise RuntimeError(f"Java -> Python local progress failed: {progress.status_code} {progress.text[:300]}")
+        completed = project_api.post(
+            f"/api/projects/local/{collection_id}/complete",
+            headers={"X-CSRF-Token": csrf, "X-Request-ID": f"project-complete-{suffix}"},
+        )
+        if completed.status_code != 200 or not isinstance(completed.json().get("project_card", {}).get("id"), int):
+            raise RuntimeError(f"Java -> Python local completion failed: {completed.status_code} {completed.text[:300]}")
+        project_id = completed.json()["project_card"]["id"]
+        listed = project_api.get(f"/api/projects?candidate_id={candidate_id}")
+        if listed.status_code != 200 or [row.get("id") for row in listed.json().get("project_cards", [])] != [project_id]:
+            raise RuntimeError(f"Java -> Python completed project list failed: {listed.status_code} {listed.text[:300]}")
+        confirmed = project_api.post(
+            f"/api/projects/{project_id}/confirm",
+            headers={"X-CSRF-Token": csrf, "X-Request-ID": f"project-confirm-{suffix}"},
+            json={"confirmed_summary": "I designed and implemented the local project workflow."},
+        )
+        if confirmed.status_code != 200 or confirmed.json().get("project_card", {}).get("status") != "已确认":
+            raise RuntimeError(f"Java -> Python project confirmation failed: {confirmed.status_code} {confirmed.text[:300]}")
+        deleted = project_api.delete(
+            f"/api/projects/{project_id}",
+            headers={"X-CSRF-Token": csrf, "X-Request-ID": f"project-delete-{suffix}"},
+        )
+        if deleted.status_code != 200 or deleted.json().get("cleanup_status") not in {"pending", "completed"}:
+            raise RuntimeError(f"Java -> Python project deletion failed: {deleted.status_code} {deleted.text[:300]}")
+        if project_api.get(f"/api/projects?candidate_id={candidate_id}").json().get("project_cards") != []:
+            raise RuntimeError("Deleted project remained visible in the project list")
+
+        github_payload = {
+            "candidate_id": candidate_id,
+            "repository_url": "https://github.com/example/python-java-acceptance",
+            "idempotency_key": f"github-{suffix}",
+        }
+        github_first = project_api.post(
+            "/api/projects/github",
+            headers={"X-CSRF-Token": csrf, "X-Request-ID": f"github-submit-{suffix}"},
+            json=github_payload,
+        )
+        if github_first.status_code != 200 or not isinstance(github_first.json().get("task", {}).get("task_key"), str):
+            raise RuntimeError(f"Java -> Python GitHub submission failed: {github_first.status_code} {github_first.text[:300]}")
+        github_replay = project_api.post(
+            "/api/projects/github",
+            headers={"X-CSRF-Token": csrf, "X-Request-ID": f"github-replay-{suffix}"},
+            json=github_payload,
+        )
+        if github_replay.status_code != 200 or github_replay.json().get("task", {}).get("task_key") != github_first.json()["task"]["task_key"]:
+            raise RuntimeError("GitHub project submission was not idempotent")
+        github_conflict = project_api.post(
+            "/api/projects/github",
+            headers={"X-CSRF-Token": csrf, "X-Request-ID": f"github-conflict-{suffix}"},
+            json={**github_payload, "repository_url": "https://github.com/example/another-project"},
+        )
+        if github_conflict.status_code != 409:
+            raise RuntimeError(f"GitHub project idempotency conflict was not rejected: {github_conflict.status_code}")
+        project_api.close()
+        print("==> Java -> Python project import lifecycle and GitHub dispatch contract: PASS")
 
         created_chat = client.post(
             "/api/chat/sessions",
@@ -777,7 +875,8 @@ def main() -> int:
                     "JOB_AGENT_DEMO_RECHARGE_ENABLED=true",
                     "JOB_AGENT_DEMO_RECHARGE_MAX_AMOUNT_YUAN=20",
                     "JOB_AGENT_DEMO_RECHARGE_MAX_TOTAL_YUAN=50",
-                    "JOB_AGENT_TASK_QUEUE_ENABLED=false",
+                    "JOB_AGENT_TASK_QUEUE_ENABLED=true",
+                    f"JOB_AGENT_REDIS_URL=redis://:{redis_password}@127.0.0.1:{redis_port}/0",
                     "JOB_AGENT_COOKIE_SECURE=false",
                     "JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS=100",
                 ]
@@ -802,7 +901,8 @@ def main() -> int:
                 "JOB_AGENT_EMAIL_VERIFICATION_REQUIRED": "true",
                 "JOB_AGENT_CONSENT_REQUIRED": "false",
                 "JOB_AGENT_DEMO_RECHARGE_ENABLED": "true",
-                "JOB_AGENT_TASK_QUEUE_ENABLED": "false",
+                "JOB_AGENT_TASK_QUEUE_ENABLED": "true",
+                "JOB_AGENT_REDIS_URL": f"redis://:{redis_password}@127.0.0.1:{redis_port}/0",
                 "JOB_AGENT_COOKIE_SECURE": "false",
                 "JOB_AGENT_RATE_LIMIT_AUTH_REQUESTS": "100",
             }
